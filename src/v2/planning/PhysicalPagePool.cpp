@@ -158,6 +158,22 @@ void PhysicalPagePool::fillWitnessRequests(std::span<planning::WitnessRequest> o
     }
 }
 
+std::vector<planning::WitnessRequest> PhysicalPagePool::liveWitnessRequests() const
+{
+    std::vector<planning::WitnessRequest> result;
+    result.reserve(requests_.size());
+    for (std::size_t record = 0; record < requests_.size(); ++record)
+    {
+        const auto &request = requests_[record];
+        if (!request.live) continue;
+        result.push_back({.generation=request.generation, .record=record,
+            .peak_frames=request.declared_peak,
+            .occupied_frames=request.assigned + request.remaining,
+            .preserved=false});
+    }
+    return result;
+}
+
 planning::WitnessBaseOccupancy PhysicalPagePool::physicalBaseOccupancy() const
 {
     // Canonical physical count, one frame exactly once: every frame that is

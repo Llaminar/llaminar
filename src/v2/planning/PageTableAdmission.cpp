@@ -9,6 +9,7 @@
  * paths; no usable partial state outlives this function.
  */
 #include "PageTableAdmission.h"
+#include "planning/AllResourceCompletionWitness.h"
 #include <utility>
 
 namespace llaminar2
@@ -47,6 +48,44 @@ std::optional<PageTableAdmission> admitPoolTableReserved(
     return PageTableAdmission{std::move(*grant), std::move(*update)};
 }
 
+namespace
+{
+/** @brief Prove the ALL-CLASS completion order before any acquisition. */
+bool proveAllClassOrder(PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
+    std::size_t declared_peak, std::size_t initial_grant)
+{
+    AllResourceCapacity capacity;
+    capacity.frames = pool.geometry().frames;
+    capacity.banks = table.bankCount();
+    capacity.lease_cells = table.leaseCellCount();
+    capacity.base = pool.physicalBaseOccupancyForWitness();
+    AllResourceRequest proposed;
+    proposed.generation = 0;
+    proposed.peak_frames = declared_peak;
+    proposed.occupied_frames = initial_grant;
+    proposed.peak_banks = 1;   // One table bank per admitted request.
+    proposed.peak_leases = 1;  // One effective-use lease per admitted request.
+    // Existing live requests enter at their declared peaks (frames only are
+    // tracked by the pool; the table's live bank/lease demand is admitted by
+    // the table itself, so the composed proof counts the admitted maxima).
+    auto live = pool.liveWitnessRequests();
+    for (const auto &r : live)
+    {
+        AllResourceRequest existing;
+        existing.generation = r.generation;
+        existing.record = r.record;
+        existing.peak_frames = r.peak_frames;
+        existing.occupied_frames = r.occupied_frames;
+        existing.peak_banks = 1;
+        existing.peak_leases = 1;
+        existing.preserved = r.preserved;
+        capacity.requests.push_back(existing);
+    }
+    capacity.requests.push_back(proposed);
+    return proveAllResourceCompletion(capacity).valid;
+}
+}
+
 std::optional<PageTableAdmission> admitPoolTableWitnessed(
     PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
     std::size_t declared_peak, std::size_t initial_grant,
@@ -54,17 +93,17 @@ std::optional<PageTableAdmission> admitPoolTableWitnessed(
 {
     if (table.issuerForAdmission() != pool.issuerForAdmission())
         throw std::invalid_argument("Witnessed pool/table admission requires one original PMA authority");
-    // The completion witness is proved BEFORE ANY ACQUISITION by the pool's
-    // own witness admission (proof precedes mutation; a refused invocation
-    // leaves every class untouched, including the reservation handle). Only
-    // when the proof holds does the pool convert the initial grant, and only
-    // then does the accepted-work handle authorize the table bank. If the
-    // table cannot supply the bank, the grant's RAII rolls back and the
-    // reservation capacity is NOT consumed.
     if (!reservation || !reservation.remaining())
         return std::nullopt;
+    // ALL-CLASS proof precedes ANY acquisition: frames, table banks and
+    // effective-use lease cells are proven together before the pool converts
+    // the initial grant, the accepted-work handle authorizes the table bank,
+    // or ANY reservation capacity is consumed. On refusal every class is
+    // untouched (proof-first, not acquire-then-rollback).
+    if (!proveAllClassOrder(pool, table, declared_peak, initial_grant))
+        return std::nullopt;
     auto grant = pool.tryAdmitWithWitness(declared_peak, initial_grant);
-    if (!grant) return std::nullopt; // No completion order or no growth: untouched.
+    if (!grant) return std::nullopt; // No conversion: untouched.
     auto update = table.tryBeginReserved(reservation);
     if (!update) return std::nullopt; // Grant RAII rolls back; no issuance consumed.
     return PageTableAdmission{std::move(*grant), std::move(*update)};

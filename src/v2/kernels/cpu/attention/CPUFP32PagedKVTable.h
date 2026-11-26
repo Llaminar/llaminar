@@ -219,6 +219,10 @@ public:
     {
         return effective_use_.retireReplica(incarnation);
     }
+    /** @return Admitted bank count (witness class maximum). */
+    std::size_t bankCount() const noexcept { return banks_.size(); }
+    /** @return Admitted effective-use lease-cell count (witness class maximum). */
+    std::size_t leaseCellCount() const noexcept { return effective_use_.leaseCapacity(); }
 private:
     enum class Phase : std::uint8_t { Free, Preparing, Published };
     /** @brief Exact CPU ownership state within the charged metadata root. */

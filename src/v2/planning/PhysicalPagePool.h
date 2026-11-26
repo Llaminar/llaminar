@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace llaminar2
 {
@@ -324,8 +325,15 @@ public:
     bool extendWithWitness(Grant &grant, std::size_t pages);
     /** @return Current live requests as witness inputs; no observed frame copies. */
     void fillWitnessRequests(std::span<planning::WitnessRequest> out) const;
+    /** @return LIVE witness requests as a vector (bounded by membership). */
+    [[nodiscard]] std::vector<planning::WitnessRequest> liveWitnessRequests() const;
     /** @return Canonical physical occupancy outside live request records, each frame once. */
     planning::WitnessBaseOccupancy physicalBaseOccupancy() const;
+    /** @return Canonical witness base occupancy (composed all-class proof input). */
+    [[nodiscard]] planning::WitnessBaseOccupancy physicalBaseOccupancyForWitness() const noexcept
+    {
+        return physicalBaseOccupancy();
+    }
     /** @return Immutable dimensions; not an observation of device state. */
     const PhysicalPagePoolGeometry &geometry() const noexcept { return geometry_; }
     /** @return Original PMA instance identity for same-authority admission checks. */
