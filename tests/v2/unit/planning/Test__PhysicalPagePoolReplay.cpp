@@ -418,6 +418,19 @@ public:
                 combinations_.emplace(name, PageTableAdmission{
                     std::move(admitted->grant), std::move(admitted->table_update)});
         }
+        else if (kind == "combined-witnessed")
+        {
+            std::string reservation_name;
+            size_t peak, initial;
+            if (!(input >> name >> reservation_name >> peak >> initial) ||
+                combinations_.contains(name) || !reservations_.contains(reservation_name)) fail();
+            auto admitted = admitPoolTableWitnessed(*pool_, *table_, peak, initial,
+                reservations_.at(reservation_name));
+            outcome = admitted ? "accepted" : "refused";
+            if (admitted)
+                combinations_.emplace(name, PageTableAdmission{
+                    std::move(admitted->grant), std::move(admitted->table_update)});
+        }
         else if (kind == "admit-witness")
         {
             std::string request;
@@ -790,7 +803,10 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedEndToEndTransactionReplayExactly)
             hex += "0123456789abcdef"[value >> 4];
             hex += "0123456789abcdef"[value & 0xf];
         }
-        const std::vector<std::string> commands{"table-reserve R 1", "combined-reserved X R 1",
+        // ONE integrated milestone: reservation -> WITNESSED all-class prepare
+        // -> actual attach/use -> publication -> retirement.
+        const std::vector<std::string> commands{"table-reserve R 1",
+            "combined-witnessed X R 1 1", // peak 1, initial grant 1.
             "table-attach-archive _ X 100 4 0 0 " + hex, "table-commit X S",
             "table-borrow B S", "table-read B", "table-drop B", "table-drop S",
             "table-drop-reserved R", "end"};
@@ -809,7 +825,7 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedEndToEndTransactionReplayExactly)
 TEST(PhysicalMemoryAuthority, PagePoolEndToEndReplayRejectsAlteredObservations)
 {
     for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
-        {"combined-reserved X R 1 | accepted", "combined-reserved X R 1 | refused"},
+        {"combined-witnessed X R 1 1 | accepted", "combined-witnessed X R 1 1 | refused"},
         {"table-read B | ", "table-read B | corrupt"},
         {"end | idle\n", ""}})
     {
