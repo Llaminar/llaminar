@@ -1816,6 +1816,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PagedKVPoolGeometry.cpp
     planning/PagedKVInstancePlan.cpp
     planning/PagedKVInstance.cpp
+    planning/PagedKVInstanceFactory.cpp
     planning/PhysicalPagePool.cpp
     planning/CompletionWitness.cpp
     planning/PageTableAdmission.cpp
