@@ -238,11 +238,14 @@ TEST(MXFP4CPUScaleLoaders, NativeE8M0BytesAndFP16WordsWidenExactlyOnEveryISA)
         }
 #endif
 #if defined(__AVX2__)
+        // Native-plane reads use the production nibble domain for this codebook.
+        if (!primary)
+            ASSERT_EQ(nibbleDotAVX2(packed.codebook_id), NibbleDotAVX2::SmallLUT);
         for (int group = 0; group < 8; ++group)
         {
             alignas(32) float out[8];
             _mm256_store_ps(out, primary ? packed.loadScales256(primary + group * 8)
-                : loadNibbleFactors256(packed, 0, 0, group * 8).primary);
+                : loadNibbleFactors256<NibbleDotAVX2::SmallLUT>(packed, 0, 0, group * 8).primary);
             for (int lane = 0; lane < 8; ++lane)
                 EXPECT_EQ(bits(out[lane]), expected[group * 8 + lane]) << "256 col " << group * 8 + lane;
         }
