@@ -112,6 +112,12 @@ struct DeviceGraphOrchestratorMTPSlotsTestAccess
         }
         owner.serving_row_slots_ = std::move(prior);
     }
+    /** @brief Submit a compact real predictor batch through the resident production boundary. */
+    static bool draft(DeviceGraphOrchestrator &owner, const std::vector<int> &slots,
+        std::span<const int32_t> tokens, std::span<const int> positions, CPUResidentMTPHidden::Bank bank)
+    {
+        return owner.executeCPUResidentMTPDraft(slots, tokens, positions, bank);
+    }
     /** @brief Submit one real sidecar row; all graph selection remains production-owned. */
     static bool execute(DeviceGraphOrchestrator &owner, int token, int position,
                         const std::vector<int> *slots)
@@ -5551,6 +5557,28 @@ TEST(Test__MTPGraphConstruction, ResidentMainHiddenTracksProductionForward)
         width * sizeof(float)), 0);
     EXPECT_NO_THROW(resident.read(first));
     EXPECT_NO_THROW(resident.read(second));
+    const std::array<int32_t, 2> draft_tokens{6, 7};
+    const std::array<int, 2> draft_positions{0, 0};
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::draft(*owner, {4, 2},
+        draft_tokens, draft_positions, Bank::Main));
+    const auto draft4 = resident.acquire(4, Bank::Draft);
+    const auto draft2 = resident.acquire(2, Bank::Draft);
+    const auto &shifted = *owner->inferenceState().mtp_kv_caches.at(0);
+    EXPECT_EQ(shifted.get_cached_tokens(0, 4), 1);
+    EXPECT_EQ(shifted.get_cached_tokens(0, 2), 1);
+    const auto *draft_hidden = owner->inferenceState().extension_buffers.at(BufferId::MTP_HIDDEN)->fp32_data();
+    EXPECT_EQ(std::memcmp(resident.read(draft4).data(), draft_hidden, width * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(resident.read(draft2).data(), draft_hidden + width, width * sizeof(float)), 0);
+    EXPECT_NO_THROW(resident.read(first));
+    EXPECT_NO_THROW(resident.read(second));
+    const std::array<int32_t, 1> next_token{8};
+    const std::array<int, 1> next_position{1};
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::draft(*owner, {4},
+        next_token, next_position, Bank::Draft));
+    EXPECT_THROW(resident.read(draft4), std::logic_error);
+    EXPECT_NO_THROW(resident.read(draft2));
+    EXPECT_EQ(shifted.get_cached_tokens(0, 4), 2);
+    EXPECT_EQ(shifted.get_cached_tokens(0, 2), 1);
     // A shorter subsequent publication invalidates only its own old receipt.
     DeviceGraphOrchestratorMTPSlotsTestAccess::publishMain(*owner, {4}, 1, {1});
     EXPECT_EQ(std::memcmp(resident.read(resident.acquire(4, Bank::Main)).data(), hidden,

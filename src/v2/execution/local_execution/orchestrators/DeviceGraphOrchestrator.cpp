@@ -25113,6 +25113,57 @@ namespace llaminar2
             defer_final_sync);
     }
 
+    bool DeviceGraphOrchestrator::executeCPUResidentMTPDraft(
+        const std::vector<int> &slots, std::span<const int32_t> tokens,
+        std::span<const int> positions, CPUResidentMTPHidden::Bank source)
+    {
+        if (!state_.device_id.is_cpu() || !cpu_resident_mtp_hidden_ ||
+            !state_.prefix_terminal_hidden || state_.mtp_kv_caches.empty() ||
+            slots.empty() || slots.size() != tokens.size() || slots.size() != positions.size() ||
+            slots.size() > static_cast<size_t>(state_.batch_size))
+            throw std::logic_error("CPU resident MTP draft lacks admitted slot/token/position state");
+        MTPForwardInput admission;
+        admission.device = state_.device_id;
+        admission.kv_cache = state_.mtp_kv_caches[0].get();
+        admission.batch_size = static_cast<int>(slots.size());
+        admission.request_kv_slots = &slots;
+        validateMTPRequestKVSlots(admission);
+        const size_t width = static_cast<size_t>(graph_builder_->config().residualWidth());
+        if (state_.prefix_terminal_hidden->numel() / width < slots.size())
+            throw std::logic_error("CPU resident MTP compact input exceeds its retained mailbox");
+        // Authenticate the complete transaction before copying any publication.
+        for (size_t row = 0; row < slots.size(); ++row)
+        {
+            if (positions[row] < 0 || positions[row] >= state_.max_seq_len ||
+                tokens[row] < 0 || tokens[row] >= state_.vocab_size)
+                throw std::invalid_argument("CPU resident MTP draft token or position is invalid");
+            (void)cpu_resident_mtp_hidden_->acquire(slots[row], source);
+        }
+        float *compact = state_.prefix_terminal_hidden->mutable_data();
+        for (size_t row = 0; row < slots.size(); ++row)
+        {
+            const auto lease = cpu_resident_mtp_hidden_->acquire(slots[row], source);
+            const auto hidden = cpu_resident_mtp_hidden_->read(lease);
+            std::copy(hidden.begin(), hidden.end(), compact + row * width);
+        }
+        state_.mtp_terminal_hidden_publication.publishResidentRows(source);
+        if (!executeMTPDepth0Batched(tokens.data(), 1, state_.prefix_terminal_hidden.get(),
+                positions.front(), "cpu_resident_draft", false, BufferId::PREFIX_TERMINAL_HIDDEN,
+                false, nullptr, -1, false, static_cast<int>(slots.size()), positions.data(),
+                nullptr, nullptr, 0, nullptr, 0, -1, 0, nullptr, 1, 1, 1, 0, 0,
+                DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch, &slots))
+            return false;
+        const auto found = state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+        if (found == state_.extension_buffers.end() || !found->second ||
+            found->second->numel() / width < slots.size() || !found->second->fp32_data())
+            throw std::logic_error("CPU resident MTP draft did not produce its exact hidden rows");
+        const float *draft = found->second->fp32_data();
+        for (size_t row = 0; row < slots.size(); ++row)
+            cpu_resident_mtp_hidden_->publish(slots[row], CPUResidentMTPHidden::Bank::Draft,
+                std::span<const float>(draft + row * width, width));
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::executeMTPDepth0Batched(
         const int32_t *draft_condition_tokens,
         int token_count,

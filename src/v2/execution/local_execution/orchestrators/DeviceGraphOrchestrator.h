@@ -140,6 +140,8 @@ namespace llaminar2
             AcceptedVerifier,
             CheckpointRestore,
             VisibleZeroHiddenBootstrap,
+            ResidentMainRows,
+            ResidentDraftRows,
         };
 
         /** @brief Immutable identity of one current mailbox publication. */
@@ -181,6 +183,10 @@ namespace llaminar2
                 return "checkpoint_restore";
             case Source::VisibleZeroHiddenBootstrap:
                 return "visible_zero_hidden_bootstrap";
+            case Source::ResidentMainRows:
+                return "resident_main_rows";
+            case Source::ResidentDraftRows:
+                return "resident_draft_rows";
             }
             return "invalid";
         }
@@ -220,6 +226,12 @@ namespace llaminar2
         void publishVisibleZeroHiddenBootstrap() noexcept
         {
             publish(Source::VisibleZeroHiddenBootstrap);
+        }
+
+        /** @brief Publish compact CPU rows copied from their current resident main/draft owners. */
+        void publishResidentRows(CPUResidentMTPHidden::Bank bank) noexcept
+        {
+            publish(bank == CPUResidentMTPHidden::Bank::Main ? Source::ResidentMainRows : Source::ResidentDraftRows);
         }
 
         /**
@@ -7150,6 +7162,18 @@ namespace llaminar2
                               bool kv_cache_only = false,
                               BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
                               bool defer_final_sync = false);
+
+        /**
+         * @brief Execute one shared CPU predictor transaction over arbitrary resident slots.
+         * @param slots Distinct admitted slots in compact row order.
+         * @param tokens One condition token per slot.
+         * @param positions Independent predictor position per slot.
+         * @param source Current main or previous draft hidden publication.
+         * @return True only after every draft hidden row is published back to its slot.
+         * @throws std::logic_error For missing, stale or foreign CPU publication state.
+         */
+        bool executeCPUResidentMTPDraft(const std::vector<int> &slots,
+            std::span<const int32_t> tokens, std::span<const int> positions, CPUResidentMTPHidden::Bank source);
 
         /**
          * @brief Submit one retained depth-zero MTP sidecar transaction.
