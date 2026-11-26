@@ -53,6 +53,17 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+import sys as _sys
+
+# This module is imported BOTH as a plain script (test harness) and as
+# mpi_diag.ci_mpi_hook by scripts/ci/run_develop_pr_tests.py. In the latter
+# case mpi_diag/ itself is NOT on sys.path, so a bare
+# "from env_policy import ..." raises ModuleNotFoundError unless the package
+# directory is on the search path. Make the sibling modules importable in
+# both modes without changing the public API.
+_diag_dir = str(Path(__file__).resolve().parent)
+if _diag_dir not in _sys.path and True:
+    _sys.path.insert(0, _diag_dir)
 
 MPI_FIXTURE_ALLOWLIST = frozenset((
     "V2_Integration_MPISessionRetirement_singleton",
@@ -380,6 +391,10 @@ def run_after_failed_host_lane(lane_xml: Path, output_root: Path,
     """Entry point. Call only after the host lane result was non-zero."""
     global _build_dir
     _build_dir = Path(build_dir)
+    from env_policy import find_ctest
+    ctest_bin = find_ctest(build_dir)
+    if "LLAMINAR_CTEST" not in os.environ:
+        os.environ["LLAMINAR_CTEST"] = ctest_bin
     diag_dir = Path(output_root) / "mpi-diag"
     diag_dir.mkdir(parents=True, exist_ok=True)
     image_env = dict(image_env or {})
@@ -407,8 +422,10 @@ def run_after_failed_host_lane(lane_xml: Path, output_root: Path,
     result["selected"] = selected
 
     # Registered TIMEOUT required: missing => fail unqualified (no default).
+    from env_policy import find_ctest
+    ctest_bin = find_ctest(build_dir)
     inventory = json.loads(subprocess.run(
-        ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1"],
+        [ctest_bin, "--test-dir", str(build_dir), "--show-only=json-v1"],
         capture_output=True, text=True, check=False).stdout)
     entry = next((t for t in inventory["tests"] if t["name"] == selected), None)
     if entry is None:

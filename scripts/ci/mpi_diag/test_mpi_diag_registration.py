@@ -174,6 +174,61 @@ class MPIStartupDiagnosticPolicy(unittest.TestCase):
             self.assertEqual(mod.source_identity(malformed)["source_note"],
                              "UNBOUND")
 
+    def test_find_ctest_resolves_without_path(self):
+        """Reproduce the CI condition: ctest NOT on PATH. find_ctest must
+        still return an executable (candidates / LLAMINAR_CTEST)."""
+        import subprocess
+        env = dict(os.environ)
+        env["LLAMINAR_CTEST"] = "/does/not/exist"
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]);"
+             "from env_policy import find_ctest;"
+             "print(find_ctest())",
+             str(HERE)], capture_output=True, text=True, env=env)
+        self.assertNotEqual(result.returncode, 0,
+                            "missing LLAMINAR_CTEST must fail closed")
+        # Without the env var, resolution must succeed even if PATH lacks ctest.
+        env2 = dict(os.environ)
+        env2["PATH"] = "/usr/bin:/bin"  # no cmake4 bin
+        env2.pop("LLAMINAR_CTEST", None)
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]);"
+             "from env_policy import find_ctest;"
+             "import os;"
+             "p = find_ctest();"
+             "print(p) if os.path.exists(p) else print('MISSING')",
+             str(HERE)], capture_output=True, text=True, env=env2)
+        self.assertEqual(result.returncode, 0, result.stderr[-300:])
+        self.assertNotIn("MISSING", result.stdout)
+
+    def test_find_ctest_resolves_from_build_cache(self):
+        """The CI runner condition: ctest NOT on PATH, but the build tree's
+        CMakeCache.txt records CMAKE_CTEST_COMMAND. find_ctest(build_dir)
+        must resolve to that exact executable."""
+        import subprocess
+        env = dict(os.environ)
+        env["PATH"] = "/usr/bin:/bin"
+        env.pop("LLAMINAR_CTEST", None)
+        script = (
+            "import sys, tempfile, pathlib, os;"
+            "sys.path.insert(0, sys.argv[1]);"
+            "from env_policy import find_ctest;"
+            "d = tempfile.mkdtemp();"
+            "p = pathlib.Path(d)/'CMakeCache.txt';"
+            "p.write_text('CMAKE_CTEST_COMMAND:INTERNAL=' + sys.executable);"
+            "print(find_ctest(d))")
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(HERE)],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr[-300:])
+        # sys.executable is an existing file, so it is the resolved value.
+        self.assertTrue(
+            result.stdout.strip().endswith("python3.12")
+            or result.stdout.strip().endswith("python3")
+            or result.stdout.strip().endswith("python"), result.stdout)
+
     def test_runner_propagates_failing_result(self):
         """Runner exit code is checked (reviewer-95 block 1): a failing test
         class (never registered) must make CTest red, not always-pass."""

@@ -85,6 +85,7 @@ EXACT_ENV_KEYS = (
     "PRTE_MCA_prte_local_tmpdir_base",
     "PRTE_MCA_prte_remote_tmpdir_base",
     "LLAMINAR_TEST_MPI_SESSION_HELPER",
+    "LLAMINAR_CTEST",
     "LLAMINAR_FORCE_CPU_ONLY_STARTUP",
     "LLAMINAR_SKIP_CUDA_STARTUP",
     "LLAMINAR_SKIP_ROCM_STARTUP",
@@ -494,8 +495,10 @@ def main() -> int:
                 gdb = str(candidate)
                 break
 
+    from env_policy import parse_environment_policy, UnsupportedPolicy, find_ctest
+    ctest_bin = find_ctest(args.build_dir)
     inventory = json.loads(subprocess.run(
-        ["ctest", "--test-dir", str(args.build_dir), "--show-only=json-v1"],
+        [ctest_bin, "--test-dir", str(args.build_dir), "--show-only=json-v1"],
         capture_output=True, text=True, check=False).stdout)
     entry = next((t for t in inventory["tests"]
                   if t["name"] == args.test), None)
@@ -504,7 +507,6 @@ def main() -> int:
         return 125
     command = [str(w) for w in entry["command"]]
     properties = {p["name"]: p["value"] for p in entry.get("properties", [])}
-    from env_policy import parse_environment_policy, UnsupportedPolicy
     policy_report: dict = {}
     try:
         environment = parse_environment_policy(entry, dict(os.environ),

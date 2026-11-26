@@ -30,6 +30,89 @@ execution, that is a separate reviewed feature.
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import shutil
+
+CTEST_CANDIDATES = (
+    "/opt/cmake4/bin/ctest",
+    # pip-installed cmake (pinned Kitware 4.0.3) keeps ctest inside the
+    # interpreter package data, never on PATH:
+    "/opt/cmake4/lib/python*/site-packages/cmake/data/bin/ctest",
+    "/usr/lib/python*/site-packages/cmake/data/bin/ctest",
+    "/usr/local/lib/python*/site-packages/cmake/data/bin/ctest",
+    "/usr/bin/ctest",
+    "/usr/local/bin/ctest",
+    "/usr/lib/llvm*/bin/ctest",
+)
+
+
+CTEST_CACHE_KEY = "CMAKE_CTEST_COMMAND"
+
+
+def _ctest_from_cache(build_dir) -> str | None:
+    """Read CMAKE_CTEST_COMMAND from the build tree's CMakeCache.txt.
+
+    This is the exact ctest that configured the build, which is authoritative
+    and works even when the runner's PATH lacks ctest entirely (the CI
+    test-runner image ships cmake as a pip package whose ctest lives under
+    /opt/cmake4/lib/python3.12/site-packages/cmake/data/bin/, never on PATH).
+    """
+    if build_dir is None:
+        return None
+    cache = Path(build_dir) / "CMakeCache.txt"
+    try:
+        for line in cache.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith(CTEST_CACHE_KEY + ":"):
+                value = line.split("=", 1)[1].strip("\"'\"")
+                if value and Path(value).is_file():
+                    return value
+    except OSError:
+        return None
+    return None
+
+
+def find_ctest(build_dir=None) -> str:
+    """Locate the ctest executable that matches the configured build.
+
+    The CMake 4 kitware bundle (used by this project) installs ctest under the
+    interpreter package directory (/opt/cmake4/lib/python3.12/site-packages/
+    cmake/data/bin/ctest), which is NOT on the runner PATH; a bare
+    subprocess.run(["ctest", ...]) fails with FileNotFoundError on the CI
+    runner even though it works on hosts where ctest happens to be on PATH.
+    Resolution order: explicit env, the build tree's CMakeCache.txt
+    (CMAKE_CTEST_COMMAND), shutil.which, known install prefixes.
+    """
+    explicit = os.environ.get("LLAMINAR_CTEST")
+    if explicit:
+        if Path(explicit).is_file():
+            return explicit
+        raise FileNotFoundError(
+            f"LLAMINAR_CTEST names a missing executable: {explicit}")
+    # The build tree's CMAKE_CTEST_COMMAND is authoritative: it is the ctest
+    # that configured this build, and it exists even when the runner PATH
+    # lacks any ctest (CI test-runner images expose only the pip wrapper).
+    from_cache = _ctest_from_cache(build_dir)
+    if from_cache:
+        return from_cache
+    resolved = shutil.which("ctest")
+    if resolved:
+        return resolved
+    for candidate in CTEST_CANDIDATES:
+        if "*" not in candidate:
+            if Path(candidate).is_file():
+                return candidate
+    import glob
+    for pattern in CTEST_CANDIDATES:
+        if "*" in pattern:
+            matches = sorted(glob.glob(pattern))
+            for match in matches:
+                if Path(match).is_file():
+                    return match
+    raise FileNotFoundError(
+        "ctest executable not found; set LLAMINAR_CTEST or install the "
+        "repository-pinned CMake toolchain")
+
 
 SUPPORTED_OPS = ("set", "unset", "string_append", "string_prepend")
 # Reviewer-93 item 4: ONLY these four exact ops. path_list_*/cmakelist/reset
