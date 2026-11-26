@@ -235,6 +235,77 @@ namespace llaminar2::test
         }
     } // namespace
 
+    /**
+     * IQ1_S / IQ1_M odd multiplier (reviewer 109, IQ-1). reconstruct<16> and <17> form the multiplier 2k+1
+     * (k = 0..7) in integers, toFloat(2 * k + 1). The former form 2.0f * toFloat(k) + 1.0f, evaluated here with
+     * contraction prevented (volatile intermediates), yields bit-identical multipliers; the factors then equal the
+     * former form's for every binary16 superblock word (all 65536: +-0, every subnormal and normal, +-Inf, every
+     * qNaN and sNaN payload) and every code byte 0..255, on this build's lane type, in raw bits.
+     */
+    TEST(CPUCodedCompactUnits, IQ1OddMultiplierIntegerFormEqualsContractionFreeFloatForm)
+    {
+        for (int k = 0; k < 8; ++k)
+        {
+            volatile float twice = 2.0f * static_cast<float>(k);
+            volatile float former = twice + 1.0f;
+            const float integer = static_cast<float>(2 * k + 1);
+            const float old_value = former;
+            ASSERT_EQ(std::bit_cast<std::uint32_t>(old_value), std::bit_cast<std::uint32_t>(integer)) << "k=" << k;
+        }
+        const auto stagedBits = [](float value) {
+            F lanes{};
+            for (int lane = 0; lane < kLanes; ++lane)
+                std::memcpy(reinterpret_cast<char *>(&lanes) + 4 * lane, &value, 4);
+            return laneBits(L::staged(lanes), 0);
+        };
+        const auto check = [&]<std::uint8_t Codebook>() {
+            for (std::uint32_t half = 0; half <= 0xFFFFu; ++half)
+                for (std::uint32_t first = 0; first < 256; first += kLanes)
+                {
+                    I code{}, word{};
+                    for (int lane = 0; lane < kLanes; ++lane)
+                    {
+                        const std::int32_t c = static_cast<std::int32_t>(first + lane);
+                        const std::int32_t w = static_cast<std::int32_t>(half);
+                        std::memcpy(reinterpret_cast<char *>(&code) + 4 * lane, &c, 4);
+                        std::memcpy(reinterpret_cast<char *>(&word) + 4 * lane, &w, 4);
+                    }
+                    const auto factors = coded_metadata::reconstruct<Codebook, Ops>(code, word);
+                    std::uint32_t d_bits = laneBits(L::half(word), 0);
+                    const float d = std::bit_cast<float>(d_bits);
+                    for (int lane = 0; lane < kLanes; ++lane)
+                    {
+                        const int c = static_cast<int>(first + lane);
+                        const auto former = [](int field) {
+                            volatile float twice = 2.0f * static_cast<float>(field);
+                            volatile float multiplier = twice + 1.0f;
+                            return static_cast<float>(multiplier);
+                        };
+                        volatile float primary = d * former(c & 7);
+                        if constexpr (Codebook == 16)
+                        {
+                            const std::uint32_t delta_bits = 0x3e000000u ^ (static_cast<std::uint32_t>((c >> 3) & 1) << 31);
+                            volatile float secondary = static_cast<float>(primary) * std::bit_cast<float>(delta_bits);
+                            ASSERT_EQ(laneBits(factors.primary, lane), stagedBits(primary))
+                                << "cb16 code=" << c << " half=0x" << std::hex << half;
+                            ASSERT_EQ(laneBits(factors.secondary, lane), stagedBits(secondary))
+                                << "cb16 code=" << c << " half=0x" << std::hex << half;
+                        }
+                        else
+                        {
+                            volatile float secondary = d * former((c >> 3) & 7);
+                            ASSERT_EQ(laneBits(factors.primary, lane), stagedBits(primary))
+                                << "cb17 code=" << c << " half=0x" << std::hex << half;
+                            ASSERT_EQ(laneBits(factors.secondary, lane), stagedBits(secondary))
+                                << "cb17 code=" << c << " half=0x" << std::hex << half;
+                        }
+                    }
+                }
+        };
+        check.template operator()<16>();
+        check.template operator()<17>();
+    }
+
     /** SIMD plane readers equal the scalar readers for every code width and column vector. */
     TEST(CPUCodedCompactUnits, SimdCodeReadersEqualScalarPlaneReaders)
     {

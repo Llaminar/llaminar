@@ -10698,6 +10698,15 @@ add_v2_test(V2_Integration_CPUCodedQ5KIQ3SProjection
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3SProjection)
 
+# IQ1_S / IQ1_M odd multiplier 2k+1 formed in integers equals the contraction-free
+# float form in raw bits for every binary16 word and code byte.
+add_v2_test(V2_Integration_CPUCodedIQ1OddMultiplier
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+        --gtest_filter=CPUCodedCompactUnits.IQ1OddMultiplierIntegerFormEqualsContractionFreeFloatForm
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedIQ1OddMultiplier)
+
 # x86 decode-once prefill panels: live-row route selection, serial-row bytes
 # and per-worker slab ownership at team widths 1-4 for every runtime ISA cell
 # (an AVX-512 build also replays its AVX2 leaves). The test binds each width
