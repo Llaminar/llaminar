@@ -45176,3 +45176,35 @@ add_v2_test(V2_Integration_NativeSuperblockWalkContract
     COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeSuperblockWalkContract)
+
+# Compile the actual x86 contribution helpers with an aggressive caller and a
+# deliberately unguarded negative control. Installed preflight needs no SDK.
+if(V2_CPU_TARGET_X86)
+    set(V2_CONTRACTION_PROOF "${CMAKE_CURRENT_BINARY_DIR}/cpu_contraction_proof.json")
+    file(GLOB_RECURSE V2_CONTRACTION_HEADERS CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2/*.h")
+    add_custom_command(OUTPUT "${V2_CONTRACTION_PROOF}"
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/cpu_contraction_proof.py compile
+            --report "${V2_CONTRACTION_PROOF}" --compiler "${CMAKE_CXX_COMPILER}"
+        DEPENDS ${V2_CONTRACTION_HEADERS}
+            scripts/cpu_contraction_proof.py scripts/check_cpu_contraction_witness.py
+            unit/kernels/cpu/CPUContractionWitness.cpp ${CMAKE_CXX_COMPILER}
+        VERBATIM)
+    add_custom_target(v2_cpu_contraction_proof DEPENDS "${V2_CONTRACTION_PROOF}")
+    add_test(NAME V2_Integration_CPUContributionContraction
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/cpu_contraction_proof.py verify
+            --report "${V2_CONTRACTION_PROOF}" --compiler "${CMAKE_CXX_COMPILER}")
+    set_property(GLOBAL PROPERTY
+        V2_TEST_BUILD_TARGETS_V2_Integration_CPUContributionContraction v2_cpu_contraction_proof)
+    set_tests_properties(V2_Integration_CPUContributionContraction PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Build;Regression"
+        TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUContributionContraction)
+endif()
+add_test(NAME V2_Unit_CPUContractionProofAdmission
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_cpu_contraction_proof.py)
+set_tests_properties(V2_Unit_CPUContractionProofAdmission PROPERTIES
+    LABELS "V2;Unit;CPU;Build;Regression" TIMEOUT 30)
