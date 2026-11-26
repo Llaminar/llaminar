@@ -5513,6 +5513,31 @@ foreach(V2_MPI_ENTRY_KIND IN ITEMS integration e2e shared original)
 endforeach()
 endif()
 
+
+# PR75/78 MPI startup diagnostic registration (reviewer-94 block 3). The
+# policy half runs in seconds; the lifecycle half uses the real hook and
+# diagnostic with its own bounded identities (TIMEOUT 60, no models, no MPI).
+add_v2_test(V2_Unit_MPIStartupDiagnosticPolicy
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
+        MPIStartupDiagnosticPolicy
+    LABELS "V2;Unit;CPU;DeviceFree;MPI;Lifecycle;Regression;SourcePolicy"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_MPIStartupDiagnosticLifecycle
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
+        MPIStartupDiagnosticLifecycle
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIStartupDiagnosticLifecycle)
+add_v2_test(V2_Integration_MPIStartupDiagnosticSafety
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
+        RegisteredSafety
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIStartupDiagnosticSafety)
+
 add_test(NAME V2_Integration_MPICTestSessionIsolation
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_ctest_session_isolation.py
