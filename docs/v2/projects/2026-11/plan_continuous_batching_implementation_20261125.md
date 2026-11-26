@@ -17,6 +17,10 @@ historical reviews, RED attempts, corrections and seals unchanged. No capacity,
 PR-readiness, merge, release or image-publication authority follows from this
 rewrite.
 
+**Amendment, 2026-11-26 (owner-requested).** Adds standard client retention
+intent and its tier ordering (design §8.4) to P0, P3, P5 and P8. No exit, gate or
+numeric default changes beyond those additions.
+
 ## 1. Direction and operating constraints
 
 1. Use the existing `feat/continuous-batching` branch and canonical worktree.
@@ -60,9 +64,11 @@ rewrite.
 | G1 adopted 2026-11-19 | Immutable ingress, destination-backed windows and authenticated terminal/ticket/storage receipts; no new permission for mutable host GPU state |
 | Existing runner and DecodeWindow seam | Keep runner/session ownership; refactor `ServingWindowDecode`/DecodeWindow identity as required, without reviving `GroupedServingEngine` or parallel proof machinery |
 | Preserve portability and request contracts | Keep cached/injectable NUMA-less handling and agreeing observations; preserve sampler/window/reasoning semantics or version and qualify explicit changes |
+| Standard client retention intent (2026-11-26) | Accept only served-API standard fields (`prompt_cache_key`, `prompt_cache_retention`; Responses/Anthropic fields only if those APIs are served); unexpired class outranks value within a tier; minimum lifetime, never a pin; tail-first, deficit-only demotion |
 
 The owner did **not** choose numeric RAM/disk capacities, page sizes, staging
-counts, worker counts, watermarks or a universal disk directory. P0 must map the
+counts, worker counts, watermarks, retention-class durations or defaults, or a
+universal disk directory. P0 must map the
 existing canonical configuration into the new typed intents and explicitly
 resolve any proposed default change. Do not invent a new public option table or
 silently reinterpret a prefix-only VRAM cap as the entire live KV pool cap.
@@ -166,7 +172,7 @@ installed interfaces. Inspect the exact implementation head before modifying.
 | Graph / movement | `src/v2/memory/BufferArena.*`, stages/model graph builders, `TransferEngine` and retained transfer channels | Stable native bindings, exact live work, registered access frontiers, admitted pack/scatter and immutable storage completion |
 | Prefix / tiers | `src/v2/execution/prefix_cache/`, host arena and disk persistence implementations | Actual sharing, coherent archive sections, protected live references, replica directory, effective-use ordering and finite storage quota |
 | MTP / hybrid | `src/v2/execution/mtp/` and model-owned recurrent/checkpoint policies | Main/shifted/speculative state, exactly-once commit/correction, coherent suspension and request-local numerical policy |
-| Frontends / response | `src/v2/app/modes/ServingBatchDriver.h`, `ServingResponseLeasePool.h`, `RequestGenerationLane.h`, `SSEPublishChannel.h`, `ChatCompletionHandler.cpp`, `ServerMode.cpp` | Intake through final HTTP borrower ownership; actual prefix summaries; detached bounded delivery |
+| Frontends / response | `src/v2/app/modes/ServingBatchDriver.h`, `ServingResponseLeasePool.h`, `RequestGenerationLane.h`, `SSEPublishChannel.h`, `ChatCompletionHandler.cpp`, `ServerMode.cpp` | Intake through final HTTP borrower ownership; actual prefix summaries; detached bounded delivery; strict parsing of standard retention fields into a typed intent; standard cached-token usage |
 | Qualification | `tests/v2/CMakeLists.txt`, `tests/v2/utils/ServingStepTrace.h`, production controller/kernel/prefix/serving suites | Focused preflight registrations, recorded production replay, native resource/capture/numerical and complete gates |
 
 The independent revision-4 review remains a historical review of its original
@@ -232,6 +238,9 @@ a date or stub alone grants no host-control permission. Price explicit output
 bounds against remaining legal context with the original terminal-token/feed
 and shifted-append rules; preserve the visible context/length terminal.
 Record unresolved numeric/default choices as choices—not invented constants.
+Record how the current frontends treat unknown and cache-related request fields,
+then propose the design §8.4 value-to-class map, minimum lifetimes, default
+class and any operator ceiling as explicit choices for owner decision.
 
 Specify a bounded completion-witness algorithm and its all-resource/topology
 inputs; queue/direct/refused outcomes; finite bypass/drain and protected progress;
@@ -336,6 +345,14 @@ metadata, pending/old replacement extents, durable completion and namespace-safe
 cleanup. Pre-admit all transfer/persistence records; use exact source and prior-
 access destination leases through `TransferEngine` and device-indexed staging.
 
+Implement the design §8.4 tier ordering in the same retention owner: typed
+intent (namespace, class, expiry) in bounded admitted metadata; unexpired class,
+then value, then stable tie-break; expiry refreshed only by effective use;
+shared pages at the highest referencing class and moved once; tail-first,
+deficit-only demotion that cascades only on real overflow and discards only from
+the lowest enabled tier. Live state and protected continuations outrank every
+class.
+
 Implement effective-use ordering at successful attachment: content/replica-bound
 immutable receipts, retention watermark/acknowledgment and bounded temporary
 pin/fence. A GPU no-copy hit refreshes valid backing usefulness; duplicates and
@@ -349,6 +366,11 @@ engine-only cleanup; UMA single accounting versus genuine duplicate allocations;
 RAM-off disk staging. Force competing backing eviction after a no-copy hit and
 pin release, including reordered receipts. Real multi-block/clamped/partial and
 mixed-participant lookup observations must reach runtime summaries and HTTP.
+Replay the design §8.4 worked trace through the real authority, plus class
+expiry before and after a refresh, a shared page under mixed classes, a partial
+hit from a tail-demoted prefix (including a hybrid boundary without a
+checkpoint), deficit-only cascade with a free lower tier, tiers off/full, and
+live demand displacing the longest class.
 
 **Exit:** implemented tier routes, exact replica/quota/memory ownership and
 actual reuse are demonstrated. A RAM experiment and a disk experiment are not
@@ -422,8 +444,11 @@ cancellable delivery deadlines; a deadline does not free borrowed storage.
 shared victims; insufficient staging or table/event records; pressure with spare
 S, Q=0, queue/response exhaustion and early/late cancellation incarnation; bursts
 of hot arrivals versus an old cold/long request; repeated suspension and concrete
-wakes. Exercise both analytical safe-order cases with real resource geometry,
-and a lower-tier displacement case without independent full maxima in RAM.
+wakes. A prewarm (only on a served API that defines one) is an ordinary admitted
+request without sampling; it gains no priority over live work and cannot reserve
+capacity for later requests. Exercise both analytical safe-order cases with real
+resource geometry, and a lower-tier displacement case without independent full
+maxima in RAM.
 
 Hold an oversized semantic event plus a prior consumer payload; verify exact
 bytes/framing and simultaneous ownership. Block the last write after producer
@@ -530,6 +555,11 @@ Required evidence:
 5. Actual HTTP/frontend lifecycle, streaming/non-streaming, tools/reasoning,
    summary observations, passive stats, final borrower custody, slow consumers,
    cancellation/reset and source-to-loaded-code provenance through retirement.
+6. Standard retention fields over HTTP: accepted values, precise rejection of
+   unsupported values, key isolation across trust domains, actual
+   `cached_tokens` usage in streaming and non-streaming responses, and a
+   recorded real client session (for example pi with long retention) whose
+   requests round-trip unchanged.
 
 **Exit:** all claimed cells have current evidence; no previously supported cell
 is silently refused or redirected to a legacy implementation. Historical failures

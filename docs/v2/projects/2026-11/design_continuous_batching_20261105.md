@@ -13,6 +13,11 @@ Complete bounded pressure handling and suspension/restore now belong to the
 main delivery path. The owner approved this architecture, not an implemented
 capability, a numerical size/default table, or a gate bypass.
 
+**Amendment, 2026-11-26 (owner-requested).** §8.4 adds client retention intent
+through the existing standard request fields only, and the tier ordering that
+intent selects. It amends §§4.3 and 14. It is a documented contract, not an
+implemented capability, a new public option table or a numeric default.
+
 This is a detailed design, not a dashboard or capability certificate. The
 [implementation plan](plan_continuous_batching_implementation_20261125.md) owns
 sequencing, implementation status and evidence. Earlier
@@ -232,6 +237,7 @@ publication and PMA path; no frontend-private defaults or duplicate budget.
 | Host retained tier | `off`, `auto` or explicit cap; bounded per real host/NUMA ownership, not duplicated per rank |
 | Disk tier | `off` or enabled with an explicit finite capacity and configured directory |
 | UMA placement | Canonical observed physical-memory-domain identity; automatic omission of a redundant retained RAM tier |
+| Retention lifetime classes | Code-owned map from each accepted standard request value (§8.4) to an ordered typed class and minimum lifetime; the class for requests without a value; optional operator ceiling on accepted classes |
 | Resolved publication | Requested and effective caps, payload versus metadata/staging, physical domains, actual tier routes and refusal reason |
 
 The owner selected the hierarchy and controls, not arbitrary numeric RAM/disk
@@ -678,6 +684,94 @@ matched blocks. Use clamped/partial and mixed-participant cases where inference
 cannot reproduce the lookup result. Passive observation is never another
 admission ledger or live GPU probe.
 
+### 8.4 Client retention intent and tier ordering
+
+Clients express retention only through the standard fields of an API surface
+that Llaminar actually serves. No vendor extension, header or private endpoint
+is added for this purpose.
+
+| Served API | Standard field | Meaning here |
+|---|---|---|
+| Chat Completions | `prompt_cache_key` | Cache namespace within the authenticated trust domain |
+| Chat Completions | `prompt_cache_retention` (`in_memory`, `24h`) | Requested minimum-lifetime class |
+| Responses (only if served) | `prompt_cache_options.ttl`, `prompt_cache_breakpoint`, `prompt_cache_options.prewarm` | Class, explicit cache boundary, prefill-only cache write |
+| Anthropic Messages (only if served) | `cache_control` with `ttl`, `max_tokens: 0` | Class at a block boundary, prefill-only cache write |
+
+Fields of an unserved API are not interpreted. A recognized field with an
+unsupported value fails the request with a precise `invalid_request_error`; it
+is never silently mapped to another class. An absent value selects the
+code-owned default class (§4.3). P0 settles the value-to-class map, minimum
+lifetimes and default; this design fixes only the semantics below.
+
+**Namespace is not trust.** A cache key partitions retention and accounting
+and keeps related requests on one owner. It never makes incompatible content
+shareable or grants access across trust domains (§8.1). Distinct live
+namespaces and per-entry intent records are bounded admitted metadata,
+priced in the BOM; no unbounded key map exists.
+
+**Lifetime is a minimum, not a pin.** An entry's class expires at its minimum
+lifetime, measured from the start of the request that wrote or last effectively
+used it. Effective use (§8.2) refreshes the expiry under the same ordered
+receipt; a provisional lookup does not. An expired entry keeps its value score
+but loses its class. Intent never protects idle content against live demand,
+never adds capacity and never authorizes an allocation: running requests and
+protected live continuations (§11) always outrank all idle retention, and PMA
+admits every byte.
+
+**Victim order.** Within one physical tier, revocable idle pages are ranked by:
+
+1. unexpired lifetime class, longest first;
+2. the §8.2 value score (recency, frequency, reuse likelihood, avoided compute,
+   footprint and measured restore cost);
+3. a stable tie-break by older effective-use sequence.
+
+Pressure in a tier selects the lowest-ranked pages. They move to the next
+enabled tier with an admitted route (GPU → RAM → disk); from the lowest enabled
+tier they are discarded. Move only the deficit, rounded to native page and
+extent granularity. Cascade into the next tier only when that tier actually
+overflows. Never move content merely because a lower tier has free space.
+
+**Tail-first partial demotion.** A hit always starts at token zero, so a
+partially demoted prefix keeps its leading pages in the faster tier and demotes
+its tail. A later hit attaches the resident head and imports the tail before
+any dependent read (§§8.1, 11.2). A hybrid prefix is usable at a shorter
+resident boundary only where a coherent recurrent/terminal checkpoint exists
+there; otherwise the hit imports the tail.
+
+**Shared pages.** A page referenced by several entries takes the highest
+unexpired class of any referencing entry, and moves once. Demoting one entry
+never moves a page that another entry still ranks higher.
+
+**Prewarm** writes a prefix cache entry without sampling. It is offered only
+where the served API defines it; Chat Completions has no such field, so no
+zero-token or other workaround is accepted there. A prewarm is an ordinary
+request for S/Q/R, PMA, fairness and response custody, returns standard
+usage, and has no priority over live work.
+
+**Reporting** uses only fields the served API defines, from the actual §8.3
+observations: `usage.prompt_tokens_details.cached_tokens` on Chat Completions,
+and write-token fields only where that API has them. The engine additionally
+reports per-tier occupancy by class, demotions, discards, expiries and
+refreshes (§14).
+
+Worked example (illustrative only). Units are tokens; GPU pool 1.1M, RAM 2M,
+disk 50M. Each request's prefix becomes idle after it finishes. The class
+labels 1h > 30m > no value are illustrative; P0 maps real request values.
+
+| Arrival | Needed on GPU | Moves | GPU | RAM | Disk |
+|---|---|---|---|---|---|
+| A, 30m | 1.0M | none | A 1.0 | — | — |
+| B, 1h | 1.0M | A tail 0.9 → RAM | A 0.1, B 1.0 | A 0.9 | — |
+| C, 30m | 1.0M | A head 0.1, then B tail 0.9 → RAM | B 0.1, C 1.0 | A 1.0, B 0.9 | — |
+| D, no value | 1.0M | C → RAM; RAM overflows by 0.9, so A tail 0.9 → disk | B 0.1, D 1.0 | A 0.1, B 0.9, C 1.0 | A 0.9 |
+
+B stays above C although it is older, because its class is longer. A and C
+share a class, so value decides; with equal use, A is less recent. Only A's
+0.9 tail moves because that is the RAM deficit; A's head stays in RAM and C is
+not touched. If B's class had expired, B would compete with A and C on value
+alone. If A were still running when D arrived, A could not be demoted; D would
+wait or a separately justified suspension (§11) would apply.
+
 ## 9. Request state, MTP and numerical behavior
 
 Paging separates attention history from request-local mutable state; it does
@@ -1102,6 +1196,7 @@ These are qualification contracts, not claims that named tests already exist:
 | Continuation | Full recurrent/MTP/sampler/DRY/handoff/grant state; same-request restore versus new-prefix attachment; zero/some/all acceptance and exactly-once correction; repeated movement without duplicate output |
 | Tier ordering / recency | Prior-read → overwrite → subsequent-read edges with missing-edge controls; cancelled/failed I/O and stale receipts; no-copy hit refresh followed by unpin and forced competing eviction; delayed/duplicate/obsolete touches |
 | Storage | Configured directory and quota, rounded/metadata/replacement peaks, full/unavailable disk, partial/corrupt writes and exact durability receipts, protected live continuation, engine-only cleanup |
+| Retention intent | The §8.4 worked trace through the real authority; class expiry and refresh ordering; shared pages under mixed classes; tail-first partial hits; deficit-only cascade; live demand overriding every class; unsupported values rejected; key isolation across trust domains; bounded namespace metadata |
 | Capture | Early CUDA and ROCm feasibility, then complete captured serving/tier policy; large-to-small replay, exact live grids/traffic, bounded catalog/receipts, no recapture/readbacks/host state shadow |
 | Response custody | Oversized event with prior slow consumer; last blocked write after producer exit, R refill attempts, concurrent rejected parses, stopped connected sink, non-streaming body/serialization and cleanup |
 | Topology | Incompatible successful local proposals; failure before/after commit; empty/expert followers; singleton/odd/larger/unequal TP/PP/EP, more than two PP stages and valid CPU/GPU compositions |
