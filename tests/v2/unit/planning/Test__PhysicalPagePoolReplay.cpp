@@ -303,37 +303,22 @@ public:
         else if (kind == "table-touch")
         {
             if (!(input >> name) || !snapshots_.contains(name)) fail();
-            switch (table_->touchEffectiveUse(snapshots_.at(name)))
-            {
-            case EffectiveUseStatus::Accepted: outcome = "accepted"; break;
-            case EffectiveUseStatus::Duplicate: outcome = "duplicate"; break;
-            case EffectiveUseStatus::Obsolete: outcome = "obsolete"; break;
-            case EffectiveUseStatus::JournalFull: outcome = "full"; break;
-            }
+            auto lease = table_->touchEffectiveUse(snapshots_.at(name));
+            outcome = lease ? "accepted" : "refused";
+            if (lease) touches_.emplace(name, std::move(*lease));
         }
         else if (kind == "table-use-ack")
         {
-            if (!(input >> name) || !snapshots_.contains(name)) fail();
-            outcome = table_->acknowledgeEffectiveUse(snapshots_.at(name)) ? "acked" : "refused";
+            if (!(input >> name) || !touches_.contains(name)) fail();
+            auto &lease = touches_.at(name);
+            outcome = lease.acknowledge() ? "acked" : "refused";
+            touches_.erase(name);
         }
-        else if (kind == "table-save-receipt")
+        else if (kind == "table-use-may-evict")
         {
-            // Retain the exact lease identity for a dropped publication so a
-            // post-retirement acknowledgement remains expressible (R10 orphan
-            // proof): the snapshot's own version + touch ordinal ARE the
-            // receipt identity.
-            if (!(input >> name) || !snapshots_.contains(name)) fail();
-            const auto &snapshot = snapshots_.at(name);
-            retained_receipts_[name] =
-                EffectiveUseReceipt{snapshot.version(), snapshot.version(),
-                    snapshot.version(), snapshot.useOrdinal()};
-            outcome = "retained";
-        }
-        else if (kind == "table-use-ack-retained")
-        {
-            if (!(input >> name) || !retained_receipts_.contains(name)) fail();
-            outcome = table_->acknowledgeEffectiveUse(retained_receipts_.at(name)) ? "acked" : "refused";
-            retained_receipts_.erase(name);
+            size_t incarnation;
+            if (!(input >> name >> incarnation) || !table_) fail();
+            outcome = table_->effectiveUseMayEvict(incarnation) ? "evictable" : "protected";
         }
         else if (kind == "table-use-may-evict")
         {
@@ -499,7 +484,7 @@ public:
         {
             if (!requests_.empty() || !pins_.empty() || !plans_.empty() || !pages_.empty() || !reads_.empty() ||
                 !updates_.empty() || !snapshots_.empty() || !shareds_.empty() || !adopted_.empty() || !cowplans_.empty() ||
-                !combinations_.empty() || !reservations_.empty() || !retained_receipts_.empty()) fail();
+                !combinations_.empty() || !reservations_.empty() || !touches_.empty()) fail();
             outcome = "idle";
         }
         else fail();
@@ -520,7 +505,7 @@ private:
     std::map<std::string, PhysicalPagePool::ReadAccess> reads_;
     std::map<std::string, CPUFP32PagedKVTable::Update> updates_;
     std::map<std::string, CPUFP32PagedKVTable::Snapshot> snapshots_;
-    std::map<std::string, EffectiveUseReceipt> retained_receipts_;
+    std::map<std::string, EffectiveUseLease> touches_;
     std::map<std::string, CPUFP32PagedKVTable::IssuanceReservation> reservations_;
     std::map<std::string, PhysicalPagePool::SharedPage> shareds_;
     std::map<std::string, PhysicalPagePool::SharedPage> adopted_;
@@ -930,8 +915,8 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedEffectiveUseLifecycleReplayExactly
             "table-use-ack B", "table-use-may-evict T 1",
             // Post-retirement release: ack after drop of the publication still
             // releases its lease (no orphaned obligation).
-            "table-touch S", "table-save-receipt S", "table-drop S",
-            "table-use-ack-retained S", "table-use-may-evict T 1",
+            "table-touch S", "table-drop S", "table-use-ack S",
+            "table-use-may-evict T 1",
             "table-drop B", "table-drop-reserved R", "end"};
         for (const std::string &command : commands)
             output << command << " | " << runner.execute(command) << '\n';
@@ -947,15 +932,15 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedEffectiveUseLifecycleReplayExactly
 /** @test Effective-use lifecycle replay rejects invented outcomes. */
 TEST(PhysicalMemoryAuthority, PagePoolEffectiveUseReplayRejectsAlteredObservations)
 {
-    // The empty bank cannot commit, so re-record with a real page or keep the
-    // mutation rejection on the EXISTING recorded transitions.
     for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
-        {"table-touch S | accepted", "table-touch S | obsolete"},
+        {"table-touch S | accepted", "table-touch S | refused"},
+        {"table-use-ack S | acked", "table-use-ack S | refused"},
+        {"table-use-may-evict T 1 | evictable", "table-use-may-evict T 1 | protected"},
         {"end | idle\n", ""}})
     {
         std::string corrupt(llaminar2::test::privatePageEffectiveUseTrace);
         const auto position = corrupt.find(original);
-        if (position == std::string::npos) continue; // Fixture pending real page.
+        if (position == std::string::npos) continue;
         corrupt.replace(position, original.size(), changed);
         std::istringstream input(corrupt);
         EXPECT_THROW(replay(input), std::exception);

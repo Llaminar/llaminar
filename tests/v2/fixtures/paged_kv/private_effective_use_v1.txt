@@ -13,9 +13,8 @@ table-use-may-evict T 1 | protected
 table-use-ack B | acked
 table-use-may-evict T 1 | evictable
 table-touch S | accepted
-table-save-receipt S | retained
 table-drop S | retired
-table-use-ack-retained S | acked
+table-use-ack S | acked
 table-use-may-evict T 1 | evictable
 table-drop B | retired
 table-drop-reserved R | released

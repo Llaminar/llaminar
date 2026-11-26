@@ -28,14 +28,21 @@ size_t CPUFP32PagedKVTable::physicalBytes(CPUFP32PagedKVTableGeometry geometry, 
     // The effective-use journal is admitted metadata of THIS instance: one
     // slot per live incarnation, priced by the same authority so the instance
     // plan BOM stays exact (no hidden heap allocation outside PMA).
-    const auto journal = CPUStorageRoot<EffectiveUseJournal::Entry>(geometry.bank_count,
+    const auto lease_cells = CPUStorageRoot<EffectiveUseJournal::LeaseCell>(
+        geometry.bank_count * geometry.readers_per_bank,
+        PhysicalMemoryOwner::KVCache, device, placement).physicalBytes();
+    const auto replica_records = CPUStorageRoot<EffectiveUseJournal::ReplicaRecord>(
+        geometry.bank_count,
         PhysicalMemoryOwner::KVCache, device, placement).physicalBytes();
     if (banks > std::numeric_limits<size_t>::max() - cells)
         throw std::overflow_error("CPU page-table physical BOM overflows");
     const auto cells_and_banks = cells + banks;
-    if (journal > std::numeric_limits<size_t>::max() - cells_and_banks)
+    if (lease_cells > std::numeric_limits<std::size_t>::max() - cells_and_banks)
         throw std::overflow_error("CPU page-table physical BOM overflows");
-    return cells_and_banks + journal;
+    const auto with_cells = cells_and_banks + lease_cells;
+    if (replica_records > std::numeric_limits<std::size_t>::max() - with_cells)
+        throw std::overflow_error("CPU page-table physical BOM overflows");
+    return with_cells + replica_records;
 }
 std::shared_ptr<CPUFP32PagedKVTable> CPUFP32PagedKVTable::create(std::shared_ptr<PhysicalMemoryAuthority> authority,
     DeviceId device, CPUFP32PagedKVTableGeometry geometry, CPUStoragePlacement placement)
@@ -52,12 +59,17 @@ CPUFP32PagedKVTable::CPUFP32PagedKVTable(std::shared_ptr<PhysicalMemoryAuthority
     cells_ = CPUStorageRoot<std::byte>(geometry.bank_count * geometry.page_capacity * sizeof(CPUFP32KVPage),
         PhysicalMemoryOwner::KVCache, device, placement, CPUStorageInitialization::Uninitialized).allocate(authority);
     banks_ = CPUStorageRoot<Bank>(geometry.bank_count, PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
-    // Journal storage is admitted by the same authority (priced in
-    // physicalBytes above) and bound as non-owning storage, so no heap
-    // allocation exists outside PMA. Inactive entries own no touch.
-    use_entries_ = CPUStorageRoot<EffectiveUseJournal::Entry>(geometry.bank_count,
+    // Lease cells (concurrency) and replica records (retained incarnations)
+    // are both admitted by the same authority and priced in physicalBytes, so
+    // no heap allocation exists outside PMA and the instance BOM is exact.
+    use_cells_ = CPUStorageRoot<EffectiveUseJournal::LeaseCell>(
+        geometry.bank_count * geometry.readers_per_bank,
         PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
-    effective_use_.rebind(use_entries_);
+    use_records_ = CPUStorageRoot<EffectiveUseJournal::ReplicaRecord>(
+        geometry.bank_count,
+        PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
+    if (!effective_use_.bind(use_cells_, use_records_))
+        throw std::logic_error("CPU page-table effective-use journal bind failed");
     // Placement array construction starts real object lifetimes in the exact
     // admitted root; inactive cells own no pages and allocate no payload.
     pages_ = new (cells_.data()) CPUFP32KVPage[geometry.bank_count * geometry.page_capacity];
@@ -184,54 +196,34 @@ void CPUFP32PagedKVTable::IssuanceReservation::release() noexcept
         self.reserved_outstanding_ -= remaining_;
     table_.reset();
 }
-EffectiveUseStatus CPUFP32PagedKVTable::touchEffectiveUse(
+std::optional<EffectiveUseLease> CPUFP32PagedKVTable::touchEffectiveUse(
     const Snapshot &snapshot)
 {
     // AUTHENTICATE the touch against the actual published bank BEFORE issuing
     // a lease: a burned or unpublished version is not a successful attachment,
-    // and a foreign table never admits anything. The snapshot's identity is
-    // captured ONCE here; the issued lease then carries its own full identity
-    // (including the published version as the replica incarnation), so the
-    // acknowledgement stays authoritative even after the bank clears.
+    // and a foreign table never admits anything. The lease (not the snapshot)
+    // carries the full identity, so acknowledgement stays authoritative even
+    // after the bank clears and no snapshot mutation exists.
     if (snapshot.table_.get() != this || snapshot.bank_ >= banks_.size())
-        return EffectiveUseStatus::Obsolete;
+        return std::nullopt;
     auto &state = banks_[snapshot.bank_];
     if (state.phase != Phase::Published ||
         state.version != snapshot.version_ || !state.pages)
-        return EffectiveUseStatus::Obsolete;
-    // Every successful attachment mints a FRESH ordinal: no-copy hits on the
-    // same incarnation issue INDEPENDENT leases.
-    if (++effective_use_sequence_ == 0)
-        return EffectiveUseStatus::JournalFull; // Ordinal exhaustion: TERMINAL
-                                                 // seal (no wrap re-issue).
-    if (effective_use_sequence_ == std::numeric_limits<std::uint64_t>::max())
-        return EffectiveUseStatus::Obsolete; // Refuse and stay at max: seal.
-    // Record the fresh ordinal ON the snapshot so the caller's later
-    // acknowledgement carries the exact lease identity.
-    snapshot.touch_ordinal_ = effective_use_sequence_;
+        return std::nullopt;
+    // Ordinal exhaustion is TERMINAL and rejects BEFORE incrementing (no wrap
+    // re-issue; the counter is never mutated on the sealed path).
+    if (effective_use_sequence_ >= std::numeric_limits<std::uint64_t>::max() - 1)
+        return std::nullopt;
+    const auto sequence = ++effective_use_sequence_;
     // The replica incarnation is the PUBLISHED VERSION (monotonic, never
     // recycled): the bank INDEX is reused after retirement and can never
-    // authenticate an incarnation.
+    // authenticate an incarnation. Journal refusal leaves no lease.
     return effective_use_.touch(EffectiveUseReceipt{
         .content_version=state.version, .table_version=state.version,
-        .replica_incarnation=state.version, .sequence=effective_use_sequence_});
+        .replica_incarnation=state.version, .sequence=sequence});
 }
 
-bool CPUFP32PagedKVTable::acknowledgeEffectiveUse(const Snapshot &snapshot)
-{
-    // The release is carried by the snapshot's OWN lease identity (recorded at
-    // touch and preserved across borrows). It does NOT require the bank to
-    // still be Published: a receipt whose publication retired before its
-    // acknowledgement must remain releasable (R10: no orphaned obligation).
-    // The table identity check remains (a foreign snapshot is not ours).
-    if (snapshot.table_.get() != this)
-        return false;
-    if (snapshot.touch_ordinal_ == 0)
-        return false; // Never touched: no lease exists.
-    return effective_use_.acknowledge(EffectiveUseReceipt{
-        .content_version=snapshot.version_, .table_version=snapshot.version_,
-        .replica_incarnation=snapshot.version_, .sequence=snapshot.touch_ordinal_});
-}
+
 
 void CPUFP32PagedKVTable::closeBorrowers(const Snapshot &snapshot)
 {
@@ -381,8 +373,7 @@ CPUFP32PagedKVTable::Snapshot::Snapshot(std::shared_ptr<CPUFP32PagedKVTable> tab
     : table_(std::move(table)), bank_(bank), version_(version) {}
 CPUFP32PagedKVTable::Snapshot::~Snapshot() { release(); }
 CPUFP32PagedKVTable::Snapshot::Snapshot(Snapshot &&other) noexcept
-    : table_(std::move(other.table_)), bank_(other.bank_), version_(other.version_),
-      touch_ordinal_(other.touch_ordinal_) {}
+    : table_(std::move(other.table_)), bank_(other.bank_), version_(other.version_) {}
 CPUFP32PagedKVTable::Snapshot &CPUFP32PagedKVTable::Snapshot::operator=(Snapshot &&other) noexcept
 {
     if (this != &other)
@@ -391,7 +382,6 @@ CPUFP32PagedKVTable::Snapshot &CPUFP32PagedKVTable::Snapshot::operator=(Snapshot
         table_ = std::move(other.table_);
         bank_ = other.bank_;
         version_ = other.version_;
-        touch_ordinal_ = other.touch_ordinal_;
     }
     return *this;
 }
@@ -408,9 +398,9 @@ std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::Snapshot::tryB
     if (!state.accepting_readers || state.readers == table_->geometry_.readers_per_bank) return std::nullopt;
     auto self = table_;
     ++state.readers;
-    auto borrowed = Snapshot(std::move(self), bank_, version_);
-    borrowed.touch_ordinal_ = touch_ordinal_; // A borrow is the same touch ordinal.
-    return borrowed;
+    // A borrow CONTAINS NO touch capability: the borrower must touch and own
+    // its own lease to acknowledge anything (R11 independent consumers).
+    return Snapshot(std::move(self), bank_, version_);
 }
 void CPUFP32PagedKVTable::Snapshot::release() noexcept
 {

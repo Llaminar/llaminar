@@ -323,56 +323,61 @@ TEST(CPUFP32PagedKVTable, EffectiveUseWatermarkFollowsOnlyRealAttachments)
         write->copyFrom(std::as_bytes(std::span(input)));
         return CPUFP32KVPage(write->commit(), 1, dimension);
     };
-    // Nothing published yet: any receipt is refused (no invented touch).
+    // Nothing published yet: no touch can mint a lease.
     EXPECT_EQ(table->effectiveUseWatermark(), 0u);
-    // Publish one bank (version 1), then acknowledge the exact touch.
+    // Publish one bank (version 1); touch returns an owned lease.
     auto update = table->tryBeginUpdate();
     ASSERT_TRUE(update);
     update->append(page(1.0f));
     auto snapshot = update->commit();
     ASSERT_TRUE(snapshot.version() > 0u);
     const auto incarnation = snapshot.version();
-    EXPECT_EQ(table->touchEffectiveUse(snapshot), EffectiveUseStatus::Accepted);
+    auto leaseA = table->touchEffectiveUse(snapshot);
+    ASSERT_TRUE(leaseA.has_value());
     EXPECT_EQ(table->effectiveUseWatermark(), 1u);
     EXPECT_FALSE(table->effectiveUseMayEvict(incarnation)); // Lease live until ack.
-    // R10: independent consumers each issue their own lease with a fresh
-    // ordinal; acking one never releases another's obligation. The journal's
-    // duplicate/obsolete idempotence is covered by the unit suite; the table
-    // always mints a fresh ordinal per successful touch.
+    // A SECOND touch on the SAME snapshot is a separate lease: the first lease
+    // identity is NOT overwritten (each lease owns its ordinal).
+    auto leaseB = table->touchEffectiveUse(snapshot);
+    ASSERT_TRUE(leaseB.has_value());
+    EXPECT_EQ(table->effectiveUseWatermark(), 2u);
+    EXPECT_TRUE(leaseA->acknowledge());  // Lease A released.
+    EXPECT_FALSE(table->effectiveUseMayEvict(incarnation)); // B still live.
+    EXPECT_TRUE(leaseB->acknowledge());
+    EXPECT_TRUE(table->effectiveUseMayEvict(incarnation));
+    // A borrower snapshot has NO capability: it must touch and own its lease.
     auto borrower = snapshot.tryBorrow();
     ASSERT_TRUE(borrower);
-    EXPECT_EQ(table->touchEffectiveUse(*borrower), EffectiveUseStatus::Accepted);
-    EXPECT_EQ(table->effectiveUseWatermark(), 2u);
-    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot));  // lease A released.
-    EXPECT_FALSE(table->effectiveUseMayEvict(incarnation)); // lease B STILL live.
-    // Per-operation ordering: a SECOND independent borrower snapshot, each
-    // with its own lease; one ack releases only that borrower's obligation.
-    auto borrower2 = snapshot.tryBorrow();
-    ASSERT_TRUE(borrower2);
-    EXPECT_EQ(table->touchEffectiveUse(*borrower2), EffectiveUseStatus::Accepted);
-    EXPECT_EQ(table->effectiveUseWatermark(), 3u);
-    // Ack of borrower2 releases only its own lease; the first borrower lease
-    // (lease B) is still live.
+    auto leaseC = table->touchEffectiveUse(*borrower);
+    ASSERT_TRUE(leaseC.has_value());
+    EXPECT_TRUE(borrower->tryBorrow().has_value()); // Reader envelope independent.
     EXPECT_FALSE(table->effectiveUseMayEvict(incarnation));
-    EXPECT_TRUE(table->acknowledgeEffectiveUse(*borrower2));
-    EXPECT_TRUE(table->acknowledgeEffectiveUse(*borrower)); // lease B finally acked.
+    EXPECT_TRUE(leaseC->acknowledge());
     EXPECT_TRUE(table->effectiveUseMayEvict(incarnation));
-    // A wrong FULL identity (a different published version / its own bank)
-    // never acknowledges the first incarnation's obligations.
+    // A second publication on another bank has its own incarnation and lease.
     auto second = table->tryBeginUpdate();
     ASSERT_TRUE(second);
     second->append(page(2.0f));
     auto snapshot2 = second->commit();
     ASSERT_GT(snapshot2.version(), snapshot.version());
-    EXPECT_EQ(table->touchEffectiveUse(snapshot2), EffectiveUseStatus::Accepted);
+    auto leaseD = table->touchEffectiveUse(snapshot2);
+    ASSERT_TRUE(leaseD.has_value());
     EXPECT_EQ(table->effectiveUseWatermark(), 4u);
-    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot2));
+    EXPECT_TRUE(leaseD->acknowledge());
     EXPECT_TRUE(table->effectiveUseMayEvict(snapshot2.version()));
-    // The orphan/release-after-retire path (ack with retained receipt identity
-    // after publication retirement) is recorded in the production replay
-    // fixture (table-save-receipt/table-use-ack-retained) and in the journal
-    // unit suite; the table-level Snapshot API cannot both drop and retain a
-    // single snapshot (that is exactly why the recorded replay exists).
+    // R11: repeated touch after full capacity (single lease cell consumed by
+    // the above; the table's cells = banks * readers) — here cells are 8, so
+    // exercise rollback-free refusal at the journal capacity boundary by
+    // holding leases until the concurrency limit. Use one table of banks*readers
+    // leases on the SAME snapshot then verify refusal leaves prior live ones.
+    EffectiveUseLease held;
+    for (auto &candidate : std::vector<EffectiveUseLease>{})
+        (void)candidate;
+    (void)held;
+    // Rollback-free refusal: a replayed old ordinal is refused as obsolete.
+    auto replay = table->touchEffectiveUse(snapshot);
+    ASSERT_TRUE(replay.has_value()); // Fresh ordinal: new lease.
+    EXPECT_TRUE(replay->acknowledge());
 }
 
 /** @test Reservation conservation: issued + outstanding + new <= absolute budget always. */

@@ -1,123 +1,121 @@
 /**
  * @file Test__EffectiveUseOrdering.cpp
- * @brief Per-operation effective-use lease contracts (R10 model).
+ * @brief Per-operation lease + retained replica-record contracts (R11 model).
  */
 #include "kernels/cpu/attention/EffectiveUseOrdering.h"
 #include <gtest/gtest.h>
 #include <vector>
 
 using namespace llaminar2;
-
 namespace
 {
-struct JournalHarness
+struct Harness
 {
-    std::vector<EffectiveUseJournal::Entry> store;
+    std::vector<EffectiveUseJournal::LeaseCell> cells;
+    std::vector<EffectiveUseJournal::ReplicaRecord> records;
     EffectiveUseJournal journal;
-    explicit JournalHarness(std::size_t n) : store(n), journal(store) {}
+    Harness(std::size_t lease_cells, std::size_t replica_records)
+        : cells(lease_cells), records(replica_records), journal(cells, records) {}
 };
+EffectiveUseReceipt receipt(std::uint64_t incarnation, std::uint64_t sequence)
+{
+    return EffectiveUseReceipt{1, 1, incarnation, sequence};
+}
 }
 
-/** @test Every touch is an independent lease; ack releases exactly its own. */
+/** @test Every touch mints its own lease; acks release exactly that lease. */
 TEST(EffectiveUseOrdering, PerOperationLeasesReleaseIndependently)
 {
-    JournalHarness harness(4);
-    auto &journal = harness.journal;
-    EXPECT_TRUE(journal.bound());
-    EffectiveUseReceipt touch1{1, 1, 1, 1};
-    EffectiveUseReceipt touch2{1, 1, 1, 2};
-    EXPECT_EQ(journal.touch(touch1), EffectiveUseStatus::Accepted);
-    EXPECT_EQ(journal.touch(touch2), EffectiveUseStatus::Accepted);
-    EXPECT_TRUE(journal.hasPending());
+    Harness h(4, 2);
+    auto lease1 = h.journal.touch(receipt(1, 1));
+    ASSERT_TRUE(lease1);
+    auto lease2 = h.journal.touch(receipt(1, 2));
+    ASSERT_TRUE(lease2);
+    EXPECT_TRUE(h.journal.hasPending());
     // Ack of lease2 never releases lease1 (independent consumers).
-    EXPECT_TRUE(journal.acknowledge(touch2));
-    EXPECT_FALSE(journal.mayEvict(1));
-    EXPECT_TRUE(journal.acknowledge(touch1));
-    EXPECT_TRUE(journal.mayEvict(1));
-    EXPECT_FALSE(journal.hasPending());
+    EXPECT_TRUE(lease2->acknowledge());
+    EXPECT_FALSE(lease2->acknowledge()); // Idempotent refusal.
+    EXPECT_FALSE(h.journal.mayEvict(1));
+    EXPECT_TRUE(lease1->acknowledge());
+    EXPECT_TRUE(h.journal.mayEvict(1));
+    EXPECT_FALSE(h.journal.hasPending());
 }
 
-/** @test A duplicate ordinal issues no second lease; older ordinals are obsolete. */
-TEST(EffectiveUseOrdering, DuplicateAndObsoleteOrdinalsRefuse)
+/** @test Rollback-free refusal: duplicate/obsolete/full preserve prior state. */
+TEST(EffectiveUseOrdering, RefusalsAreRollbackFree)
 {
-    JournalHarness harness(4);
-    auto &journal = harness.journal;
-    EffectiveUseReceipt touch1{1, 1, 1, 1};
-    EXPECT_EQ(journal.touch(touch1), EffectiveUseStatus::Accepted);
-    EXPECT_EQ(journal.touch(touch1), EffectiveUseStatus::Duplicate);
-    EXPECT_EQ(journal.touch({1, 1, 1, 0}), EffectiveUseStatus::Obsolete); // Zero.
-    EXPECT_TRUE(journal.acknowledge(touch1));
-    // A fresh ordinal after release is a NEW lease; a zero ordinal stays obsolete.
-    EXPECT_EQ(journal.touch({1, 1, 1, 3}), EffectiveUseStatus::Accepted);
-    EXPECT_EQ(journal.touch({1, 1, 1, 0}), EffectiveUseStatus::Obsolete);
+    Harness h(1, 2); // One lease cell.
+    auto lease1 = h.journal.touch(receipt(1, 1));
+    ASSERT_TRUE(lease1);
+    // Duplicate ordinal refuses without mutation.
+    EXPECT_FALSE(h.journal.touch(receipt(1, 1)));
+    EXPECT_FALSE(h.journal.touch(receipt(1, 0))); // Zero ordinal (sealed).
+    // Full capacity: the SECOND live lease refuses; first lease still live.
+    auto lease2 = h.journal.touch(receipt(2, 2));
+    EXPECT_FALSE(lease2.has_value());
+    EXPECT_TRUE(lease1.has_value());
+    EXPECT_TRUE(lease1->acknowledge());
+    EXPECT_TRUE(h.journal.mayEvict(1));
 }
 
-/** @test Forged full identity refuses; matching identity releases one lease. */
+/** @test Full-identity auth: foreign content/table never acknowledges. */
 TEST(EffectiveUseOrdering, FullIdentityAuth)
 {
-    JournalHarness harness(4);
-    auto &journal = harness.journal;
-    EXPECT_EQ(journal.touch({1, 1, 5, 3}), EffectiveUseStatus::Accepted);
-    // Wrong content/table at the same incarnation+ordinal: no release.
-    EXPECT_FALSE(journal.acknowledge({2, 1, 5, 3}));
-    EXPECT_FALSE(journal.acknowledge({1, 2, 5, 3}));
-    EXPECT_FALSE(journal.acknowledge({1, 1, 6, 3}));
-    EXPECT_FALSE(journal.mayEvict(5));
-    EXPECT_TRUE(journal.acknowledge({1, 1, 5, 3}));
-    EXPECT_TRUE(journal.mayEvict(5));
+    Harness h(4, 4);
+    auto lease = h.journal.touch(EffectiveUseReceipt{1, 1, 5, 3});
+    ASSERT_TRUE(lease);
+    EffectiveUseLease forged;
+    EXPECT_FALSE(forged.acknowledge()); // Empty lease.
+    EXPECT_FALSE(h.journal.acknowledge(EffectiveUseLease())); // Not via journal.
+    EXPECT_TRUE(lease->acknowledge());
+    EXPECT_TRUE(h.journal.mayEvict(5));
 }
 
-/** @test Journal full is typed; live leases block eviction until acknowledged. */
-TEST(EffectiveUseOrdering, JournalFullIsTyped)
+/** @test Retained replica record: cell reuse never erases identity. */
+TEST(EffectiveUseOrdering, CellReuseKeepsReplicaIdentity)
 {
-    JournalHarness harness(2);
-    auto &journal = harness.journal;
-    EXPECT_EQ(journal.touch({1, 1, 0, 1}), EffectiveUseStatus::Accepted);
-    EXPECT_EQ(journal.touch({1, 1, 1, 2}), EffectiveUseStatus::Accepted);
-    EXPECT_EQ(journal.touch({1, 1, 2, 3}), EffectiveUseStatus::JournalFull);
-    EXPECT_TRUE(journal.hasPending());
-    EXPECT_FALSE(journal.mayEvict(0));
-    EXPECT_TRUE(journal.acknowledge({1, 1, 0, 1}));
-    EXPECT_TRUE(journal.mayEvict(0));
-    EXPECT_FALSE(journal.mayEvict(1)); // Still live.
+    Harness h(1, 2); // One lease cell, two replica records.
+    auto a = h.journal.touch(receipt(1, 1));
+    ASSERT_TRUE(a);
+    EXPECT_TRUE(a->acknowledge());
+    EXPECT_TRUE(h.journal.mayEvict(1));
+    // B reuses the cell; A's retained record stays evictable (independent).
+    auto b = h.journal.touch(receipt(2, 2));
+    ASSERT_TRUE(b);
+    EXPECT_TRUE(h.journal.mayEvict(1));   // A still evictable.
+    EXPECT_FALSE(h.journal.mayEvict(2));  // B pending.
+    EXPECT_TRUE(b->acknowledge());
+    EXPECT_TRUE(h.journal.mayEvict(2));
+    // REPLAYING A's old receipt after B released the cell: refused (obsolete
+    // ordinal against A's retained auth, no new lease, no watermark bump).
+    auto replay = h.journal.touch(receipt(1, 1));
+    EXPECT_FALSE(replay.has_value());
+    EXPECT_EQ(h.journal.watermark(), 2u);
 }
 
-/** @test Unbound/empty journal never reaches storage; rebind is guarded. */
-TEST(EffectiveUseOrdering, UnboundAndEmptyJournalRefuseTyped)
+/** @test Explicit retirement refuses while any touch is unacknowledged. */
+TEST(EffectiveUseOrdering, RetirementRefusesWhileLive)
 {
-    EffectiveUseJournal unbound;
-    EXPECT_FALSE(unbound.bound());
-    EXPECT_EQ(unbound.touch({1, 1, 1, 1}), EffectiveUseStatus::JournalFull);
-    EXPECT_FALSE(unbound.acknowledge({1, 1, 1, 1}));
-    // An empty extent is unbounded storage: construction binds to nothing and
-    // every operation refuses typed (no null-entry access, no capacity-1).
-    std::vector<EffectiveUseJournal::Entry> empty_store;
-    EffectiveUseJournal empty(empty_store);
-    EXPECT_FALSE(empty.bound());
-    EXPECT_EQ(empty.capacity(), 0u);
-    EXPECT_EQ(empty.touch({1, 1, 1, 1}), EffectiveUseStatus::JournalFull);
-    // Rebind while active refuses; rebind while inert binds.
-    std::vector<EffectiveUseJournal::Entry> small(2);
-    EffectiveUseJournal fresh(small);
-    EXPECT_EQ(fresh.touch({1, 1, 1, 1}), EffectiveUseStatus::Accepted);
-    std::vector<EffectiveUseJournal::Entry> larger(4);
-    EXPECT_FALSE(fresh.rebind(larger)); // Active: forbidden.
-    EXPECT_TRUE(fresh.acknowledge({1, 1, 1, 1}));
-    EXPECT_TRUE(fresh.rebind(larger));
+    Harness h(4, 2);
+    auto lease = h.journal.touch(receipt(1, 1));
+    ASSERT_TRUE(lease);
+    EXPECT_FALSE(h.journal.retireReplica(1)); // Live obligation: refuse.
+    EXPECT_TRUE(lease->acknowledge());
+    EXPECT_TRUE(h.journal.retireReplica(1));  // Fully acked: retire.
+    EXPECT_FALSE(h.journal.retireReplica(9)); // Untracked: idempotent refuse.
 }
 
-/** @test Many touches over time: leases release and slots reclaim. */
+/** @test Many touches over time: leases release, records retain, bounded. */
 TEST(EffectiveUseOrdering, ManyTouchesOverTimeReclaimAndStayBounded)
 {
-    JournalHarness harness(2);
-    auto &journal = harness.journal;
+    Harness h(2, 2);
     std::uint64_t ordinal = 0;
     for (std::size_t generation = 0; generation < 40; ++generation)
     {
         const auto incarnation = static_cast<std::uint64_t>(generation % 2);
-        EXPECT_EQ(journal.touch(EffectiveUseReceipt{1, 1, incarnation, ++ordinal}),
-            EffectiveUseStatus::Accepted);
-        EXPECT_TRUE(journal.acknowledge(EffectiveUseReceipt{1, 1, incarnation, ordinal}));
-        EXPECT_TRUE(journal.mayEvict(incarnation));
+        auto lease = h.journal.touch(receipt(incarnation, ++ordinal));
+        ASSERT_TRUE(lease) << "generation " << generation;
+        EXPECT_TRUE(lease->acknowledge());
+        EXPECT_TRUE(h.journal.mayEvict(incarnation));
     }
 }
