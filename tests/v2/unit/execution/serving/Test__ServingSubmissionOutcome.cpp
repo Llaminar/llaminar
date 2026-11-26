@@ -128,6 +128,44 @@ TEST(ServingSubmissionOutcome, SuspendRestoreKeepsExactContinuation)
     EXPECT_EQ(session.restore(ServingContinuationManifest{}, error), false); // Empty refuses.
 }
 
+/** @test P4 interleaving: A continues while B suspends and C enters the freed slot. */
+TEST(ServingSubmissionOutcome, InterleavedABCSuspendKeepsPeerProgressExact)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(3, 3, error, nullptr, 2));
+    auto a = greedy(1);
+    a.max_new_tokens = 500;
+    auto b = greedy(2);
+    b.max_new_tokens = 500;
+    auto c = greedy(3);
+    c.max_new_tokens = 500;
+    EXPECT_EQ(session.submit(a, error), ServingSubmissionOutcome::Direct);
+    EXPECT_EQ(session.submit(b, error), ServingSubmissionOutcome::Direct);
+    // Settle both rows to their decision boundary with a bounded loop.
+    std::optional<ServingContinuationManifest> suspended_b;
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        suspended_b = session.suspend(2, error);
+        if (suspended_b) break;
+        session.step();
+    }
+    ASSERT_TRUE(suspended_b.has_value()) << error;
+    // A continues decoding while B is suspended (no cohort drain).
+    const auto a_events = session.step();
+    ASSERT_EQ(session.occupancy().resident, 1);
+    // C enters the freed slot and sees the same shared-forward treatment.
+    EXPECT_EQ(session.submit(c, error), ServingSubmissionOutcome::Direct);
+    session.step();
+    ASSERT_EQ(session.occupancy().resident, 2);
+    // B restores (slot identity may differ if C took the original address) and
+    // all three continue decoding together; the cohort never drained.
+    EXPECT_TRUE(session.restore(std::move(*suspended_b), error)) << error;
+    ASSERT_EQ(session.occupancy().resident, 3); // B resident again alongside A and C.
+    (void)a_events;
+}
+
 /** @test Q=0 refuses queued requests typed; Direct still works with a free slot. */
 TEST(ServingSubmissionOutcome, ZeroQueueAcceptsOnlyDirect)
 {

@@ -612,11 +612,22 @@ namespace llaminar2
         }
         if (!manifest.valid(&error))
             return false;
+        // The request identity keeps its original S record; the PHYSICAL slot
+        // may have been reused while suspended, so the session restores into
+        // any free slot (preferring the original identity) rather than failing
+        // on a busy physical address.
         const auto &content = manifest.content();
-        if (content.slot < 0 || static_cast<std::size_t>(content.slot) >= slot_busy_.size() ||
-            slot_busy_[static_cast<std::size_t>(content.slot)])
+        int target = content.slot;
+        if (target < 0 || static_cast<std::size_t>(target) >= slot_busy_.size() ||
+            slot_busy_[static_cast<std::size_t>(target)])
         {
-            error = "Serving continuation slot is busy or invalid";
+            target = -1;
+            for (std::size_t s = 0; s < slot_busy_.size(); ++s)
+                if (!slot_busy_[s]) { target = static_cast<int>(s); break; }
+        }
+        if (target < 0)
+        {
+            error = "Serving continuation has no free slot";
             return false;
         }
         if (std::any_of(rows_.begin(), rows_.end(), [&](const Row &row) {
@@ -651,7 +662,8 @@ namespace llaminar2
         // Restoring the KV state is the executor's responsibility; the session
         // advertises the restored KV length so the next forward continues at
         // the exact position (no duplicate output, no reseed).
-        slot_busy_[static_cast<std::size_t>(content.slot)] = true;
+        row.slot = target;
+        slot_busy_[static_cast<std::size_t>(target)] = true;
         rows_.push_back(std::move(row));
         return true;
     }
