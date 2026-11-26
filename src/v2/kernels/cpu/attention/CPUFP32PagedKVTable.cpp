@@ -81,12 +81,9 @@ void CPUFP32PagedKVTable::clear(size_t bank) noexcept
     state.pages = state.readers = 0;
     state.accepting_readers = false;
     state.phase = Phase::Free;
-    // TRUE retirement of the touch obligation: only a fully acknowledged
-    // incarnation may be reclaimed. A pending touch keeps its journal slot
-    // (the retired bank index is reusable, but the incarnation identity is
-    // the published version and never reuses; the obligation outlives the bank
-    // until acknowledged, exactly as §8.2 requires).
-    (void)effective_use_.retire(state.version);
+    // The bank's publication retires; live touch LEASES remain owned by their
+    // receipts (the snapshot keeps the exact identity) until each is
+    // acknowledged. Clearing never drops an obligation (R10).
 }
 std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdate()
 {
@@ -190,34 +187,31 @@ void CPUFP32PagedKVTable::IssuanceReservation::release() noexcept
 EffectiveUseStatus CPUFP32PagedKVTable::touchEffectiveUse(
     const Snapshot &snapshot)
 {
-    // AUTHENTICATE the touch against the actual published bank: a burned or
-    // unpublished version is not a successful attachment, and a foreign bank
-    // (incarnation mismatch) is refused before any journal mutation. The
-    // caller's incarnation is never trusted without this proof.
+    // AUTHENTICATE the touch against the actual published bank BEFORE issuing
+    // a lease: a burned or unpublished version is not a successful attachment,
+    // and a foreign table never admits anything. The snapshot's identity is
+    // captured ONCE here; the issued lease then carries its own full identity
+    // (including the published version as the replica incarnation), so the
+    // acknowledgement stays authoritative even after the bank clears.
     if (snapshot.table_.get() != this || snapshot.bank_ >= banks_.size())
         return EffectiveUseStatus::Obsolete;
     auto &state = banks_[snapshot.bank_];
     if (state.phase != Phase::Published ||
         state.version != snapshot.version_ || !state.pages)
         return EffectiveUseStatus::Obsolete;
-    // Every successful attachment mints a FRESH ordinal: a repeated no-copy
-    // hit on the same unchanged incarnation REFRESHES the watermark rather
-    // than deduplicating into a stale touch.
+    // Every successful attachment mints a FRESH ordinal: no-copy hits on the
+    // same incarnation issue INDEPENDENT leases.
     if (++effective_use_sequence_ == 0)
         return EffectiveUseStatus::JournalFull; // Ordinal exhaustion: TERMINAL
-                                                 // seal. The counter stays 0
-                                                 // and refuses every later
-                                                 // touch (no wrap can re-issue
-                                                 // ordinal1).
+                                                 // seal (no wrap re-issue).
     if (effective_use_sequence_ == std::numeric_limits<std::uint64_t>::max())
         return EffectiveUseStatus::Obsolete; // Refuse and stay at max: seal.
-    // Record the fresh ordinal ON the snapshot: the acknowledgment must carry
-    // the exact touch identity, not the table's current sequence (a later
-    // touch on another incarnation would otherwise release the wrong pin).
+    // Record the fresh ordinal ON the snapshot so the caller's later
+    // acknowledgement carries the exact lease identity.
     snapshot.touch_ordinal_ = effective_use_sequence_;
     // The replica incarnation is the PUBLISHED VERSION (monotonic, never
-    // recycled): the bank INDEX is reused after retirement, so it can never
-    // authenticate an incarnation. A burned/unpublished version refuses.
+    // recycled): the bank INDEX is reused after retirement and can never
+    // authenticate an incarnation.
     return effective_use_.touch(EffectiveUseReceipt{
         .content_version=state.version, .table_version=state.version,
         .replica_incarnation=state.version, .sequence=effective_use_sequence_});
@@ -225,17 +219,18 @@ EffectiveUseStatus CPUFP32PagedKVTable::touchEffectiveUse(
 
 bool CPUFP32PagedKVTable::acknowledgeEffectiveUse(const Snapshot &snapshot)
 {
-    // Acknowledgment carries the snapshot's OWN touch ordinal (set at touch
-    // and preserved across borrows): a delayed acknowledgement can never
-    // release a newer re-pin of the same incarnation.
-    if (snapshot.table_.get() != this || snapshot.bank_ >= banks_.size())
+    // The release is carried by the snapshot's OWN lease identity (recorded at
+    // touch and preserved across borrows). It does NOT require the bank to
+    // still be Published: a receipt whose publication retired before its
+    // acknowledgement must remain releasable (R10: no orphaned obligation).
+    // The table identity check remains (a foreign snapshot is not ours).
+    if (snapshot.table_.get() != this)
         return false;
-    auto &state = banks_[snapshot.bank_];
-    if (state.phase != Phase::Published || state.version != snapshot.version_)
-        return false;
+    if (snapshot.touch_ordinal_ == 0)
+        return false; // Never touched: no lease exists.
     return effective_use_.acknowledge(EffectiveUseReceipt{
-        .content_version=state.version, .table_version=state.version,
-        .replica_incarnation=state.version, .sequence=snapshot.touch_ordinal_});
+        .content_version=snapshot.version_, .table_version=snapshot.version_,
+        .replica_incarnation=snapshot.version_, .sequence=snapshot.touch_ordinal_});
 }
 
 void CPUFP32PagedKVTable::closeBorrowers(const Snapshot &snapshot)

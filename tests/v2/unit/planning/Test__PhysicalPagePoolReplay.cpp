@@ -306,7 +306,6 @@ public:
             switch (table_->touchEffectiveUse(snapshots_.at(name)))
             {
             case EffectiveUseStatus::Accepted: outcome = "accepted"; break;
-            case EffectiveUseStatus::Refreshed: outcome = "refreshed"; break;
             case EffectiveUseStatus::Duplicate: outcome = "duplicate"; break;
             case EffectiveUseStatus::Obsolete: outcome = "obsolete"; break;
             case EffectiveUseStatus::JournalFull: outcome = "full"; break;
@@ -317,12 +316,36 @@ public:
             if (!(input >> name) || !snapshots_.contains(name)) fail();
             outcome = table_->acknowledgeEffectiveUse(snapshots_.at(name)) ? "acked" : "refused";
         }
-
-        else if (kind == "table-use-retire")
+        else if (kind == "table-save-receipt")
+        {
+            // Retain the exact lease identity for a dropped publication so a
+            // post-retirement acknowledgement remains expressible (R10 orphan
+            // proof): the snapshot's own version + touch ordinal ARE the
+            // receipt identity.
+            if (!(input >> name) || !snapshots_.contains(name)) fail();
+            const auto &snapshot = snapshots_.at(name);
+            retained_receipts_[name] =
+                EffectiveUseReceipt{snapshot.version(), snapshot.version(),
+                    snapshot.version(), snapshot.useOrdinal()};
+            outcome = "retained";
+        }
+        else if (kind == "table-use-ack-retained")
+        {
+            if (!(input >> name) || !retained_receipts_.contains(name)) fail();
+            outcome = table_->acknowledgeEffectiveUse(retained_receipts_.at(name)) ? "acked" : "refused";
+            retained_receipts_.erase(name);
+        }
+        else if (kind == "table-use-may-evict")
         {
             size_t incarnation;
             if (!(input >> name >> incarnation) || !table_) fail();
-            outcome = table_->retireEffectiveUse(incarnation) ? "reclaimed" : "refused";
+            outcome = table_->effectiveUseMayEvict(incarnation) ? "evictable" : "protected";
+        }
+        else if (kind == "table-use-may-evict")
+        {
+            size_t incarnation;
+            if (!(input >> name >> incarnation) || !table_) fail();
+            outcome = table_->effectiveUseMayEvict(incarnation) ? "evictable" : "protected";
         }
         else if (kind == "table-read")
         {
@@ -476,7 +499,7 @@ public:
         {
             if (!requests_.empty() || !pins_.empty() || !plans_.empty() || !pages_.empty() || !reads_.empty() ||
                 !updates_.empty() || !snapshots_.empty() || !shareds_.empty() || !adopted_.empty() || !cowplans_.empty() ||
-                !combinations_.empty() || !reservations_.empty()) fail();
+                !combinations_.empty() || !reservations_.empty() || !retained_receipts_.empty()) fail();
             outcome = "idle";
         }
         else fail();
@@ -497,6 +520,7 @@ private:
     std::map<std::string, PhysicalPagePool::ReadAccess> reads_;
     std::map<std::string, CPUFP32PagedKVTable::Update> updates_;
     std::map<std::string, CPUFP32PagedKVTable::Snapshot> snapshots_;
+    std::map<std::string, EffectiveUseReceipt> retained_receipts_;
     std::map<std::string, CPUFP32PagedKVTable::IssuanceReservation> reservations_;
     std::map<std::string, PhysicalPagePool::SharedPage> shareds_;
     std::map<std::string, PhysicalPagePool::SharedPage> adopted_;
@@ -897,14 +921,18 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedEffectiveUseLifecycleReplayExactly
         }
         const std::vector<std::string> commands{"table-reserve R 1",
             "combined-witnessed X R 1 1", "table-attach-archive _ X 100 4 0 0 " + hex,
-            "table-commit X S", "table-touch S", "table-use-ack S", "table-touch S",
-            "table-use-ack S", "table-touch S", "table-use-retire T 1",
-            // R9 adversarial through the PRODUCTION path: a fresh touch keeps
-            // an unacked obligation; retire REFUSES; frontier ack releases;
-            // retire then reclaims. Incarnation = published version (1).
-            "table-touch S", "table-use-retire T 1", "table-use-ack S",
-            "table-use-retire T 1",
-            "table-drop S", "table-drop-reserved R", "end"};
+            "table-commit X S", "table-touch S", "table-use-may-evict T 1",
+            "table-borrow B S", "table-touch B", "table-use-may-evict T 1",
+            // R10 per-operation ordering through the PRODUCTION path: lease2
+            // ack never releases lease1; eviction stays protected; lease1 ack
+            // then releases.
+            "table-use-ack S", "table-use-may-evict T 1",
+            "table-use-ack B", "table-use-may-evict T 1",
+            // Post-retirement release: ack after drop of the publication still
+            // releases its lease (no orphaned obligation).
+            "table-touch S", "table-save-receipt S", "table-drop S",
+            "table-use-ack-retained S", "table-use-may-evict T 1",
+            "table-drop B", "table-drop-reserved R", "end"};
         for (const std::string &command : commands)
             output << command << " | " << runner.execute(command) << '\n';
         output.close(); ASSERT_TRUE(output.good());

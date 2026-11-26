@@ -1,19 +1,22 @@
 /**
  * @file EffectiveUseOrdering.h
- * @brief Effective-use receipts, membership-sized journal and eviction gate.
+ * @brief Per-operation effective-use LEASES with exact consumer ordering.
  *
  * Design §8.2: define effective use as successful compatible attachment, bind
  * the accepted touch to sealed content/version and replica incarnation, and
  * watermark accepted touches before any eviction decision. A bounded retention
  * pin/fence protects an unacknowledged accepted touch; once acknowledged,
- * ordinary recency governs. Obsolete touches never refresh a replacement, and
- * every fresh successful attachment mints a NEW ordinal (no-copy hits refresh).
+ * ordinary recency governs.
  *
- * The journal is sized from ADMITTED LIVE MEMBERSHIP (one entry per replica
- * incarnation), not a magic constant: entries are replaced on refresh and
- * reclaimed on retirement, so the journal never accumulates an unbounded
- * lifetime history and never needs to throw as a lifetime limit. Capacity
- * refusal is TYPED (a status), never a silent drop.
+ * R10 model: EVERY touch is one independent lease with its own ordinal. A lease
+ * is released ONLY by an acknowledgement carrying the EXACT full identity
+ * (content/table version, replica incarnation, ordinal). There is no
+ * cumulative-frontier shortcut: ack of lease N never proves lease M<N
+ * finished, so it can never clear another consumer's obligation. Eviction is
+ * permitted only when the incarnation has ZERO live leases. Retirement refuses
+ * while any lease is live and otherwise reclaims the slot. The journal is
+ * NON-OWNING: storage is admitted by the owner (PMA), never allocated here.
+ * A receipt released by its only acknowledgement is automatically reclaimed.
  */
 #pragma once
 #include <cstddef>
@@ -36,26 +39,23 @@ struct EffectiveUseReceipt final
 /** @brief Typed touch outcome (never a silent drop). */
 enum class EffectiveUseStatus
 {
-    Accepted,       ///< New accepted touch (watermark advanced).
-    Refreshed,      ///< Newer touch on an already-live incarnation (watermark advanced).
-    Duplicate,      ///< Exact same ordinal replayed: idempotent, no advance.
-    Obsolete,       ///< Older ordinal on a superseded incarnation: refused.
-    JournalFull,    ///< Bounded journal is full (all live): refused typed.
+    Accepted,       ///< New accepted touch (issued a lease).
+    Duplicate,      ///< Exact same ordinal replayed: no new lease.
+    Obsolete,       ///< Older ordinal on a superseded identity: refused (no lease).
+    JournalFull,    ///< Bounded journal is full (all leases live): refused typed.
 };
 
 /**
- * @brief Membership-sized effective-use journal with incarnation reclamation.
+ * @brief Membership-sized per-operation lease journal.
  *
- * One entry per replica incarnation; a newer touch replaces the older entry
- * (reclamation by refresh), a retired incarnation releases its entry, and a
- * full journal is reported typed. The sequence is the fresh attachment
- * ordinal minted by the owner, so duplicate/obsolete receipts are recognized
- * by exact ordinal and delayed acknowledgements cannot release a newer pin.
- *
- * The journal is NON-OWNING: its entry storage is admitted by the owner
- * through PhysicalMemoryAuthority (the same authority prices the table's
- * other metadata), so no hot-start allocation and no second accounting
- * ledger exist here.
+ * One slot per live lease. touch() issues a lease; acknowledge() releases the
+ * EXACT lease (full identity + ordinal). Duplicate touch ordinals never issue
+ * a second lease; older ordinals on the same incarnation are obsolete (a new
+ * touch on a LIVE incarnation uses a fresh ordinal, which is a separate lease;
+ * the old lease remains outstanding until its own acknowledgement). retired
+ * incarnations release their slots only after every lease acknowledged.
+ * The entry array is obtained by the owner; an empty/unbound journal refuses
+ * every operation (no null access, no capacity1-with-null trap).
  */
 class EffectiveUseJournal final
 {
@@ -63,46 +63,59 @@ public:
     /** @brief One journal slot; storage is owner-admitted. */
     struct Entry
     {
-        EffectiveUseReceipt receipt;  ///< Full identity of the newest touch.
-        std::size_t pinned_ = 0;      ///< Unacknowledged touches in the frontier.
-        std::size_t obligations_ = 0; ///< Total obligations effectively released once.
-        bool live = false;
+        EffectiveUseReceipt receipt;  ///< Exact identity of this lease.
+        bool live = false;            ///< Slot holds an outstanding lease.
     };
-    /** @brief Empty journal; the owner must bind admitted storage before use. */
+    /** @brief Empty/unbound journal: every operation refuses typed. */
     EffectiveUseJournal() noexcept = default;
-    /** @brief Bind journal storage admitted by the owner (@p entries, exact capacity). */
+    /** @brief Bind journal storage admitted by the owner (@p entries, nonzero). */
     explicit EffectiveUseJournal(std::span<Entry> entries) noexcept
-        : entries_(entries.data()), capacity_(entries.size() ? entries.size() : 1)
+        : entries_(entries.data()), capacity_(entries.size())
     {
+        // CLEAN the extent: dirty/foreign entries must never be interpreted as
+        // live leases (R10 dirty-storage control).
+        for (std::size_t i = 0; i < entries.size(); ++i)
+            entries[i] = Entry{};
+    }
+    /** @brief Bind admitted storage once, only while NO lease is live. */
+    bool rebind(std::span<Entry> entries) noexcept
+    {
+        if (pending_ != 0)
+            return false; // Active journal: forbid rebinding live leases.
+        for (std::size_t i = 0; i < entries.size(); ++i)
+            entries[i] = Entry{}; // Reclaimed storage is clean before use.
+        entries_ = entries.data();
+        capacity_ = entries.size();
+        watermark_ = 0; // New storage begins a fresh history.
+        return true;
     }
     EffectiveUseJournal(const EffectiveUseJournal &) = delete;
     EffectiveUseJournal &operator=(const EffectiveUseJournal &) = delete;
-    /** @brief Rebind admitted storage (owner-two-phase construction only). */
-    void rebind(std::span<Entry> entries) noexcept
-    {
-        entries_ = entries.data();
-        capacity_ = entries.size() ? entries.size() : 1;
-        pending_ = 0;
-        watermark_ = 0;
-    }
+    /** @brief Reveal whether the journal is bound to admitted storage. */
+    bool bound() const noexcept { return entries_ != nullptr; }
 
-    /** @brief Touch one incarnation; typed outcome; pins on new/refreshed. */
+    /** @brief Issue one lease or refuse typed (no silent drop, no null access). */
     EffectiveUseStatus touch(EffectiveUseReceipt receipt) noexcept;
-    /** @brief Ordering point: release the pin of the EXACT touch ordinal. */
+    /** @brief Release the EXACT lease; wrong identity releases nothing. */
     bool acknowledge(EffectiveUseReceipt receipt) noexcept;
-    /** @brief Retirement: reclaim the incarnation's entry (update its age). */
-    bool retire(std::uint64_t incarnation) noexcept;
-    /** @return Whether @p incarnation may be evicted (no pending pin). */
+    /**
+     * @brief Retirement ordering point for one incarnation.
+     * @return True when the incarnation had no live leases (its slot may
+     * already be reclaimed by per-lease acknowledgement); false when a lease
+     * is still live. An untracked incarnation returns false.
+     * @note The slots are reclaimed by their own acknowledgement; retire is
+     * the ordering CHECK (no retirement may precede every acknowledgement).
+     */
     bool mayEvict(std::uint64_t incarnation) const noexcept;
     /** @return Highest accepted ordinal; eviction may not precede it. */
     std::uint64_t watermark() const noexcept { return watermark_; }
-    /** @return Whether any incarnation holds an unacknowledged pin. */
+    /** @return Whether any incarnation holds a live lease. */
     bool hasPending() const noexcept { return pending_ != 0; }
-    /** @return Admitted membership capacity. */
+    /** @return Admitted lease-slot capacity (0 when unbound). */
     std::size_t capacity() const noexcept { return capacity_; }
 private:
     Entry *entries_ = nullptr;
-    std::size_t capacity_;
+    std::size_t capacity_ = 0;
     std::size_t pending_ = 0;
     std::uint64_t watermark_ = 0;
 };

@@ -215,20 +215,18 @@ public:
      * @return True when the exact ordinal's pin was released; a delayed ack
      * of an older ordinal never releases a newer re-pin (idempotent false).
      */
+    /** @brief Release an exact lease by its full identity (post-retirement). */
+    bool acknowledgeEffectiveUse(EffectiveUseReceipt receipt) noexcept
+    {
+        return effective_use_.acknowledge(receipt);
+    }
     bool acknowledgeEffectiveUse(const Snapshot &snapshot);
     /** @return Highest acknowledged retention watermark (§8.2 ordering point). */
     std::uint64_t effectiveUseWatermark() const noexcept { return effective_use_.watermark(); }
-    /** @return Whether @p bank/incarnation may be evicted (no pending touch). */
+    /** @return Whether @p incarnation may be evicted (no live lease). */
     bool effectiveUseMayEvict(std::uint64_t incarnation) const noexcept
     {
         return effective_use_.mayEvict(incarnation);
-    }
-    /** @brief Reclaim a retired incarnation's effective-use entry.
-     *  @return True when reclaimed; false when a pending touch remains (the
-     *  obligation is preserved and the entry stays live). */
-    bool retireEffectiveUse(std::uint64_t incarnation) noexcept
-    {
-        return effective_use_.retire(incarnation);
     }
 private:
     enum class Phase : std::uint8_t { Free, Preparing, Published };
