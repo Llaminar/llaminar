@@ -65,6 +65,39 @@ namespace llaminar2
 #endif
 #endif
 
+#ifndef LLAMINAR_COMPILED_WITH_FP16FML
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+#define LLAMINAR_COMPILED_WITH_FP16FML 1
+#else
+#define LLAMINAR_COMPILED_WITH_FP16FML 0
+#endif
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON && !defined(__ARM_NEON)
+#error "Declared NEON envelope lacks compiler feature __ARM_NEON"
+#endif
+#if !LLAMINAR_COMPILED_WITH_NEON && defined(__aarch64__) && defined(__ARM_NEON)
+#error "Compiler enables NEON outside the declared envelope"
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON_DOTPROD && !defined(__ARM_FEATURE_DOTPROD)
+#error "Declared NEON_DOTPROD envelope lacks compiler feature __ARM_FEATURE_DOTPROD"
+#endif
+#if !LLAMINAR_COMPILED_WITH_NEON_DOTPROD && defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#error "Compiler enables NEON_DOTPROD outside the declared envelope"
+#endif
+#if LLAMINAR_COMPILED_WITH_FP16FML && !defined(__ARM_FEATURE_FP16_FML)
+#error "Declared FP16FML envelope lacks compiler feature __ARM_FEATURE_FP16_FML"
+#endif
+#if !LLAMINAR_COMPILED_WITH_FP16FML && defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+#error "Compiler enables FP16FML outside the declared envelope"
+#endif
+#if LLAMINAR_COMPILED_WITH_AVX2 && (!defined(__AVX2__) || !defined(__FMA__) || !defined(__F16C__))
+#error "Declared AVX2 envelope requires AVX2, FMA and F16C"
+#endif
+#if LLAMINAR_COMPILED_WITH_AVX512 && (!defined(__AVX512F__) || !defined(__AVX512BW__) || !defined(__AVX512DQ__) || !defined(__AVX512VL__) || !defined(__AVX512VNNI__))
+#error "Declared AVX512 envelope requires F, BW, DQ, VL and VNNI"
+#endif
+
 // The I8MM build envelope is DotProd plus the Int8 matrix-multiply extension.
 // A declared envelope that its compiler does not implement, or the reverse,
 // would make the startup admission below authenticate the wrong instructions.
