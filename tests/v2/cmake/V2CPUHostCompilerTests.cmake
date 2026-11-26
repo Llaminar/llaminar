@@ -16,4 +16,8 @@ v2_add_core_free_test(V2_Integration_CPUHostCompileContract
         --database "${CMAKE_BINARY_DIR}/compile_commands.json"
         "--flags=${LLAMINAR_CPU_COMPILE_FLAGS}"
         ${V2_CPU_HOST_DEFINITION_ARGS}
+        "--compiler-C=${CMAKE_C_COMPILER}"
+        "--compiler-CXX=${CMAKE_CXX_COMPILER}"
+        "--compiler-CUDA=${CMAKE_CUDA_COMPILER}"
+        "--compiler-HIP=${CMAKE_HIP_COMPILER}"
     LABELS V2 Integration DeviceFree ProductionTestPreflight)

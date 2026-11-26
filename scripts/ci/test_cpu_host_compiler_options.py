@@ -47,10 +47,10 @@ endforeach()
         with tempfile.TemporaryDirectory() as directory:
             database = pathlib.Path(directory) / 'compile_commands.json'
             base = ['nvcc', '-DLLAMINAR_COMPILED_WITH_NEON=1', '-c', 'test.cu']
-            database.write_text(json.dumps([dict(file='test.cu', arguments=base)]))
+            database.write_text(json.dumps([dict(file='test.cu', host_language='CUDA', arguments=base)]))
             with self.assertRaisesRegex(ValueError, 'missing host option'):
                 verify(database, '-mcpu=generic -march=armv8-a+simd')
-            database.write_text(json.dumps([dict(file='test.cu', arguments=base + ['-Xcompiler=-mcpu=generic', '-Xcompiler=-march=armv8-a+simd'])]))
+            database.write_text(json.dumps([dict(file='test.cu', host_language='CUDA', arguments=base + ['-Xcompiler=-mcpu=generic', '-Xcompiler=-march=armv8-a+simd'])]))
             verify(database, '-mcpu=generic -march=armv8-a+simd')
 
     def test_host_language_and_declaration_failures(self):
@@ -70,3 +70,14 @@ endforeach()
                         verify(database, '-mcpu=generic', [definition])
             with self.assertRaisesRegex(ValueError, 'empty expected'):
                 verify(database, '')
+
+    def test_host_codegen_predicate_scope(self):
+        header = (ROOT / 'src/v2/utils/CPUFeatures.h').read_text()
+        self.assertEqual(header.count('#define LLAMINAR_CPU_HOST_CODEGEN_PASS 1'), 1)
+        self.assertEqual(header.count('#define LLAMINAR_CPU_HOST_CODEGEN_PASS 0'), 1)
+        start = header.index('#if LLAMINAR_CPU_HOST_CODEGEN_PASS')
+        end = header.index('#endif // host compiler coherence', start)
+        block = header[start:end]
+        self.assertIn('LLAMINAR_COMPILED_WITH_NEON_I8MM', block)
+        self.assertNotIn('__CUDA_ARCH__', block)
+        self.assertNotIn('__HIP_DEVICE_COMPILE__', block)

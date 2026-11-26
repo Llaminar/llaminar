@@ -73,6 +73,15 @@ namespace llaminar2
 #endif
 #endif
 
+// COMPILED_WITH values describe the program envelope and remain identical on
+// GPU passes for stable shared layouts. Only a host codegen pass must expose
+// the corresponding native CPU compiler features.
+#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+#define LLAMINAR_CPU_HOST_CODEGEN_PASS 1
+#else
+#define LLAMINAR_CPU_HOST_CODEGEN_PASS 0
+#endif
+#if LLAMINAR_CPU_HOST_CODEGEN_PASS
 #if LLAMINAR_COMPILED_WITH_NEON && !defined(__ARM_NEON)
 #error "Declared NEON envelope lacks compiler feature __ARM_NEON"
 #endif
@@ -98,6 +107,10 @@ namespace llaminar2
 #error "Declared AVX512 envelope requires F, BW, DQ, VL and VNNI"
 #endif
 
+#if !LLAMINAR_COMPILED_WITH_AVX512 && defined(__AVX512F__)
+#error "Compiler enables AVX512 outside the declared envelope"
+#endif
+
 // The I8MM build envelope is DotProd plus the Int8 matrix-multiply extension.
 // A declared envelope that its compiler does not implement, or the reverse,
 // would make the startup admission below authenticate the wrong instructions.
@@ -108,6 +121,8 @@ namespace llaminar2
 #if !LLAMINAR_COMPILED_WITH_NEON_I8MM && defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
 #error "The compiler enables I8MM outside the declared NEON_I8MM envelope"
 #endif
+
+#endif // host compiler coherence
 
     /** @return Whether native AArch64 ASIMD is available on the executing host. */
     inline bool cpu_supports_neon()
