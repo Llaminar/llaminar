@@ -11,6 +11,7 @@
 #include "PageTableAdmission.h"
 #include "planning/AllResourceCompletionWitness.h"
 #include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -54,6 +55,15 @@ namespace
 bool proveAllClassOrder(PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
     std::size_t declared_peak, std::size_t initial_grant)
 {
+    // Compliance helper is a planning path, not a hot loop; its workspace is
+    // bounded by the pool's admitted membership (the production admission
+    // entry reuses the pool/table's own arrays, never a per-call rebuild). For
+    // the device-free planner we construct the membership-sized frame workspace
+    // once here; the composed witness itself never allocates.
+    std::vector<planning::WitnessRequest> frame_workspace(
+        pool.geometry().request_records + 1);
+    std::vector<AllResourceRequest> members;
+    members.reserve(pool.geometry().request_records + 1);
     AllResourceCapacity capacity;
     capacity.frames = pool.geometry().frames;
     capacity.banks = table.bankCount();
@@ -79,10 +89,11 @@ bool proveAllClassOrder(PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
         existing.peak_banks = 1;
         existing.peak_leases = 1;
         existing.preserved = r.preserved;
-        capacity.requests.push_back(existing);
+        members.push_back(existing);
     }
-    capacity.requests.push_back(proposed);
-    return proveAllResourceCompletion(capacity).valid;
+    members.push_back(proposed);
+    capacity.requests = members;
+    return proveAllResourceCompletion(capacity, frame_workspace).valid;
 }
 }
 

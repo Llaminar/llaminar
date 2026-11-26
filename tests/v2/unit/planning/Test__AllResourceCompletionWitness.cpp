@@ -14,6 +14,14 @@ using namespace llaminar2;
 
 namespace
 {
+std::vector<planning::WitnessRequest> frameSpaceFor(const AllResourceCapacity &c)
+{
+    return std::vector<planning::WitnessRequest>(c.requests.size());
+}
+std::span<planning::WitnessRequest> spanOf(std::vector<planning::WitnessRequest> &v)
+{
+    return v;
+}
 AllResourceCapacity capacityFor(std::size_t frames, std::size_t banks,
     std::size_t leases, std::vector<AllResourceRequest> requests = {})
 {
@@ -42,7 +50,8 @@ AllResourceRequest request(std::size_t frames, std::size_t banks, std::size_t le
 TEST(AllResourceCompletionWitness, AllClassesFitIsValid)
 {
     auto c = capacityFor(4, 2, 4, {request(2, 1, 2), request(2, 1, 2)});
-    auto result = proveAllResourceCompletion(c);
+    auto ws_c = frameSpaceFor(c);
+    auto result = proveAllResourceCompletion(c, spanOf(ws_c));
     EXPECT_TRUE(result.valid) << result.refusal;
     EXPECT_TRUE(result.refusal.empty());
 }
@@ -51,7 +60,8 @@ TEST(AllResourceCompletionWitness, AllClassesFitIsValid)
 TEST(AllResourceCompletionWitness, BankOverDemandRefuses)
 {
     auto c = capacityFor(4, 1, 4, {request(2, 1, 2), request(2, 1, 2)});
-    auto result = proveAllResourceCompletion(c);
+    auto ws_c = frameSpaceFor(c);
+    auto result = proveAllResourceCompletion(c, spanOf(ws_c));
     EXPECT_FALSE(result.valid);
     EXPECT_NE(result.refusal.find("bank"), std::string::npos) << result.refusal;
 }
@@ -60,7 +70,8 @@ TEST(AllResourceCompletionWitness, BankOverDemandRefuses)
 TEST(AllResourceCompletionWitness, LeaseOverDemandRefuses)
 {
     auto c = capacityFor(8, 4, 2, {request(2, 1, 2), request(2, 1, 2)});
-    auto result = proveAllResourceCompletion(c);
+    auto ws_c = frameSpaceFor(c);
+    auto result = proveAllResourceCompletion(c, spanOf(ws_c));
     EXPECT_FALSE(result.valid);
     EXPECT_NE(result.refusal.find("lease"), std::string::npos) << result.refusal;
 }
@@ -69,7 +80,8 @@ TEST(AllResourceCompletionWitness, LeaseOverDemandRefuses)
 TEST(AllResourceCompletionWitness, FrameOverDemandRefuses)
 {
     auto c = capacityFor(3, 4, 8, {request(2, 1, 2), request(2, 1, 2)});
-    auto result = proveAllResourceCompletion(c);
+    auto ws_c = frameSpaceFor(c);
+    auto result = proveAllResourceCompletion(c, spanOf(ws_c));
     EXPECT_FALSE(result.valid);
     EXPECT_FALSE(result.refusal.empty());
 }
@@ -78,9 +90,11 @@ TEST(AllResourceCompletionWitness, FrameOverDemandRefuses)
 TEST(AllResourceCompletionWitness, InvalidMaximaRejectedTyped)
 {
     auto zero = capacityFor(0, 2, 4, {request(1, 1, 1)});
-    EXPECT_FALSE(proveAllResourceCompletion(zero).valid);
+    auto ws_zero = frameSpaceFor(zero);
+    EXPECT_FALSE(proveAllResourceCompletion(zero, spanOf(ws_zero)).valid);
     auto no_banks = capacityFor(4, 0, 4, {request(1, 1, 1)});
-    EXPECT_FALSE(proveAllResourceCompletion(no_banks).valid);
+    auto ws_no_banks = frameSpaceFor(no_banks);
+    EXPECT_FALSE(proveAllResourceCompletion(no_banks, spanOf(ws_no_banks)).valid);
 }
 
 /** @test Overlapping shared base occupancy is counted once, exact-boundary valid. */
@@ -92,7 +106,9 @@ TEST(AllResourceCompletionWitness, SharedBaseCountedOnceAtBoundary)
     c.lease_cells = 2;
     c.base.shared_frames = 1;   // One shared frame outside requests.
     c.base.retiring_frames = 1; // One retiring frame outside requests.
-    c.requests = {request(2, 1, 2), request(1, 0, 0)};
-    auto result = proveAllResourceCompletion(c);
+    std::vector<AllResourceRequest> members{request(2, 1, 2), request(1, 0, 0)};
+    c.requests = members;
+    auto ws_c = frameSpaceFor(c);
+    auto result = proveAllResourceCompletion(c, spanOf(ws_c));
     EXPECT_TRUE(result.valid) << result.refusal;
 }

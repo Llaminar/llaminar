@@ -43,7 +43,10 @@ struct AllResourceCapacity
     std::size_t banks = 0;              ///< Admitted table banks.
     std::size_t lease_cells = 0;        ///< Admitted effective-use lease cells.
     planning::WitnessBaseOccupancy base; ///< Physical occupancy outside requests.
-    std::vector<AllResourceRequest> requests; ///< Live + proposed (bounded membership).
+    // Bounded membership: the caller supplies capacity-owned request storage
+    // (no per-call heap allocation; the witness follows the same supplied
+    // bounded-workspace rule as the frame proof).
+    std::span<const AllResourceRequest> requests;
 };
 
 /** @brief Composition result: valid on success with a precise refusal otherwise. */
@@ -63,9 +66,13 @@ struct AllResourceWitnessResult
  * required to evacuate an owner must not itself be obtainable only by
  * evacuating that owner).
  *
+ * @param frame_workspace Caller-owned frame workspace, one cell per request
+ * (BOM-priced membership storage; the composed witness allocates nothing and
+ * never owns a second ledger). Its size must cover capacity.requests.
  * @return A valid result when every class has a bounded completion order;
  * otherwise a valid=false with the first deterministic refusal diagnostic.
  */
 AllResourceWitnessResult proveAllResourceCompletion(
-    const AllResourceCapacity &capacity);
+    const AllResourceCapacity &capacity,
+    std::span<planning::WitnessRequest> frame_workspace);
 } // namespace llaminar2

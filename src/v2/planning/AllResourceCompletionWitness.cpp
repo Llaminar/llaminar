@@ -9,22 +9,29 @@
 namespace llaminar2
 {
 AllResourceWitnessResult proveAllResourceCompletion(
-    const AllResourceCapacity &capacity)
+    const AllResourceCapacity &capacity,
+    std::span<planning::WitnessRequest> frame_workspace)
 {
     if (!capacity.frames || !capacity.banks || !capacity.lease_cells)
         return AllResourceWitnessResult{false,
             "all-resource witness requires positive admitted class maxima"};
-    // 1) Frame proof (identical arithmetic to the pool's own boundary proof).
-    std::vector<planning::WitnessRequest> frame_requests;
-    frame_requests.reserve(capacity.requests.size());
-    for (const auto &r : capacity.requests)
-        frame_requests.push_back(planning::WitnessRequest{
+    if (frame_workspace.size() < capacity.requests.size())
+        return AllResourceWitnessResult{false,
+            "all-resource witness frame workspace is smaller than the request membership"};
+    // 1) Frame proof through the caller's bounded workspace (ZERO per-call heap
+    //    allocation; the composed witness follows the supplied-workspace rule
+    //    of the frame proof exactly).
+    for (std::size_t i = 0; i < capacity.requests.size(); ++i)
+    {
+        const auto &r = capacity.requests[i];
+        frame_workspace[i] = planning::WitnessRequest{
             .generation=r.generation, .record=r.record,
             .peak_frames=r.peak_frames, .occupied_frames=r.occupied_frames,
-            .preserved=r.preserved});
+            .preserved=r.preserved};
+    }
     const auto frame_proof = planning::proveCompletionOrder(
         capacity.frames, capacity.base,
-        std::span<const planning::WitnessRequest>(frame_requests));
+        frame_workspace.first(capacity.requests.size()));
     if (!frame_proof.valid())
         return AllResourceWitnessResult{false, frame_proof.refusal};
     // 2) Table-bank + lease-cell maxima together. At any phase, the requests
