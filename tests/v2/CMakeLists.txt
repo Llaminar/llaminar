@@ -16100,7 +16100,7 @@ add_v2_test(V2_Integration_PrefixArchiveMaintenanceWriter
     LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Disk;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_disk_prefix_storage_backend unit/prefix_cache/Test__DiskPrefixStorageBackend.cpp)
+add_executable(v2_test_disk_prefix_storage_backend unit/prefix_cache/Test__DiskPrefixStorageBackend.cpp unit/prefix_cache/Test__DiskExtentQuota.cpp)
 target_link_libraries(v2_test_disk_prefix_storage_backend llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DiskPrefixStorageBackend
     COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
@@ -16109,6 +16109,12 @@ add_v2_test(V2_Unit_DiskPrefixStorageBackend
     NO_MODELS
 )
 
+add_v2_test(V2_Integration_DiskExtentQuota
+    COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
+        --gtest_filter=DiskExtentQuota.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Storage;Quota;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DiskExtentQuota)
 add_v2_test(V2_Integration_PrefixCommittedIdentityPreservation
     COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
         --gtest_filter=Test__DiskPrefixStorageBackend.CommittedIdentityCorruptionPreservesArchive:Test__DiskPrefixStorageBackend.CommittedMetadataCorruptionPreservesArchive

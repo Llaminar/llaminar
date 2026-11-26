@@ -1661,6 +1661,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/prefix_cache/BlockHash.cpp
     execution/prefix_cache/DeviceHotPrefixStorageBackend.cpp
     execution/prefix_cache/DiskPrefixStorageBackend.cpp
+    execution/prefix_cache/DiskExtentQuota.cpp
     execution/prefix_cache/PrefixArchivePersistence.cpp
     execution/prefix_cache/PrefixCacheCoordinator.cpp
     execution/prefix_cache/PrefixRestoreMetadata.cpp
