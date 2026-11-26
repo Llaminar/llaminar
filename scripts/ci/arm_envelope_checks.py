@@ -46,7 +46,11 @@ def run(root, output, execute=subprocess.run, *, test_identity=None):
     """Run all owned CMake stages and retain commands, status and complete output."""
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    # Evidence contains no secrets; root-run containers must publish it to the
+    # unprivileged host artifact uploader even when a stage fails.
+    os.umask(0o022)
     output = Path(tempfile.mkdtemp(prefix='attempt-', dir=output))
+    output.chmod(0o755)
     tools = {name: shutil.which(value) or value for name, value in
              dict(ninja='ninja', cc=os.environ.get('CC', 'cc'),
                   cxx=os.environ.get('CXX', 'c++')).items()}
@@ -122,6 +126,7 @@ def run(root, output, execute=subprocess.run, *, test_identity=None):
                             destination = snapshot / source.relative_to(build)
                             destination.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(source, destination)
+                            destination.chmod(0o644)
                 failed = failed or bool(code)
                 records.append(dict(isa=isa, configuration=config, stage=stage, commit=identity.get('manifest', {}).get('commit'), tree=identity.get('manifest', {}).get('tree'), command=command, returncode=code, classification='probe-envelope(non-canonical-for-productionGate7)', status='skipped-after-failure' if skipped else 'executed', seconds=time.monotonic()-started))
                 (output / 'stages.json').write_text(json.dumps(records, indent=2))

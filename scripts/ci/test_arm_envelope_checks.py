@@ -130,3 +130,32 @@ class EnvelopeChecks(unittest.TestCase):
                 with patch.dict(os.environ, ARM_ENVELOPE_MANIFEST_SHA256=hashlib.sha256(path.read_bytes()).hexdigest()):
                     with self.assertRaises(ValueError):
                         source_identity(root)
+
+    def test_failed_attempt_is_host_readable(self):
+        import os
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            def execute(*args, **kwargs):
+                return SimpleNamespace(returncode=7)
+            self.assertEqual(run('.', directory, execute, test_identity=False), 1)
+            attempt, = Path(directory).iterdir()
+            self.assertEqual(attempt.stat().st_mode & 0o777, 0o755)
+            self.assertTrue(all(path.stat().st_mode & 0o004 for path in attempt.rglob('*') if path.is_file()))
+            if os.name == 'posix' and os.geteuid() == 0:
+                # Exercise real Linux DAC with a root-created failed attempt,
+                # not root's ability to read its own private output.
+                Path(directory).chmod(0o755)
+                child = os.fork()
+                if child == 0:
+                    try:
+                        os.setgroups([])
+                        os.setgid(65534)
+                        os.setuid(65534)
+                        for path in Path(directory).rglob('*'):
+                            if path.is_file():
+                                path.read_bytes()
+                        os._exit(0)
+                    except BaseException:
+                        os._exit(1)
+                _, status = os.waitpid(child, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0)

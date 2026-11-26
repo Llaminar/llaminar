@@ -116,8 +116,9 @@ jobs:
             --cache-from type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }} \
             --cache-to type=gha,scope=llaminar-build-neon-pr,mode=max,version=2,ignore-error=true . \
             2>&1 1>&3 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" >&2; } 3>&1 || build_status=$?
-          python3 scripts/ci/native_build_cache_receipt.py "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json" > "$RUNNER_TEMP/llaminar-arm64-evidence/main-cache.json"
-          exit "${build_status:-0}"
+          python3 scripts/ci/native_build_cache_receipt.py "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json" > "$RUNNER_TEMP/llaminar-arm64-evidence/main-cache.json" || provenance_status=$?
+          if [[ "${build_status:-0}" != 0 ]]; then exit "$build_status"; fi
+          exit "${provenance_status:-0}"
       - name: Export the sibling Release runtime from the same builder
         shell: bash
         env:
@@ -175,6 +176,9 @@ jobs:
           WORKDIR /envelope-source
           ENTRYPOINT ["python3", "scripts/ci/arm_envelope_checks.py", "/envelope-source", "/evidence"]
           EOF
+          # This immutable git archive is already the complete admitted context.
+          # Override root .dockerignore so COPY cannot silently omit manifest files.
+          : > "$RUNNER_TEMP/arm-envelope.Dockerfile.dockerignore"
           context=$(mktemp -d)
           git archive HEAD | tar -x -C "$context"
           git rev-parse HEAD HEAD^{tree} > "$context/arm-envelope-source.txt"

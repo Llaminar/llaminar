@@ -9,7 +9,13 @@ import sys
 def receipt(progress, status):
     """Join streamed vertex updates by identity and report the original operation."""
     vertices = {}
+    diagnostics = []
     for line in Path(progress).read_text().splitlines():
+        if line.startswith('ERROR: failed to build: '):
+            diagnostics.append(line)
+            continue
+        if diagnostics and line.strip():
+            raise ValueError('unexpected data after BuildKit terminal diagnostic')
         event = json.loads(line)
         for vertex in event.get('vertexes', [event]):
             key = vertex.get('digest', vertex.get('id'))
@@ -19,7 +25,10 @@ def receipt(progress, status):
     if len(matches) != 1 or not matches[0].get('completed') or matches[0].get('error'):
         raise ValueError('missing or ambiguous completed operation vertex')
     origin = json.loads(Path(status).read_text())['nonce']
-    return dict(cached=matches[0].get('cached', False), origin=origin)
+    result = dict(cached=matches[0].get('cached', False), origin=origin)
+    if diagnostics:
+        result['terminal_diagnostics'] = diagnostics
+    return result
 
 
 if __name__ == '__main__':
