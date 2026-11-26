@@ -35,4 +35,21 @@ struct PageTableAdmission
  */
 std::optional<PageTableAdmission> admitPoolAndTable(
     PhysicalPagePool &pool, CPUFP32PagedKVTable &table, std::size_t pages);
+
+/**
+ * @brief Admit protected growth, one table bank and one accepted-work
+ *        reservation issuance as ONE all-resource transaction.
+ *
+ * plan P1: bounded optimistic admission protects issuance for accepted work;
+ * a normal begin can never consume the reserved headroom, so only a minted
+ * reservation handle authorizes the accepted update. The reservation is
+ * consumed exactly once; if the table bank cannot be acquired (or the
+ * reservation is foreign/exhausted), the pool grant rolls back and no
+ * reservation capacity is lost.
+ * @param reservation Authority-issued accepted-work handle from the SAME
+ * table; a foreign or exhausted handle refuses before bank acquisition.
+ */
+std::optional<PageTableAdmission> admitPoolTableReserved(
+    PhysicalPagePool &pool, CPUFP32PagedKVTable &table, std::size_t pages,
+    CPUFP32PagedKVTable::IssuanceReservation &reservation);
 } // namespace llaminar2

@@ -113,3 +113,59 @@ TEST(PageTableAdmission, AbortedCombinedAdmissionLeavesBothClassesAvailable)
     ASSERT_TRUE(again);
     EXPECT_EQ(again->grant.remainingCommitment(), 1u);
 }
+
+/** @test Reserved all-resource admission consumes exactly one accepted-work issuance. */
+TEST(PageTableAdmission, ReservedAdmissionConsumesOneIssuanceAndRollsBackTogether)
+{
+    // Budget 8 with headroom 4: the reserved path is usable alongside normal.
+    CombinedFixture fx(/*frames=*/2, /*banks=*/2);
+    fx.table.reset(); // Rebuild the table with a reservation-capable geometry.
+    fx.table = CPUFP32PagedKVTable::create(fx.authority, DeviceId::cpu(),
+        CPUFP32PagedKVTableGeometry{1, 2, 2, 1, 8, 4});
+    auto reservation = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(reservation);
+    EXPECT_EQ(fx.table->outstandingReserved(), 1u);
+    auto admitted = admitPoolTableReserved(*fx.pool, *fx.table, 1, *reservation);
+    ASSERT_TRUE(admitted);
+    EXPECT_EQ(admitted->grant.remainingCommitment(), 1u);
+    EXPECT_EQ(reservation->remaining(), 0u);
+    EXPECT_EQ(fx.table->outstandingReserved(), 0u);
+    EXPECT_EQ(fx.table->issuedVersions(), 1u);
+    // The accepted update is independently usable: attach + commit.
+    std::vector<float> rows(2 * 4, 2.0f);
+    auto frame = admitted->grant.assignFrame();
+    auto plan = admitted->grant.prepareFreshWrite(frame, rows.size() * sizeof(float));
+    ASSERT_TRUE(plan);
+    plan->copyFrom(std::as_bytes(std::span(rows)));
+    admitted->table_update.append(CPUFP32KVPage(plan->commit(), 1, 4));
+    EXPECT_NO_THROW(admitted->table_update.commit());
+}
+
+/** @test Foreign/exhausted reservation refuses before any class is acquired. */
+TEST(PageTableAdmission, ReservedAdmissionRefusesForeignOrExhaustedHandles)
+{
+    CombinedFixture fx;
+    fx.table.reset();
+    fx.table = CPUFP32PagedKVTable::create(fx.authority, DeviceId::cpu(),
+        CPUFP32PagedKVTableGeometry{1, 2, 2, 1, 8, 4});
+    CombinedFixture foreign;
+    foreign.table.reset();
+    foreign.table = CPUFP32PagedKVTable::create(foreign.authority, DeviceId::cpu(),
+        CPUFP32PagedKVTableGeometry{1, 2, 2, 1, 8, 4});
+    auto foreign_reservation = foreign.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(foreign_reservation);
+    // Foreign handle: same pool, but the handle was minted by another table.
+    EXPECT_FALSE(admitPoolTableReserved(*fx.pool, *fx.table, 1, *foreign_reservation));
+    EXPECT_EQ(fx.pool->tryAdmit(3)->remainingCommitment(), 3u); // No growth leaked.
+    EXPECT_EQ(foreign.table->outstandingReserved(), 1u);        // No capacity consumed.
+    // Exhausted handle: consume it first, then admission must refuse upfront.
+    auto own = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(own);
+    auto first = admitPoolTableReserved(*fx.pool, *fx.table, 1, *own);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->grant.remainingCommitment(), 1u);
+    auto after_pool = fx.pool->tryAdmit(2);
+    ASSERT_TRUE(after_pool); // Two frames remain (3-frames fixture).
+    EXPECT_FALSE(admitPoolTableReserved(*fx.pool, *fx.table, 1, *own));
+    EXPECT_EQ(after_pool->remainingCommitment(), 2u); // Untouched by the refusal.
+}

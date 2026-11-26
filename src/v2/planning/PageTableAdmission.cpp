@@ -27,4 +27,23 @@ std::optional<PageTableAdmission> admitPoolAndTable(
     if (!update) return std::nullopt; // Grant RAII rolls back on scope exit.
     return PageTableAdmission{std::move(*grant), std::move(*update)};
 }
+
+std::optional<PageTableAdmission> admitPoolTableReserved(
+    PhysicalPagePool &pool, CPUFP32PagedKVTable &table, std::size_t pages,
+    CPUFP32PagedKVTable::IssuanceReservation &reservation)
+{
+    if (!pages || pages > pool.geometry().max_pages_per_request)
+        throw std::invalid_argument("Reserved page/table admission requires positive pages within the pool bound");
+    if (table.issuerForAdmission() != pool.issuerForAdmission())
+        throw std::invalid_argument("Reserved page/table admission requires one original PMA authority");
+    // Refuse BEFORE acquiring anything when the handle cannot authorize an
+    // accepted update (foreign, moved-from or exhausted reservation).
+    if (!reservation || !reservation.remaining())
+        return std::nullopt;
+    auto grant = pool.tryAdmit(pages);
+    if (!grant) return std::nullopt; // No growth; the reservation is untouched.
+    auto update = table.tryBeginReserved(reservation);
+    if (!update) return std::nullopt; // Grant RAII rolls back; no capacity consumed.
+    return PageTableAdmission{std::move(*grant), std::move(*update)};
+}
 } // namespace llaminar2
