@@ -492,6 +492,7 @@ FROM scratch AS arm64-build-evidence
 COPY --from=builder-integration-operation /src/native-build-evidence/ /
 
 FROM builder-integration-operation AS builder
+ARG LLAMINAR_EXPECTED_BUILD_NONCE
 RUN python3 scripts/ci/arm_native_build_evidence.py assert
 
 # This receipt permits the campaign driver to use installed binaries without

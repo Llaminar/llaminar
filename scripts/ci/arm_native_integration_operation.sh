@@ -55,4 +55,3 @@
      && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles \
      && echo "==> [integration] done; elapsed_seconds=$(( $(date +%s) - integration_started_epoch )); final size: $(du -sh build_v2_integration | cut -f1)"; \
     fi
-

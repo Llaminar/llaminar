@@ -80,6 +80,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/transfer_arm64_ccache.sh restore
       - name: Export original canonical Integration attempt evidence
+        id: integration-evidence
         shell: bash
         env:
           BUILD_ARGS: ${{ steps.build.outputs.args }}
@@ -88,24 +89,27 @@ jobs:
           args=()
           while IFS= read -r arg; do args+=(--build-arg "$arg"); done <<< "$BUILD_ARGS"
           docker buildx build "${args[@]}" --build-context "$TOOLCHAIN_CONTEXT" \
-            --platform linux/arm64 --progress plain --target arm64-build-evidence \
-            --output "type=local,dest=$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration" .
+            --platform linux/arm64 --progress rawjson --target arm64-build-evidence \
+            --output "type=local,dest=$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration" . \
+            2> "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-export.rawjson"
+          nonce=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nonce"])' "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json")
+          echo "nonce=$nonce" >> "$GITHUB_OUTPUT"
       - name: Build the sealed ARM64 test-runner
-        uses: docker/build-push-action@v7
+        shell: bash
         env:
-          DOCKER_BUILD_RECORD_UPLOAD: "false"
-        with:
-          context: .
-          platforms: linux/arm64
-          target: test-runner
-          build-args: ${{ steps.build.outputs.args }}
-          build-contexts: ${{ steps.toolchain.outputs.neon-context }}
-          tags: llaminar-arm64-test-runner:pr
-          load: true
-          cache-from: |
-            type=gha,scope=llaminar-build-neon-pr,version=2
-            type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}
-          cache-to: type=gha,scope=llaminar-build-neon-pr,mode=max,version=2,ignore-error=true
+          BUILD_ARGS: ${{ steps.build.outputs.args }}
+          TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
+          EXPECTED_NONCE: ${{ steps.integration-evidence.outputs.nonce }}
+        run: |
+          args=()
+          while IFS= read -r arg; do args+=(--build-arg "$arg"); done <<< "$BUILD_ARGS"
+          docker buildx build "${args[@]}" --build-arg "LLAMINAR_EXPECTED_BUILD_NONCE=$EXPECTED_NONCE" \
+            --build-context "$TOOLCHAIN_CONTEXT" --platform linux/arm64 --progress rawjson \
+            --load --target test-runner --tag llaminar-arm64-test-runner:pr \
+            --cache-from type=gha,scope=llaminar-build-neon-pr,version=2 \
+            --cache-from type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }} \
+            --cache-to type=gha,scope=llaminar-build-neon-pr,mode=max,version=2,ignore-error=true . \
+            2> "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson"
       - name: Export the sibling Release runtime from the same builder
         shell: bash
         env:

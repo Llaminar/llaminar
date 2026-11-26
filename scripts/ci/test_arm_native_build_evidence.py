@@ -32,3 +32,15 @@ class EvidenceTests(unittest.TestCase):
             with patch.dict(os.environ, LLAMINAR_SOURCE_TREE='different'):
                 with self.assertRaises(AssertionError):
                     evidence.enforce()
+
+    def test_nonce_and_operation_chokepoint(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(evidence, 'ROOT', Path(directory) / 'evidence'):
+            evidence.capture(['true'])
+            with patch.dict(os.environ, LLAMINAR_EXPECTED_BUILD_NONCE='wrong'):
+                with self.assertRaisesRegex(AssertionError, 'nonce'):
+                    evidence.enforce()
+        dockerfile = (Path(__file__).resolve().parents[2] / 'Dockerfile').read_text()
+        references = [line for line in dockerfile.splitlines() if 'builder-integration-operation' in line]
+        self.assertEqual(references, ['FROM toolchain AS builder-integration-operation',
+                                    'COPY --from=builder-integration-operation /src/native-build-evidence/ /',
+                                    'FROM builder-integration-operation AS builder'])
