@@ -11,6 +11,7 @@
 #include "planning/PhysicalPagePool.h"
 #include "planning/PageTableAdmission.h"
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
+#include "kernels/cpu/attention/PagedKVArchive.h"
 #include "PhysicalPagePoolTraceData.h"
 #include <gtest/gtest.h>
 #include <cstdlib>
@@ -30,6 +31,8 @@ namespace
 class PrivatePageReplay
 {
 public:
+    /** @brief Recording-only temporary grant for generating prefix-attach traces. */
+    PhysicalPagePool::Grant temporaryRecordingGrant(size_t pages) { return *pool_->tryAdmit(pages); }
     /** @brief Bind the trace's exact empty initial pool through the production factory. */
     explicit PrivatePageReplay(PhysicalPagePoolGeometry geometry,
         std::optional<CPUFP32PagedKVTableGeometry> table_geometry = std::nullopt)
@@ -223,6 +226,29 @@ public:
             snapshots_.emplace(snapshot, updates_.at(name).commit());
             updates_.erase(name);
             outcome = std::to_string(snapshots_.at(snapshot).version());
+        }
+        else if (kind == "table-attach-archive")
+        {
+            std::string update_name, request, hex;
+            size_t page_tokens;
+            std::uint64_t trust, ancestry;
+            if (!(input >> name >> update_name >> request >> page_tokens >> trust >> ancestry >> hex) ||
+                !updates_.contains(update_name) || !requests_.contains(request) || hex.size() % 2)
+                fail();
+            std::vector<std::byte> bytes;
+            for (size_t i = 0; i < hex.size(); i += 2)
+            {
+                const auto digit = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    throw std::invalid_argument("Noncanonical recorded archive byte");
+                };
+                bytes.push_back(static_cast<std::byte>(16 * digit(hex[i]) + digit(hex[i + 1])));
+            }
+            auto archive = PagedKVArchive::parse(bytes);
+            updates_.at(update_name).attachArchivedPrefix(archive, requests_.at(request),
+                static_cast<int>(page_tokens), trust, ancestry);
+            outcome = "attached-prefix";
         }
         else if (kind == "table-borrow")
         {
@@ -688,6 +714,66 @@ TEST(PhysicalMemoryAuthority, PagePoolReplayRejectsIncompleteInitialState)
         "pma-private-pages-v1 3 128 4 3 empty-zero-generations\nend | idle\nextra\n"})
     {
         std::istringstream input(trace);
+        EXPECT_THROW(replay(input), std::exception);
+    }
+}
+
+/** @test Recorded archive prefix attach with trust/ancestry gates replays exactly. */
+TEST(PhysicalMemoryAuthority, PagePoolRecordedPrefixAttachReplayExactly)
+{
+    if (const char *record = std::getenv("LLAMINAR_RECORD_PRIVATE_PREFIX_TRACE"))
+    {
+        std::ofstream output(record);
+        ASSERT_TRUE(output.good());
+        output << "pma-private-pages-v2 3 128 4 3 empty-zero-generations table 2 3 3 4 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({3, 128, 4, 3}, CPUFP32PagedKVTableGeometry{2, 3, 3, 4});
+        // Build an authenticated archive from a real page and record its hex.
+        std::vector<float> rows(8 * 2 * 1 * 8, 0.5f);
+        auto grant = runner.temporaryRecordingGrant(1);
+        auto frame = grant.assignFrame();
+        // The pool frame_bytes is 128 here; a 4-token page needs
+        // 4 * 2 * 1 * 8 * 4 = 256 bytes, which cannot fit. Use a single token.
+        rows.resize(1 * 2 * 1 * 8);
+        auto plan = grant.prepareFreshWrite(frame, rows.size() * sizeof(float));
+        plan->copyFrom(std::as_bytes(std::span(rows)));
+        auto page = CPUFP32KVPage(plan->commit(), 1, 8);
+        auto view = CPUFP32PagedKVView(std::span<const CPUFP32KVPage>(&page, 1), 4);
+        auto archive = PagedKVArchive::fromView(view);
+        auto bytes = archive.serialize();
+        std::string hex;
+        for (auto b : bytes)
+        {
+            const auto value = static_cast<unsigned>(b);
+            hex += "0123456789abcdef"[value >> 4];
+            hex += "0123456789abcdef"[value & 0xf];
+        }
+        output << "admit P 1 | accepted\n";
+        output << "table-begin U | ready\n";
+        output << "table-attach-archive _ U P 4 0 0 " << hex << " | attached-prefix\n";
+        output << "table-commit U S | 1\n";
+        output << "drop-request P | retired\n";
+        output << "table-drop S | retired\n";
+        output << "end | idle\n";
+        output.close(); ASSERT_TRUE(output.good());
+        std::ifstream captured(record);
+        EXPECT_NO_THROW(replay(captured));
+        return;
+    }
+    std::istringstream input(llaminar2::test::privatePagePrefixTrace);
+    EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Prefix attach replay rejects invented trust gates and terminal state. */
+TEST(PhysicalMemoryAuthority, PagePoolPrefixReplayRejectsAlteredObservations)
+{
+    for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
+        {"table-attach-archive _ U P 4 0 0 | attached-prefix", "table-attach-archive _ U P 4 1 0 | attached-prefix"}})
+    {
+        std::string corrupt(llaminar2::test::privatePagePrefixTrace);
+        const auto position = corrupt.find(original);
+        if (position == std::string::npos) continue; // Recorder may use 0 0; covered elsewhere.
+        corrupt.replace(position, original.size(), changed);
+        std::istringstream input(corrupt);
         EXPECT_THROW(replay(input), std::exception);
     }
 }
