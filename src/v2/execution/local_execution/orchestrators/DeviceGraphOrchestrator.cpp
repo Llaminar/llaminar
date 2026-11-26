@@ -18378,6 +18378,51 @@ namespace llaminar2
         // graph consumes pooled pages and must NOT use the ring cache (the
         // graph builder refuses ring+pooled combinations).
         input.pooled_kv = pooled_kv_binding_;
+        /*
+         * R24 M6: admit the step's COMPLETE page demand (all layers, one pool
+         * grant) BEFORE the graph builds or runs. A page shortage refuses the
+         * forward here; no graph node ever admids mid-execution and no layer
+         * publishes alone. The binding's publication row count is ALSO the
+         * single decode-position authority (M1/R24): the graph's position
+         * offset comes from the pooled publication, and the host cursor must
+         * agree or the forward is refused (a shifted origin or prefix attach
+         * that would break rows-1 is rejected, not silently mis-attended).
+         */
+        if (pooled_kv_binding_)
+        {
+            // M4: a continued/chunked prefill with live pooled history is
+            // refused BEFORE graph execution — pooled attention is single-row
+            // decode only and would attend to the current chunk alone.
+            if (input.execution_phase == ForwardExecutionPhase::Prefill &&
+                pooled_kv_binding_->hasLivePublication())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Continued pooled prefill refused "
+                    "(live pooled history; pooled attention is decode-only)");
+                return std::nullopt;
+            }
+            const int pooled_next_position = pooled_kv_binding_->nextPosition();
+            if (pooled_next_position != state_.positions[0])
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Pooled decode position authority "
+                    "disagrees with the host cursor (publication="
+                    << pooled_next_position << " cursor=" << state_.positions[0]
+                    << "); refusing pooled forward");
+                return std::nullopt;
+            }
+            const int live_rows =
+                input.execution_phase == ForwardExecutionPhase::Prefill
+                    ? seq_len
+                    : 1;
+            if (!pooled_kv_binding_->prepareStep(live_rows))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Pooled decode step grant admission "
+                    "refused (page pressure); refusing forward before graph execution");
+                return std::nullopt;
+            }
+        }
 
         /*
          * Pipeline prefill binds each non-embedding participant's persistent
@@ -18687,6 +18732,17 @@ namespace llaminar2
 
         // Execute forward pass
         bool success = executeForward(input, output);
+
+        // R24 M1/M6: pooled step publication. Only a completely successful
+        // forward advances next→current for every layer; any failure cancels
+        // every not-yet-visible publication, so layers never disagree.
+        if (pooled_kv_binding_)
+        {
+            if (success)
+                pooled_kv_binding_->advanceStep();
+            else
+                pooled_kv_binding_->cancelStep();
+        }
 
         std::string overlay_finish_error;
         if (!overlay_graph_scope.finish(

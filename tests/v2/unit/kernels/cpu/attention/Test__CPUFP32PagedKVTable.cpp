@@ -568,3 +568,163 @@ TEST(CPUFP32PagedKVTable, IssuanceHeadroomValidationIsTyped)
     // Budget strictly above headroom is legal.
     EXPECT_GT(CPUFP32PagedKVTable::physicalBytes({1, 2, 2, 2, 5, 1}, DeviceId::cpu()), 0u);
 }
+
+/** @test R24 M5: a published bank binds exactly once; rebinding is refused. */
+TEST(CPUFP32PagedKVTable, PublishedBankBindingIsSingleUseAndRebindingRefused)
+{
+    constexpr int dimension = 64;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{2, 2 * 2 * dimension * sizeof(float), 3, 1};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2, 32, 4};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const auto page = [&](float value) {
+        auto grant = pool->tryAdmit(1);
+        if (!grant) throw std::logic_error("Fixture page grant refused");
+        const auto frame = grant->assignFrame();
+        // 1 row (heads=1): K row then V row, 2*dimension floats total.
+        std::vector<float> input(2 * dimension, 0.0f);
+        std::fill_n(input.data() + dimension, dimension, value);
+        auto write = grant->prepareAppend(frame, input.size() * sizeof(float));
+        if (!write) throw std::logic_error("Fixture page write refused");
+        write->copyFrom(std::as_bytes(std::span(input)));
+        return CPUFP32KVPage(write->commit(), 1, dimension);
+    };
+    auto update = table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    update->append(page(1.0f));
+    auto snapshot = update->commit();
+    // First bind succeeds; a second bind of the SAME publication refuses.
+    ASSERT_TRUE(table->bindPublication(snapshot, /*request_id=*/9, /*slot=*/0));
+    EXPECT_FALSE(table->bindPublication(snapshot, 9, 0));
+    EXPECT_FALSE(table->bindPublication(snapshot, 10, 0));
+    // The ref minted against the bound publication resolves; a wrong-request
+    // ref (never minted) refuses.
+    auto ref = table->refFor(snapshot, 9, 0);
+    ASSERT_TRUE(ref.valid());
+    auto resolved = table->resolveSnapshotRef(ref);
+    ASSERT_TRUE(resolved);
+    EXPECT_EQ(resolved->view().rows(), 1);
+    auto wrong = ref;
+    wrong.request_id = 10;
+    EXPECT_FALSE(table->resolveSnapshotRef(wrong));
+}
+
+/** @test R24 M5: a released bank is entirely unbound; reuse starts clean. */
+TEST(CPUFP32PagedKVTable, ReleasedBankReuseHasNoStaleBinding)
+{
+    constexpr int dimension = 64;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{2, 2 * 2 * dimension * sizeof(float), 3, 1};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2, 32, 4};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const auto page = [&](float value) {
+        auto grant = pool->tryAdmit(1);
+        if (!grant) throw std::logic_error("Fixture page grant refused");
+        const auto frame = grant->assignFrame();
+        // 1 row (heads=1): K row then V row, 2*dimension floats total.
+        std::vector<float> input(2 * dimension, 0.0f);
+        std::fill_n(input.data() + dimension, dimension, value);
+        auto write = grant->prepareAppend(frame, input.size() * sizeof(float));
+        if (!write) throw std::logic_error("Fixture page write refused");
+        write->copyFrom(std::as_bytes(std::span(input)));
+        return CPUFP32KVPage(write->commit(), 1, dimension);
+    };
+    auto update_a = table->tryBeginUpdate();
+    ASSERT_TRUE(update_a);
+    update_a->append(page(1.0f));
+    auto snap_a = update_a->commit();
+    ASSERT_TRUE(table->bindPublication(snap_a, /*request_id=*/5, /*slot=*/1));
+    auto ref_a = table->refFor(snap_a, 5, 1);
+    ASSERT_TRUE(ref_a.valid());
+    // Release the only reader: the bank returns to Free, fully unbound.
+    snap_a = {};
+    // Reuse the same physical bank: the new publication binds to a DIFFERENT
+    // request with no stale binding. The old ref can never resolve (its
+    // version was already retired), and the new binding is clean.
+    auto update_b = table->tryBeginUpdate();
+    ASSERT_TRUE(update_b);
+    update_b->append(page(2.0f));
+    auto snap_b = update_b->commit();
+    ASSERT_TRUE(table->bindPublication(snap_b, /*request_id=*/6, /*slot=*/0));
+    EXPECT_FALSE(table->resolveSnapshotRef(ref_a)); // Superseded version: refuse.
+    auto ref_b = table->refFor(snap_b, 6, 0);
+    ASSERT_TRUE(ref_b.valid());
+    EXPECT_EQ(ref_b.publication_version, ref_a.publication_version + 1);
+    auto resolved_b = table->resolveSnapshotRef(ref_b);
+    ASSERT_TRUE(resolved_b);
+}
+
+/** @test R24: a superseded-but-still-published version resolves while a reader holds it. */
+TEST(CPUFP32PagedKVTable, SupersededButStillLiveVersionResolvesForReaders)
+{
+    constexpr int dimension = 64;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{2, 2 * 2 * dimension * sizeof(float), 3, 1};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2, 32, 4};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const auto page = [&](float value) {
+        auto grant = pool->tryAdmit(1);
+        if (!grant) throw std::logic_error("Fixture page grant refused");
+        const auto frame = grant->assignFrame();
+        // 1 row (heads=1): K row then V row, 2*dimension floats total.
+        std::vector<float> input(2 * dimension, 0.0f);
+        std::fill_n(input.data() + dimension, dimension, value);
+        auto write = grant->prepareAppend(frame, input.size() * sizeof(float));
+        if (!write) throw std::logic_error("Fixture page write refused");
+        write->copyFrom(std::as_bytes(std::span(input)));
+        return CPUFP32KVPage(write->commit(), 1, dimension);
+    };
+    // Publish v1 and bind it; a reader borrows it.
+    auto update1 = table->tryBeginUpdate();
+    ASSERT_TRUE(update1);
+    update1->append(page(1.0f));
+    auto snap1 = update1->commit();
+    ASSERT_TRUE(table->bindPublication(snap1, /*request_id=*/7, /*slot=*/0));
+    auto ref1 = table->refFor(snap1, 7, 0);
+    ASSERT_TRUE(ref1.valid());
+    auto reader1 = table->resolveSnapshotRef(ref1);
+    ASSERT_TRUE(reader1);
+    // Release the owner snapshot but NOT the reader: v1 stays published.
+    snap1 = {};
+    // v1 is superseded (the request moved on) but still live for the reader.
+    auto update2 = table->tryBeginUpdate();
+    ASSERT_TRUE(update2);
+    update2->append(page(2.0f));
+    auto snap2 = update2->commit();
+    ASSERT_TRUE(table->bindPublication(snap2, 7, 0));
+    // The old ref resolves exactly (reader envelope), the new ref resolves too.
+    auto still_live = table->resolveSnapshotRef(ref1);
+    ASSERT_TRUE(still_live);
+    EXPECT_EQ(still_live->view().rows(), 1);
+    auto ref2 = table->refFor(snap2, 7, 0);
+    ASSERT_TRUE(ref2.valid());
+    ASSERT_TRUE(table->resolveSnapshotRef(ref2));
+    // Retiring the last reader closes v1; a stale ref now refuses.
+    reader1 = {};
+    still_live = {};
+    EXPECT_FALSE(table->resolveSnapshotRef(ref1));
+}

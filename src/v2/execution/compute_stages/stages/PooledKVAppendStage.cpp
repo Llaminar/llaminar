@@ -2,22 +2,69 @@
  * @file PooledKVAppendStage.cpp
  * @brief P2 production-caller pooled append: page write + typed ref mint.
  *
- * Contract:
- * - ONE decode row, CPU, FP32 K/V only (fail-closed otherwise).
+ * Contract (R24 M1-M6):
+ * - CPU, FP32, single-row decode only (fail-closed otherwise). Multi-row
+ *   append is allowed ONLY on an empty bank (initial prefill); a prior
+ *   publication with multi-row append is refused before mutation (M4).
  * - The caller supplies the SAME admitted pool and table (one PMA instance);
  *   a foreign pair is rejected before any mutation.
- * - The stage admits one page from the pool, copies the interleaved K/V row
- *   into the page frame, appends it to the table update, commits the
- *   publication, binds the request and mints the exact typed ref into
- *   `ref_out`. On ANY failure nothing is published and `ref_out` is cleared.
- * - No allocation, no host shadow, no full-history gather.
+ * - ALL page frames come from the caller's pre-admitted step grant (M6).
+ *   The stage never calls tryAdmit, never allocates a staging vector: K/V
+ *   rows are written in the native per-row interleaved layout directly from
+ *   the K/V tensors (K row, then V row, at the KVNativeStorageLayout stride).
+ * - On any failure nothing is published and `ref_out` is cleared; the prior
+ *   cell (a DISTINCT object) is never touched (M1).
+ * - The bank is bound exactly once at commit (M5, table enforces).
  */
 #include "PooledKVAppendStage.h"
 #include "utils/Assertions.h"
+#include "kernels/kvcache/KVStorageLayout.h"
 #include <cstring>
 
 namespace llaminar2
 {
+namespace
+{
+/** @brief Native per-row interleaved byte geometry (K row then V row). */
+struct InterleaveGeometry
+{
+    std::size_t k_bytes = 0; ///< K extent of one token row.
+    std::size_t v_bytes = 0; ///< V extent of one token row.
+    std::size_t row_stride = 0; ///< Native stride between token rows (k+v).
+    std::size_t row_floats = 0; ///< Floats of one K row (tensor row width).
+};
+
+InterleaveGeometry nativeInterleave(int kv_heads, int head_dim)
+{
+    const auto layout = KVNativeStorageLayout::resolve(KVCacheFamily::AttentionOnly,
+        kv_heads, head_dim, "fp32", DeviceId::cpu());
+    const auto pair = layout.pagePayload(1);
+    if (pair.k_bytes != pair.v_bytes ||
+        (pair.k_bytes % sizeof(float)) != 0)
+        throw std::invalid_argument("Pooled FP32 interleave requires equal aligned K/V rows");
+    InterleaveGeometry geometry;
+    geometry.k_bytes = pair.k_bytes;
+    geometry.v_bytes = pair.v_bytes;
+    geometry.row_stride = pair.totalBytes();
+    geometry.row_floats = pair.k_bytes / sizeof(float);
+    return geometry;
+}
+
+/** @brief Copy one page worth of rows from K/V tensors via fragment copies. */
+template <typename WriteLike>
+void writePageRows(WriteLike &write, const float *k,
+    const float *v, int row0, int rows, const InterleaveGeometry &geometry)
+{
+    for (int row = row0; row < row0 + rows; ++row)
+    {
+        const auto *k_row = k + static_cast<std::size_t>(row) * geometry.row_floats;
+        const auto *v_row = v + static_cast<std::size_t>(row) * geometry.row_floats;
+        write.copyNext(std::as_bytes(std::span(k_row, geometry.k_bytes / sizeof(float))));
+        write.copyNext(std::as_bytes(std::span(v_row, geometry.v_bytes / sizeof(float))));
+    }
+}
+} // namespace
+
 PooledKVAppendStage::PooledKVAppendStage(Params params)
     : IComputeStage(params.device_id), params_(std::move(params))
 {
@@ -26,6 +73,8 @@ PooledKVAppendStage::PooledKVAppendStage(Params params)
 bool PooledKVAppendStage::execute(IDeviceContext *ctx)
 {
     (void)ctx;
+    // M1: clearing ref_out must never affect the prior cell. The prior is a
+    // different object; this clears only the NEXT cell of the caller.
     if (params_.ref_out)
         *params_.ref_out = {}; // No stale publication on any failure path.
 
@@ -61,6 +110,16 @@ bool PooledKVAppendStage::execute(IDeviceContext *ctx)
         LOG_ERROR("[PooledKVAppendStage] Pooled append requires positive KV geometry");
         return false;
     }
+    if (!params_.grant)
+    {
+        LOG_ERROR("[PooledKVAppendStage] Pooled append requires the pre-admitted step grant");
+        return false;
+    }
+    if (params_.grant->issuer() != params_.pool->issuerForAdmission())
+    {
+        LOG_ERROR("[PooledKVAppendStage] Step grant must come from the same pool authority");
+        return false;
+    }
     const int rows = params_.live_rows > 0 ? params_.live_rows
                                             : static_cast<int>(params_.K->rows());
     if (rows <= 0)
@@ -68,9 +127,24 @@ bool PooledKVAppendStage::execute(IDeviceContext *ctx)
         LOG_ERROR("[PooledKVAppendStage] Pooled append requires positive live rows");
         return false;
     }
-    const std::size_t width = static_cast<std::size_t>(params_.kv_heads) *
-        static_cast<std::size_t>(params_.head_dim);
-    const std::size_t row_bytes = width * 2 * sizeof(float); // K then V interleaved per row.
+
+    // M3: native per-row interleaved layout and stride from the layout
+    // authority, never a hard-coded 2*width assumption.
+    InterleaveGeometry geometry;
+    try
+    {
+        geometry = nativeInterleave(params_.kv_heads, params_.head_dim);
+    }
+    catch (const std::exception &e)
+    {
+        LOG_ERROR("[PooledKVAppendStage] Pooled interleave geometry refused: " << e.what());
+        return false;
+    }
+    if (params_.K->fp32_data() == nullptr || params_.V->fp32_data() == nullptr)
+    {
+        LOG_ERROR("[PooledKVAppendStage] Pooled append requires host FP32 K/V backing");
+        return false;
+    }
     const float *k = params_.K->fp32_data();
     const float *v = params_.V->fp32_data();
 
@@ -82,105 +156,104 @@ bool PooledKVAppendStage::execute(IDeviceContext *ctx)
     }
 
     // Publication-source model (immutable sharing + private COW tail):
-    // - every page of the prior publication is kept;
-    // - the prior LAST page is extended by COW copy only when it is PARTIAL
-    //   (a decode step appending into the current page): the new bank shares
-    //   all FULL prior pages, and one fresh private page holds the prior last
-    //   page's rows + this step's new row(s);
-    // - a new page is started only when the prior last page was FULL.
-    const CPUFP32KVPage *prior_pages = nullptr;
+    // - every prior FULL page is shared verbatim into the new bank;
+    // - the prior LAST page, when PARTIAL, is COW-extended: the new bank
+    //   shares pages 0..n-2, and ONE fresh private page holds the prior last
+    //   page's rows plus this step's new rows (M2: history beyond one page is
+    //   never lost);
+    // - a new page is started only when the prior last page was FULL, or when
+    //   there is no prior publication at all (initial prefill), in which case
+    //   the row count is split across any number of full/partial pages (M4).
+    // M4: multi-row splitting is supported FROM a partial tail (the caller
+    // boundary refuses continued prefill before execution for ATTENTION
+    // correctness; the append itself must never refuse rows>remaining).
+    const bool prior_live = params_.prior && params_.prior->live();
+    const bool has_prior = prior_live;
+    int prior_full_pages = 0;
     int prior_last_rows = 0;
-    int prior_page_count = 0;
-    if (params_.prior && params_.prior->live())
+    if (has_prior)
     {
         const auto pages = params_.prior->snapshot.view().pages();
-        prior_page_count = static_cast<int>(pages.size());
+        prior_full_pages = static_cast<int>(pages.size()) - 1;
         prior_last_rows = pages.empty() ? 0 : pages.back().rows();
-        prior_pages = pages.data();
     }
-    const int final_page_rows = prior_page_count > 0 ? prior_last_rows : 0;
-    const bool extend_partial = prior_page_count > 0 && final_page_rows < params_.page_tokens;
+    const bool extend_partial =
+        has_prior && prior_last_rows > 0 && prior_last_rows < params_.page_tokens;
 
-    if (!extend_partial && prior_pages)
-    {
-        // All prior pages are full: share them verbatim.
-        const auto pages = params_.prior->snapshot.view().pages();
-        for (const auto &page : pages)
-        {
-            auto shared = page.share();
-            update->appendShared(std::move(shared), page.heads(), page.dimension());
-        }
-    }
-
+    int written = 0;
     if (extend_partial)
     {
-        // COW the prior last page and append this step's rows after it.
-        const auto &prior_last = params_.prior->snapshot.view().pages().back();
+        // M2: share EVERY prior full page first (0..n-2), then COW the last.
+        const auto pages = params_.prior->snapshot.view().pages();
+        for (int page = 0; page < prior_full_pages; ++page)
+        {
+            auto shared = pages[static_cast<std::size_t>(page)].share();
+            update->appendShared(std::move(shared), params_.kv_heads, params_.head_dim);
+        }
+        const auto &prior_last = pages.back();
         auto prior_shared = prior_last.share();
-        const std::size_t source_rows = prior_last.rows();
-        const std::size_t total_rows = static_cast<std::size_t>(source_rows) + rows;
-        if (total_rows > static_cast<std::size_t>(params_.page_tokens))
-        {
-            LOG_ERROR("[PooledKVAppendStage] Pooled decode exceeds the page capacity at this step");
-            return false;
-        }
-        auto grant = params_.pool->tryAdmit(1);
-        if (!grant)
-        {
-            LOG_ERROR("[PooledKVAppendStage] Pool has no free frame for the COW extension");
-            return false;
-        }
-        auto cow = grant->prepareCOW(prior_shared, static_cast<std::size_t>(rows) * row_bytes);
-        if (!cow)
+        const int tail_room = params_.page_tokens - prior_last_rows;
+        // M4: extend the partial tail as far as it fits, then split the
+        // remainder into fresh pages (never refuse rows>remaining).
+        const int tail_rows = std::min(tail_room, rows);
+        auto tail_write = params_.grant->prepareCOW(
+            prior_shared, static_cast<std::size_t>(tail_rows) * geometry.row_stride);
+        if (!tail_write)
         {
             LOG_ERROR("[PooledKVAppendStage] Pooled COW extension preparation refused");
             return false;
         }
-        cow->copySource();
-        std::vector<float> fresh(static_cast<std::size_t>(rows) * width * 2);
-        std::memcpy(fresh.data(), k, static_cast<std::size_t>(rows) * width * sizeof(float));
-        std::memcpy(fresh.data() + static_cast<std::size_t>(rows) * width, v,
-            static_cast<std::size_t>(rows) * width * sizeof(float));
-        cow->copyNext(std::as_bytes(std::span(fresh)));
-        auto committed = cow->commit();
+        tail_write->copySource();
+        writePageRows(*tail_write, k, v, 0, tail_rows, geometry);
+        auto committed = tail_write->commit();
         auto shared = committed.share();
         update->appendShared(std::move(shared), params_.kv_heads, params_.head_dim);
+        written = tail_rows;
     }
-    else
+    else if (has_prior)
     {
-        // Fresh page(s): prefill of an empty bank, or a decode step starting a
-        // new full page. Every page except the last is written full; the last
-        // may be partial.
-        int written = 0;
-        while (written < rows)
+        // The prior tail was FULL (or an empty-history edge): share EVERY
+        // prior page verbatim; the fresh loop then appends new full pages.
+        const auto pages = params_.prior->snapshot.view().pages();
+        for (const auto &page : pages)
         {
-            const int page_rows = std::min(params_.page_tokens, rows - written);
-            const std::size_t page_bytes = static_cast<std::size_t>(page_rows) * row_bytes;
-            auto grant = params_.pool->tryAdmit(1);
-            if (!grant)
-            {
-                LOG_ERROR("[PooledKVAppendStage] Pool has no free page for the append");
-                return false;
-            }
-            const auto frame = grant->assignFrame();
-            auto write = grant->prepareAppend(frame, page_bytes);
-            if (!write)
-            {
-                LOG_ERROR("[PooledKVAppendStage] Pooled page append preparation refused");
-                return false;
-            }
-            std::vector<float> payload(static_cast<std::size_t>(page_rows) * width * 2);
-            std::memcpy(payload.data(), k + static_cast<std::size_t>(written) * width,
-                static_cast<std::size_t>(page_rows) * width * sizeof(float));
-            std::memcpy(payload.data() + static_cast<std::size_t>(page_rows) * width,
-                v + static_cast<std::size_t>(written) * width,
-                static_cast<std::size_t>(page_rows) * width * sizeof(float));
-            write->copyFrom(std::as_bytes(std::span(payload)));
-            auto committed = write->commit();
-            auto shared = committed.share();
+            auto shared = page.share();
             update->appendShared(std::move(shared), params_.kv_heads, params_.head_dim);
-            written += page_rows;
         }
+    }
+    // Fresh pages for the remainder (no prior case: all rows; extension case:
+    // rows beyond the tail room; full-tail case: all rows).
+    while (written < rows)
+    {
+        const int page_rows = std::min(params_.page_tokens, rows - written);
+        const std::size_t page_bytes =
+            static_cast<std::size_t>(page_rows) * geometry.row_stride;
+        if (params_.grant->remainingCommitment() == 0)
+        {
+            LOG_ERROR("[PooledKVAppendStage] Pre-admitted step grant exhausted mid-append");
+            return false;
+        }
+        llaminar2::PhysicalPagePool::FrameHandle frame;
+        try
+        {
+            frame = params_.grant->assignFrame();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[PooledKVAppendStage] Step grant frame assignment refused: " << e.what());
+            return false;
+        }
+        auto write = params_.grant->prepareAppend(frame, page_bytes);
+        if (!write)
+        {
+            LOG_ERROR("[PooledKVAppendStage] Pooled page append preparation refused");
+            return false;
+        }
+        writePageRows(*write, k, v, written, page_rows, geometry);
+        auto committed = write->commit();
+        auto shared = committed.share();
+        update->appendShared(std::move(shared), params_.kv_heads, params_.head_dim);
+        written += page_rows;
     }
     auto snapshot = update->commit();
     if (!params_.table->bindPublication(snapshot, params_.request_id, params_.slot))

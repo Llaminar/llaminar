@@ -868,13 +868,17 @@ namespace llaminar2
         createForTest(Dependencies deps);
 
         /**
-         * @brief Attach one pooled decode binding to this orchestrator.
+         * @brief Attach one pooled decode binding to this orchestrator (test-only).
          *
          * The binding is injected into every forward graph this orchestrator
          * builds while attached. It is owned by the caller (runner serving
          * state) and must outlive the attached interval; detach with nullptr.
          * Only a CPU single-row dense decode forward may consume it; the graph
-         * builder refuses other combinations before any ring work.
+         * builder refuses other combinations before any ring work. R24: this
+         * surface has NO production caller while the pooled decode path is
+         * under qualification; it exists purely for the runner-level unit
+         * fixture to drive the graph seam. Production attach arrives with the
+         * P2 admission/runner milestone.
          */
         void setPooledDecodeBinding(PooledKVDecodeBinding *binding) noexcept
         {

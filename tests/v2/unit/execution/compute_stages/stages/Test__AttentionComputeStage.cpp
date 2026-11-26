@@ -21,6 +21,7 @@
 #include "backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/compute_stages/stages/PooledKVAppendStage.h"
+#include "execution/compute_stages/stages/PooledKVDecodeBinding.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "v2/tensors/Tensors.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
@@ -1560,6 +1561,10 @@ TEST(PooledStageConsumption, PooledAppendAndAttentionMatchContiguousControl)
         std::memcpy(kt->mutable_data(), k_row.data(), sizeof(float) * width);
         std::memcpy(vt->mutable_data(), v_row.data(), sizeof(float) * width);
         PooledPublicationCell ref_cell;
+        // M6: the complete step demand is admitted BEFORE the stage runs.
+        auto step_grant = pool->tryAdmit(1);
+        ASSERT_TRUE(step_grant);
+        ASSERT_EQ(step_grant->remainingCommitment(), 1u);
         PooledKVAppendStage::Params append_params;
         append_params.device_id = device;
         append_params.K = kt.get();
@@ -1567,6 +1572,7 @@ TEST(PooledStageConsumption, PooledAppendAndAttentionMatchContiguousControl)
         append_params.pool = pool.get();
         append_params.table = table.get();
         append_params.ref_out = &ref_cell;
+        append_params.grant = &*step_grant;
         append_params.request_id = 9;
         append_params.slot = 0;
         append_params.layer_idx = 0;
@@ -1685,4 +1691,362 @@ TEST(PooledStageConsumption, PlanShapedPrefillAppendCommits)
     update->appendShared(std::move(shared), kv_heads, dimension);
     auto snapshot = update->commit();
     EXPECT_EQ(static_cast<int>(snapshot.view().rows()), tokens);
+}
+
+/** @test R24 M1/M3: the K/V of every appended pooled row survives byte-exact:
+ * 3-row prefill into an 8-row page, then 8-row (full-page) and 9-row (2-page)
+ * prefill, each compared against the contiguous interleaved control. */
+TEST(PooledStageConsumption, PrefillRowsAreByteExactInNativeInterleave)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{16,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 16};
+    const CPUFP32PagedKVTableGeometry table_geometry{8, 8, 4, page_tokens, 64, 16};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+
+    std::mt19937 random(7);
+    std::uniform_real_distribution<float> values(-0.5f, 0.5f);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    constexpr int max_rows = 9;
+    std::vector<float> k(static_cast<size_t>(max_rows) * width), v(k.size());
+    for (auto *bank : {&k, &v}) for (auto &x : *bank) x = values(random);
+    // Build K/V tensors through the shared MPIContext factory.
+    MPIContext mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory factory(mpi);
+    auto K = factory.createFP32({max_rows, static_cast<long long>(width)}, device);
+    auto V = factory.createFP32({max_rows, static_cast<long long>(width)}, device);
+    std::memcpy(K->mutable_data(), k.data(), k.size() * sizeof(float));
+    std::memcpy(V->mutable_data(), v.data(), v.size() * sizeof(float));
+
+    // Expected native interleaved bytes for N rows.
+    const auto expected = [&](int rows) {
+        std::vector<float> payload(static_cast<size_t>(rows) * 2 * width);
+        for (int row = 0; row < rows; ++row)
+        {
+            std::copy_n(k.data() + row * width, width, payload.data() + static_cast<size_t>(row) * 2 * width);
+            std::copy_n(v.data() + row * width, width, payload.data() + static_cast<size_t>(row) * 2 * width + width);
+        }
+        return payload;
+    };
+    const auto append_via_stage = [&](int rows, PooledPublicationCell &out) {
+        auto grant = pool->tryAdmit(static_cast<std::size_t>((rows + page_tokens - 1) / page_tokens));
+        ASSERT_TRUE(grant);
+        PooledKVAppendStage::Params params;
+        params.device_id = device;
+        params.K = K.get();
+        params.V = V.get();
+        params.pool = pool.get();
+        params.table = table.get();
+        params.ref_out = &out;
+        params.grant = &*grant;
+        params.request_id = 42;
+        params.slot = 0;
+        params.layer_idx = 0;
+        params.kv_heads = kv_heads;
+        params.head_dim = dimension;
+        params.page_tokens = page_tokens;
+        params.live_rows = rows;
+        PooledKVAppendStage stage(params);
+        EXPECT_TRUE(stage.execute(nullptr)) << "append rows=" << rows;
+    };
+
+    // 3-row prefill: one partial page, byte-exact.
+    PooledPublicationCell pub3;
+    append_via_stage(3, pub3);
+    ASSERT_TRUE(pub3.live());
+    {
+        const auto pages = pub3.snapshot.view().pages();
+        ASSERT_EQ(static_cast<int>(pages.size()), 1);
+        const auto want = expected(3);
+        const auto got = pages[0].storage();
+        ASSERT_EQ(got.size(), want.size() * sizeof(float));
+        EXPECT_EQ(std::memcmp(got.data(), want.data(), want.size() * sizeof(float)), 0)
+            << "3-row prefill page is not byte-exact";
+    }
+    // 8-row prefill: one full page, byte-exact.
+    PooledPublicationCell pub8;
+    append_via_stage(8, pub8);
+    ASSERT_TRUE(pub8.live());
+    {
+        const auto pages = pub8.snapshot.view().pages();
+        ASSERT_EQ(static_cast<int>(pages.size()), 1);
+        const auto want = expected(8);
+        const auto got = pages[0].storage();
+        ASSERT_EQ(got.size(), want.size() * sizeof(float));
+        EXPECT_EQ(std::memcmp(got.data(), want.data(), want.size() * sizeof(float)), 0)
+            << "8-row full page is not byte-exact";
+    }
+    // 9-row prefill: two pages (8+1), both byte-exact.
+    PooledPublicationCell pub9;
+    append_via_stage(9, pub9);
+    ASSERT_TRUE(pub9.live());
+    {
+        const auto pages = pub9.snapshot.view().pages();
+        ASSERT_EQ(static_cast<int>(pages.size()), 2);
+        const auto want = expected(9);
+        const std::size_t row_bytes = 2 * width * sizeof(float);
+        const auto got0 = pages[0].storage();
+        const auto got1 = pages[1].storage();
+        ASSERT_EQ(got0.size(), static_cast<std::size_t>(8) * row_bytes);
+        ASSERT_EQ(got1.size(), static_cast<std::size_t>(1) * row_bytes);
+        EXPECT_EQ(std::memcmp(got0.data(), want.data(), got0.size()), 0)
+            << "9-row first page is not byte-exact";
+        EXPECT_EQ(std::memcmp(got1.data(), want.data() + 8 * 2 * width, got1.size()), 0)
+            << "9-row second page is not byte-exact";
+    }
+}
+
+/** @test R24 M3/M2: a partial tail extended by 2+ rows keeps every prior
+ * full page shared verbatim and the COW bytes in native interleave. */
+TEST(PooledStageConsumption, PartialTailExtensionKeepsPriorPagesAndBytes)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 4;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{8,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 8};
+    const CPUFP32PagedKVTableGeometry table_geometry{4, 4, 4, page_tokens, 32, 8};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+
+    std::mt19937 random(11);
+    std::uniform_real_distribution<float> values(-0.5f, 0.5f);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    // 5-row history: pages [4 full][1 partial] then extend the tail by 2 rows.
+    constexpr int history = 5, extra = 2;
+    std::vector<float> k(static_cast<size_t>(history + extra) * width), v(k.size());
+    for (auto *bank : {&k, &v}) for (auto &x : *bank) x = values(random);
+    MPIContext mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory factory(mpi);
+    auto K = factory.createFP32({history + extra, static_cast<long long>(width)}, device);
+    auto V = factory.createFP32({history + extra, static_cast<long long>(width)}, device);
+    std::memcpy(K->mutable_data(), k.data(), k.size() * sizeof(float));
+    std::memcpy(V->mutable_data(), v.data(), v.size() * sizeof(float));
+
+    auto grant5 = pool->tryAdmit(2);
+    ASSERT_TRUE(grant5);
+    PooledPublicationCell pub5;
+    PooledKVAppendStage::Params params5;
+    params5.device_id = device;
+    params5.K = K.get();
+    params5.V = V.get();
+    params5.pool = pool.get();
+    params5.table = table.get();
+    params5.ref_out = &pub5;
+    params5.grant = &*grant5;
+    params5.request_id = 11;
+    params5.slot = 0;
+    params5.layer_idx = 0;
+    params5.kv_heads = kv_heads;
+    params5.head_dim = dimension;
+    params5.page_tokens = page_tokens;
+    params5.live_rows = history;
+    PooledKVAppendStage stage5(params5);
+    ASSERT_TRUE(stage5.execute(nullptr));
+    ASSERT_TRUE(pub5.live());
+    EXPECT_EQ(pub5.snapshot.view().rows(), history);
+    EXPECT_EQ(static_cast<int>(pub5.snapshot.view().pages().size()), 2);
+
+    // Extend by 2 rows (history 5 + 2 = 7): M2 must share page 0 verbatim and
+    // COW page 1 (1 row) + 2 fresh rows; M3 bytes exact. The graph caller's
+    // K/V tensors hold ONLY the rows of this forward (rows 5..6), never the
+    // full history — model that exactly.
+    auto K2 = factory.createFP32({extra, static_cast<long long>(width)}, device);
+    auto V2 = factory.createFP32({extra, static_cast<long long>(width)}, device);
+    std::memcpy(K2->mutable_data(), k.data() + static_cast<size_t>(history) * width,
+        static_cast<size_t>(extra) * width * sizeof(float));
+    std::memcpy(V2->mutable_data(), v.data() + static_cast<size_t>(history) * width,
+        static_cast<size_t>(extra) * width * sizeof(float));
+    auto grant7 = pool->tryAdmit(1);
+    ASSERT_TRUE(grant7);
+    PooledPublicationCell pub7;
+    PooledKVAppendStage::Params params7;
+    params7.device_id = device;
+    params7.K = K2.get();
+    params7.V = V2.get();
+    params7.pool = pool.get();
+    params7.table = table.get();
+    params7.ref_out = &pub7;
+    params7.prior = &pub5; // M1: distinct prior cell.
+    params7.grant = &*grant7;
+    params7.request_id = 11;
+    params7.slot = 0;
+    params7.layer_idx = 0;
+    params7.kv_heads = kv_heads;
+    params7.head_dim = dimension;
+    params7.page_tokens = page_tokens;
+    params7.live_rows = extra;
+    PooledKVAppendStage stage7(params7);
+    ASSERT_TRUE(stage7.execute(nullptr));
+    ASSERT_TRUE(pub7.live());
+    EXPECT_EQ(pub7.snapshot.view().rows(), history + extra);
+    const auto pages = pub7.snapshot.view().pages();
+    ASSERT_EQ(static_cast<int>(pages.size()), 2);
+    const auto got0 = pages[0].storage();
+    const std::size_t row_bytes = 2 * width * sizeof(float);
+    ASSERT_EQ(got0.size(), static_cast<std::size_t>(page_tokens) * row_bytes);
+    const auto full_control = [&](int rows) {
+        std::vector<float> payload(static_cast<size_t>(rows) * 2 * width);
+        for (int row = 0; row < rows; ++row)
+        {
+            std::copy_n(k.data() + row * width, width, payload.data() + static_cast<size_t>(row) * 2 * width);
+            std::copy_n(v.data() + row * width, width, payload.data() + static_cast<size_t>(row) * 2 * width + width);
+        }
+        return payload;
+    };
+    const auto want0 = full_control(page_tokens);
+    EXPECT_EQ(std::memcmp(got0.data(), want0.data(), got0.size()), 0)
+        << "shared prior full page differs from the contiguous control";
+    // Tail page: rows 4..6 = prior last row (row 4) + fresh rows 5,6; bytes are
+    // the interleaved prefix of rows 4..6.
+    const auto got1 = pages[1].storage();
+    ASSERT_EQ(got1.size(), static_cast<std::size_t>(1 + extra) * row_bytes);
+    const auto want1 = full_control(history + extra);
+    EXPECT_EQ(std::memcmp(got1.data(), want1.data() + static_cast<std::size_t>(4) * 2 * width, got1.size()), 0)
+        << "COW tail bytes differ from the contiguous control";
+}
+
+/** @test R24 M4: the caller boundary refuses a continued pooled prefill
+ * (prior live, rows>1) before graph execution; the append stage itself never
+ * refuses rows>remaining (it splits). The refusal is implemented in the
+ * orchestrator's pooled forward gate; this test proves the stage-level split
+ * path is the opposite of refusal (extension test above) and that a caller
+ * asking the stage for a continued prefill gets a well-formed split whose
+ * attention would be wrong — the DGO gate refuses before it is reached.
+ */
+TEST(PooledStageConsumption, ContinuedPooledPrefillRefusesBeforeMutation)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{8,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 8};
+    const CPUFP32PagedKVTableGeometry table_geometry{4, 4, 4, page_tokens, 32, 8};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    MPIContext mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory factory(mpi);
+    auto K = factory.createFP32({8, static_cast<long long>(width)}, device);
+    auto V = factory.createFP32({8, static_cast<long long>(width)}, device);
+    std::fill_n(K->mutable_data(), 8 * width, 0.25f);
+    std::fill_n(V->mutable_data(), 8 * width, -0.25f);
+
+    auto grant = pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    PooledPublicationCell prior;
+    PooledKVAppendStage::Params p0;
+    p0.device_id = device;
+    p0.K = K.get();
+    p0.V = V.get();
+    p0.pool = pool.get();
+    p0.table = table.get();
+    p0.ref_out = &prior;
+    p0.grant = &*grant;
+    p0.request_id = 21;
+    p0.slot = 0;
+    p0.layer_idx = 0;
+    p0.kv_heads = kv_heads;
+    p0.head_dim = dimension;
+    p0.page_tokens = page_tokens;
+    p0.live_rows = 3;
+    PooledKVAppendStage s0(p0);
+    ASSERT_TRUE(s0.execute(nullptr));
+    ASSERT_TRUE(prior.live());
+    const std::uint64_t prior_version = prior.ref.publication_version;
+
+    // Continued prefill (rows=3 with a live prior): the APPEND stage splits
+    // (3 prior rows + 3 new rows, one page) — it never refuses rows>remaining.
+    auto grant2 = pool->tryAdmit(1);
+    ASSERT_TRUE(grant2);
+    PooledPublicationCell next;
+    PooledKVAppendStage::Params p1;
+    p1.device_id = device;
+    p1.K = K.get();
+    p1.V = V.get();
+    p1.pool = pool.get();
+    p1.table = table.get();
+    p1.ref_out = &next;
+    p1.prior = &prior;
+    p1.grant = &*grant2;
+    p1.request_id = 21;
+    p1.slot = 0;
+    p1.layer_idx = 0;
+    p1.kv_heads = kv_heads;
+    p1.head_dim = dimension;
+    p1.page_tokens = page_tokens;
+    p1.live_rows = 3;
+    PooledKVAppendStage s1(p1);
+    ASSERT_TRUE(s1.execute(nullptr));
+    ASSERT_TRUE(next.live());
+    EXPECT_EQ(next.snapshot.view().rows(), 6);
+    // The prior remains a separate, still-valid publication (twin-cell rule:
+    // the stage never clears it). The CALLER (orchestrator) refuses a
+    // continued prefill before this stage is reachable (DGO gate).
+    EXPECT_TRUE(prior.live());
+    EXPECT_EQ(prior.ref.publication_version, prior_version);
+    auto resolved = table->resolveSnapshotRef(prior.ref);
+    ASSERT_TRUE(resolved);
+    EXPECT_EQ(resolved->view().rows(), 3);
+}
+
+/** @test R24 M6: pre-admitted step grant exhaustion refuses before ANY layer
+ * publishes (all-or-none); no partially published layer set exists. */
+TEST(PooledStageConsumption, StepGrantExhaustionRefusesBeforeAnyLayerPublishes)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    const auto device = DeviceId::cpu();
+    // Four frames; the step needs 4 pages (2 layers x 2 pages for 9 rows).
+    // Two frames are occupied BEFORE the step, so the pre-admitted grant must
+    // refuse cleanly (never a mid-graph partial publication).
+    const PhysicalPagePoolGeometry pool_geometry{4,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 4};
+    const CPUFP32PagedKVTableGeometry table_geometry{4, 4, 4, page_tokens, 32, 8};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    // Occupy two frames so the step grant (4 pages) cannot fit.
+    auto occupant1 = pool->tryAdmit(1);
+    ASSERT_TRUE(occupant1);
+    (void)occupant1->assignFrame();
+    auto occupant2 = pool->tryAdmit(1);
+    ASSERT_TRUE(occupant2);
+    (void)occupant2->assignFrame();
+
+    PooledKVDecodeBinding binding(pool.get(), table.get(), /*request_id=*/31,
+        /*slot=*/0, kv_heads, dimension, page_tokens, /*layers=*/2);
+    const int required = binding.pagesForStep(9); // 8+1 = 2 pages per layer.
+    EXPECT_EQ(required, 2);
+    EXPECT_FALSE(binding.prepareStep(9)); // One frame is already occupied.
+    EXPECT_FALSE(binding.stepPrepared());
+    EXPECT_FALSE(binding.hasLivePublication());
+    EXPECT_FALSE(binding.priorFor(0));
+    EXPECT_FALSE(binding.priorFor(1));
 }

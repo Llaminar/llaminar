@@ -4928,7 +4928,7 @@ namespace llaminar2
         // binding, the append and attention use pooled pages (CPU single-row
         // dense decode only). The pooled branch is decided HERE, before any
         // ring work, and refuses every other combination (never a fallback).
-        const auto *pooled = forward_input_construction_
+        auto *pooled = forward_input_construction_
             ? forward_input_construction_->pooled_kv
             : nullptr;
         if (pooled)
@@ -4943,16 +4943,15 @@ namespace llaminar2
                     << " predictor=" << (predictor_layout != nullptr) << ")";
                 throw std::invalid_argument(why.str());
             }
-            if (seq_len > pooled->pageTokens())
-            {
-                std::ostringstream why;
-                why << "Pooled append page is smaller than this request batch (seq=" << seq_len
-                    << " pageTokens=" << pooled->pageTokens() << ")";
-                throw std::invalid_argument(why.str());
-            }
-            auto *cell = pooled->cellFor(layer_idx);
+            // M4: a prompt longer than one page is split across pages by the
+            // append stage (no construction-time page-capacity refusal).
+            auto *cell = pooled->nextCell(layer_idx);
             if (!cell)
-                throw std::invalid_argument("Pooled decode binding has no cell for the layer");
+                throw std::invalid_argument("Pooled decode binding has no next cell for the layer");
+            // M1: the prior is the binding's CURRENT cell, a DISTINCT object
+            // from the next cell; the stage reads it at execute and never
+            // clears it. M6: all page frames come from the pre-admitted step
+            // grant; the graph never admits pages mid-execution.
             graph.addNode(prefix + "kv_append",
                           ComputeStageFactory::createPooledKVAppend({
                               .device_id = device,
@@ -4961,6 +4960,8 @@ namespace llaminar2
                               .pool = pooled->pool(),
                               .table = pooled->table(),
                               .ref_out = cell,
+                              .prior = pooled->priorFor(layer_idx),
+                              .grant = pooled->stepGrant(),
                               .request_id = pooled->requestId(),
                               .slot = pooled->slot(),
                               .layer_idx = layer_idx,
@@ -4968,7 +4969,6 @@ namespace llaminar2
                               .head_dim = pooled->headDim(),
                               .page_tokens = pooled->pageTokens(),
                               .live_rows = total_tokens,
-                              .prior = pooled->priorFor(layer_idx),
                           }),
                           device);
             graph.addDependency(prefix + "kv_append", rope_dependency);
@@ -5405,7 +5405,7 @@ namespace llaminar2
             // P2 pooled decode: the attention consumes the pooled publication
             // written by the pooled append stage in the same graph. The ref is
             // read from the cell at execute time; the ring cache is not used.
-            const auto *pooled = forward_input_construction_
+            auto *pooled = forward_input_construction_
                 ? forward_input_construction_->pooled_kv
                 : nullptr;
             if (pooled && total_tokens == 1)
@@ -5414,7 +5414,7 @@ namespace llaminar2
                 // the ref into the cell during graph execution; attention reads
                 // the cell at execute time. The pooled kernel is single-row
                 // decode only — this is the decoded-consumption vertical path.
-                auto *pooled_cell = pooled->cellFor(layer_idx);
+                auto *pooled_cell = pooled->nextCell(layer_idx);
                 if (!pooled_cell)
                     throw std::invalid_argument("Pooled decode binding has no attention cell");
                 attn_params.kv_cache = nullptr;

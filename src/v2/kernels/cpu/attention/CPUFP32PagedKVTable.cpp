@@ -105,6 +105,11 @@ void CPUFP32PagedKVTable::clear(size_t bank) noexcept
     state.pages = state.readers = 0;
     state.accepting_readers = false;
     state.phase = Phase::Free;
+    // M5: the request binding belongs to the publication and dies with it.
+    // A bank returning to Free is entirely unbound; a reused bank can never
+    // inherit another request's binding.
+    state.request_id = 0;
+    state.slot = -1;
     // The bank's publication retires; live touch LEASES remain owned by their
     // receipts (the snapshot keeps the exact identity) until each is
     // acknowledged. Clearing never drops an obligation (R10).
@@ -422,6 +427,16 @@ bool CPUFP32PagedKVTable::bindPublication(Snapshot &snapshot,
     if (snapshot.table_.get() != this)
         return false;
     auto &state = require(snapshot.bank_, snapshot.version_, Phase::Published);
+    // M5: bind exactly once. A published bank is owned by one request
+    // publication; rebinding would reassign shared history under a new
+    // identity while existing readers still hold the old refs. clear()
+    // resets the binding when the bank returns to Free. Unbound means
+    // request_id == 0 (request identities are always non-zero; K1 refuses
+    // request_id 0 at resolve time), so the slot sentinel is irrelevant here.
+    if (state.request_id != 0)
+        return false;
+    if (request_id == 0)
+        return false; // A zero request can never own a publication.
     state.request_id = request_id;
     state.slot = slot;
     return true;
