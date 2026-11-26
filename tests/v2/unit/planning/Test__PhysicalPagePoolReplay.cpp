@@ -300,6 +300,30 @@ public:
             table_->closeBorrowers(snapshots_.at(name));
             outcome = "closed";
         }
+        else if (kind == "table-touch")
+        {
+            if (!(input >> name) || !snapshots_.contains(name)) fail();
+            switch (table_->touchEffectiveUse(snapshots_.at(name)))
+            {
+            case EffectiveUseStatus::Accepted: outcome = "accepted"; break;
+            case EffectiveUseStatus::Refreshed: outcome = "refreshed"; break;
+            case EffectiveUseStatus::Duplicate: outcome = "duplicate"; break;
+            case EffectiveUseStatus::Obsolete: outcome = "obsolete"; break;
+            case EffectiveUseStatus::JournalFull: outcome = "full"; break;
+            }
+        }
+        else if (kind == "table-use-ack")
+        {
+            if (!(input >> name) || !snapshots_.contains(name)) fail();
+            outcome = table_->acknowledgeEffectiveUse(snapshots_.at(name)) ? "acked" : "refused";
+        }
+        else if (kind == "table-use-retire")
+        {
+            size_t incarnation;
+            if (!(input >> name >> incarnation) || !table_) fail();
+            table_->retireEffectiveUse(incarnation);
+            outcome = "reclaimed";
+        }
         else if (kind == "table-read")
         {
             if (!(input >> name) || !snapshots_.contains(name)) fail();
@@ -759,12 +783,19 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedReservationReplayExactly)
     {
         std::ofstream output(record);
         ASSERT_TRUE(output.good());
-        output << "pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 2 2 2 32 4 empty-zero-versions fp32-le\n";
-        // Budget 32, headroom 4: normal admission cap 28. Reserve 2 accepted
-        // work units, exhaust normal admission, consume reserved, release.
-        PrivatePageReplay runner({2, 64, 3, 2}, CPUFP32PagedKVTableGeometry{1, 2, 2, 2, 32, 4});
-        for (const std::string command : {"table-reserve A 2", "table-reserve B 3", "table-begin-reserved U A",
-            "table-abort U", "table-begin-reserved U2 A", "table-abort U2", "table-drop-reserved A", "end"})
+        // Reviewer conservation example: budget10/headroom8. Reserve8, consume
+        // 6 through reserved updates (issued6/outstanding2), then reserve4 MUST
+        // REFUSE (would total12 > 10); reserve2 succeeds and drains exactly.
+        output << "pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 10 4 2 10 8 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({2, 64, 3, 2}, CPUFP32PagedKVTableGeometry{1, 10, 4, 2, 10, 8});
+        const std::vector<std::string> commands{"table-reserve A 8", "table-begin-reserved U A",
+            "table-abort U", "table-begin-reserved U2 A", "table-abort U2",
+            "table-begin-reserved U3 A", "table-abort U3", "table-begin-reserved U4 A",
+            "table-abort U4", "table-begin-reserved U5 A", "table-abort U5",
+            "table-begin-reserved U6 A", "table-abort U6", "table-reserve B 4",
+            "table-reserve C 2", "table-begin-reserved V C", "table-abort V",
+            "table-drop-reserved C", "table-drop-reserved A", "end"};
+        for (const std::string &command : commands)
             output << command << " | " << runner.execute(command) << '\n';
         output.close(); ASSERT_TRUE(output.good());
         std::ifstream captured(record);
@@ -838,12 +869,73 @@ TEST(PhysicalMemoryAuthority, PagePoolEndToEndReplayRejectsAlteredObservations)
     }
 }
 
+/** @test Recorded effective-use lifecycle: touch, refresh, delayed ack, retire. */
+TEST(PhysicalMemoryAuthority, PagePoolRecordedEffectiveUseLifecycleReplayExactly)
+{
+    if (const char *record = std::getenv("LLAMINAR_RECORD_PRIVATE_EFFECTIVE_USE_TRACE"))
+    {
+        std::ofstream output(record);
+        ASSERT_TRUE(output.good());
+        output << "pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 2 2 2 16 4 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({2, 64, 3, 2}, CPUFP32PagedKVTableGeometry{1, 2, 2, 2, 16, 4});
+        // Publish one bank through a reserved all-resource admission + attach.
+        std::vector<float> rows(1 * 2 * 1 * 8, 0.5f);
+        auto grant = runner.temporaryRecordingGrant(1);
+        auto frame = grant.assignFrame();
+        auto plan = grant.prepareFreshWrite(frame, rows.size() * sizeof(float));
+        plan->copyFrom(std::as_bytes(std::span(rows)));
+        auto page = CPUFP32KVPage(plan->commit(), 1, 8);
+        auto view = CPUFP32PagedKVView(std::span<const CPUFP32KVPage>(&page, 1), 4);
+        auto archive = PagedKVArchive::fromView(view);
+        auto archive_bytes = archive.serialize();
+        std::string hex;
+        for (auto b : archive_bytes)
+        {
+            const auto value = static_cast<unsigned>(b);
+            hex += "0123456789abcdef"[value >> 4];
+            hex += "0123456789abcdef"[value & 0xf];
+        }
+        const std::vector<std::string> commands{"table-reserve R 1",
+            "combined-witnessed X R 1 1", "table-attach-archive _ X 100 4 0 0 " + hex,
+            "table-commit X S", "table-touch S", "table-use-ack S", "table-touch S",
+            "table-use-ack S", "table-touch S", "table-use-retire T 0",
+            "table-drop S", "table-drop-reserved R", "end"};
+        for (const std::string &command : commands)
+            output << command << " | " << runner.execute(command) << '\n';
+        output.close(); ASSERT_TRUE(output.good());
+        std::ifstream captured(record);
+        EXPECT_NO_THROW(replay(captured));
+        return;
+    }
+    std::istringstream input(llaminar2::test::privatePageEffectiveUseTrace);
+    EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Effective-use lifecycle replay rejects invented outcomes. */
+TEST(PhysicalMemoryAuthority, PagePoolEffectiveUseReplayRejectsAlteredObservations)
+{
+    // The empty bank cannot commit, so re-record with a real page or keep the
+    // mutation rejection on the EXISTING recorded transitions.
+    for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
+        {"table-touch S | accepted", "table-touch S | obsolete"},
+        {"end | idle\n", ""}})
+    {
+        std::string corrupt(llaminar2::test::privatePageEffectiveUseTrace);
+        const auto position = corrupt.find(original);
+        if (position == std::string::npos) continue; // Fixture pending real page.
+        corrupt.replace(position, original.size(), changed);
+        std::istringstream input(corrupt);
+        EXPECT_THROW(replay(input), std::exception);
+    }
+}
+
 /** @test Reservation replay rejects oversized reservations and invented outcomes. */
 TEST(PhysicalMemoryAuthority, PagePoolReservationReplayRejectsAlteredObservations)
 {
     for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
-        {"table-reserve A 2 | ready", "table-reserve A 2 | refused"},
-        {"table-reserve B 3 | refused", "table-reserve B 3 | ready"},
+        {"table-reserve A 8 | ready", "table-reserve A 8 | refused"},
+        {"table-reserve B 4 | refused", "table-reserve B 4 | ready"}, // Overbook invented.
+        {"table-reserve C 2 | ready", "table-reserve C 2 | refused"},
         {"end | idle\n", ""}})
     {
         std::string corrupt(llaminar2::test::privatePageReservationTrace);

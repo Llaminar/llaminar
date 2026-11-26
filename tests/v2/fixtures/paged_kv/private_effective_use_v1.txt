@@ -1,0 +1,14 @@
+pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 2 2 2 16 4 empty-zero-versions fp32-le
+table-reserve R 1 | ready
+combined-witnessed X R 1 1 | accepted
+table-attach-archive _ X 100 4 0 0 5641475044564b4c010000000000000001000000080000000100000001000000000000000100000000000000000000000000000000000000000000000000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f | attached-prefix
+table-commit X S | 1
+table-touch S | accepted
+table-use-ack S | acked
+table-touch S | refreshed
+table-use-ack S | acked
+table-touch S | refreshed
+table-use-retire T 0 | reclaimed
+table-drop S | retired
+table-drop-reserved R | released
+end | idle
