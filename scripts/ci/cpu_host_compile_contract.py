@@ -66,8 +66,13 @@ def verify(database, flags, definitions=None, compilers=None):
                 options.append(token)
         def isa_option(option):
             # Address width and code model do not select optional CPU ISA features.
-            return option.startswith('-m') and option not in ('-m64', '-m32') and not option.startswith('-mcmodel=')
-        if any(command[i] == '-Xarch_device' and isa_option(command[i+1]) for i in range(len(command)-1)):
+            return option.startswith('-m') and option != '-m64' and not option.startswith('-mcmodel=')
+        hip_spill_option = '-mllvm=-amdgpu-spill-cfi-saved-regs=false'
+        # GpuSpillGuard.cmake owns this exact device-only allocation diagnostic;
+        # ROCmArchitectures.cmake owns wave64. Neither is a host ISA option.
+        if language == 'HIP':
+            options = [option for option in options if not (option == '-mwavefrontsize64' and any(token == option and (i == 0 or command[i-1] not in ('-Xarch_host', '-Xarch_device', '-Xcompiler', '--compiler-options')) for i, token in enumerate(command))) and not (option == hip_spill_option and any(command[i:i+2] == ['-Xarch_device', hip_spill_option] for i in range(len(command)-1)))]
+        if any(command[i] == '-Xarch_device' and isa_option(command[i+1]) and not (language == 'HIP' and command[i+1] == hip_spill_option) for i in range(len(command)-1)):
             raise ValueError('CPU option leaks to device')
         if any(option not in expected for option in options if isa_option(option)):
             raise ValueError('contrary CPU compiler option')

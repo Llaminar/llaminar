@@ -116,3 +116,18 @@ endforeach()
             database.write_text(json.dumps([row]))
             with self.assertRaisesRegex(ValueError, 'contrary|leaks to device'):
                 verify(database, '-mavx2', definitions, compilers)
+
+    def test_exact_hip_device_options(self):
+        import json
+        from cpu_host_compile_contract import verify
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / 'commands.json'
+            definition = 'LLAMINAR_COMPILED_WITH_AVX2=1'
+            base = ['clang++', '-D' + definition, '-Xarch_host', '-mavx2']
+            def check(language, extra):
+                database.write_text(json.dumps([dict(file='fixture.cpp', host_language=language, arguments=base + extra)]))
+                verify(database, '-mavx2', [definition])
+            check('HIP', ['-mwavefrontsize64', '-Xarch_device', '-mllvm=-amdgpu-spill-cfi-saved-regs=false'])
+            for language, extra in [('CXX', ['-mwavefrontsize64']), ('HIP', ['-Xarch_device', '-mavx2']), ('HIP', ['-m32']), ('HIP', ['-Xarch_host', '-mwavefrontsize64']), ('HIP', ['-Xarch_device', '-mllvm=unknown'])]:
+                with self.assertRaises(ValueError):
+                    check(language, extra)
