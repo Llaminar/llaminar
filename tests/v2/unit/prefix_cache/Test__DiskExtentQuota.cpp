@@ -27,6 +27,18 @@ TEST(DiskExtentQuota, QuotaAndExactRetirementContracts)
     EXPECT_EQ(quota.bytesAdmitted(), 41u);
 }
 
+/** @test Zero quota admits NOTHING: no underflow admission into an empty ledger. */
+TEST(DiskExtentQuota, ZeroQuotaNeverAdmits)
+{
+    DiskExtentQuota zero(0);
+    EXPECT_FALSE(zero.admit(DiskExtentKey{1, 1, 1, 1}));
+    EXPECT_EQ(zero.count(), 0u);
+    EXPECT_EQ(zero.bytesAdmitted(), 0u);
+    // Large extent must not underflow the subtraction either.
+    EXPECT_FALSE(zero.admit(DiskExtentKey{2, 1, 1, SIZE_MAX / 2}));
+    EXPECT_EQ(zero.count(), 0u);
+}
+
 /** @test Extent identity is generation/namespace/digest exact; same bytes differ. */
 TEST(DiskExtentQuota, ExtentIdentityIsExact)
 {
