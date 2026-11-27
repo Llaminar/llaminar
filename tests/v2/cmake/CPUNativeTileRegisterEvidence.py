@@ -2265,14 +2265,21 @@ def _static_implicit_dsos(dependencies: set[Path], traced: set[Path], verbose: s
             if pending is None or pending[0] != name or name in found_names:
                 raise ValueError("unmatched, wrong-name or duplicate native DSO resolution")
             p = (cwd / raw_path).resolve(strict=True)
-            if p not in missing or p in admitted:
-                raise ValueError("native DSO found path is not the unique missing input")
-            soname = dynamic[p][1]
-            if soname is not None and soname != name:
-                raise ValueError("native DSO SONAME disagrees with needed/found name")
-            records.append(dict(name=name, parent=str(pending[1]), path=str(p), soname=soname))
+            already_traced = p in roots
+            if already_traced:
+                soname = _static_dso(p.read_bytes())[1]
+                if soname != name:
+                    raise ValueError("already-traced DSO SONAME disagrees with needed/found name")
+            else:
+                if p not in missing or p in admitted:
+                    raise ValueError("native DSO found path is not the unique missing input")
+                soname = dynamic[p][1]
+                if soname is not None and soname != name:
+                    raise ValueError("native DSO SONAME disagrees with needed/found name")
+                admitted.add(p)
+            records.append(dict(name=name, parent=str(pending[1]), path=str(p), soname=soname,
+                                already_traced=already_traced))
             found_names.add(name)
-            admitted.add(p)
             pending = None
     if pending is not None or admitted != missing:
         raise ValueError("missing native successful resolution for implicit DSO closure")

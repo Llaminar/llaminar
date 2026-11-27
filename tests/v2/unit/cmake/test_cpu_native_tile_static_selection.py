@@ -411,6 +411,24 @@ class StaticSelectionNativeTest(unittest.TestCase):
                 C._static_implicit_dsos(dependencies, traced, changed, root, target)
         with self.assertRaisesRegex(ValueError, "extra trace input"):
             C._static_implicit_dsos(dependencies, traced | {root / "f.o"}, verbose, root, target)
+        loader_needed = next(line for line in verbose.splitlines() if line.startswith("ld-linux-aarch64.so.1 needed by "))
+        loader_found = next(line for line in verbose.splitlines() if line.startswith("found ld-linux-aarch64.so.1 at "))
+        loader = Path(loader_found.split(" at ", 1)[1]).resolve()
+        clone = root / "loader-copy.so"
+        clone.write_bytes(loader.read_bytes())
+        for label, changed, expected in (
+            ("duplicate-already-traced", verbose+"\n"+loader_found, "unmatched, wrong-name or duplicate"),
+            ("already-traced-parent-not-needed", verbose.replace(loader_needed, "ld-linux-aarch64.so.1 needed by "+str(root/"libparent.so")),
+             "parent does not prove DT_NEEDED"),
+            ("untraced-nondifference-path", verbose.replace(loader_found, "found ld-linux-aarch64.so.1 at "+str(clone)),
+             "found path is not the unique missing input")):
+            (root / (label+".verbose")).write_text(changed)
+            with self.subTest(boundary=label), self.assertRaisesRegex(ValueError, expected):
+                C._static_implicit_dsos(dependencies, traced, changed, root, target)
+        clone.write_bytes(loader.read_bytes().replace(b"ld-linux-aarch64.so.1\x00", b"xx-linux-aarch64.so.1\x00"))
+        with self.assertRaisesRegex(ValueError, "already-traced DSO SONAME disagrees"):
+            C._static_implicit_dsos((dependencies-{loader})|{clone}, (traced-{loader})|{clone},
+                                    verbose.replace(loader_found, "found ld-linux-aarch64.so.1 at "+str(clone)), root, target)
         original_child = child.read_bytes()
         for label, replacement, expected in (
             ("implicit-object", obj, "not an ELF DSO"),
