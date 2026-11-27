@@ -135,7 +135,40 @@ Key findings folded into the code:
   needs), ccache, and a raised memory limit; all recorded in
   `README-BUILD-BF16.md` on the validation worktree.
 
-Remaining follow-ups are unchanged: default-engine flip after isolated
+## Microbenchmark evidence (2026-11, AVX512BF16 tree, this VM)
+
+Same-buffer comparison, oneDNN BF16×BF16→FP32 (`run_onednn_bf16_matmul`
+mirror, the production library path) vs the native AVX512-BF16 route,
+8 worker threads, median of 30-40 reps, `nice 15`, pinned CPUs:
+
+| M | N | K | oneDNN | native AVX512-BF16 | native / oneDNN |
+|---|---|---|---|---|---|
+| 16 | 4096 | 4096 | 0.299 ms (1.80 TF/s) | 2.161 ms (0.25 TF/s) | 7.2× |
+| 32 | 4096 | 4096 | 0.532 ms (2.02 TF/s) | 4.106 ms (0.26 TF/s) | 7.7× |
+| 96 | 4096 | 4096 | 0.837 ms (3.85 TF/s) | 12.362 ms (0.26 TF/s) | 14.8× |
+| 32 | 8192 | 8192 | 1.404 ms (3.06 TF/s) | 17.914 ms (0.24 TF/s) | 12.8× |
+
+Interpretation: the first-slice native route is **7-15× slower than the
+library** on this AVX512-BF16 host. The dominant cost is weight reuse: the
+current kernel processes one row at a time and re-streams the whole N×K
+weight matrix per row (no M-blocking), with 8-column register blocking, a
+per-column 16-lane reduction at the end and no multi-M tiling. oneDNN
+blocks M so B is read once per block. This is the measurement the plan
+predicted: the route exists for its fixed deterministic contract; economy
+is the next work package (M-blocking with B reuse, wider column tiles,
+batched lane reductions) before any automatic default flip. AMX could not
+be measured on this VM (tile data instructions are #UD); on real Sapphire
+Rapids hardware AMX's 16×16 tiles give B reuse as a side effect and are
+the expected win over oneDNN, pending the same isolated measurement.
+
+Max absolute difference between native and oneDNN outputs was ~4.0 on
+values of magnitude ~4096 (≈0.1%): both routes are FP32-accumulating
+BF16×BF16 but use different fixed reduction trees, so cross-route
+bit-equality is not a contract (per-route determinism is).
+
+## Remaining follow-ups
+
+Default-engine flip after isolated
 `perf` measurements on true AMX hardware (this VM cannot execute tile data
 instructions), `PerfStats` counter registration, `M=1` native GEMV,
 fused-SwiGLU/LM-head gate sites, codegen-witness registration, image matrix
