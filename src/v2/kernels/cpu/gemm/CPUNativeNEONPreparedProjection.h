@@ -1761,11 +1761,9 @@ namespace llaminar2::cpu::native_quantised
                             int strip = column;
                             if constexpr (opaqueStripColumn<Ops, Policy, Physical, Map, WithMinimum, Coded>())
                             {
-                                // IQ4_XS and Q6_K tie the barrier to the block, so GCC cannot
-                                // hoist it (and the payload/scale offsets derived from it)
-                                // out of the K walk. The input adds no instruction or arithmetic.
-                                if constexpr (Physical == Encoding::NibbleLUTSourceScale ||
-                                              Physical == Encoding::Q6KNativeDualScale)
+                                // IQ4_XS ties the barrier to the block, so GCC cannot hoist it
+                                // (and every offset derived from it) out of the K walk.
+                                if constexpr (Physical == Encoding::NibbleLUTSourceScale)
                                     asm("" : "+r"(strip) : "r"(block));
                                 else
                                     asm("" : "+r"(strip));
