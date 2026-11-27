@@ -941,23 +941,12 @@ namespace llaminar2::cpu::native_quantised
             }
             else if constexpr (Coded == 0)
             {
-                constexpr bool local_row = Physical == Encoding::NibbleLUTSourceScale && Rows == 3 && Ordered;
-                [[maybe_unused]] const auto *row_root = weights_.interleavedBase();
-                if constexpr (local_row)
-                    // Seal the admitted chunk's origin before entering K. Carrying the
-                    // chunk and matrix-row geometry through decode evicts partition state.
-                    row_root += codedGeometry<Physical>(weights_.blocks_per_row).blockOffset(std::size_t(chunk_), 0);
                 for (int block = first; block < last; ++block)
                 {
-                    const auto *unit = [&]() __attribute__((always_inline)) {
-                        if constexpr (local_row)
-                            return row_root + codedGeometry<Physical>(weights_.blocks_per_row).blockOffset(0, std::size_t(block));
-                        else
-                            return preparedSuperblockCoded(Physical)
-                                ? weights_.interleavedBase() + codedGeometry<Physical>(weights_.blocks_per_row).blockOffset(std::size_t(chunk_), std::size_t(block))
-                                : weights_.interleavedBase() +
-                                    (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
-                    }();
+                    const auto *unit = preparedSuperblockCoded(Physical)
+                        ? weights_.interleavedBase() + codedGeometry<Physical>(weights_.blocks_per_row).blockOffset(std::size_t(chunk_), std::size_t(block))
+                        : weights_.interleavedBase() +
+                            (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
                     visit(block, unit, nullptr);
                 }
             }
