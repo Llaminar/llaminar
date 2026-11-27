@@ -1456,7 +1456,7 @@ namespace llaminar2::cpu::native_quantised
             "2:1:0:2:0:0", "2:1:1:3:11:0", "2:2:0:3:11:0", "2:2:0:4:2:0", "2:2:1:3:11:0", "2:2:1:4:2:0",
             "2:2:1:7:0:0", "2:2:1:7:1:1", "3:0:0:2:0:0", "3:0:0:3:11:0", "3:0:1:3:7:1", "3:0:1:3:11:0",
             "3:1:0:2:0:0", "3:1:0:3:11:0", "3:1:1:3:7:1", "3:1:1:3:11:0", "3:2:0:2:0:0", "3:2:0:3:11:0",
-            "3:0:1:4:2:0", "3:1:1:4:2:0", "3:2:0:4:2:0", "3:2:1:2:0:0", "3:2:1:3:11:0", "3:2:1:4:2:0", "3:2:1:6:1:1", "4:0:0:2:0:0",
+            "3:2:0:4:2:0", "3:2:1:2:0:0", "3:2:1:3:11:0", "3:2:1:4:2:0", "3:2:1:6:1:1", "4:0:0:2:0:0",
             "4:0:0:3:11:0", "4:0:0:6:1:1", "4:0:1:3:7:1", "4:0:1:3:11:0", "4:1:0:3:11:0", "4:1:0:4:2:0",
             "4:1:0:7:0:0", "4:1:0:7:1:1", "4:1:1:3:7:1", "4:1:1:3:11:0", "4:1:1:6:1:1", "4:1:1:7:1:1",
             "4:2:0:3:11:0", "4:2:0:4:2:0", "4:2:1:3:11:0", "4:2:1:4:2:0", "4:2:1:6:1:1",
@@ -1672,7 +1672,9 @@ namespace llaminar2::cpu::native_quantised
             else if constexpr (Physical == Encoding::Q6KNativeDualScale)
                 return !(pairs && Rows == 3 && ordered);
             else if constexpr (Physical == Encoding::NibbleLUTSourceScale)
-                return true;
+                // Three ordered rows leave too few scalar registers to carry both
+                // opaque strip addressing and partition bounds through the K walk.
+                return !(Rows == 3 && ordered && !pairs);
             else if constexpr (Physical == Encoding::Q5NativeSingleScale)
                 return Rows == 4 && WithMinimum && !ordered;
             else
