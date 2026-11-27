@@ -1926,10 +1926,11 @@ class TypedStaticExecutableSelection:
             raise ValueError("static selection requires the native verifier")
         self.unit, self.target = unit, target
         self.files, self.environment = dict(files), dict(environment)
+        self.unit_identity = hashlib.sha256(pickle.dumps(unit)).digest()
 
     def check(self, unit: "Unit", target: str) -> None:
         """Recheck retained bytes and process environment at the call-model boundary."""
-        if unit != self.unit or target != self.target:
+        if unit != self.unit or target != self.target or hashlib.sha256(pickle.dumps(unit)).digest() != self.unit_identity:
             raise ValueError("static selected Unit/target changed")
         if dict(os.environ) != self.environment:
             raise ValueError("static link environment changed")
@@ -2172,6 +2173,10 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         return {(cwd / p).resolve(strict=True) for p in first.split(":", 1)[1].split()}
 
     original_dependencies = dependency_paths(dep_bytes)
+    if not original_dependencies:
+        raise ValueError("static production dependency inventory is empty")
+    for p in original_dependencies:
+        files[str(p)] = _static_hash(p.read_bytes())
 
     def relink(label, extras):
         command = args.copy()
@@ -2207,6 +2212,13 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         raise ValueError("static driver must expose one collect2 job")
     cp = Path(collect[0]).resolve(strict=True)
     files[str(cp)] = _static_hash(cp.read_bytes())
+    job_tokens = [token for line in jobs.splitlines() if line.strip() and
+                  Path(shlex.split(line)[0]).name == "collect2" for token in shlex.split(line)]
+    # GNU14 exposes the plugin on the actual job even when there is no LTO work.
+    for i, token in enumerate(job_tokens):
+        if token in ("-plugin", "--plugin"):
+            p = Path(job_tokens[i+1]).resolve(strict=True)
+            files[str(p)] = _static_hash(p.read_bytes())
     debug = run("collect2-debug", relink("debug", ["-Wl,-debug"]))
     if dependency_paths((artifacts / "debug.d").read_bytes()) != original_dependencies:
         raise ValueError("static debug dependency set differs from production")
@@ -2230,21 +2242,20 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     if len(native_jobs) != 1 or "-debug" in native_jobs[0]:
         raise ValueError("collect2 must consume debug before invoking its linker")
     files[str(linker)] = _static_hash(linker.read_bytes())
+    nm_names = re.findall(r"^nm_file_name\s*=\s*(\S+)\s*$", debug, re.M)
+    if len(nm_names) != 1:
+        raise ValueError("collect2 did not identify its native nm")
+    nm = Path(nm_names[0]).resolve(strict=True)
+    files[str(nm)] = _static_hash(nm.read_bytes())
+    (artifacts / "nm-path.txt").write_text(str(nm))
     if not run("linker-version", [str(linker), "--version"]).startswith("GNU ld ("):
         raise ValueError("static linker is not GNU bfd")
     if (artifacts / "debug.elf").read_bytes() != production:
         raise ValueError("collect2 debug preparation changed production bytes")
-    job_tokens = [token for line in jobs.splitlines() if line.strip() and
-                  Path(shlex.split(line)[0]).name == "collect2" for token in shlex.split(line)]
     emulation = _static_emulation(job_tokens, run("linker-emulations", [str(linker), "-V"]))
     script_command = [str(linker), "-m", emulation, "--verbose"]
     default_script = run("default-script", script_command)
     (artifacts / "default-script.txt").write_text(default_script)
-    # GNU14 exposes the plugin on the actual job even when there is no LTO work.
-    for i, token in enumerate(job_tokens):
-        if token in ("-plugin", "--plugin"):
-            p = Path(job_tokens[i+1]).resolve(strict=True)
-            files[str(p)] = _static_hash(p.read_bytes())
     transactions = []
     for label in ("instrumented", "control", "map"):
         extras = [] if label == "control" else ["-Wl,--trace"]
@@ -2339,6 +2350,19 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
     if len(originals) != 1 or originals[0].binding != "weak" or originals[0].visibility != "default":
         raise ValueError("ambiguous static input symbol")
     original = originals[0]
+    nm = Path((artifacts / "nm-path.txt").read_text())
+    audited_path = artifacts / "audited-selected.o"
+    audited_path.write_bytes(object_bytes)
+    for label, path, expected_value in (("input", audited_path, original.value), ("final", output, address)):
+        command = [str(nm), "--defined-only", "-S", "-P", str(path)]
+        result = subprocess.run(command, cwd=cwd, env=recipe["env"], capture_output=True, timeout=30)
+        (artifacts / f"nm-{label}.json").write_text(json.dumps(command))
+        (artifacts / f"nm-{label}.stdout").write_bytes(result.stdout)
+        (artifacts / f"nm-{label}.stderr").write_bytes(result.stderr)
+        entries = [line.split() for line in result.stdout.decode().splitlines() if line.split()[:1] == [target]]
+        if result.returncode or len(entries) != 1 or len(entries[0]) != 4 or entries[0][1] != "W" or \
+                int(entries[0][2], 16) != expected_value or int(entries[0][3], 16) != size:
+            raise ValueError("static native nm disagrees with selected/final symbol extent")
     mapping = (artifacts / "native.map").read_text()
     discarded, kept = _static_map_records(mapping)
     rejected = [r for r in discarded if r[0] == original.section and r[2]]
