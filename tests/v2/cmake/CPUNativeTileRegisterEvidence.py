@@ -2080,7 +2080,7 @@ def _static_options(argv: list[str]) -> None:
     tokens = [token for arg in argv for token in arg.removeprefix("-Wl,").split(",")]
     for t in tokens:
         if (t in ("-r", "--relocatable", "--gc-sections", "-shared", "--shared") or
-                t.startswith(("-flto", "--icf", "--plugin-opt", "-fuse-linker-plugin"))):
+                t.startswith(("-flto", "--icf", "--plugin-opt", "-fuse-linker-plugin", "-T", "--script", "--default-script", "-dT"))):
             raise ValueError(f"unsupported static link option: {t}")
 
 
@@ -2194,6 +2194,7 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
 
     args = _static_response(list(original_argv), cwd, files)
     _static_options(args)
+    retain("production-policy.json", json.dumps(dict(expanded_argv=args, explicit_scripts=[])))
     if args.count("-o") != 1 or args.index("-o") + 1 >= len(args):
         raise ValueError("static edge needs exactly one separate -o output")
     oi = args.index("-o") + 1

@@ -59,7 +59,7 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
             C._static_unit_fingerprint(unit._replace(bodies=UnknownBodies(bodies)))
 
     def test_rewriting_options_include_forwarded_forms(self):
-        for option in ("-flto", "-flto=auto", "--gc-sections", "--icf=all", "-r", "--relocatable", "-shared"):
+        for option in ("-flto", "-flto=auto", "--gc-sections", "--icf=all", "-r", "--relocatable", "-shared", "-T", "-Tscript.ld", "--script=script.ld"):
             for arg in (option, "-Wl," + option):
                 with self.subTest(arg=arg), self.assertRaisesRegex(ValueError, "unsupported static"):
                     C._static_options([arg])
@@ -455,7 +455,7 @@ class StaticSelectionNativeTest(unittest.TestCase):
         explicit_args = ["-Wl,--dependency-file=" + str(root / "explicit-script.d")
                          if a.startswith("-Wl,--dependency-file=") else a for a in explicit_args]
         native_run(explicit_args, check=True)
-        with self.assertRaisesRegex(ValueError, "trace/dependency input set mismatch"):
+        with self.assertRaisesRegex(ValueError, "unsupported static link option: -T"):
             C.capture_static_link(explicit_args, root, root / "explicit-script-app", root / "unsupported-explicit-script")
 
 
