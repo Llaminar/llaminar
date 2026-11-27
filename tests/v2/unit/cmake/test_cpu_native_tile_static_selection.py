@@ -137,6 +137,11 @@ class StaticSelectionNativeTest(unittest.TestCase):
             result = C.capture_static_link(args, root, root / "app", root / "capture")
             self.assertIn(str(root / "f.a"), result["files"])
             self.assertTrue(any("crt" in p for p in result["files"]))
+            without_dep = [a for a in args if not a.startswith("-Wl,--dependency-file=")]
+            duplicated = args + [next(a for a in args if a.startswith("-Wl,--dependency-file="))]
+            for bad in (without_dep, duplicated):
+                with self.assertRaisesRegex(ValueError, "exactly one"):
+                    C.capture_static_link(bad, root, root / "app", root / "bad-dependency-token")
             for flag in ("-Wl,--gc-sections", "-Wl,--icf=all", "-flto"):
                 with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, "unsupported static"):
                     C.capture_static_link(args + [flag], root, root / "app", root / "rejected")
@@ -236,6 +241,64 @@ class StaticSelectionNativeTest(unittest.TestCase):
         inject("ordinary-dso", elf_edit(clear_pie), "ET_EXEC or PIE")
         inject("missing-interpreter", elf_edit(clear_interpreter), "ET_EXEC or PIE")
         inject("stale-elf", elf_edit(lambda d: d.__setitem__(-1, d[-1] ^ 1)), "artifact changed")
+        def symbol_field(field, value):
+            def change(d):
+                headers, _ = C._static_elf(d)
+                for h in headers:
+                    if h["type"] != 2:
+                        continue
+                    strings = headers[h["link"]]
+                    for b in range(h["offset"]+24, h["offset"]+h["size"], 24):
+                        name = C._string(d, strings["offset"]+int.from_bytes(d[b:b+4], "little"),
+                                         strings["offset"]+strings["size"])
+                        if name == target:
+                            if field == "binding":
+                                d[b+4] = value
+                            elif field == "visibility":
+                                d[b+5] = value
+                            else:
+                                offset = b + (8 if field == "address" else 16)
+                                old = int.from_bytes(d[offset:offset+8], "little")
+                                d[offset:offset+8] = (old+value).to_bytes(8, "little")
+                            return
+                self.fail("native final symbol missing")
+            return change
+        inject("wrong-address", elf_edit(symbol_field("address", 4)), "nm disagrees|extent mismatch|outside executable")
+        inject("wrong-size", elf_edit(symbol_field("size", 4)), "nm disagrees|extent mismatch|outside executable")
+        inject("global-binding", elf_edit(symbol_field("binding", 0x12)), "weak/default")
+        inject("hidden-binding", elf_edit(symbol_field("visibility", 2)), "weak/default")
+        def ambiguous_map(text):
+            discarded, kept = C._static_map_records(text)
+            n, a, size, owner = next(r for r in kept if r[0] == ".text." + target)
+            return text + f"\n {n} 0x{a:x} 0x{size:x} {owner}\n"
+        inject("ambiguous-kept", map_edit(ambiguous_map), "ambiguous/missing kept owner")
+        # Duplicate names are real archive headers, not a caller-provided ordinal.
+        saved_archive = (root / "f.a").read_bytes()
+        def duplicate_member(directory):
+            data = (root / "f.a").read_bytes()
+            member = C._static_members(data)[0]
+            start, length = member[1], len(member[4])
+            (root / "f.a").write_bytes(data + data[start:start+60+length+length%2])
+        inject("duplicate-members", duplicate_member, "ambiguous archive member")
+        (root / "duplicate-members/injected-archive.a").write_bytes((root / "f.a").read_bytes())
+        (root / "f.a").write_bytes(saved_archive)
+        def mutate_member(directory):
+            data = bytearray(saved_archive)
+            member = C._static_members(data)[0]
+            headers, names = C._static_elf(member[4])
+            code = headers[names.index(".text." + target)]
+            data[member[1]+60+code["offset"]] ^= 1
+            (root / "f.a").write_bytes(data)
+        inject("mutated-member", mutate_member, "kept member/section")
+        (root / "mutated-member/injected-archive.a").write_bytes((root / "f.a").read_bytes())
+        (root / "f.a").write_bytes(saved_archive)
+        exported_args = args.copy()
+        exported_args[exported_args.index("-o")+1] = str(root / "exported-app")
+        exported_args = [f"-Wl,--dependency-file={root / 'exported.d'}" if a.startswith("-Wl,--dependency-file=")
+                         else a for a in exported_args] + ["-Wl,--export-dynamic"]
+        subprocess.run(exported_args, check=True)
+        with self.assertRaisesRegex(ValueError, "dynsym"):
+            C.verify_static_executable_selection(exported_args, root, root / "exported-app", root / "dynsym", unit, obj, obj, target)
         # Identity controls use the actual selected object, not synthetic booleans.
         with self.assertRaisesRegex(ValueError, "audited Unit/B1"):
             C.verify_static_executable_selection(args, root, root / "app", root / "wrong-replay", unit, obj,
