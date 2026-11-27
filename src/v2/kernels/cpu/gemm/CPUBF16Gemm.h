@@ -312,11 +312,13 @@ namespace llaminar2
 
             /**
              * @brief Load 32 BF16 elements into one BF16 vector register.
-             * @param ptr Contiguous 64-byte source.
+             * @param ptr Contiguous 64-byte source (alignment not required).
              * @return The loaded chunk.
-             * @details Both GCC and Clang define __m512bh as a vector type, so a
-             * word copy is ABI-portable without depending on either compiler's
-             * cast intrinsic spelling. Release code lowers this to one load.
+             * @details GCC lowers this word copy to a single unaligned
+             * vmovdqu16; a bare __m512bh dereference would emit an ALIGNED
+             * vmovdqa64 (compilers assume vector-size alignment for vector
+             * types) and fault on 16-byte-aligned tensor storage, so the copy
+             * form with an unaligned move is the contract here.
              */
             inline __m512bh loadBf16Chunk(const void *ptr) noexcept
             {
@@ -356,7 +358,237 @@ namespace llaminar2
             }
 
             /**
-             * @brief Execute the AVX512-BF16 GEMM route (M/N register blocked).
+             * @brief One pipelined 4×4 BF16 microkernel tile over the full K.
+             *
+             * Hand-scheduled because compilers serialize load and FMA issue:
+             * the GCC-intrinsic form reached ~0.45 vdpbf16/cycle; this
+             * pipeline reaches ~1.0-1.2 with the identical arithmetic
+             * contract (K ascending in 32-element chunks, hardware lane i
+             * accumulating pair partition i, per-lane FP32 accumulation).
+             *
+             * Register contract (all 32 ZMM, ABI-saved around the body):
+             *   zmm0-15  -> sixteen FP32 lane accumulators, acc(4*r+c)
+             *   zmm16-23 -> double-buffer set 1 (a0-3, b0-3)
+             *   zmm24-31 -> double-buffer set 2
+             * The pipeline keeps one 32-element chunk in flight: the loads
+             * for chunk kt+1 are issued before the 16 FMAs of chunk kt, so
+             * L2 latency overlaps the FMA work. A-phase consumes set 1 and
+             * loads set 2; B-phase consumes set 2 and loads set 1, so no
+             * register moves are needed. K = 32 runs the single-chunk tail.
+             *
+             * @param pa[4] Activation row bases (row-major [M,K] rows of the tile).
+             * @param pb[4] Weight row bases (row-major [N,K] columns of the tile).
+             * @param K Reduction width (positive multiple of 32).
+             * @param acc[16] Receives the lane partials with acc[4*r+c].
+             */
+            inline void avx512Bf16TileKernel(const uint16_t *pa[4], const uint16_t *pb[4],
+                                             int K, float acc_lanes[16][16]) noexcept
+            {
+                alignas(64) unsigned char saved[1024];
+                // zmm16-31 are callee-saved in the System V x86-64 ABI.
+                asm volatile(
+                    "vmovups %%zmm16, 0(%0)\n\t"
+                    "vmovups %%zmm17, 64(%0)\n\t"
+                    "vmovups %%zmm18, 128(%0)\n\t"
+                    "vmovups %%zmm19, 192(%0)\n\t"
+                    "vmovups %%zmm20, 256(%0)\n\t"
+                    "vmovups %%zmm21, 320(%0)\n\t"
+                    "vmovups %%zmm22, 384(%0)\n\t"
+                    "vmovups %%zmm23, 448(%0)\n\t"
+                    "vmovups %%zmm24, 512(%0)\n\t"
+                    "vmovups %%zmm25, 576(%0)\n\t"
+                    "vmovups %%zmm26, 640(%0)\n\t"
+                    "vmovups %%zmm27, 704(%0)\n\t"
+                    "vmovups %%zmm28, 768(%0)\n\t"
+                    "vmovups %%zmm29, 832(%0)\n\t"
+                    "vmovups %%zmm30, 896(%0)\n\t"
+                    "vmovups %%zmm31, 960(%0)\n\t"
+                    :: "r"(saved) : "memory");
+                asm volatile(
+                    "vpxord %%zmm0, %%zmm0, %%zmm0\n\t"
+                    "vpxord %%zmm1, %%zmm1, %%zmm1\n\t"
+                    "vpxord %%zmm2, %%zmm2, %%zmm2\n\t"
+                    "vpxord %%zmm3, %%zmm3, %%zmm3\n\t"
+                    "vpxord %%zmm4, %%zmm4, %%zmm4\n\t"
+                    "vpxord %%zmm5, %%zmm5, %%zmm5\n\t"
+                    "vpxord %%zmm6, %%zmm6, %%zmm6\n\t"
+                    "vpxord %%zmm7, %%zmm7, %%zmm7\n\t"
+                    "vpxord %%zmm8, %%zmm8, %%zmm8\n\t"
+                    "vpxord %%zmm9, %%zmm9, %%zmm9\n\t"
+                    "vpxord %%zmm10, %%zmm10, %%zmm10\n\t"
+                    "vpxord %%zmm11, %%zmm11, %%zmm11\n\t"
+                    "vpxord %%zmm12, %%zmm12, %%zmm12\n\t"
+                    "vpxord %%zmm13, %%zmm13, %%zmm13\n\t"
+                    "vpxord %%zmm14, %%zmm14, %%zmm14\n\t"
+                    "vpxord %%zmm15, %%zmm15, %%zmm15\n\t"
+                    // Prologue: set A (zmm16-23) = chunk 0. Invariant at label 1:
+                    // set A holds the current chunk; %8 = K in BYTES (2*K elements).
+                    "vmovdqu16 (%0), %%zmm16\n\t"
+                    "vmovdqu16 (%1), %%zmm17\n\t"
+                    "vmovdqu16 (%2), %%zmm18\n\t"
+                    "vmovdqu16 (%3), %%zmm19\n\t"
+                    "vmovdqu16 (%4), %%zmm20\n\t"
+                    "vmovdqu16 (%5), %%zmm21\n\t"
+                    "vmovdqu16 (%6), %%zmm22\n\t"
+                    "vmovdqu16 (%7), %%zmm23\n\t"
+                    "add $64, %0\n\tadd $64, %1\n\tadd $64, %2\n\tadd $64, %3\n\t"
+                    "add $64, %4\n\tadd $64, %5\n\tadd $64, %6\n\tadd $64, %7\n\t"
+                    "xor %%r12d, %%r12d\n\t"
+                    "1:\n\t"
+                    // If the next chunk does not exist, consume set A only.
+                    "mov %%r12d, %%r13d\n\t"
+                    "add $64, %%r13d\n\t"
+                    "cmp %8, %%r13d\n\t"
+                    "jge 6f\n\t"
+                    // Load set B = chunk i+1, FMA set A = chunk i.
+                    "vmovdqu16 (%0), %%zmm24\n\t"
+                    "vmovdqu16 (%1), %%zmm25\n\t"
+                    "vmovdqu16 (%2), %%zmm26\n\t"
+                    "vmovdqu16 (%3), %%zmm27\n\t"
+                    "vmovdqu16 (%4), %%zmm28\n\t"
+                    "vmovdqu16 (%5), %%zmm29\n\t"
+                    "vmovdqu16 (%6), %%zmm30\n\t"
+                    "vmovdqu16 (%7), %%zmm31\n\t"
+                    "vdpbf16ps %%zmm20, %%zmm16, %%zmm0\n\t"
+                    "vdpbf16ps %%zmm21, %%zmm16, %%zmm1\n\t"
+                    "vdpbf16ps %%zmm22, %%zmm16, %%zmm2\n\t"
+                    "vdpbf16ps %%zmm23, %%zmm16, %%zmm3\n\t"
+                    "vdpbf16ps %%zmm20, %%zmm17, %%zmm4\n\t"
+                    "vdpbf16ps %%zmm21, %%zmm17, %%zmm5\n\t"
+                    "vdpbf16ps %%zmm22, %%zmm17, %%zmm6\n\t"
+                    "vdpbf16ps %%zmm23, %%zmm17, %%zmm7\n\t"
+                    "vdpbf16ps %%zmm20, %%zmm18, %%zmm8\n\t"
+                    "vdpbf16ps %%zmm21, %%zmm18, %%zmm9\n\t"
+                    "vdpbf16ps %%zmm22, %%zmm18, %%zmm10\n\t"
+                    "vdpbf16ps %%zmm23, %%zmm18, %%zmm11\n\t"
+                    "vdpbf16ps %%zmm20, %%zmm19, %%zmm12\n\t"
+                    "vdpbf16ps %%zmm21, %%zmm19, %%zmm13\n\t"
+                    "vdpbf16ps %%zmm22, %%zmm19, %%zmm14\n\t"
+                    "vdpbf16ps %%zmm23, %%zmm19, %%zmm15\n\t"
+                    "add $64, %0\n\tadd $64, %1\n\tadd $64, %2\n\tadd $64, %3\n\t"
+                    "add $64, %4\n\tadd $64, %5\n\tadd $64, %6\n\tadd $64, %7\n\t"
+                    "add $64, %%r12d\n\t"
+                    // If chunk i+2 does not exist, consume set B only.
+                    "mov %%r12d, %%r13d\n\t"
+                    "add $64, %%r13d\n\t"
+                    "cmp %8, %%r13d\n\t"
+                    "jge 7f\n\t"
+                    // Load set A = chunk i+2, FMA set B = chunk i+1.
+                    "vmovdqu16 (%0), %%zmm16\n\t"
+                    "vmovdqu16 (%1), %%zmm17\n\t"
+                    "vmovdqu16 (%2), %%zmm18\n\t"
+                    "vmovdqu16 (%3), %%zmm19\n\t"
+                    "vmovdqu16 (%4), %%zmm20\n\t"
+                    "vmovdqu16 (%5), %%zmm21\n\t"
+                    "vmovdqu16 (%6), %%zmm22\n\t"
+                    "vmovdqu16 (%7), %%zmm23\n\t"
+                    "add $64, %0\n\tadd $64, %1\n\tadd $64, %2\n\tadd $64, %3\n\t"
+                    "add $64, %4\n\tadd $64, %5\n\tadd $64, %6\n\tadd $64, %7\n\t"
+                    "add $64, %%r12d\n\t"
+                    "vdpbf16ps %%zmm28, %%zmm24, %%zmm0\n\t"
+                    "vdpbf16ps %%zmm29, %%zmm24, %%zmm1\n\t"
+                    "vdpbf16ps %%zmm30, %%zmm24, %%zmm2\n\t"
+                    "vdpbf16ps %%zmm31, %%zmm24, %%zmm3\n\t"
+                    "vdpbf16ps %%zmm28, %%zmm25, %%zmm4\n\t"
+                    "vdpbf16ps %%zmm29, %%zmm25, %%zmm5\n\t"
+                    "vdpbf16ps %%zmm30, %%zmm25, %%zmm6\n\t"
+                    "vdpbf16ps %%zmm31, %%zmm25, %%zmm7\n\t"
+                    "vdpbf16ps %%zmm28, %%zmm26, %%zmm8\n\t"
+                    "vdpbf16ps %%zmm29, %%zmm26, %%zmm9\n\t"
+                    "vdpbf16ps %%zmm30, %%zmm26, %%zmm10\n\t"
+                    "vdpbf16ps %%zmm31, %%zmm26, %%zmm11\n\t"
+                    "vdpbf16ps %%zmm28, %%zmm27, %%zmm12\n\t"
+                    "vdpbf16ps %%zmm29, %%zmm27, %%zmm13\n\t"
+                    "vdpbf16ps %%zmm30, %%zmm27, %%zmm14\n\t"
+                    "vdpbf16ps %%zmm31, %%zmm27, %%zmm15\n\t"
+                    "jmp 1b\n\t"
+                    "6:\n\t"
+                    // Final chunk lives in set A.
+                    "vdpbf16ps %%zmm20, %%zmm16, %%zmm0\n\t"
+                    "vdpbf16ps %%zmm21, %%zmm16, %%zmm1\n\t"
+                    "vdpbf16ps %%zmm22, %%zmm16, %%zmm2\n\t"
+                    "vdpbf16ps %%zmm23, %%zmm16, %%zmm3\n\t"
+                    "vdpbf16ps %%zmm20, %%zmm17, %%zmm4\n\t"
+                    "vdpbf16ps %%zmm21, %%zmm17, %%zmm5\n\t"
+                    "vdpbf16ps %%zmm22, %%zmm17, %%zmm6\n\t"
+                    "vdpbf16ps %%zmm23, %%zmm17, %%zmm7\n\t"
+                    "vdpbf16ps %%zmm20, %%zmm18, %%zmm8\n\t"
+                    "vdpbf16ps %%zmm21, %%zmm18, %%zmm9\n\t"
+                    "vdpbf16ps %%zmm22, %%zmm18, %%zmm10\n\t"
+                    "vdpbf16ps %%zmm23, %%zmm18, %%zmm11\n\t"
+                    "vdpbf16ps %%zmm20, %%zmm19, %%zmm12\n\t"
+                    "vdpbf16ps %%zmm21, %%zmm19, %%zmm13\n\t"
+                    "vdpbf16ps %%zmm22, %%zmm19, %%zmm14\n\t"
+                    "vdpbf16ps %%zmm23, %%zmm19, %%zmm15\n\t"
+                    "jmp 3f\n\t"
+                    "7:\n\t"
+                    // Final chunk lives in set B.
+                    "vdpbf16ps %%zmm28, %%zmm24, %%zmm0\n\t"
+                    "vdpbf16ps %%zmm29, %%zmm24, %%zmm1\n\t"
+                    "vdpbf16ps %%zmm30, %%zmm24, %%zmm2\n\t"
+                    "vdpbf16ps %%zmm31, %%zmm24, %%zmm3\n\t"
+                    "vdpbf16ps %%zmm28, %%zmm25, %%zmm4\n\t"
+                    "vdpbf16ps %%zmm29, %%zmm25, %%zmm5\n\t"
+                    "vdpbf16ps %%zmm30, %%zmm25, %%zmm6\n\t"
+                    "vdpbf16ps %%zmm31, %%zmm25, %%zmm7\n\t"
+                    "vdpbf16ps %%zmm28, %%zmm26, %%zmm8\n\t"
+                    "vdpbf16ps %%zmm29, %%zmm26, %%zmm9\n\t"
+                    "vdpbf16ps %%zmm30, %%zmm26, %%zmm10\n\t"
+                    "vdpbf16ps %%zmm31, %%zmm26, %%zmm11\n\t"
+                    "vdpbf16ps %%zmm28, %%zmm27, %%zmm12\n\t"
+                    "vdpbf16ps %%zmm29, %%zmm27, %%zmm13\n\t"
+                    "vdpbf16ps %%zmm30, %%zmm27, %%zmm14\n\t"
+                    "vdpbf16ps %%zmm31, %%zmm27, %%zmm15\n\t"
+                    "3:\n\t"
+                    "4:\n\t"
+                    // Publish the 16 accumulators and restore callee-saved ZMMs
+                    // inside the SAME asm: the compiler never sees the accs as
+                    // outputs, so a separate store block could be scheduled over
+                    // the clobbered registers.
+                    "vmovups %%zmm0, 0(%9)\n\t"
+                    "vmovups %%zmm1, 64(%9)\n\t"
+                    "vmovups %%zmm2, 128(%9)\n\t"
+                    "vmovups %%zmm3, 192(%9)\n\t"
+                    "vmovups %%zmm4, 256(%9)\n\t"
+                    "vmovups %%zmm5, 320(%9)\n\t"
+                    "vmovups %%zmm6, 384(%9)\n\t"
+                    "vmovups %%zmm7, 448(%9)\n\t"
+                    "vmovups %%zmm8, 512(%9)\n\t"
+                    "vmovups %%zmm9, 576(%9)\n\t"
+                    "vmovups %%zmm10, 640(%9)\n\t"
+                    "vmovups %%zmm11, 704(%9)\n\t"
+                    "vmovups %%zmm12, 768(%9)\n\t"
+                    "vmovups %%zmm13, 832(%9)\n\t"
+                    "vmovups %%zmm14, 896(%9)\n\t"
+                    "vmovups %%zmm15, 960(%9)\n\t"
+                    "vmovups 0(%10), %%zmm16\n\t"
+                    "vmovups 64(%10), %%zmm17\n\t"
+                    "vmovups 128(%10), %%zmm18\n\t"
+                    "vmovups 192(%10), %%zmm19\n\t"
+                    "vmovups 256(%10), %%zmm20\n\t"
+                    "vmovups 320(%10), %%zmm21\n\t"
+                    "vmovups 384(%10), %%zmm22\n\t"
+                    "vmovups 448(%10), %%zmm23\n\t"
+                    "vmovups 512(%10), %%zmm24\n\t"
+                    "vmovups 576(%10), %%zmm25\n\t"
+                    "vmovups 640(%10), %%zmm26\n\t"
+                    "vmovups 704(%10), %%zmm27\n\t"
+                    "vmovups 768(%10), %%zmm28\n\t"
+                    "vmovups 832(%10), %%zmm29\n\t"
+                    "vmovups 896(%10), %%zmm30\n\t"
+                    "vmovups 960(%10), %%zmm31\n\t"
+                    : "+r"(pa[0]), "+r"(pa[1]), "+r"(pa[2]), "+r"(pa[3]),
+                      "+r"(pb[0]), "+r"(pb[1]), "+r"(pb[2]), "+r"(pb[3])
+                    : "r"(static_cast<std::uint32_t>(K) * 2u), "r"(acc_lanes), "r"(saved)
+                    : "zmm0","zmm1","zmm2","zmm3","zmm4","zmm5","zmm6","zmm7",
+                      "zmm8","zmm9","zmm10","zmm11","zmm12","zmm13","zmm14","zmm15",
+                      "zmm16","zmm17","zmm18","zmm19","zmm20","zmm21","zmm22","zmm23",
+                      "zmm24","zmm25","zmm26","zmm27","zmm28","zmm29","zmm30","zmm31",
+                      "r12", "r13", "r14", "cc", "memory");
+            }
+
+            /**
+             * @brief Execute the AVX512-BF16 GEMM route (pipelined 4×4 tiles).
              * @param A Row-major BF16 activations [M,K].
              * @param B Row-major BF16 transposed weights [N,K].
              * @param C FP32 output [M,N].
@@ -376,16 +608,16 @@ namespace llaminar2
              * lanes reduce through fixedReduceLanes16(), then the shared
              * epilogue rounds the output.
              *
-             * Economy: the kernel registers kMBlock rows × kColumnBlock
-             * columns and keeps every accumulator ZMM resident, so each
-             * weight chunk is loaded once per row block and reused across
-             * kMBlock rows (the dominant traffic in the measured first slice
-             * was B re-read per row) while each activation chunk is reused
-             * across the column block. Blocking changes only data reuse:
-             * every output word still visits K in the same ascending chunk
-             * order with the same per-lane partitions, so the route contract
-             * and its bytes are unchanged. Row blocks are independent; OpenMP
-             * schedules them statically so every worker builds identical words.
+             * Economy: each 4×4 microtile runs through the hand-scheduled
+             * avx512Bf16TileKernel pipeline (one 32-element chunk in flight),
+             * then the fixed lane tree and rounded epilogue publish the word.
+             * N panels are the parallel dimension with the M sweep inside so
+             * the K×128-column weight panel is shared across the row sweep.
+             * Blocking and scheduling change only data movement; every output
+             * word still visits K in the same ascending chunk order with the
+             * same per-lane partitions, so the route contract and its bytes
+             * are unchanged. Output tiles are independent; OpenMP schedules
+             * the N panels statically so every worker builds identical words.
              */
             inline bool run_avx512bf16_matmul(const uint16_t *A, const uint16_t *B,
                                               float *C, int M, int N, int K,
@@ -401,23 +633,28 @@ namespace llaminar2
                     bf16NativeRouteCounter(Engine::AVX512BF16).fetch_add(1, std::memory_order_relaxed);
 
                 // 4×4 microkernel: 16 accumulators + 4 A + 4 B chunks keep the
-                // working set register-resident. Panels: a 32-row × 128-column
-                // block holds its activation panel (32×K×2 B) and weight panel
-                // (K×128×2 B) in L2, so the weight matrix is streamed from DRAM
-                // roughly once per N panel instead of once per row group.
+                // working set register-resident. Loop order is the GEMM bold
+                // blocking rule: N panels are the parallel dimension (one per
+                // thread) and the M sweep runs inside, so the Kx128-column
+                // weight panel is L2-resident across the ENTIRE row sweep and
+                // the weight matrix is streamed from DRAM once per N panel
+                // (the previous collapse(2) schedule let row panels migrate
+                // across threads and re-stream weights). Loads are unaligned
+                // vector dereferences (one vmovdqu per chunk) and the K loop
+                // prefetches the next chunk of every stream.
                 constexpr int kRowBlock = 4;
                 constexpr int kColumnBlock = 4;
                 const int row_group_count = (M + kRowBlock - 1) / kRowBlock;
                 const int col_tile_count = (N + kColumnBlock - 1) / kColumnBlock;
                 auto work = [&]()
                 {
-#pragma omp for schedule(static) collapse(2)
-                    for (int mbg = 0; mbg < row_group_count; mbg += 8)
+#pragma omp for schedule(static)
+                    for (int nbg = 0; nbg < col_tile_count; nbg += 32)
                     {
-                        for (int nbg = 0; nbg < col_tile_count; nbg += 32)
+                        const int ct_end = std::min(nbg + 32, col_tile_count);
+                        for (int mbg = 0; mbg < row_group_count; mbg += 8)
                         {
                             const int rg_end = std::min(mbg + 8, row_group_count);
-                            const int ct_end = std::min(nbg + 32, col_tile_count);
                             for (int rg = mbg; rg < rg_end; ++rg)
                             {
                                 const int row0 = rg * kRowBlock;
@@ -426,35 +663,25 @@ namespace llaminar2
                                 {
                                     const int first_col = ct * kColumnBlock;
                                     const int cols = std::min(kColumnBlock, N - first_col);
-                                    __m512 acc[kRowBlock][kColumnBlock];
-#pragma unroll
-                                    for (int row = 0; row < kRowBlock; ++row)
-#pragma unroll
-                                        for (int col = 0; col < kColumnBlock; ++col)
-                                            acc[row][col] = _mm512_setzero_ps();
-                                    for (int kt = 0; kt < K; kt += 32)
-                                    {
-                                        __m512bh a_chunk[kRowBlock];
-#pragma unroll
-                                        for (int row = 0; row < rows; ++row)
-                                            a_chunk[row] = loadBf16Chunk(
-                                                A + static_cast<std::size_t>(row0 + row) * K + kt);
-                                        for (int col = 0; col < cols; ++col)
-                                        {
-                                            const __m512bh b_chunk = loadBf16Chunk(
-                                                B + static_cast<std::size_t>(first_col + col) * K + kt);
-#pragma unroll
-                                            for (int row = 0; row < rows; ++row)
-                                                acc[row][col] = _mm512_dpbf16_ps(
-                                                    acc[row][col], a_chunk[row], b_chunk);
-                                        }
-                                    }
+                                    const uint16_t *pa[4]
+                                        = {A + static_cast<std::size_t>(row0) * K,
+                                           A + static_cast<std::size_t>(row0 + 1) * K,
+                                           A + static_cast<std::size_t>(row0 + 2) * K,
+                                           A + static_cast<std::size_t>(row0 + 3) * K};
+                                    const uint16_t *pb[4]
+                                        = {B + static_cast<std::size_t>(first_col) * K,
+                                           B + static_cast<std::size_t>(first_col + 1) * K,
+                                           B + static_cast<std::size_t>(first_col + 2) * K,
+                                           B + static_cast<std::size_t>(first_col + 3) * K};
+                                    alignas(64) float acc_lanes[kRowBlock * kColumnBlock][16];
+                                    avx512Bf16TileKernel(pa, pb, K, acc_lanes);
                                     for (int row = 0; row < rows; ++row)
                                     {
                                         float *c = C + static_cast<std::size_t>(row0 + row) * N;
                                         for (int col = 0; col < cols; ++col)
                                         {
-                                            const float dot = fixedReduceLanes16(acc[row][col]);
+                                            const float dot = fixedReduceLanes16(
+                                                _mm512_loadu_ps(acc_lanes[row * kColumnBlock + col]));
                                             float *out = c + first_col + col;
                                             *out = completeEpilogueValue(dot, alpha, beta, out);
                                         }
