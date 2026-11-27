@@ -1442,6 +1442,10 @@ namespace llaminar2
             int rows_per_request,
             void *producer_stream) override;
 
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] std::optional<MoEGroupedVerifierHistogramBatchBinding>
+        groupedVerifierHistogramBatchBinding() const noexcept override;
+
         // Test accessor
         void setMoEKernelForTesting(IMoEKernel *kernel)
         {

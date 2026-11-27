@@ -12,12 +12,36 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
 namespace llaminar2
 {
+    class IMoEKernel;
+    struct DeviceMoELayerRuntime;
+    class IMoERuntimeTable;
+    class DeviceWorkspaceManager;
     enum class RuntimeHistogramProducerCaptureTransition : std::uint8_t;
+
+    /**
+     * @brief Immutable device-ledger binding for batched multi-layer verifier commit.
+     *
+     * When consecutive deferred publishers share one MoE runtime table, kernel,
+     * workspace, and verifier shape with contiguous @ref DeviceMoELayerRuntime
+     * storage, accepted-state publication collapses per-layer launches into one
+     * 2D kernel launch without altering validation or arithmetic semantics.
+     */
+    struct MoEGroupedVerifierHistogramBatchBinding
+    {
+        IMoEKernel *kernel = nullptr;
+        IMoERuntimeTable *runtime_table = nullptr;
+        DeviceMoELayerRuntime *runtime_layer = nullptr;
+        DeviceWorkspaceManager *workspace = nullptr;
+        int seq_len = 0;
+        int num_experts = 0;
+        int top_k = 0;
+    };
 
     /**
      * @brief Explicit lifecycle role at a grouped-verifier history boundary.
@@ -161,6 +185,20 @@ namespace llaminar2
             int request_count,
             int rows_per_request,
             void *producer_stream) = 0;
+
+        /**
+         * @brief Expose immutable layer runtime binding for batched multi-layer commit.
+         *
+         * Read-only inspection performed before launch; implementations without
+         * a contiguous device runtime array return @c std::nullopt.
+         *
+         * @return Validated device-layer binding when eligible for batched commit.
+         */
+        [[nodiscard]] virtual std::optional<MoEGroupedVerifierHistogramBatchBinding>
+        groupedVerifierHistogramBatchBinding() const noexcept
+        {
+            return std::nullopt;
+        }
     };
 
 } // namespace llaminar2

@@ -1592,7 +1592,8 @@ __global__ void rocm_moe_prefill_group_count_assigned_kernel(
  * padded row from the maintenance histograms.
  */
 __global__ void rocm_moe_commit_grouped_verifier_histograms_kernel(
-    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    void *__restrict__ runtime_layers,
+    size_t layer_stride_bytes,
     const int32_t *__restrict__ accepted_state_counts,
     const int32_t *__restrict__ publication_ok_flags,
     int request_count,
@@ -1601,6 +1602,11 @@ __global__ void rocm_moe_commit_grouped_verifier_histograms_kernel(
     int num_experts,
     int top_k)
 {
+    auto *const runtime = runtime_layers != nullptr
+        ? reinterpret_cast<DeviceMoELayerRuntimeView *>(
+              static_cast<uint8_t *>(runtime_layers) +
+              static_cast<size_t>(blockIdx.y) * layer_stride_bytes)
+        : nullptr;
     const int slot = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_slots = total_rows * top_k;
     const bool ledger_is_complete =
@@ -2455,29 +2461,82 @@ __global__ __launch_bounds__(kActiveExpertThreads) void rocm_moe_materialize_run
      * Scalable grouping already requires this descriptor publication. Count
      * the final route ledger here so route-only conversion remains free of
      * persistent history effects and no extra launch enters the hot path.
+     * Aggregate per-expert hits in LDS first when num_experts fits in the
+     * 1024-entry local table (matching CUDA CUDAMoEGroupingKernels.cu) so 5k+
+     * route slots flush with at most one global/mapped 64-bit atomic per active
+     * expert instead of one per route slot.
      */
     if (publish_prefill_histogram != 0 &&
         runtime_histogram_admits_rows(*runtime))
     {
-        for (int slot = threadIdx.x;
-             slot < current_slots;
-             slot += static_cast<int>(blockDim.x))
+        uint64_t *const sel_hist = runtime_selected_histogram(*runtime, 1u);
+        uint64_t *const loc_hist = runtime_local_histogram(*runtime, 1u);
+        const int local_pid = static_cast<int>(runtime->participant_id);
+        constexpr int kLdsHistCap = 1024;
+        if (num_experts <= kLdsHistCap)
         {
-            const int expert_id = runtime->route_expert_ids[slot];
-            const int participant_id = runtime->route_participant_ids[slot];
-            if (expert_id < 0 || expert_id >= num_experts)
-                continue;
-            atomicAdd(
-                reinterpret_cast<unsigned long long *>(
-                    &runtime_selected_histogram(*runtime, 1u)[expert_id]),
-                1ULL);
-            if (participant_id ==
-                static_cast<int>(runtime->participant_id))
+            __shared__ uint32_t s_sel[kLdsHistCap];
+            __shared__ uint32_t s_loc[kLdsHistCap];
+            for (int e = static_cast<int>(threadIdx.x);
+                 e < num_experts;
+                 e += static_cast<int>(blockDim.x))
             {
+                s_sel[e] = 0u;
+                s_loc[e] = 0u;
+            }
+            __syncthreads();
+            for (int slot = static_cast<int>(threadIdx.x);
+                 slot < current_slots;
+                 slot += static_cast<int>(blockDim.x))
+            {
+                const int expert_id = runtime->route_expert_ids[slot];
+                const int participant_id = runtime->route_participant_ids[slot];
+                if (expert_id < 0 || expert_id >= num_experts)
+                    continue;
+                atomicAdd(&s_sel[expert_id], 1u);
+                if (participant_id == local_pid)
+                    atomicAdd(&s_loc[expert_id], 1u);
+            }
+            __syncthreads();
+            for (int e = static_cast<int>(threadIdx.x);
+                 e < num_experts;
+                 e += static_cast<int>(blockDim.x))
+            {
+                const uint32_t sc = s_sel[e];
+                if (sc != 0u)
+                {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long *>(&sel_hist[e]),
+                        static_cast<unsigned long long>(sc));
+                }
+                const uint32_t lc = s_loc[e];
+                if (lc != 0u)
+                {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long *>(&loc_hist[e]),
+                        static_cast<unsigned long long>(lc));
+                }
+            }
+        }
+        else
+        {
+            for (int slot = static_cast<int>(threadIdx.x);
+                 slot < current_slots;
+                 slot += static_cast<int>(blockDim.x))
+            {
+                const int expert_id = runtime->route_expert_ids[slot];
+                const int participant_id = runtime->route_participant_ids[slot];
+                if (expert_id < 0 || expert_id >= num_experts)
+                    continue;
                 atomicAdd(
-                    reinterpret_cast<unsigned long long *>(
-                        &runtime_local_histogram(*runtime, 1u)[expert_id]),
+                    reinterpret_cast<unsigned long long *>(&sel_hist[expert_id]),
                     1ULL);
+                if (participant_id == local_pid)
+                {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long *>(&loc_hist[expert_id]),
+                        1ULL);
+                }
             }
         }
     }
@@ -3841,8 +3900,10 @@ hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
     return true;
 }
 
-bool hipMoE_commit_grouped_verifier_histograms(
-    void *runtime,
+bool hipMoE_commit_grouped_verifier_histograms_batch(
+    void *runtime_layers,
+    int layer_count,
+    size_t layer_stride_bytes,
     const int32_t *accepted_state_counts,
     const int32_t *publication_ok_flags,
     int request_count,
@@ -3853,7 +3914,9 @@ bool hipMoE_commit_grouped_verifier_histograms(
     int device_idx,
     void *stream)
 {
-    if (!runtime ||
+    if (!runtime_layers ||
+        layer_count <= 0 ||
+        (layer_count > 1 && layer_stride_bytes < sizeof(DeviceMoELayerRuntimeView)) ||
         !accepted_state_counts ||
         !publication_ok_flags ||
         !stream ||
@@ -3875,11 +3938,14 @@ bool hipMoE_commit_grouped_verifier_histograms(
     const int blocks = (total_slots + threads - 1) / threads;
     hipLaunchKernelGGL(
         rocm_moe_commit_grouped_verifier_histograms_kernel,
-        dim3(blocks),
+        dim3(static_cast<unsigned int>(blocks),
+             static_cast<unsigned int>(layer_count),
+             1u),
         dim3(threads),
         0,
         static_cast<hipStream_t>(stream),
-        static_cast<DeviceMoELayerRuntimeView *>(runtime),
+        runtime_layers,
+        layer_stride_bytes,
         accepted_state_counts,
         publication_ok_flags,
         request_count,
@@ -3893,11 +3959,38 @@ bool hipMoE_commit_grouped_verifier_histograms(
     {
         fprintf(
             stderr,
-            "HIP MoE committed grouped-verifier histogram launch failed: %s\n",
+            "HIP MoE committed grouped-verifier histogram batch launch failed: %s\n",
             hipGetErrorString(err));
         return false;
     }
     return true;
+}
+
+bool hipMoE_commit_grouped_verifier_histograms(
+    void *runtime,
+    const int32_t *accepted_state_counts,
+    const int32_t *publication_ok_flags,
+    int request_count,
+    int rows_per_request,
+    int total_rows,
+    int num_experts,
+    int top_k,
+    int device_idx,
+    void *stream)
+{
+    return hipMoE_commit_grouped_verifier_histograms_batch(
+        runtime,
+        1,
+        0u,
+        accepted_state_counts,
+        publication_ok_flags,
+        request_count,
+        rows_per_request,
+        total_rows,
+        num_experts,
+        top_k,
+        device_idx,
+        stream);
 }
 
 bool hipMoE_assign_prefill_routes_least_loaded_resident(

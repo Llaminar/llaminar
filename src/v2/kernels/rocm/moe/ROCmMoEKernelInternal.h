@@ -1236,6 +1236,19 @@ extern "C"
         int top_k,
         int device_idx, void *stream);
 
+    bool hipMoE_commit_grouped_verifier_histograms_batch(
+        void *runtime_layers,
+        int layer_count,
+        size_t layer_stride_bytes,
+        const int32_t *accepted_state_counts,
+        const int32_t *publication_ok_flags,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k,
+        int device_idx, void *stream);
+
     bool hipMoE_assign_prefill_routes_least_loaded_resident(
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,

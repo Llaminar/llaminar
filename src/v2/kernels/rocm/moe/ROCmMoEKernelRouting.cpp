@@ -4124,6 +4124,62 @@ namespace llaminar2
             stream);
     }
 
+    bool ROCmMoEKernel::commitGroupedVerifierHistogramsBatch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layers,
+        int layer_count,
+        size_t layer_stride_bytes,
+        const int32_t *accepted_state_counts_device,
+        const int32_t *publication_ok_flags_device,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "commitGroupedVerifierHistogramsBatch");
+        if (!stream)
+            return false;
+        if (!runtime_layers ||
+            layer_count <= 0 ||
+            (layer_count > 1 && layer_stride_bytes < sizeof(DeviceMoELayerRuntime)) ||
+            !accepted_state_counts_device ||
+            !publication_ok_flags_device ||
+            request_count <= 0 ||
+            rows_per_request <= 0 ||
+            total_rows != request_count * rows_per_request ||
+            num_experts <= 0 ||
+            top_k <= 0)
+        {
+            LOG_ERROR(
+                "[ROCmMoEKernel::commitGroupedVerifierHistogramsBatch] invalid "
+                "device publication contract");
+            return false;
+        }
+        if (!setMoEDevice(
+                device_ordinal_,
+                "commitGroupedVerifierHistogramsBatch"))
+        {
+            return false;
+        }
+
+        return hipMoE_commit_grouped_verifier_histograms_batch(
+            static_cast<void *>(runtime_layers),
+            layer_count,
+            layer_stride_bytes,
+            accepted_state_counts_device,
+            publication_ok_flags_device,
+            request_count,
+            rows_per_request,
+            total_rows,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            stream);
+    }
+
     bool ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident(
         const MoEKernelLaunchContext &launch,
         DeviceMoELayerRuntime *runtime_layer,

@@ -253,16 +253,19 @@ TEST(MoEProjectionDiagnostic, Promoted23RepresentationPreservesDefaultAndOrigina
     authored["prepared_representation"] = "original-gpu-prepared";
     EXPECT_EQ(parseMoEProjectionDiagnostic(authored, Json::object()).evidenceId(), original.evidenceId());
     authored["prepared_representation"] = "cpu-prepared-promoted23";
+    authored["source"]["routed"]["gate"] = "IQ1_S";
+    authored["source"]["routed"]["up"] = "IQ1_S";
+    const auto original_iq1s = parseMoEProjectionDiagnostic(syntheticRequest("IQ1_S"), Json::object());
     const auto promoted = parseMoEProjectionDiagnostic(authored, Json::object());
     EXPECT_EQ(promoted.prepared_representation, MoEProjectionPreparedRepresentation::CpuPreparedPromoted23);
-    EXPECT_EQ(promoted.source.evidenceId(), original.source.evidenceId());
-    EXPECT_EQ(promoted.source.routed.gate, "Q5_K");
-    EXPECT_NE(promoted.evidenceId(), original.evidenceId());
+    EXPECT_EQ(promoted.source.evidenceId(), original_iq1s.source.evidenceId());
+    EXPECT_EQ(promoted.source.routed.gate, "IQ1_S");
+    EXPECT_NE(promoted.evidenceId(), original_iq1s.evidenceId());
     EXPECT_NE(promoted.evidenceId().find("cpu-prepared-promoted23"), std::string::npos);
     const auto &gate = promoted.descriptor_evidence.at("original_source_roles").at("gate");
-    EXPECT_EQ(gate.at("source_codebook").get<int>(), 7);
+    EXPECT_EQ(gate.at("source_codebook").get<int>(), 16);
     EXPECT_TRUE(gate.at("source_is_superblock").get<bool>());
-    EXPECT_EQ(gate.at("canonical_execution_codebook").get<int>(), 7);
+    EXPECT_EQ(gate.at("canonical_execution_codebook").get<int>(), 16);
     EXPECT_EQ(gate.at("migration_execution_codebook").get<int>(), 23);
 }
 
@@ -288,9 +291,10 @@ TEST(MoEProjectionDiagnostic, Promoted23SourcesUseCanonicalMigrationContract)
         }
         else EXPECT_THROW((void)parseMoEProjectionDiagnostic(authored, Json::object()), std::invalid_argument);
     }
-    EXPECT_EQ(accepted, (std::set<std::string>{"Q5_1", "Q5_K", "IQ1_S"}));
+    EXPECT_EQ(accepted, (std::set<std::string>{"IQ1_S"}));
     EXPECT_FALSE(moeProjectionSupportsPromoted23("23"));
     EXPECT_FALSE(moeProjectionSupportsPromoted23("Q4_K"));
+    EXPECT_FALSE(moeProjectionSupportsPromoted23("Q5_K"));
 }
 
 /** Unknown or mixed preparation authority fails before synthetic weights, allocation or transfer setup. */
@@ -298,14 +302,14 @@ TEST(MoEProjectionDiagnostic, Promoted23RejectsUnknownAndMixedPreparationAuthori
 {
     for (const Json invalid : {Json("23"), Json("cpu"), Json(""), Json(true), Json(23), Json(nullptr)})
     {
-        auto bad = syntheticRequest("Q5_K"); bad["prepared_representation"] = invalid;
+        auto bad = syntheticRequest("IQ1_S"); bad["prepared_representation"] = invalid;
         EXPECT_THROW((void)parseMoEProjectionDiagnostic(bad, Json::object()), std::invalid_argument);
     }
     auto bad = request(); bad["prepared_representation"] = "cpu-prepared-promoted23";
     EXPECT_THROW((void)parseMoEProjectionDiagnostic(bad, descriptors()), std::invalid_argument);
     for (const auto *contest : {"gate-up-geometry", "inline64-vs-parallel-partitions64"})
     {
-        bad = syntheticRequest("Q5_K"); bad["contest"] = contest;
+        bad = syntheticRequest("IQ1_S"); bad["contest"] = contest;
         bad["prepared_representation"] = "cpu-prepared-promoted23";
         EXPECT_THROW((void)parseMoEProjectionDiagnostic(bad, Json::object()), std::invalid_argument);
     }

@@ -78,7 +78,8 @@ public:
         if (!device().is_cuda() || compute.seq_len != 1 || !compute.moe_runtime_table ||
             !compute.canonical_route_contributions ||
             compute.canonical_route_layout != MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots ||
-            compute.weight_descriptor_source != MoEDecodeDescriptorSource::RuntimePlacementTable ||
+            (compute.weight_descriptor_source != MoEDecodeDescriptorSource::RuntimePlacementTable &&
+             compute.weight_descriptor_source != MoEDecodeDescriptorSource::StaticDescriptorTable) ||
             compute.d_model <= 0 || compute.expert_intermediate <= 0 ||
             (compute.expert_intermediate % 32) != 0 ||
             compute.input != router_.input)

@@ -1282,9 +1282,11 @@ void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previ
         }
         else if(const auto* comp=dynamic_cast<const MoEExpertComputeStage*>(node.stage.get());
             comp && comp->declaration().input==mixed.tensor &&
+            comp->declaration().moe_runtime_table!=nullptr &&
             comp->declaration().canonical_route_contributions!=nullptr &&
             comp->declaration().canonical_route_layout==MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots &&
-            comp->declaration().weight_descriptor_source==MoEDecodeDescriptorSource::RuntimePlacementTable)
+            (comp->declaration().weight_descriptor_source==MoEDecodeDescriptorSource::RuntimePlacementTable ||
+             comp->declaration().weight_descriptor_source==MoEDecodeDescriptorSource::StaticDescriptorTable))
         {
             if(binding || compute_stage)throw std::invalid_argument("CUDA retained QFN has multiple route-slot publishers");
             compute_stage=comp;

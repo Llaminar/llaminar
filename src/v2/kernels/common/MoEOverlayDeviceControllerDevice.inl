@@ -1336,7 +1336,8 @@ namespace llaminar2::moe_overlay_controller_device
         std::uint32_t cycle_length,
         std::uint32_t participant_count,
         std::uint32_t expert_count,
-        std::uint32_t imbalance_threshold_per_mille) noexcept
+        std::uint32_t imbalance_threshold_per_mille,
+        const std::uint64_t *cached_target_loads = nullptr) noexcept
     {
         if (cycle_length == 0u)
             return false;
@@ -1367,22 +1368,27 @@ namespace llaminar2::moe_overlay_controller_device
             }
         }
 
-        for (std::uint32_t participant = 0u;
-             participant < participant_count;
-             ++participant)
+        const std::uint64_t *loads = cached_target_loads;
+        if (!loads)
         {
-            scratch.target_load()[participant] = 0u;
-        }
-        for (std::uint32_t expert = 0u; expert < expert_count; ++expert)
-        {
-            const auto owner = static_cast<std::uint32_t>(
-                scratch.current_owner()[expert]);
-            scratch.target_load()[owner] = saturatingAdd(
-                scratch.target_load()[owner],
-                scratch.expert_counts()[expert]);
+            for (std::uint32_t participant = 0u;
+                 participant < participant_count;
+                 ++participant)
+            {
+                scratch.target_load()[participant] = 0u;
+            }
+            for (std::uint32_t expert = 0u; expert < expert_count; ++expert)
+            {
+                const auto owner = static_cast<std::uint32_t>(
+                    scratch.current_owner()[expert]);
+                scratch.target_load()[owner] = saturatingAdd(
+                    scratch.target_load()[owner],
+                    scratch.expert_counts()[expert]);
+            }
+            loads = scratch.target_load();
         }
         return moe_rebalance_policy::samePriorityLoadIsImbalanced(
-            scratch.target_load(),
+            loads,
             scratch.target_priority(),
             participant_count,
             cycle_priority,
@@ -1470,11 +1476,30 @@ namespace llaminar2::moe_overlay_controller_device
         std::uint32_t participant_count,
         std::uint32_t expert_count,
         std::uint64_t transaction,
-        std::uint32_t minimum_improvement_per_mille) noexcept
+        std::uint32_t minimum_improvement_per_mille,
+        const std::uint64_t *cached_observed_activations = nullptr,
+        std::uint32_t cached_routed_experts_per_token = 0u) noexcept
     {
         DynamicCycleEconomyScore score{};
         if (cycle_length == 0u)
             return score;
+
+        const std::uint32_t *const cycle_ptr = scratch.cycle();
+        const std::int32_t *const current_owner_ptr = scratch.current_owner();
+        const std::int32_t *const desired_owner_ptr = scratch.desired_owner();
+        std::uint64_t *const target_load_ptr = scratch.target_load();
+        const auto phase_target_rows = scratch.phaseTargetRows();
+        const auto phase_expert_rows = scratch.phaseExpertRows();
+        const auto service_rows = scratch.serviceRows();
+        const auto transfer_rows = scratch.transferRows();
+        const auto interference_rows = scratch.interferenceRows();
+        const std::uint64_t *const last_moved_ptr = scratch.last_moved();
+        const std::uint64_t minimum_residency =
+            scratch.minimum_residency_generations()[0];
+        const std::uint64_t payoff_horizon_tokens =
+            scratch.payoff_horizon_tokens()[0];
+        const std::uint64_t minimum_net_benefit_ns =
+            scratch.minimum_net_benefit_ns()[0];
 
         constexpr std::uint32_t kMeasuredDemandPhases =
             kMoEOverlayDeviceControllerDemandPhaseCount;
@@ -1482,12 +1507,15 @@ namespace llaminar2::moe_overlay_controller_device
              phase < kMeasuredDemandPhases;
              ++phase)
         {
+            const std::uint64_t *const phase_target_row =
+                phase_target_rows[phase];
+            const std::uint64_t *const phase_expert_row =
+                phase_expert_rows[phase];
             for (std::uint32_t participant = 0u;
                  participant < participant_count;
                  ++participant)
             {
-                scratch.target_load()[participant] =
-                    scratch.phaseTargetRows()[phase][participant];
+                target_load_ptr[participant] = phase_target_row[participant];
             }
             std::uint64_t before_critical_path = 0u;
             for (std::uint32_t participant = 0u;
@@ -1496,8 +1524,8 @@ namespace llaminar2::moe_overlay_controller_device
             {
                 const std::uint64_t participant_service =
                     saturatingMultiply(
-                        scratch.target_load()[participant],
-                        scratch.serviceRows()[participant][phase]);
+                        target_load_ptr[participant],
+                        service_rows[participant][phase]);
                 before_critical_path =
                     participant_service > before_critical_path
                         ? participant_service
@@ -1511,16 +1539,15 @@ namespace llaminar2::moe_overlay_controller_device
                  edge < cycle_length;
                  ++edge)
             {
-                const std::uint32_t expert = scratch.cycle()[edge];
+                const std::uint32_t expert = cycle_ptr[edge];
                 const auto source = static_cast<std::uint32_t>(
-                    scratch.current_owner()[expert]);
+                    current_owner_ptr[expert]);
                 const auto destination = static_cast<std::uint32_t>(
-                    scratch.desired_owner()[expert]);
-                const std::uint64_t demand =
-                    scratch.phaseExpertRows()[phase][expert];
-                scratch.target_load()[source] -= demand;
-                scratch.target_load()[destination] = saturatingAdd(
-                    scratch.target_load()[destination], demand);
+                    desired_owner_ptr[expert]);
+                const std::uint64_t demand = phase_expert_row[expert];
+                target_load_ptr[source] -= demand;
+                target_load_ptr[destination] = saturatingAdd(
+                    target_load_ptr[destination], demand);
             }
             std::uint64_t after_critical_path = 0u;
             for (std::uint32_t participant = 0u;
@@ -1529,8 +1556,8 @@ namespace llaminar2::moe_overlay_controller_device
             {
                 const std::uint64_t participant_service =
                     saturatingMultiply(
-                        scratch.target_load()[participant],
-                        scratch.serviceRows()[participant][phase]);
+                        target_load_ptr[participant],
+                        service_rows[participant][phase]);
                 after_critical_path =
                     participant_service > after_critical_path
                         ? participant_service
@@ -1543,23 +1570,21 @@ namespace llaminar2::moe_overlay_controller_device
         }
 
         const bool reciprocal_pair = cycle_length == 2u &&
-            scratch.current_owner()[scratch.cycle()[0]] ==
-                scratch.desired_owner()[scratch.cycle()[1]] &&
-            scratch.current_owner()[scratch.cycle()[1]] ==
-                scratch.desired_owner()[scratch.cycle()[0]];
+            current_owner_ptr[cycle_ptr[0]] ==
+                desired_owner_ptr[cycle_ptr[1]] &&
+            current_owner_ptr[cycle_ptr[1]] ==
+                desired_owner_ptr[cycle_ptr[0]];
         for (std::uint32_t edge = 0u; edge < cycle_length; ++edge)
         {
-            const std::uint32_t expert = scratch.cycle()[edge];
+            const std::uint32_t expert = cycle_ptr[edge];
             const auto source = static_cast<std::uint32_t>(
-                scratch.current_owner()[expert]);
+                current_owner_ptr[expert]);
             const auto destination = static_cast<std::uint32_t>(
-                scratch.desired_owner()[expert]);
+                desired_owner_ptr[expert]);
             const std::uint64_t movement_transfer_and_repack_ns =
-                scratch.transferRows()
-                    [source][destination];
+                transfer_rows[source][destination];
             const std::uint64_t movement_inference_interference_ns =
-                scratch.interferenceRows()
-                    [source][destination];
+                interference_rows[source][destination];
             if (reciprocal_pair)
             {
                 score.transfer_and_repack_ns =
@@ -1583,9 +1608,7 @@ namespace llaminar2::moe_overlay_controller_device
                     movement_inference_interference_ns);
             }
 
-            const std::uint64_t last_moved = scratch.last_moved()[expert];
-            const std::uint64_t minimum_residency =
-                scratch.minimum_residency_generations()[0];
+            const std::uint64_t last_moved = last_moved_ptr[expert];
             if (last_moved !=
                     kMoEOverlayDeviceControllerNeverMovedGeneration &&
                 (transaction < last_moved ||
@@ -1622,15 +1645,28 @@ namespace llaminar2::moe_overlay_controller_device
         const std::uint64_t gain =
             score.service_before_ns - score.service_after_ns;
         std::uint64_t observed_activations = 0u;
-        for (std::uint32_t expert = 0u; expert < expert_count; ++expert)
+        if (cached_observed_activations)
         {
-            observed_activations = saturatingAdd(
-                observed_activations, scratch.expert_counts()[expert]);
+            observed_activations = *cached_observed_activations;
         }
+        else
+        {
+            const std::uint64_t *const expert_counts_ptr =
+                scratch.expert_counts();
+            for (std::uint32_t expert = 0u; expert < expert_count; ++expert)
+            {
+                observed_activations = saturatingAdd(
+                    observed_activations, expert_counts_ptr[expert]);
+            }
+        }
+        const std::uint32_t routed_experts_per_token =
+            cached_routed_experts_per_token != 0u
+                ? cached_routed_experts_per_token
+                : binding.layout->routed_experts_per_token;
         score.projected_service_gain_ns = projectDynamicServiceGain(
             gain,
-            scratch.payoff_horizon_tokens()[0],
-            binding.layout->routed_experts_per_token,
+            payoff_horizon_tokens,
+            routed_experts_per_token,
             observed_activations);
         const std::uint64_t measured_cost = saturatingAdd(
             score.transfer_and_repack_ns,
@@ -1641,7 +1677,7 @@ namespace llaminar2::moe_overlay_controller_device
                 score.projected_service_gain_ns - measured_cost;
         }
         score.payoff_eligible = score.projected_net_benefit_ns >
-            scratch.minimum_net_benefit_ns()[0];
+            minimum_net_benefit_ns;
         return score;
     }
 
@@ -1663,12 +1699,14 @@ namespace llaminar2::moe_overlay_controller_device
         DynamicPolicyScratch &scratch,
         const std::uint8_t *excluded,
         std::uint32_t participant_count,
-        std::uint32_t expert_count) noexcept
+        std::uint32_t expert_count,
+        std::uint32_t first_start = 0u) noexcept
     {
         return findMoEOverlayPlacementCycle(
             scratch.current_owner(), scratch.desired_owner(), excluded,
             participant_count, expert_count, scratch.visited(),
-            scratch.dfs_source(), scratch.dfs_next_expert(), scratch.cycle()).length;
+            scratch.dfs_source(), scratch.dfs_next_expert(), scratch.cycle(),
+            first_start).length;
     }
 
     /**
@@ -2291,779 +2329,1335 @@ namespace llaminar2::moe_overlay_controller_device
         const MoEOverlayDeviceControllerActionLaunch &launch,
         DynamicPolicyScratch &scratch) noexcept
     {
+        constexpr std::uint32_t kMaxCachedTargets = 64u;
+        constexpr std::uint32_t kMaxCachedMembers = 64u;
+        constexpr std::uint32_t kMaxCompressedTargets = 32u;
+        constexpr std::uint16_t kCompressedEdgeNone = 0xffffu;
+        struct CachedLogicalTarget
+        {
+            std::uint32_t first_member;
+            std::uint32_t member_count;
+            std::uint8_t is_cohort;
+        };
+        struct DynamicAuthorSharedHeader
+        {
+            std::uint64_t transaction;
+            std::uint64_t base_epoch;
+            std::uint64_t candidate_epoch;
+            std::uint64_t minimum_observations;
+            const std::uint64_t *demand_pub_base;
+            std::uint32_t target_count;
+            std::uint32_t layer_count;
+            std::uint32_t expert_count;
+            std::uint32_t routed_experts_per_token;
+            std::uint32_t command_capacity;
+            std::uint32_t maximum_cycles;
+            std::uint32_t imbalance_threshold_per_mille;
+            std::uint32_t minimum_improvement_per_mille;
+            std::uint32_t maximum_cycles_per_layer;
+            std::uint32_t maximum_commands;
+            std::uint32_t active_sources;
+            std::uint32_t priority_count;
+            std::uint32_t layer_scan_start;
+            std::uint32_t ok;
+            std::uint32_t economy_ready;
+            std::uint32_t targets_cached;
+            std::uint32_t layer_action; // 0=skip, 1=score_only, 2=full_search
+        };
+
+        __shared__ DynamicAuthorSharedHeader s_hdr;
+        __shared__ CachedLogicalTarget s_targets[kMaxCachedTargets];
+        __shared__ std::uint32_t s_member_pids[kMaxCachedMembers];
+        __shared__ std::uint32_t s_target_priority_rank[kMaxCachedTargets];
+        __shared__ std::uint64_t s_working_load[kMaxCachedTargets];
+        __shared__ std::uint64_t s_candidate_load[kMaxCachedTargets];
+        __shared__ std::uint64_t s_expert_counts[kMoEOverlayDeviceControllerFabricMaxExperts];
+        __shared__ std::uint64_t s_obs_reduce[kControllerThreads];
+        __shared__ std::uint32_t s_invalid_reduce[kControllerThreads];
+        __shared__ std::int16_t s_cur_owner[kMoEOverlayDeviceControllerFabricMaxExperts];
+        __shared__ std::int16_t s_des_owner[kMoEOverlayDeviceControllerFabricMaxExperts];
+        __shared__ std::uint8_t s_excl[kMoEOverlayDeviceControllerFabricMaxExperts];
+        __shared__ std::uint8_t s_enum[kMoEOverlayDeviceControllerFabricMaxExperts];
+        __shared__ std::uint16_t s_pair_head[kMaxCompressedTargets * kMaxCompressedTargets];
+        __shared__ std::uint16_t s_pair_next[kMoEOverlayDeviceControllerFabricMaxExperts];
+        __shared__ std::uint8_t s_dead_pair[kMaxCompressedTargets * kMaxCompressedTargets];
+        __shared__ std::uint8_t s_dfs_visited[kMaxCompressedTargets];
+        __shared__ std::uint8_t s_dfs_sources[kMaxCompressedTargets];
+        __shared__ std::uint16_t s_dfs_min_edge[kMaxCompressedTargets];
+
         const auto &binding = launch.binding;
-        const std::uint64_t transaction =
-            loadSystemAcquire(&binding.controller->transaction_id);
-        if (!binding.authorityLeader() || !launch.policy_result ||
-            transaction == 0u ||
-            !waitForState(
-                binding,
-                MoEOverlayDeviceControllerState::CollectingSnapshots) ||
-            !waitForAllGroups(
-                binding,
-                GroupWordField::SnapshotTransaction,
-                transaction) ||
-            loadSystemAcquire(&binding.controller->transaction_kind) !=
-                raw(MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) ||
-            loadPeerPublished(&binding.controller->transaction_demand_phase) !=
-                raw(launch.demand_phase))
-        {
-            if (binding.authorityLeader())
-                failLeader(
-                    binding,
-                    MoEOverlayDeviceControllerError::InvalidState);
-            return;
-        }
-
-        const std::uint32_t target_count =
-            loadPeerPublished(&binding.layout->logical_target_count);
-        const std::uint32_t layer_count =
-            loadPeerPublished(&binding.layout->num_layers);
-        const std::uint32_t expert_count =
-            loadPeerPublished(&binding.layout->num_experts);
-        const std::uint32_t command_capacity =
-            loadPeerPublished(&binding.layout->command_capacity);
-        const std::uint32_t maximum_cycles =
-            loadPeerPublished(&binding.layout->maximum_cycles_per_wave);
-        const std::uint32_t imbalance_threshold_per_mille =
-            loadPeerPublished(
-                &binding.layout->dynamic_imbalance_threshold_per_mille);
-        const std::uint32_t minimum_improvement_per_mille =
-            loadPeerPublished(
-                &binding.layout->dynamic_minimum_improvement_per_mille);
-        const std::uint32_t maximum_cycles_per_layer =
-            loadPeerPublished(
-                &binding.layout->dynamic_maximum_cycles_per_layer);
-        const std::uint32_t configured_maximum_commands =
-            loadPeerPublished(
-                &binding.layout->dynamic_maximum_commands_per_wave);
-        const std::uint64_t minimum_observations =
-            loadPeerPublished(&binding.layout->minimum_window_activations);
-        const std::uint32_t economy_state = loadSystemAcquire(
-            &binding.economy->state);
-        const bool economy_ready =
-            economy_state == raw(
-                MoEOverlayDeviceControllerEconomyState::Ready);
-        // The profile is immutable after acquire-observing Ready. Read its
-        // source mask once rather than once per expert through mapped PCIe.
-        const std::uint32_t active_sources = economy_ready
-            ? loadPeerPublished(&binding.economy->active_source_bits)
-            : (1u << kMoEOverlayDeviceControllerDemandPhaseCount) - 1u;
-        const std::uint64_t expected_history_words =
-            static_cast<std::uint64_t>(
-                kMoEOverlayDeviceControllerDemandPhaseCount) *
-            layer_count * expert_count;
-        // Every policy vertex is an original typed target. Physical member
-        // snapshots and logical quotas have independently admitted extents.
-        if (target_count == 0u ||
-            layer_count == 0u ||
-            layer_count > kMoEOverlayDeviceControllerFabricMaxLayers ||
-            expert_count == 0u ||
-            expert_count > kMoEOverlayDeviceControllerFabricMaxExperts ||
-            binding.layout->tier_count == 0u ||
-            binding.layout->tier_count > target_count ||
-            !scratch.validFor({binding.layout->participant_count, target_count, binding.layout->tier_count, expert_count}) ||
-            command_capacity == 0u || maximum_cycles == 0u ||
-            minimum_observations == 0u || !binding.demand_history ||
-            (launch.demand_phase != MoEOverlayDeviceDemandPhase::Prefill &&
-             launch.demand_phase != MoEOverlayDeviceDemandPhase::Decode) ||
-            loadPeerPublished(&binding.layout->demand_history_words) !=
-                expected_history_words ||
-            (economy_state != raw(
-                 MoEOverlayDeviceControllerEconomyState::Empty) &&
-             !economy_ready) ||
-            (economy_ready &&
-             (loadPeerPublished(&binding.economy->magic) !=
-                  kMoEOverlayDeviceControllerFabricMagic ||
-              loadPeerPublished(&binding.economy->version) !=
-                  kMoEOverlayDeviceControllerFabricVersion ||
-              loadPeerPublished(&binding.economy->tier_count) !=
-                  binding.layout->tier_count ||
-              loadPeerPublished(&binding.economy->logical_target_count) !=
-                  target_count ||
-              loadPeerPublished(&binding.economy->layer_count) !=
-                  layer_count ||
-              loadPeerPublished(&binding.economy->service_phase_count) !=
-                  kMoEOverlayDeviceControllerEconomyServicePhaseCount ||
-              loadPeerPublished(
-                  &binding.economy->topology_fingerprint) !=
-                  binding.topology_fingerprint ||
-              loadPeerPublished(
-                  &binding.economy->service_identity_fingerprint) == 0u ||
-              loadPeerPublished(
-                  &binding.economy->migration_identity_fingerprint) == 0u ||
-              loadPeerPublished(
-                  &binding.economy->publication_generation) == 0u ||
-              active_sources == 0u ||
-              (active_sources &
-               ~((1u << kMoEOverlayDeviceControllerDemandPhaseCount) - 1u)) != 0u ||
-              loadPeerPublished(
-                  &binding.economy->current_window_weight) == 0u ||
-              loadPeerPublished(
-                  &binding.economy->payoff_horizon_tokens) == 0u)))
-        {
-            failLeader(
-                binding,
-                MoEOverlayDeviceControllerError::InvalidTopology);
-            return;
-        }
-
-        std::uint32_t priority_count = 0u;
-        if (!prepareLogicalPolicyScratch(binding, scratch, priority_count))
-        {
-            failLeader(binding, MoEOverlayDeviceControllerError::InvalidTopology);
-            return;
-        }
+        const std::uint32_t tid = threadIdx.x;
 
         MoEOverlayDeviceControllerPolicyResult result{};
-        result.kind = raw(
-            MoEOverlayDeviceControllerTransactionKind::DynamicPlacement);
-        const std::uint64_t base_epoch =
-            loadSystemAcquire(&binding.controller->base_epoch);
-        const std::uint64_t candidate_epoch =
-            loadSystemAcquire(&binding.controller->candidate_epoch);
-        const std::uint32_t maximum_commands =
-            configured_maximum_commands == 0u ||
-                    configured_maximum_commands > command_capacity
-                ? command_capacity
-                : configured_maximum_commands;
-        const std::uint32_t layer_scan_start = loadSystemAcquire(
-            &binding.controller->placement_layer_cursor);
-        if (layer_scan_start >= layer_count)
-        {
-            failLeader(
-                binding,
-                MoEOverlayDeviceControllerError::InvalidState);
-            return;
-        }
-        result.layer_scan_start = layer_scan_start;
-        result.layer_scan_next = (layer_scan_start + 1u) % layer_count;
         moe_rebalance_policy::DynamicPlacementAxisProgress axis_progress;
+
+        if (tid == 0u)
+        {
+            s_hdr = DynamicAuthorSharedHeader{};
+            const std::uint64_t transaction =
+                loadSystemAcquire(&binding.controller->transaction_id);
+            if (!binding.authorityLeader() || !launch.policy_result ||
+                transaction == 0u ||
+                !waitForState(
+                    binding,
+                    MoEOverlayDeviceControllerState::CollectingSnapshots) ||
+                !waitForAllGroups(
+                    binding,
+                    GroupWordField::SnapshotTransaction,
+                    transaction) ||
+                loadSystemAcquire(&binding.controller->transaction_kind) !=
+                    raw(MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) ||
+                loadPeerPublished(&binding.controller->transaction_demand_phase) !=
+                    raw(launch.demand_phase))
+            {
+                if (binding.authorityLeader())
+                    failLeader(
+                        binding,
+                        MoEOverlayDeviceControllerError::InvalidState);
+            }
+            else
+            {
+                const std::uint32_t target_count =
+                    loadPeerPublished(&binding.layout->logical_target_count);
+                const std::uint32_t layer_count =
+                    loadPeerPublished(&binding.layout->num_layers);
+                const std::uint32_t expert_count =
+                    loadPeerPublished(&binding.layout->num_experts);
+                const std::uint32_t command_capacity =
+                    loadPeerPublished(&binding.layout->command_capacity);
+                const std::uint32_t maximum_cycles =
+                    loadPeerPublished(&binding.layout->maximum_cycles_per_wave);
+                const std::uint32_t imbalance_threshold_per_mille =
+                    loadPeerPublished(
+                        &binding.layout->dynamic_imbalance_threshold_per_mille);
+                const std::uint32_t minimum_improvement_per_mille =
+                    loadPeerPublished(
+                        &binding.layout->dynamic_minimum_improvement_per_mille);
+                const std::uint32_t maximum_cycles_per_layer =
+                    loadPeerPublished(
+                        &binding.layout->dynamic_maximum_cycles_per_layer);
+                const std::uint32_t configured_maximum_commands =
+                    loadPeerPublished(
+                        &binding.layout->dynamic_maximum_commands_per_wave);
+                const std::uint64_t minimum_observations =
+                    loadPeerPublished(&binding.layout->minimum_window_activations);
+                const std::uint32_t economy_state = loadSystemAcquire(
+                    &binding.economy->state);
+                const bool economy_ready =
+                    economy_state == raw(
+                        MoEOverlayDeviceControllerEconomyState::Ready);
+                const std::uint32_t active_sources = economy_ready
+                    ? loadPeerPublished(&binding.economy->active_source_bits)
+                    : (1u << kMoEOverlayDeviceControllerDemandPhaseCount) - 1u;
+                const std::uint64_t expected_history_words =
+                    static_cast<std::uint64_t>(
+                        kMoEOverlayDeviceControllerDemandPhaseCount) *
+                    layer_count * expert_count;
+                std::uint32_t priority_count = 0u;
+                const std::uint32_t layer_scan_start = loadSystemAcquire(
+                    &binding.controller->placement_layer_cursor);
+                if (target_count == 0u ||
+                    layer_count == 0u ||
+                    layer_count > kMoEOverlayDeviceControllerFabricMaxLayers ||
+                    expert_count == 0u ||
+                    expert_count > kMoEOverlayDeviceControllerFabricMaxExperts ||
+                    binding.layout->tier_count == 0u ||
+                    binding.layout->tier_count > target_count ||
+                    !scratch.validFor({binding.layout->participant_count, target_count, binding.layout->tier_count, expert_count}) ||
+                    command_capacity == 0u || maximum_cycles == 0u ||
+                    minimum_observations == 0u || !binding.demand_history ||
+                    (launch.demand_phase != MoEOverlayDeviceDemandPhase::Prefill &&
+                     launch.demand_phase != MoEOverlayDeviceDemandPhase::Decode) ||
+                    loadPeerPublished(&binding.layout->demand_history_words) !=
+                        expected_history_words ||
+                    (economy_state != raw(
+                         MoEOverlayDeviceControllerEconomyState::Empty) &&
+                     !economy_ready) ||
+                    (economy_ready &&
+                     (loadPeerPublished(&binding.economy->magic) !=
+                          kMoEOverlayDeviceControllerFabricMagic ||
+                      loadPeerPublished(&binding.economy->version) !=
+                          kMoEOverlayDeviceControllerFabricVersion ||
+                      loadPeerPublished(&binding.economy->tier_count) !=
+                          binding.layout->tier_count ||
+                      loadPeerPublished(&binding.economy->logical_target_count) !=
+                          target_count ||
+                      loadPeerPublished(&binding.economy->layer_count) !=
+                          layer_count ||
+                      loadPeerPublished(&binding.economy->service_phase_count) !=
+                          kMoEOverlayDeviceControllerEconomyServicePhaseCount ||
+                      loadPeerPublished(
+                          &binding.economy->topology_fingerprint) !=
+                          binding.topology_fingerprint ||
+                      loadPeerPublished(
+                          &binding.economy->service_identity_fingerprint) == 0u ||
+                      loadPeerPublished(
+                          &binding.economy->migration_identity_fingerprint) == 0u ||
+                      loadPeerPublished(
+                          &binding.economy->publication_generation) == 0u ||
+                      active_sources == 0u ||
+                      (active_sources &
+                       ~((1u << kMoEOverlayDeviceControllerDemandPhaseCount) - 1u)) != 0u ||
+                      loadPeerPublished(
+                          &binding.economy->current_window_weight) == 0u ||
+                      loadPeerPublished(
+                          &binding.economy->payoff_horizon_tokens) == 0u)) ||
+                    !prepareLogicalPolicyScratch(binding, scratch, priority_count))
+                {
+                    failLeader(
+                        binding,
+                        MoEOverlayDeviceControllerError::InvalidTopology);
+                }
+                else if (layer_scan_start >= layer_count)
+                {
+                    failLeader(
+                        binding,
+                        MoEOverlayDeviceControllerError::InvalidState);
+                }
+                else
+                {
+                    s_hdr.transaction = transaction;
+                    s_hdr.base_epoch =
+                        loadSystemAcquire(&binding.controller->base_epoch);
+                    s_hdr.candidate_epoch =
+                        loadSystemAcquire(&binding.controller->candidate_epoch);
+                    s_hdr.minimum_observations = minimum_observations;
+                    s_hdr.demand_pub_base =
+                        scratch.participant_state_base()[
+                            binding.layout->demand_publisher_participant_id];
+                    s_hdr.target_count = target_count;
+                    s_hdr.layer_count = layer_count;
+                    s_hdr.expert_count = expert_count;
+                    s_hdr.routed_experts_per_token = loadPeerPublished(
+                        &binding.layout->routed_experts_per_token);
+                    s_hdr.command_capacity = command_capacity;
+                    s_hdr.maximum_cycles = maximum_cycles;
+                    s_hdr.imbalance_threshold_per_mille =
+                        imbalance_threshold_per_mille;
+                    s_hdr.minimum_improvement_per_mille =
+                        minimum_improvement_per_mille;
+                    s_hdr.maximum_cycles_per_layer = maximum_cycles_per_layer;
+                    s_hdr.maximum_commands =
+                        configured_maximum_commands == 0u ||
+                                configured_maximum_commands > command_capacity
+                            ? command_capacity
+                            : configured_maximum_commands;
+                    s_hdr.active_sources = active_sources;
+                    s_hdr.priority_count = priority_count;
+                    s_hdr.layer_scan_start = layer_scan_start;
+                    s_hdr.economy_ready = economy_ready ? 1u : 0u;
+                    s_hdr.targets_cached = 0u;
+
+                    /* Cache immutable target->member topology in shared memory
+                     * once per transaction so the 256-thread per-layer loop
+                     * reads only live snapshot words across PCIe. */
+                    if (target_count <= kMaxCachedTargets)
+                    {
+                        bool cached_ok = true;
+                        std::uint32_t member_cursor = 0u;
+                        for (std::uint32_t vertex = 0u;
+                             vertex < target_count;
+                             ++vertex)
+                        {
+                            s_target_priority_rank[vertex] = dynamicPriorityRank(
+                                scratch,
+                                priority_count,
+                                scratch.target_priority()[vertex]);
+                            const auto metadata = snapshotPeerRecord(
+                                binding.logical_targets + vertex);
+                            const auto *group = groupLayout(
+                                binding, metadata.group_id);
+                            const auto *ids = group
+                                ? moeOverlayGroupMemberIds(
+                                      binding.mapped_base,
+                                      binding.mapped_bytes,
+                                      *group)
+                                : nullptr;
+                            if (!ids ||
+                                member_cursor + metadata.member_count >
+                                    kMaxCachedMembers)
+                            {
+                                cached_ok = false;
+                                break;
+                            }
+                            s_targets[vertex] = CachedLogicalTarget{
+                                .first_member = member_cursor,
+                                .member_count = metadata.member_count,
+                                .is_cohort = static_cast<std::uint8_t>(
+                                    metadata.target.isCohort() ? 1u : 0u),
+                            };
+                            for (std::uint32_t m = 0u;
+                                 m < metadata.member_count;
+                                 ++m)
+                            {
+                                s_member_pids[member_cursor++] =
+                                    ids[metadata.first_group_member + m];
+                            }
+                        }
+                        s_hdr.targets_cached = cached_ok ? 1u : 0u;
+                    }
+
+                    result.kind = raw(
+                        MoEOverlayDeviceControllerTransactionKind::DynamicPlacement);
+                    result.layer_scan_start = layer_scan_start;
+                    result.layer_scan_next =
+                        (layer_scan_start + 1u) % layer_count;
+                    s_hdr.ok = 1u;
+                }
+            }
+        }
+        __syncthreads();
+        if (s_hdr.ok == 0u)
+            return;
+
+        const std::uint32_t target_count = s_hdr.target_count;
+        const std::uint32_t layer_count = s_hdr.layer_count;
+        const std::uint32_t expert_count = s_hdr.expert_count;
+        const std::uint32_t active_sources = s_hdr.active_sources;
+        const bool targets_cached = s_hdr.targets_cached != 0u;
+        const bool economy_ready = s_hdr.economy_ready != 0u;
 
         for (std::uint32_t layer_offset = 0u;
              layer_offset < layer_count;
              ++layer_offset)
         {
             const std::uint32_t layer =
-                (layer_scan_start + layer_offset) % layer_count;
-            std::uint64_t observations = 0u;
-            for (std::uint32_t participant = 0u;
-                 participant < target_count;
-                 ++participant)
+                (s_hdr.layer_scan_start + layer_offset) % layer_count;
+            const std::uint64_t layer_row_base =
+                static_cast<std::uint64_t>(layer) * expert_count;
+            const std::uint64_t plane_stride =
+                static_cast<std::uint64_t>(layer_count) * expert_count;
+
+            /* Parallel coalesced snapshot + demand-history update across all
+             * 256 controller threads. Plain stores to leader-owned demand
+             * history are made globally visible by the single system fence in
+             * finalizeDurablePolicyResult() instead of one fence per word. */
+            std::uint64_t local_observations = 0u;
+            std::uint32_t local_invalid = 0u;
+            for (std::uint32_t expert = tid;
+                 expert < expert_count;
+                 expert += kControllerThreads)
             {
-                scratch.quotas()[participant] = 0u;
+                std::uint32_t owner_count = 0u;
+                std::int32_t owner = -1;
+                const std::uint64_t row_offset = layer_row_base + expert;
+                for (std::uint32_t vertex = 0u;
+                     vertex < target_count;
+                     ++vertex)
+                {
+                    MoEOverlayLogicalTargetSnapshot snapshot{};
+                    if (targets_cached)
+                    {
+                        const auto &t = s_targets[vertex];
+                        snapshot = moeOverlayFoldLogicalTargetSnapshot(
+                            t.is_cohort != 0u,
+                            t.member_count,
+                            [&](std::uint32_t member)
+                            {
+                                const std::uint32_t participant =
+                                    s_member_pids[t.first_member + member];
+                                return loadPeerPublished(
+                                    scratch.participant_state_base()[participant] +
+                                    row_offset);
+                            });
+                    }
+                    else
+                    {
+                        snapshot = logicalPolicySnapshot(
+                            binding, scratch, vertex, layer, expert);
+                    }
+                    if (!snapshot.valid)
+                    {
+                        local_invalid = 1u;
+                        break;
+                    }
+                    if (snapshot.authoritative)
+                    {
+                        owner = static_cast<std::int32_t>(vertex);
+                        ++owner_count;
+                    }
+                }
+                if (local_invalid != 0u || owner_count != 1u)
+                {
+                    local_invalid = 1u;
+                    continue;
+                }
+
+                std::uint64_t combined_count = 0u;
                 for (std::uint32_t phase = 0u;
                      phase < kMoEOverlayDeviceControllerDemandPhaseCount;
                      ++phase)
                 {
-                    scratch.phaseTargetRows()[phase][participant] = 0u;
-                }
-            }
-            for (std::uint32_t expert = 0u;
-                 expert < expert_count;
-                 ++expert)
-            {
-                std::uint64_t phase_delta[kMoEOverlayDeviceControllerDemandPhaseCount]{};
-                std::uint32_t owner_count = 0u;
-                std::int32_t owner = -1;
-                for (std::uint32_t vertex = 0u; vertex < target_count; ++vertex)
-                {
-                    const auto snapshot = logicalPolicySnapshot(binding, scratch, vertex, layer, expert);
-                    if (!snapshot.valid)
+                    const std::uint64_t offset =
+                        static_cast<std::uint64_t>(phase) * plane_stride +
+                        row_offset;
+                    const std::uint64_t delta =
+                        moe_rebalance_policy::collectedStateActivationCount(
+                            loadPeerPublished(s_hdr.demand_pub_base + offset));
+                    const auto update = moeOverlayAccumulateDeviceDemandHistory(
+                        loadPeerPublished(binding.demand_history + offset),
+                        combined_count,
+                        delta);
+                    binding.demand_history[offset] = update.updated_phase_count;
+                    const bool priced = (active_sources & (1u << phase)) != 0u;
+                    const auto recurring_history =
+                        priced ? update.updated_phase_count : 0u;
+                    scratch.phaseExpertRows()[phase][expert] =
+                        recurring_history;
+                    if (priced)
                     {
-                        failLeader(binding, MoEOverlayDeviceControllerError::InvalidSnapshot);
-                        return;
+                        combined_count = update.combined_count;
+                        local_observations = saturatingAdd(
+                            local_observations, delta);
                     }
-                    if (snapshot.authoritative) { owner = static_cast<std::int32_t>(vertex); ++owner_count; }
                 }
-                // The continuation-root selected bank contributes global demand,
-                // including experts for which that GPU owns no current payload.
-                for (std::uint32_t phase = 0u; phase < kMoEOverlayDeviceControllerDemandPhaseCount; ++phase)
-                    phase_delta[phase] = moe_rebalance_policy::collectedStateActivationCount(loadPeerPublished(
-                        scratch.participant_state_base()[binding.layout->demand_publisher_participant_id] +
-                        moeOverlayDeviceDemandHistoryOffset(phase, layer, expert, layer_count, expert_count)));
-                if (owner_count != 1u)
+                scratch.expert_counts()[expert] = combined_count;
+                s_expert_counts[expert] = combined_count;
+                scratch.current_owner()[expert] = owner;
+                s_cur_owner[expert] = static_cast<std::int16_t>(owner);
+                scratch.desired_owner()[expert] = -1;
+                s_des_owner[expert] = -1;
+                scratch.excluded()[expert] = 0u;
+                s_excl[expert] = 0u;
+            }
+
+            s_obs_reduce[tid] = local_observations;
+            s_invalid_reduce[tid] = local_invalid;
+            __syncthreads();
+            for (std::uint32_t stride = kControllerThreads / 2u;
+                 stride != 0u;
+                 stride >>= 1u)
+            {
+                if (tid < stride)
+                {
+                    s_obs_reduce[tid] = saturatingAdd(
+                        s_obs_reduce[tid], s_obs_reduce[tid + stride]);
+                    s_invalid_reduce[tid] |= s_invalid_reduce[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            if (s_invalid_reduce[0] != 0u)
+            {
+                if (tid == 0u)
                 {
                     failLeader(
                         binding,
                         MoEOverlayDeviceControllerError::InvalidSnapshot);
-                    return;
                 }
-                scratch.expert_counts()[expert] = 0u;
-                for (std::uint32_t phase = 0u;
-                     phase < kMoEOverlayDeviceControllerDemandPhaseCount;
-                     ++phase)
-                {
-                    const auto offset = moeOverlayDeviceDemandHistoryOffset(
-                        phase, layer, expert, layer_count, expert_count);
-                    const auto update = moeOverlayAccumulateDeviceDemandHistory(
-                        loadPeerPublished(binding.demand_history + offset),
-                        scratch.expert_counts()[expert], phase_delta[phase]);
-                    storeSystemRelease(binding.demand_history + offset,
-                                       update.updated_phase_count);
-                    // Retain even catch-up history, but do not let unpriced
-                    // exceptional work skew a recurring-service placement.
-                    const bool priced = (active_sources & (1u << phase)) != 0u;
-                    const auto recurring_history = priced ? update.updated_phase_count : 0u;
-                    scratch.phaseExpertRows()[phase][expert] = recurring_history;
-                    if (priced)
-                        scratch.expert_counts()[expert] = update.combined_count;
-                    if (priced)
-                        observations = saturatingAdd(observations, phase_delta[phase]);
-                }
-                scratch.current_owner()[expert] = owner;
-                scratch.desired_owner()[expert] = -1;
-                scratch.excluded()[expert] = 0u;
-                const auto owner_index = static_cast<std::uint32_t>(owner);
-                ++scratch.quotas()[owner_index];
-                for (std::uint32_t phase = 0u;
-                     phase < kMoEOverlayDeviceControllerDemandPhaseCount;
-                     ++phase)
-                {
-                    scratch.phaseTargetRows()[phase][owner_index] =
-                        saturatingAdd(
-                            scratch.phaseTargetRows()
-                                [phase][owner_index],
-                            scratch.phaseExpertRows()[phase][expert]);
-                }
-            }
-            result.snapshot_observations = saturatingAdd(
-                result.snapshot_observations, observations);
-            /* Before setup calibration is complete, this transaction remains
-             * an observe-only device epoch. Histories still accumulate, so
-             * the first certified decision sees every warmup/prefill sample;
-             * the host cannot substitute an unmeasured placement meanwhile. */
-            if (!economy_ready || observations < minimum_observations)
-                continue;
-
-            /* The economy profile is immutable for the transaction, but its
-             * publication storage is node-local mapped memory. Cache the
-             * current layer once before enumerating thousands of candidate
-             * cycles; all later deterministic arithmetic stays in the exact
-             * admitted device workspace and cannot amplify PCIe latency. */
-            for (std::uint32_t target = 0u;
-                 target < target_count;
-                 ++target)
-            {
-                for (std::uint32_t phase_index = 0u;
-                     phase_index <
-                         kMoEOverlayDeviceControllerDemandPhaseCount;
-                     ++phase_index)
-                {
-                    scratch.serviceRows()[target][phase_index] =
-                        dynamicEconomyServiceCost(
-                            binding, target, layer, phase_index);
-                }
-            }
-            for (std::uint32_t source = 0u;
-                 source < target_count;
-                 ++source)
-            {
-                for (std::uint32_t destination = 0u;
-                     destination < target_count;
-                     ++destination)
-                {
-                    const auto movement = dynamicEconomyMigrationCost(
-                        binding, source, destination, layer);
-                    scratch.transferRows()
-                        [source][destination] =
-                            movement.transfer_and_repack_ns;
-                    scratch.interferenceRows()
-                        [source][destination] =
-                            movement.inference_interference_ns;
-                }
-            }
-            for (std::uint32_t expert = 0u;
-                 expert < expert_count;
-                 ++expert)
-            {
-                scratch.last_moved()[expert] = loadPeerPublished(
-                    binding.economy_last_moved +
-                    static_cast<std::uint64_t>(layer) * expert_count +
-                    expert);
-            }
-            scratch.minimum_residency_generations()[0] = loadPeerPublished(
-                &binding.economy->minimum_residency_generations);
-            scratch.payoff_horizon_tokens()[0] = loadPeerPublished(
-                &binding.economy->payoff_horizon_tokens);
-            scratch.minimum_net_benefit_ns()[0] = loadPeerPublished(
-                &binding.economy->minimum_net_benefit_ns);
-
-            // Selection sort is intentionally explicit: CUDA, HIP, and the
-            // CPU oracle all use count-descending/expert-ascending order.
-            for (std::uint32_t expert = 0u;
-                 expert < expert_count;
-                 ++expert)
-            {
-                scratch.ordered_experts()[expert] = expert;
-            }
-            for (std::uint32_t position = 0u;
-                 position < expert_count;
-                 ++position)
-            {
-                std::uint32_t selected = position;
-                for (std::uint32_t candidate = position + 1u;
-                     candidate < expert_count;
-                     ++candidate)
-                {
-                    const std::uint32_t left =
-                        scratch.ordered_experts()[candidate];
-                    const std::uint32_t right =
-                        scratch.ordered_experts()[selected];
-                    if (scratch.expert_counts()[left] >
-                            scratch.expert_counts()[right] ||
-                        (scratch.expert_counts()[left] ==
-                             scratch.expert_counts()[right] &&
-                         left < right))
-                    {
-                        selected = candidate;
-                    }
-                }
-                const std::uint32_t temporary =
-                    scratch.ordered_experts()[position];
-                scratch.ordered_experts()[position] =
-                    scratch.ordered_experts()[selected];
-                scratch.ordered_experts()[selected] = temporary;
-            }
-
-            std::uint32_t expert_cursor = 0u;
-            for (std::uint32_t priority_index = 0u;
-                 priority_index < priority_count;
-                 ++priority_index)
-            {
-                std::uint32_t member_count = 0u;
-                std::uint32_t group_quota = 0u;
-                for (std::uint32_t participant = 0u;
-                     participant < target_count;
-                     ++participant)
-                {
-                    if (scratch.target_priority()[participant] ==
-                        scratch.priorities()[priority_index])
-                    {
-                        scratch.priority_targets()[member_count] =
-                            participant;
-                        scratch.remaining()[member_count] =
-                            scratch.quotas()[participant];
-                        scratch.target_load()[member_count] = 0u;
-                        group_quota += scratch.quotas()[participant];
-                        ++member_count;
-                    }
-                }
-                for (std::uint32_t slot = 0u;
-                     slot < group_quota;
-                     ++slot)
-                {
-                    if (expert_cursor >= expert_count)
-                    {
-                        failLeader(
-                            binding,
-                            MoEOverlayDeviceControllerError::InvalidSnapshot);
-                        return;
-                    }
-                    const std::uint32_t expert =
-                        scratch.ordered_experts()[expert_cursor++];
-                    std::uint32_t selected = member_count;
-                    for (std::uint32_t member = 0u;
-                         member < member_count;
-                         ++member)
-                    {
-                        if (scratch.remaining()[member] == 0u)
-                            continue;
-                        if (selected == member_count ||
-                            scratch.target_load()[member] <
-                                scratch.target_load()[selected] ||
-                            (scratch.target_load()[member] ==
-                                 scratch.target_load()[selected] &&
-                             scratch.priority_targets()[member] <
-                                 scratch.priority_targets()[selected]))
-                        {
-                            selected = member;
-                        }
-                    }
-                    if (selected == member_count)
-                    {
-                        failLeader(
-                            binding,
-                            MoEOverlayDeviceControllerError::InvalidSnapshot);
-                        return;
-                    }
-                    scratch.desired_owner()[expert] =
-                        static_cast<std::int32_t>(
-                            scratch.priority_targets()[selected]);
-                    --scratch.remaining()[selected];
-                    scratch.target_load()[selected] = saturatingAdd(
-                        scratch.target_load()[selected],
-                        scratch.expert_counts()[expert]);
-                }
-            }
-            if (expert_cursor != expert_count)
-            {
-                failLeader(
-                    binding,
-                    MoEOverlayDeviceControllerError::InvalidSnapshot);
                 return;
             }
 
-            DynamicPlacementScore working_score = scoreDynamicLayer(
-                scratch,
-                scratch.current_owner(),
-                target_count,
-                expert_count,
-                priority_count);
-            result.priority_cost_before = saturatingAdd(
-                result.priority_cost_before,
-                working_score.priority_cost);
-            result.same_priority_makespan_before = saturatingAdd(
-                result.same_priority_makespan_before,
-                working_score.same_priority_makespan);
+            std::uint64_t layer_observed_activations = 0u;
+            DynamicPlacementScore working_score{};
+            bool working_load_saturated = target_count > kMaxCachedTargets;
 
-            bool changed_layer = false;
-            std::uint32_t layer_cycles = 0u;
-            while (result.accepted_cycles < maximum_cycles &&
-                   layer_cycles < maximum_cycles_per_layer)
+            if (tid == 0u)
             {
-                const auto preferred_objective =
-                    axis_progress.nextObjective(
-                        maximum_cycles, result.accepted_cycles);
-                /* Decompose the remaining owner/target multigraph into its
-                 * canonical disjoint cycles, then admit the best measured
-                 * payoff. Expert-id order is only the final deterministic
-                 * tie break; it is no longer an accidental economy policy. */
-                for (std::uint32_t expert = 0u;
-                     expert < expert_count;
-                     ++expert)
+                const std::uint64_t observations = s_obs_reduce[0];
+                result.snapshot_observations = saturatingAdd(
+                    result.snapshot_observations, observations);
+                if (!economy_ready || observations < s_hdr.minimum_observations)
                 {
-                    scratch.enumerated()[expert] = scratch.excluded()[expert];
+                    s_hdr.layer_action = 0u;
                 }
-                std::uint32_t best_cycle_length = 0u;
-                DynamicCycleEconomyScore best_economy{};
-                std::uint32_t fallback_cycle_length = 0u;
-                DynamicCycleEconomyScore fallback_economy{};
-                while (true)
-                {
-                    const std::uint32_t cycle_length = findDynamicCycle(
-                        scratch,
-                        scratch.enumerated(),
-                        target_count,
-                        expert_count);
-                    if (cycle_length == 0u)
-                        break;
-                    for (std::uint32_t edge = 0u;
-                         edge < cycle_length;
-                         ++edge)
-                    {
-                        scratch.enumerated()[scratch.cycle()[edge]] = 1u;
-                    }
-                    if (result.command_count + cycle_length > maximum_commands)
-                        continue;
-
-                    for (std::uint32_t expert = 0u;
-                         expert < expert_count;
-                         ++expert)
-                    {
-                        scratch.candidate_owner()[expert] =
-                            scratch.current_owner()[expert];
-                    }
-                    for (std::uint32_t edge = 0u;
-                         edge < cycle_length;
-                         ++edge)
-                    {
-                        const std::uint32_t expert = scratch.cycle()[edge];
-                        scratch.candidate_owner()[expert] =
-                            scratch.desired_owner()[expert];
-                    }
-                    const DynamicPlacementScore candidate_score =
-                        scoreDynamicLayer(
-                            scratch,
-                            scratch.candidate_owner(),
-                            target_count,
-                            expert_count,
-                            priority_count);
-                    const bool improves_priority =
-                        candidate_score.priority_cost <
-                        working_score.priority_cost;
-                    const bool targets_skew =
-                        !improves_priority &&
-                        samePriorityDynamicCycleIsEligible(
-                            scratch,
-                            cycle_length,
-                            target_count,
-                            expert_count,
-                            imbalance_threshold_per_mille);
-                    if (!improves_priority && !targets_skew)
-                    {
-                        ++result.rejected_cycles;
-                        for (std::uint32_t edge = 0u;
-                             edge < cycle_length;
-                             ++edge)
-                        {
-                            scratch.excluded()[scratch.cycle()[edge]] = 1u;
-                        }
-                        continue;
-                    }
-
-                    const DynamicCycleEconomyScore economy =
-                        scoreDynamicCycleEconomy(
-                            binding,
-                            scratch,
-                            cycle_length,
-                            layer,
-                            target_count,
-                            expert_count,
-                            transaction,
-                            minimum_improvement_per_mille);
-                    result.residency_rejected_cycles +=
-                        economy.residency_eligible ? 0u : 1u;
-                    result.phase_tradeoff_candidates +=
-                        economy.phase_non_regressing ? 0u : 1u;
-                    result.improvement_floor_rejected_cycles +=
-                        economy.improvement_floor_met ? 0u : 1u;
-                    result.payoff_rejected_cycles +=
-                        economy.improvement_floor_met &&
-                                !economy.payoff_eligible
-                            ? 1u
-                            : 0u;
-                    if (!economy.eligible())
-                    {
-                        ++result.rejected_cycles;
-                        /* Reconsider the cycle in a later transaction after
-                         * demand, prices, or hysteresis age changes. Within
-                         * this bounded wave it cannot become admissible until
-                         * another cycle changes placement, so exclude it. */
-                        for (std::uint32_t edge = 0u;
-                             edge < cycle_length;
-                             ++edge)
-                        {
-                            scratch.excluded()[scratch.cycle()[edge]] = 1u;
-                        }
-                        continue;
-                    }
-                    if (fallback_cycle_length == 0u ||
-                        dynamicEconomyScoreBetter(
-                            economy, fallback_economy))
-                    {
-                        fallback_cycle_length = cycle_length;
-                        fallback_economy = economy;
-                        for (std::uint32_t edge = 0u;
-                             edge < cycle_length;
-                             ++edge)
-                        {
-                            scratch.fallback_cycle()[edge] =
-                                scratch.cycle()[edge];
-                        }
-                    }
-                    const bool advances_participant =
-                        candidate_score.same_priority_makespan <
-                        working_score.same_priority_makespan;
-                    if (moe_rebalance_policy::
-                            DynamicPlacementAxisProgress::matches(
-                                preferred_objective,
-                                improves_priority,
-                                advances_participant) &&
-                        (best_cycle_length == 0u ||
-                         dynamicEconomyScoreBetter(
-                             economy, best_economy)))
-                    {
-                        best_cycle_length = cycle_length;
-                        best_economy = economy;
-                        for (std::uint32_t edge = 0u;
-                             edge < cycle_length;
-                             ++edge)
-                        {
-                            scratch.best_cycle()[edge] = scratch.cycle()[edge];
-                        }
-                    }
-                }
-
-                /* The reservation belongs to the complete wave. A later layer
-                 * gets an admission opportunity before this layer can spend
-                 * the slot on its ordinary economy fallback. */
-                if (moe_rebalance_policy::DynamicPlacementAxisProgress::
-                        searchesLaterLayerBeforeFallback(
-                            preferred_objective,
-                            best_cycle_length != 0u,
-                            layer_offset,
-                            layer_count))
-                {
-                    break;
-                }
-
-                /* The final layer preserves ordinary economy when no layer
-                 * exposed the preferred independent objective. */
-                if (best_cycle_length == 0u)
-                {
-                    best_cycle_length = fallback_cycle_length;
-                    best_economy = fallback_economy;
-                    for (std::uint32_t edge = 0u;
-                         edge < fallback_cycle_length;
-                         ++edge)
-                    {
-                        scratch.best_cycle()[edge] =
-                            scratch.fallback_cycle()[edge];
-                    }
-                }
-                if (best_cycle_length == 0u)
-                    break;
-                for (std::uint32_t edge = 0u;
-                     edge < best_cycle_length;
-                     ++edge)
-                {
-                    scratch.cycle()[edge] = scratch.best_cycle()[edge];
-                }
-                for (std::uint32_t expert = 0u;
-                     expert < expert_count;
-                     ++expert)
-                {
-                    scratch.candidate_owner()[expert] =
-                        scratch.current_owner()[expert];
-                }
-                for (std::uint32_t edge = 0u;
-                     edge < best_cycle_length;
-                     ++edge)
-                {
-                    const std::uint32_t expert = scratch.cycle()[edge];
-                    scratch.candidate_owner()[expert] =
-                        scratch.desired_owner()[expert];
-                }
-                const DynamicPlacementScore candidate_score =
-                    scoreDynamicLayer(
-                        scratch,
-                        scratch.candidate_owner(),
-                        target_count,
-                        expert_count,
-                        priority_count);
-                const bool advances_priority =
-                    candidate_score.priority_cost <
-                    working_score.priority_cost;
-                const bool advances_participant =
-                    candidate_score.same_priority_makespan <
-                    working_score.same_priority_makespan;
-                axis_progress.observe(
-                    advances_priority, advances_participant);
-                bool crosses_tier = false, stays_in_tier = false;
-                for (std::uint32_t edge = 0u; edge < best_cycle_length; ++edge)
-                {
-                    const auto expert = scratch.cycle()[edge];
-                    const bool same = scratch.target_tier()[scratch.current_owner()[expert]] ==
-                        scratch.target_tier()[scratch.desired_owner()[expert]];
-                    crosses_tier = crosses_tier || !same;
-                    stays_in_tier = stays_in_tier || same;
-                }
-                const auto movement_axis = crosses_tier
-                    ? (stays_in_tier ? MoEOverlayDeviceMovementAxis::Combined : MoEOverlayDeviceMovementAxis::TierResidency)
-                    : MoEOverlayDeviceMovementAxis::ParticipantPlacement;
-
-                const std::uint64_t payload_bytes = loadPeerPublished(
-                    binding.payload_bytes_per_layer + layer);
-                if (payload_bytes == 0u)
-                {
-                    failLeader(binding, MoEOverlayDeviceControllerError::InvalidControl);
-                    return;
-                }
-
-                for (std::uint32_t edge = 0u;
-                     edge < best_cycle_length;
-                     ++edge)
-                {
-                    const std::uint32_t expert = scratch.cycle()[edge];
-                    const auto source = static_cast<std::uint32_t>(
-                        scratch.current_owner()[expert]);
-                    const auto destination = static_cast<std::uint32_t>(
-                        scratch.desired_owner()[expert]);
-                    MoEOverlayDeviceMovementCommand command{};
-                    command.op = raw(
-                        MoEOverlayDeviceMovementOp::DurableMove);
-                    command.layer = layer;
-                    command.expert = expert;
-                    command.source_target = logicalPolicyTarget(binding, source);
-                    command.destination_target = logicalPolicyTarget(binding, destination);
-                    command.flags = moeOverlayMovementFlags(
-                        movement_axis, result.accepted_cycles + 1u);
-                    command.payload_bytes = payload_bytes;
-                    command.source_epoch = base_epoch;
-                    command.candidate_epoch = candidate_epoch;
-                    binding.command_entries[result.command_count++] = command;
-
-                    const std::int32_t source_priority =
-                        scratch.target_priority()[source];
-                    const std::int32_t destination_priority =
-                        scratch.target_priority()[destination];
-                    if (destination_priority < source_priority)
-                        ++result.promotions;
-                    else if (destination_priority > source_priority)
-                        ++result.demotions;
-                    else
-                        ++result.same_priority_moves;
-                }
-                for (std::uint32_t expert = 0u;
-                     expert < expert_count;
-                     ++expert)
-                {
-                    scratch.current_owner()[expert] =
-                        scratch.candidate_owner()[expert];
-                    /* Economy rejection belongs to the placement that was
-                     * just replaced. Removing one straggler can make a
-                     * previously neutral cycle the next critical-path win. */
-                    scratch.excluded()[expert] = 0u;
-                }
-                /* Keep the layer-local critical-path cache coherent with the
-                 * newly accepted owner map. Later cycle candidates in this
-                 * same wave then price against exactly the placement they
-                 * would follow, without rebuilding all expert loads. */
-                for (std::uint32_t phase = 0u;
-                     phase < kMoEOverlayDeviceControllerDemandPhaseCount;
-                     ++phase)
+                else
                 {
                     for (std::uint32_t participant = 0u;
                          participant < target_count;
                          ++participant)
                     {
-                        scratch.phaseTargetRows()[phase][participant] =
-                            0u;
+                        scratch.quotas()[participant] = 0u;
+                        for (std::uint32_t phase = 0u;
+                             phase < kMoEOverlayDeviceControllerDemandPhaseCount;
+                             ++phase)
+                        {
+                            scratch.phaseTargetRows()[phase][participant] = 0u;
+                        }
+                        if (participant < kMaxCachedTargets)
+                            s_working_load[participant] = 0u;
                     }
                     for (std::uint32_t expert = 0u;
                          expert < expert_count;
                          ++expert)
                     {
-                        const auto owner = static_cast<std::uint32_t>(
+                        const auto owner_index = static_cast<std::uint32_t>(
                             scratch.current_owner()[expert]);
-                        scratch.phaseTargetRows()[phase][owner] =
-                            saturatingAdd(
-                                scratch.phaseTargetRows()[phase][owner],
-                                scratch.phaseExpertRows()[phase][expert]);
+                        const std::uint64_t cnt = s_expert_counts[expert];
+                        ++scratch.quotas()[owner_index];
+                        layer_observed_activations = saturatingAdd(
+                            layer_observed_activations, cnt);
+                        if (owner_index < kMaxCachedTargets)
+                        {
+                            s_working_load[owner_index] = saturatingAdd(
+                                s_working_load[owner_index], cnt);
+                        }
+                        for (std::uint32_t phase = 0u;
+                             phase < kMoEOverlayDeviceControllerDemandPhaseCount;
+                             ++phase)
+                        {
+                            scratch.phaseTargetRows()[phase][owner_index] =
+                                saturatingAdd(
+                                    scratch.phaseTargetRows()[phase][owner_index],
+                                    scratch.phaseExpertRows()[phase][expert]);
+                        }
+                    }
+
+                    if (result.accepted_cycles >= s_hdr.maximum_cycles)
+                    {
+                        /* Wave budget is full: skip PCIe economy loads,
+                         * expert sorting, greedy target assignment, and cycle
+                         * search while preserving exact layer score totals. */
+                        working_score = scoreDynamicLayer(
+                            scratch,
+                            scratch.current_owner(),
+                            target_count,
+                            expert_count,
+                            s_hdr.priority_count);
+                        result.priority_cost_before = saturatingAdd(
+                            result.priority_cost_before,
+                            working_score.priority_cost);
+                        result.same_priority_makespan_before = saturatingAdd(
+                            result.same_priority_makespan_before,
+                            working_score.same_priority_makespan);
+                        result.priority_cost_after = saturatingAdd(
+                            result.priority_cost_after,
+                            working_score.priority_cost);
+                        result.same_priority_makespan_after = saturatingAdd(
+                            result.same_priority_makespan_after,
+                            working_score.same_priority_makespan);
+                        s_hdr.layer_action = 1u;
+                    }
+                    else
+                    {
+                        s_hdr.layer_action = 2u;
                     }
                 }
-                working_score = candidate_score;
-                result.projected_service_gain_ns = saturatingAdd(
-                    result.projected_service_gain_ns,
-                    best_economy.projected_service_gain_ns);
-                result.projected_transfer_and_repack_ns = saturatingAdd(
-                    result.projected_transfer_and_repack_ns,
-                    best_economy.transfer_and_repack_ns);
-                result.projected_inference_interference_ns = saturatingAdd(
-                    result.projected_inference_interference_ns,
-                    best_economy.inference_interference_ns);
-                result.projected_net_benefit_ns = saturatingAdd(
-                    result.projected_net_benefit_ns,
-                    best_economy.projected_net_benefit_ns);
-                ++result.accepted_cycles;
-                ++layer_cycles;
-                changed_layer = true;
             }
-            if (changed_layer)
+            __syncthreads();
+
+            if (s_hdr.layer_action != 2u)
+                continue;
+
+            /* Parallel coalesced load of last_moved + parallel exact rank sort
+             * (count descending, expert ascending) in shared memory. */
+            const std::uint64_t last_moved_layer_base =
+                static_cast<std::uint64_t>(layer) * expert_count;
+            for (std::uint32_t expert = tid;
+                 expert < expert_count;
+                 expert += kControllerThreads)
             {
-                ++result.changed_layers;
-                result.layer_scan_next = (layer + 1u) % layer_count;
+                scratch.last_moved()[expert] = loadPeerPublished(
+                    binding.economy_last_moved +
+                    last_moved_layer_base + expert);
+                const std::uint64_t my_count = s_expert_counts[expert];
+                std::uint32_t rank = 0u;
+                for (std::uint32_t other = 0u;
+                     other < expert_count;
+                     ++other)
+                {
+                    const std::uint64_t oc = s_expert_counts[other];
+                    if (oc > my_count || (oc == my_count && other < expert))
+                        ++rank;
+                }
+                scratch.ordered_experts()[rank] = expert;
             }
-            result.priority_cost_after = saturatingAdd(
-                result.priority_cost_after,
-                working_score.priority_cost);
-            result.same_priority_makespan_after = saturatingAdd(
-                result.same_priority_makespan_after,
-                working_score.same_priority_makespan);
+            __syncthreads();
+
+            if (tid == 0u)
+            {
+                const std::uint32_t priority_count = s_hdr.priority_count;
+                for (std::uint32_t target = 0u;
+                     target < target_count;
+                     ++target)
+                {
+                    for (std::uint32_t phase_index = 0u;
+                         phase_index <
+                             kMoEOverlayDeviceControllerDemandPhaseCount;
+                         ++phase_index)
+                    {
+                        scratch.serviceRows()[target][phase_index] =
+                            dynamicEconomyServiceCost(
+                                binding, target, layer, phase_index);
+                    }
+                }
+                for (std::uint32_t source = 0u;
+                     source < target_count;
+                     ++source)
+                {
+                    for (std::uint32_t destination = 0u;
+                         destination < target_count;
+                         ++destination)
+                    {
+                        const auto movement = dynamicEconomyMigrationCost(
+                            binding, source, destination, layer);
+                        scratch.transferRows()[source][destination] =
+                            movement.transfer_and_repack_ns;
+                        scratch.interferenceRows()[source][destination] =
+                            movement.inference_interference_ns;
+                    }
+                }
+                scratch.minimum_residency_generations()[0] = loadPeerPublished(
+                    &binding.economy->minimum_residency_generations);
+                scratch.payoff_horizon_tokens()[0] = loadPeerPublished(
+                    &binding.economy->payoff_horizon_tokens);
+                scratch.minimum_net_benefit_ns()[0] = loadPeerPublished(
+                    &binding.economy->minimum_net_benefit_ns);
+
+                std::uint32_t expert_cursor = 0u;
+                bool greedy_ok = true;
+                for (std::uint32_t priority_index = 0u;
+                     priority_index < priority_count && greedy_ok;
+                     ++priority_index)
+                {
+                    std::uint32_t member_count = 0u;
+                    std::uint32_t group_quota = 0u;
+                    for (std::uint32_t participant = 0u;
+                         participant < target_count;
+                         ++participant)
+                    {
+                        if (scratch.target_priority()[participant] ==
+                            scratch.priorities()[priority_index])
+                        {
+                            scratch.priority_targets()[member_count] =
+                                participant;
+                            scratch.remaining()[member_count] =
+                                scratch.quotas()[participant];
+                            scratch.target_load()[member_count] = 0u;
+                            group_quota += scratch.quotas()[participant];
+                            ++member_count;
+                        }
+                    }
+                    for (std::uint32_t slot = 0u;
+                         slot < group_quota;
+                         ++slot)
+                    {
+                        if (expert_cursor >= expert_count)
+                        {
+                            greedy_ok = false;
+                            break;
+                        }
+                        const std::uint32_t expert =
+                            scratch.ordered_experts()[expert_cursor++];
+                        std::uint32_t selected = member_count;
+                        for (std::uint32_t member = 0u;
+                             member < member_count;
+                             ++member)
+                        {
+                            if (scratch.remaining()[member] == 0u)
+                                continue;
+                            if (selected == member_count ||
+                                scratch.target_load()[member] <
+                                    scratch.target_load()[selected] ||
+                                (scratch.target_load()[member] ==
+                                     scratch.target_load()[selected] &&
+                                 scratch.priority_targets()[member] <
+                                     scratch.priority_targets()[selected]))
+                            {
+                                selected = member;
+                            }
+                        }
+                        if (selected == member_count)
+                        {
+                            greedy_ok = false;
+                            break;
+                        }
+                        const std::int32_t assigned_target =
+                            static_cast<std::int32_t>(
+                                scratch.priority_targets()[selected]);
+                        scratch.desired_owner()[expert] = assigned_target;
+                        s_des_owner[expert] =
+                            static_cast<std::int16_t>(assigned_target);
+                        --scratch.remaining()[selected];
+                        scratch.target_load()[selected] = saturatingAdd(
+                            scratch.target_load()[selected],
+                            s_expert_counts[expert]);
+                    }
+                }
+                if (!greedy_ok || expert_cursor != expert_count)
+                {
+                    failLeader(
+                        binding,
+                        MoEOverlayDeviceControllerError::InvalidSnapshot);
+                    s_hdr.ok = 0u;
+                }
+                else
+                {
+                    working_score = scoreDynamicLayer(
+                        scratch,
+                        scratch.current_owner(),
+                        target_count,
+                        expert_count,
+                        priority_count);
+                    working_load_saturated =
+                        target_count > kMaxCachedTargets ||
+                        working_score.priority_cost == ~0ull;
+                    if (!working_load_saturated)
+                    {
+                        for (std::uint32_t p = 0u; p < target_count; ++p)
+                        {
+                            if (s_working_load[p] == ~0ull)
+                            {
+                                working_load_saturated = true;
+                                break;
+                            }
+                        }
+                    }
+                    result.priority_cost_before = saturatingAdd(
+                        result.priority_cost_before,
+                        working_score.priority_cost);
+                    result.same_priority_makespan_before = saturatingAdd(
+                        result.same_priority_makespan_before,
+                        working_score.same_priority_makespan);
+
+                    bool changed_layer = false;
+                    std::uint32_t layer_cycles = 0u;
+                    const bool use_compressed_search =
+                        target_count <= kMaxCompressedTargets &&
+                        expert_count <= kMoEOverlayDeviceControllerFabricMaxExperts;
+                    std::uint32_t *const cycle_out = scratch.cycle();
+                    while (result.accepted_cycles < s_hdr.maximum_cycles &&
+                           layer_cycles < s_hdr.maximum_cycles_per_layer)
+                    {
+                        const auto preferred_objective =
+                            axis_progress.nextObjective(
+                                s_hdr.maximum_cycles, result.accepted_cycles);
+                        if (use_compressed_search)
+                        {
+                            const std::uint32_t pair_slots =
+                                target_count * target_count;
+                            for (std::uint32_t idx = 0u;
+                                 idx < pair_slots;
+                                 ++idx)
+                            {
+                                s_pair_head[idx] = kCompressedEdgeNone;
+                                s_dead_pair[idx] = 0u;
+                            }
+                            for (std::uint32_t rev = expert_count;
+                                 rev != 0u;
+                                 --rev)
+                            {
+                                const std::uint32_t expert = rev - 1u;
+                                const std::uint8_t ex = s_excl[expert];
+                                s_enum[expert] = ex;
+                                if (ex != 0u)
+                                    continue;
+                                const auto u = static_cast<std::uint32_t>(
+                                    s_cur_owner[expert]);
+                                const auto v = static_cast<std::uint32_t>(
+                                    s_des_owner[expert]);
+                                if (u == v)
+                                    continue;
+                                const std::uint32_t slot =
+                                    u * target_count + v;
+                                s_pair_next[expert] = s_pair_head[slot];
+                                s_pair_head[slot] =
+                                    static_cast<std::uint16_t>(expert);
+                            }
+                        }
+                        else
+                        {
+                            for (std::uint32_t expert = 0u;
+                                 expert < expert_count;
+                                 ++expert)
+                            {
+                                scratch.enumerated()[expert] =
+                                    scratch.excluded()[expert];
+                            }
+                        }
+                        std::uint32_t best_cycle_length = 0u;
+                        DynamicCycleEconomyScore best_economy{};
+                        DynamicPlacementScore best_score{};
+                        std::uint32_t fallback_cycle_length = 0u;
+                        DynamicCycleEconomyScore fallback_economy{};
+                        DynamicPlacementScore fallback_score{};
+                        std::uint32_t search_first = 0u;
+                        while (true)
+                        {
+                            std::uint32_t cycle_length = 0u;
+                            if (use_compressed_search)
+                            {
+                                /* Exact compressed canonical cycle search on
+                                 * the target_count-vertex minimum-edge graph
+                                 * in shared memory. Because DFS never reopens
+                                 * a visited vertex and visits edges in strict
+                                 * ascending expert-id order, only the smallest
+                                 * available edge per (u, v) pair can ever be
+                                 * traversed at depth >= 1, and dead (start,
+                                 * next) pairs remain unreachable as enumerated
+                                 * edges monotonically shrink the graph. */
+                                for (std::uint32_t first = search_first;
+                                     first < expert_count;
+                                     ++first)
+                                {
+                                    if (s_enum[first] != 0u)
+                                        continue;
+                                    const auto start =
+                                        static_cast<std::uint32_t>(
+                                            s_cur_owner[first]);
+                                    const auto next =
+                                        static_cast<std::uint32_t>(
+                                            s_des_owner[first]);
+                                    if (start == next ||
+                                        s_dead_pair[start * target_count +
+                                                    next] != 0u)
+                                    {
+                                        continue;
+                                    }
+                                    cycle_out[0] = first;
+                                    for (std::uint32_t p = 0u;
+                                         p < target_count;
+                                         ++p)
+                                    {
+                                        s_dfs_visited[p] = 0u;
+                                    }
+                                    s_dfs_visited[start] = 1u;
+                                    s_dfs_visited[next] = 1u;
+                                    std::uint32_t depth = 1u;
+                                    s_dfs_sources[1] =
+                                        static_cast<std::uint8_t>(next);
+                                    s_dfs_min_edge[1] = 0u;
+                                    while (true)
+                                    {
+                                        const std::uint32_t u =
+                                            s_dfs_sources[depth];
+                                        const std::uint16_t min_e =
+                                            s_dfs_min_edge[depth];
+                                        std::uint16_t best_e =
+                                            kCompressedEdgeNone;
+                                        std::uint32_t best_v = target_count;
+                                        const std::uint32_t row_base =
+                                            u * target_count;
+                                        for (std::uint32_t v = 0u;
+                                             v < target_count;
+                                             ++v)
+                                        {
+                                            if (v == u)
+                                                continue;
+                                            std::uint16_t h =
+                                                s_pair_head[row_base + v];
+                                            while (h != kCompressedEdgeNone &&
+                                                   s_enum[h] != 0u)
+                                            {
+                                                h = s_pair_next[h];
+                                            }
+                                            s_pair_head[row_base + v] = h;
+                                            if (h != kCompressedEdgeNone &&
+                                                h >= min_e && h < best_e)
+                                            {
+                                                best_e = h;
+                                                best_v = v;
+                                            }
+                                        }
+                                        if (best_e == kCompressedEdgeNone)
+                                        {
+                                            if (depth == 1u)
+                                                break;
+                                            --depth;
+                                            continue;
+                                        }
+                                        s_dfs_min_edge[depth] =
+                                            static_cast<std::uint16_t>(
+                                                best_e + 1u);
+                                        if (best_v == start)
+                                        {
+                                            cycle_out[depth] = best_e;
+                                            cycle_length = depth + 1u;
+                                            break;
+                                        }
+                                        if (s_dfs_visited[best_v] == 0u &&
+                                            depth + 1u < target_count)
+                                        {
+                                            s_dfs_visited[best_v] = 1u;
+                                            cycle_out[depth] = best_e;
+                                            ++depth;
+                                            s_dfs_sources[depth] =
+                                                static_cast<std::uint8_t>(
+                                                    best_v);
+                                            s_dfs_min_edge[depth] = 0u;
+                                        }
+                                    }
+                                    if (cycle_length != 0u)
+                                        break;
+                                    s_dead_pair[start * target_count + next] =
+                                        1u;
+                                }
+                            }
+                            else
+                            {
+                                cycle_length = findDynamicCycle(
+                                    scratch,
+                                    scratch.enumerated(),
+                                    target_count,
+                                    expert_count,
+                                    search_first);
+                            }
+                            if (cycle_length == 0u)
+                                break;
+                            search_first = cycle_out[0] + 1u;
+                            for (std::uint32_t edge = 0u;
+                                 edge < cycle_length;
+                                 ++edge)
+                            {
+                                const std::uint32_t e = cycle_out[edge];
+                                if (use_compressed_search)
+                                    s_enum[e] = 1u;
+                                else
+                                    scratch.enumerated()[e] = 1u;
+                            }
+                            if (result.command_count + cycle_length >
+                                s_hdr.maximum_commands)
+                            {
+                                continue;
+                            }
+
+                            /* Compute candidate score in O(cycle_length + target_count)
+                             * from maintained target loads; fall back to full scan
+                             * only if any uint64 total saturates or target_count > 64. */
+                            DynamicPlacementScore candidate_score{};
+                            bool used_incremental = false;
+                            if (!working_load_saturated)
+                            {
+                                for (std::uint32_t p = 0u;
+                                     p < target_count;
+                                     ++p)
+                                {
+                                    s_candidate_load[p] = s_working_load[p];
+                                }
+                                std::uint64_t cand_priority_cost =
+                                    working_score.priority_cost;
+                                bool overflowed = false;
+                                for (std::uint32_t edge = 0u;
+                                     edge < cycle_length;
+                                     ++edge)
+                                {
+                                    const std::uint32_t expert =
+                                        scratch.cycle()[edge];
+                                    const auto src = static_cast<std::uint32_t>(
+                                        scratch.current_owner()[expert]);
+                                    const auto dst = static_cast<std::uint32_t>(
+                                        scratch.desired_owner()[expert]);
+                                    const std::uint64_t cnt =
+                                        s_expert_counts[expert];
+                                    s_candidate_load[src] -= cnt;
+                                    if (s_candidate_load[dst] > ~0ull - cnt)
+                                    {
+                                        overflowed = true;
+                                        break;
+                                    }
+                                    s_candidate_load[dst] += cnt;
+                                    const std::uint64_t src_term =
+                                        saturatingMultiply(
+                                            cnt, s_target_priority_rank[src]);
+                                    const std::uint64_t dst_term =
+                                        saturatingMultiply(
+                                            cnt, s_target_priority_rank[dst]);
+                                    if (src_term == ~0ull || dst_term == ~0ull)
+                                    {
+                                        overflowed = true;
+                                        break;
+                                    }
+                                    if (dst_term >= src_term)
+                                    {
+                                        const std::uint64_t delta =
+                                            dst_term - src_term;
+                                        if (cand_priority_cost > ~0ull - delta)
+                                        {
+                                            overflowed = true;
+                                            break;
+                                        }
+                                        cand_priority_cost += delta;
+                                    }
+                                    else
+                                    {
+                                        cand_priority_cost -=
+                                            (src_term - dst_term);
+                                    }
+                                }
+                                if (!overflowed)
+                                {
+                                    candidate_score.priority_cost =
+                                        cand_priority_cost;
+                                    std::uint64_t makespan = 0u;
+                                    for (std::uint32_t priority = 0u;
+                                         priority < priority_count;
+                                         ++priority)
+                                    {
+                                        std::uint64_t maximum = 0u;
+                                        const std::int32_t target_prio =
+                                            scratch.priorities()[priority];
+                                        for (std::uint32_t p = 0u;
+                                             p < target_count;
+                                             ++p)
+                                        {
+                                            if (scratch.target_priority()[p] ==
+                                                target_prio)
+                                            {
+                                                const std::uint64_t load =
+                                                    s_candidate_load[p];
+                                                maximum = load > maximum
+                                                              ? load
+                                                              : maximum;
+                                            }
+                                        }
+                                        makespan = saturatingAdd(
+                                            makespan, maximum);
+                                    }
+                                    candidate_score.same_priority_makespan =
+                                        makespan;
+                                    used_incremental = true;
+                                }
+                            }
+                            if (!used_incremental)
+                            {
+                                for (std::uint32_t expert = 0u;
+                                     expert < expert_count;
+                                     ++expert)
+                                {
+                                    scratch.candidate_owner()[expert] =
+                                        scratch.current_owner()[expert];
+                                }
+                                for (std::uint32_t edge = 0u;
+                                     edge < cycle_length;
+                                     ++edge)
+                                {
+                                    const std::uint32_t expert =
+                                        scratch.cycle()[edge];
+                                    scratch.candidate_owner()[expert] =
+                                        scratch.desired_owner()[expert];
+                                }
+                                candidate_score = scoreDynamicLayer(
+                                    scratch,
+                                    scratch.candidate_owner(),
+                                    target_count,
+                                    expert_count,
+                                    priority_count);
+                            }
+
+                            const bool improves_priority =
+                                candidate_score.priority_cost <
+                                working_score.priority_cost;
+                            const bool targets_skew =
+                                !improves_priority &&
+                                samePriorityDynamicCycleIsEligible(
+                                    scratch,
+                                    cycle_length,
+                                    target_count,
+                                    expert_count,
+                                    s_hdr.imbalance_threshold_per_mille,
+                                    working_load_saturated ? nullptr
+                                                           : s_working_load);
+                            if (!improves_priority && !targets_skew)
+                            {
+                                ++result.rejected_cycles;
+                                for (std::uint32_t edge = 0u;
+                                     edge < cycle_length;
+                                     ++edge)
+                                {
+                                    const std::uint32_t e = cycle_out[edge];
+                                    scratch.excluded()[e] = 1u;
+                                    if (use_compressed_search)
+                                        s_excl[e] = 1u;
+                                }
+                                continue;
+                            }
+
+                            const DynamicCycleEconomyScore economy =
+                                scoreDynamicCycleEconomy(
+                                    binding,
+                                    scratch,
+                                    cycle_length,
+                                    layer,
+                                    target_count,
+                                    expert_count,
+                                    s_hdr.transaction,
+                                    s_hdr.minimum_improvement_per_mille,
+                                    &layer_observed_activations,
+                                    s_hdr.routed_experts_per_token);
+                            result.residency_rejected_cycles +=
+                                economy.residency_eligible ? 0u : 1u;
+                            result.phase_tradeoff_candidates +=
+                                economy.phase_non_regressing ? 0u : 1u;
+                            result.improvement_floor_rejected_cycles +=
+                                economy.improvement_floor_met ? 0u : 1u;
+                            result.payoff_rejected_cycles +=
+                                economy.improvement_floor_met &&
+                                        !economy.payoff_eligible
+                                    ? 1u
+                                    : 0u;
+                            if (!economy.eligible())
+                            {
+                                ++result.rejected_cycles;
+                                for (std::uint32_t edge = 0u;
+                                     edge < cycle_length;
+                                     ++edge)
+                                {
+                                    const std::uint32_t e = cycle_out[edge];
+                                    scratch.excluded()[e] = 1u;
+                                    if (use_compressed_search)
+                                        s_excl[e] = 1u;
+                                }
+                                continue;
+                            }
+                            if (fallback_cycle_length == 0u ||
+                                dynamicEconomyScoreBetter(
+                                    economy, fallback_economy))
+                            {
+                                fallback_cycle_length = cycle_length;
+                                fallback_economy = economy;
+                                fallback_score = candidate_score;
+                                for (std::uint32_t edge = 0u;
+                                     edge < cycle_length;
+                                     ++edge)
+                                {
+                                    scratch.fallback_cycle()[edge] =
+                                        scratch.cycle()[edge];
+                                }
+                            }
+                            const bool advances_participant =
+                                candidate_score.same_priority_makespan <
+                                working_score.same_priority_makespan;
+                            if (moe_rebalance_policy::
+                                    DynamicPlacementAxisProgress::matches(
+                                        preferred_objective,
+                                        improves_priority,
+                                        advances_participant) &&
+                                (best_cycle_length == 0u ||
+                                 dynamicEconomyScoreBetter(
+                                     economy, best_economy)))
+                            {
+                                best_cycle_length = cycle_length;
+                                best_economy = economy;
+                                best_score = candidate_score;
+                                for (std::uint32_t edge = 0u;
+                                     edge < cycle_length;
+                                     ++edge)
+                                {
+                                    scratch.best_cycle()[edge] =
+                                        scratch.cycle()[edge];
+                                }
+                            }
+                        }
+
+                        if (moe_rebalance_policy::DynamicPlacementAxisProgress::
+                                searchesLaterLayerBeforeFallback(
+                                    preferred_objective,
+                                    best_cycle_length != 0u,
+                                    layer_offset,
+                                    layer_count))
+                        {
+                            break;
+                        }
+
+                        if (best_cycle_length == 0u)
+                        {
+                            best_cycle_length = fallback_cycle_length;
+                            best_economy = fallback_economy;
+                            best_score = fallback_score;
+                            for (std::uint32_t edge = 0u;
+                                 edge < fallback_cycle_length;
+                                 ++edge)
+                            {
+                                scratch.best_cycle()[edge] =
+                                    scratch.fallback_cycle()[edge];
+                            }
+                        }
+                        if (best_cycle_length == 0u)
+                            break;
+                        for (std::uint32_t edge = 0u;
+                             edge < best_cycle_length;
+                             ++edge)
+                        {
+                            scratch.cycle()[edge] = scratch.best_cycle()[edge];
+                        }
+                        const DynamicPlacementScore candidate_score =
+                            best_score;
+                        const bool advances_priority =
+                            candidate_score.priority_cost <
+                            working_score.priority_cost;
+                        const bool advances_participant =
+                            candidate_score.same_priority_makespan <
+                            working_score.same_priority_makespan;
+                        axis_progress.observe(
+                            advances_priority, advances_participant);
+                        bool crosses_tier = false, stays_in_tier = false;
+                        for (std::uint32_t edge = 0u;
+                             edge < best_cycle_length;
+                             ++edge)
+                        {
+                            const auto expert = scratch.cycle()[edge];
+                            const bool same =
+                                scratch.target_tier()[scratch.current_owner()[expert]] ==
+                                scratch.target_tier()[scratch.desired_owner()[expert]];
+                            crosses_tier = crosses_tier || !same;
+                            stays_in_tier = stays_in_tier || same;
+                        }
+                        const auto movement_axis = crosses_tier
+                            ? (stays_in_tier
+                                   ? MoEOverlayDeviceMovementAxis::Combined
+                                   : MoEOverlayDeviceMovementAxis::TierResidency)
+                            : MoEOverlayDeviceMovementAxis::ParticipantPlacement;
+
+                        const std::uint64_t payload_bytes = loadPeerPublished(
+                            binding.payload_bytes_per_layer + layer);
+                        if (payload_bytes == 0u)
+                        {
+                            failLeader(
+                                binding,
+                                MoEOverlayDeviceControllerError::InvalidControl);
+                            s_hdr.ok = 0u;
+                            break;
+                        }
+
+                        for (std::uint32_t edge = 0u;
+                             edge < best_cycle_length;
+                             ++edge)
+                        {
+                            const std::uint32_t expert = scratch.cycle()[edge];
+                            const auto source = static_cast<std::uint32_t>(
+                                scratch.current_owner()[expert]);
+                            const auto destination = static_cast<std::uint32_t>(
+                                scratch.desired_owner()[expert]);
+                            MoEOverlayDeviceMovementCommand command{};
+                            command.op = raw(
+                                MoEOverlayDeviceMovementOp::DurableMove);
+                            command.layer = layer;
+                            command.expert = expert;
+                            command.source_target =
+                                logicalPolicyTarget(binding, source);
+                            command.destination_target =
+                                logicalPolicyTarget(binding, destination);
+                            command.flags = moeOverlayMovementFlags(
+                                movement_axis, result.accepted_cycles + 1u);
+                            command.payload_bytes = payload_bytes;
+                            command.source_epoch = s_hdr.base_epoch;
+                            command.candidate_epoch = s_hdr.candidate_epoch;
+                            binding.command_entries[result.command_count++] =
+                                command;
+
+                            const std::int32_t source_priority =
+                                scratch.target_priority()[source];
+                            const std::int32_t destination_priority =
+                                scratch.target_priority()[destination];
+                            if (destination_priority < source_priority)
+                                ++result.promotions;
+                            else if (destination_priority > source_priority)
+                                ++result.demotions;
+                            else
+                                ++result.same_priority_moves;
+
+                            scratch.current_owner()[expert] =
+                                static_cast<std::int32_t>(destination);
+                            if (use_compressed_search)
+                            {
+                                s_cur_owner[expert] =
+                                    static_cast<std::int16_t>(destination);
+                            }
+                        }
+                        for (std::uint32_t expert = 0u;
+                             expert < expert_count;
+                             ++expert)
+                        {
+                            scratch.excluded()[expert] = 0u;
+                            if (use_compressed_search)
+                                s_excl[expert] = 0u;
+                        }
+                        for (std::uint32_t phase = 0u;
+                             phase <
+                                 kMoEOverlayDeviceControllerDemandPhaseCount;
+                             ++phase)
+                        {
+                            for (std::uint32_t participant = 0u;
+                                 participant < target_count;
+                                 ++participant)
+                            {
+                                scratch.phaseTargetRows()[phase][participant] =
+                                    0u;
+                            }
+                            for (std::uint32_t expert = 0u;
+                                 expert < expert_count;
+                                 ++expert)
+                            {
+                                const auto owner = static_cast<std::uint32_t>(
+                                    scratch.current_owner()[expert]);
+                                scratch.phaseTargetRows()[phase][owner] =
+                                    saturatingAdd(
+                                        scratch.phaseTargetRows()[phase][owner],
+                                        scratch.phaseExpertRows()[phase][expert]);
+                            }
+                        }
+                        if (target_count <= kMaxCachedTargets)
+                        {
+                            for (std::uint32_t p = 0u; p < target_count; ++p)
+                                s_working_load[p] = 0u;
+                            for (std::uint32_t expert = 0u;
+                                 expert < expert_count;
+                                 ++expert)
+                            {
+                                const auto owner = static_cast<std::uint32_t>(
+                                    scratch.current_owner()[expert]);
+                                s_working_load[owner] = saturatingAdd(
+                                    s_working_load[owner],
+                                    s_expert_counts[expert]);
+                            }
+                            working_load_saturated =
+                                candidate_score.priority_cost == ~0ull;
+                            if (!working_load_saturated)
+                            {
+                                for (std::uint32_t p = 0u;
+                                     p < target_count;
+                                     ++p)
+                                {
+                                    if (s_working_load[p] == ~0ull)
+                                    {
+                                        working_load_saturated = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        working_score = candidate_score;
+                        result.projected_service_gain_ns = saturatingAdd(
+                            result.projected_service_gain_ns,
+                            best_economy.projected_service_gain_ns);
+                        result.projected_transfer_and_repack_ns = saturatingAdd(
+                            result.projected_transfer_and_repack_ns,
+                            best_economy.transfer_and_repack_ns);
+                        result.projected_inference_interference_ns =
+                            saturatingAdd(
+                                result.projected_inference_interference_ns,
+                                best_economy.inference_interference_ns);
+                        result.projected_net_benefit_ns = saturatingAdd(
+                            result.projected_net_benefit_ns,
+                            best_economy.projected_net_benefit_ns);
+                        ++result.accepted_cycles;
+                        ++layer_cycles;
+                        changed_layer = true;
+                    }
+                    if (s_hdr.ok != 0u)
+                    {
+                        if (changed_layer)
+                        {
+                            ++result.changed_layers;
+                            result.layer_scan_next =
+                                (layer + 1u) % layer_count;
+                        }
+                        result.priority_cost_after = saturatingAdd(
+                            result.priority_cost_after,
+                            working_score.priority_cost);
+                        result.same_priority_makespan_after = saturatingAdd(
+                            result.same_priority_makespan_after,
+                            working_score.same_priority_makespan);
+                    }
+                }
+            }
+            __syncthreads();
+            if (s_hdr.ok == 0u)
+                return;
         }
 
-        finalizeDurablePolicyResult(launch, result);
+        if (tid == 0u)
+            finalizeDurablePolicyResult(launch, result);
     }
 
     /**
@@ -5515,14 +6109,11 @@ namespace llaminar2::moe_overlay_controller_device
                 authorStaticPolicy(launch);
             return;
         }
-        if (launch.action ==
+        if constexpr (Action ==
             MoEOverlayDeviceControllerAction::AuthorDynamicPolicy)
         {
-            if (threadIdx.x == 0u)
-            {
-                DynamicPolicyScratch scratch(launch.policy_workspace);
-                authorDynamicPolicy(launch, scratch);
-            }
+            DynamicPolicyScratch scratch(launch.policy_workspace);
+            authorDynamicPolicy(launch, scratch);
             return;
         }
         if (launch.action == MoEOverlayDeviceControllerAction::
@@ -5664,6 +6255,7 @@ namespace llaminar2::moe_overlay_controller_device
             awaitRuntimeRetirement(launch);
             break;
         case MoEOverlayDeviceControllerAction::Invalid:
+        case MoEOverlayDeviceControllerAction::CollectRuntimeSnapshot:
         case MoEOverlayDeviceControllerAction::PublishParticipantSnapshot:
         case MoEOverlayDeviceControllerAction::PublishGroupSnapshot:
             failLeader(

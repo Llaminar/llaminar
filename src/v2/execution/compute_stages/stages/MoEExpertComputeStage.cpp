@@ -1800,6 +1800,28 @@ namespace llaminar2
         return true;
     }
 
+    std::optional<MoEGroupedVerifierHistogramBatchBinding>
+    MoEExpertComputeStage::groupedVerifierHistogramBatchBinding() const noexcept
+    {
+        if (groupedVerifierHistogramRole() !=
+                MoEGroupedVerifierHistogramRole::DeferredAcceptedRows ||
+            !moe_kernel_ ||
+            !params_.moe_runtime_table ||
+            !moe_runtime_layer_)
+        {
+            return std::nullopt;
+        }
+        return MoEGroupedVerifierHistogramBatchBinding{
+            .kernel = moe_kernel_,
+            .runtime_table = params_.moe_runtime_table,
+            .runtime_layer = moe_runtime_layer_,
+            .workspace = bound_workspace_,
+            .seq_len = params_.seq_len,
+            .num_experts = params_.num_experts,
+            .top_k = params_.top_k,
+        };
+    }
+
     bool MoEExpertComputeStage::waitForPendingGpuDirectTransfers()
     {
         if (pending_gpu_direct_transfers_.empty())

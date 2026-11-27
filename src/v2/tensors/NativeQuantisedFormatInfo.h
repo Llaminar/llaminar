@@ -405,7 +405,8 @@ namespace llaminar2
         const NativeQuantisedFormatInfo &source) noexcept
     {
         if (source.codebook_id == 0 || source.codebook_id == 4 ||
-            source.codebook_id == 5 || source.codebook_id == 11)
+            source.codebook_id == 5 || source.codebook_id == 6 ||
+            source.codebook_id == 7 || source.codebook_id == 11)
         {
             return canonicalDeviceVnniFormat(source);
         }

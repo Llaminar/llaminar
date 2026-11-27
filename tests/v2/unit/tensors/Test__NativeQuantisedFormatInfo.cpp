@@ -378,7 +378,9 @@ TEST(Test__NativeQuantisedFormatInfo, MigrationStableAndReusableFormatsCoverEver
 
         const auto migrated = migrationStableDeviceVnniFormat(*source);
         const int expected_migrated_payload =
-            source->codebook_id == 8 || source->codebook_id == 11 || hasCompactMultiScaleVnniPayload(source->codebook_id)
+            source->codebook_id == 6 || source->codebook_id == 7 ||
+            source->codebook_id == 8 || source->codebook_id == 11 ||
+            hasCompactMultiScaleVnniPayload(source->codebook_id)
                 ? source->payload_bytes
                 : (source->codebook_id == 0 ||
                            source->codebook_id == 4 ||

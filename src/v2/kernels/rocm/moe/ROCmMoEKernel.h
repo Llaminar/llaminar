@@ -1046,6 +1046,19 @@ namespace llaminar2
             int num_experts,
             int top_k) override;
 
+        bool commitGroupedVerifierHistogramsBatch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layers,
+            int layer_count,
+            size_t layer_stride_bytes,
+            const int32_t *accepted_state_counts_device,
+            const int32_t *publication_ok_flags_device,
+            int request_count,
+            int rows_per_request,
+            int total_rows,
+            int num_experts,
+            int top_k) override;
+
         bool assignPrefillRoutesLeastLoadedResident(
             const MoEKernelLaunchContext &launch,
             DeviceMoELayerRuntime *runtime_layer,

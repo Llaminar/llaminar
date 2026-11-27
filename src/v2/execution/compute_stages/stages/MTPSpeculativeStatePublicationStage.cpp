@@ -16,6 +16,7 @@
 #include "../../../execution/moe/IMoEGroupedVerifierHistogramPublisher.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../kernels/IKVCache.h"
+#include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/common/SamplingMath.h"
 #include "../../../memory/BufferId.h"
 #include "../../../utils/Logger.h"
@@ -383,6 +384,99 @@ namespace llaminar2
     bool MTPSpeculativeStatePublicationStage::publishMoEHistograms(
         void *stream) const
     {
+        if (params_.moe_histogram_publishers.size() > 1u &&
+            stream != nullptr &&
+            params_.accepted_state_counts_device != nullptr &&
+            params_.publication_ok_flags_device != nullptr &&
+            params_.request_count > 0 &&
+            params_.verifier_rows_per_request > 0)
+        {
+            const int expected_seq_len =
+                params_.request_count * params_.verifier_rows_per_request;
+            std::optional<MoEGroupedVerifierHistogramBatchBinding> first;
+            bool batchable = true;
+            for (std::size_t idx = 0u;
+                 idx < params_.moe_histogram_publishers.size();
+                 ++idx)
+            {
+                IMoEGroupedVerifierHistogramPublisher *const publisher =
+                    params_.moe_histogram_publishers[idx];
+                if (!publisher ||
+                    publisher->groupedVerifierHistogramRole() !=
+                        MoEGroupedVerifierHistogramRole::DeferredAcceptedRows ||
+                    publisher->groupedVerifierHistogramPublicationStream() != stream)
+                {
+                    batchable = false;
+                    break;
+                }
+                const auto binding =
+                    publisher->groupedVerifierHistogramBatchBinding();
+                if (!binding ||
+                    !binding->kernel ||
+                    !binding->runtime_table ||
+                    !binding->runtime_layer ||
+                    binding->seq_len != expected_seq_len ||
+                    binding->num_experts <= 0 ||
+                    binding->top_k <= 0)
+                {
+                    batchable = false;
+                    break;
+                }
+                if (idx == 0u)
+                {
+                    first = binding;
+                }
+                else if (binding->runtime_table != first->runtime_table ||
+                         binding->seq_len != first->seq_len ||
+                         binding->num_experts != first->num_experts ||
+                         binding->top_k != first->top_k ||
+                         binding->runtime_layer != first->runtime_layer + idx)
+                {
+                    batchable = false;
+                    break;
+                }
+            }
+            if (batchable && first)
+            {
+                try
+                {
+                    first->runtime_table->recordDecodeHistogramProducerStream(
+                        stream);
+                }
+                catch (const std::exception &error)
+                {
+                    LOG_ERROR(
+                        "[MTPSpeculativeStatePublicationStage] Batched deferred "
+                        "MoE histogram producer was not prepared before enqueue"
+                        << " reason=" << error.what());
+                    return false;
+                }
+                const MoEKernelLaunchContext launch{
+                    .stream = stream,
+                    .workspace = first->workspace};
+                if (!first->kernel->commitGroupedVerifierHistogramsBatch(
+                        launch,
+                        first->runtime_layer,
+                        static_cast<int>(params_.moe_histogram_publishers.size()),
+                        sizeof(DeviceMoELayerRuntime),
+                        params_.accepted_state_counts_device,
+                        params_.publication_ok_flags_device,
+                        params_.request_count,
+                        params_.verifier_rows_per_request,
+                        first->seq_len,
+                        first->num_experts,
+                        first->top_k))
+                {
+                    LOG_ERROR(
+                        "[MTPSpeculativeStatePublicationStage] Backend rejected "
+                        "batched committed MoE verifier history publication"
+                        << " layers=" << params_.moe_histogram_publishers.size());
+                    return false;
+                }
+                return true;
+            }
+        }
+
         for (IMoEGroupedVerifierHistogramPublisher *publisher :
              params_.moe_histogram_publishers)
         {

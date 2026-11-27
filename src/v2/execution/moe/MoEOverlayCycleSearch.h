@@ -55,10 +55,10 @@ namespace llaminar2
         const Excluded &excluded, std::uint32_t participants,
         std::uint32_t experts, std::uint8_t *visited,
         std::uint32_t *sources, std::uint32_t *next_edges,
-        std::uint32_t *cycle) noexcept
+        std::uint32_t *cycle, std::uint32_t first_start = 0u) noexcept
     {
         MoEOverlayCycleSearchResult result;
-        for (std::uint32_t first = 0u; first < experts; ++first)
+        for (std::uint32_t first = first_start; first < experts; ++first)
         {
             if (excluded[first] || current[first] == desired[first]) continue;
             const auto start = static_cast<std::uint32_t>(current[first]);

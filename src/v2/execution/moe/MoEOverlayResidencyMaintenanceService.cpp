@@ -733,10 +733,20 @@ namespace llaminar2
                 return;
             }
 
+            const auto poll_state = state_.load(std::memory_order_acquire);
+            const bool active_protocol =
+                poll_state != MoEOverlayMaintenanceState::Waiting &&
+                poll_state != MoEOverlayMaintenanceState::AwaitingDemandActivation &&
+                poll_state != MoEOverlayMaintenanceState::Deferred &&
+                poll_state != MoEOverlayMaintenanceState::Stopped &&
+                poll_state != MoEOverlayMaintenanceState::Failed;
+            const auto poll_wait = active_protocol
+                ? std::min(config_.idle_poll_interval, std::chrono::microseconds(100))
+                : config_.idle_poll_interval;
             std::unique_lock<std::mutex> wake_lock(wake_mutex_);
             wake_cv_.wait_for(
                 wake_lock,
-                config_.idle_poll_interval,
+                poll_wait,
                 [this, &stop_token]
                 {
                     return wake_requested_ || stop_token.stop_requested() ||

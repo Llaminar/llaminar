@@ -3167,6 +3167,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief Commit accepted grouped-verifier rows across a contiguous layer range in one launch.
+         *
+         * All @p layer_count entries starting at @p runtime_layers with byte stride
+         * @p layer_stride_bytes execute concurrently in a single 2D launch so
+         * accepted-state publication avoids per-layer launch serialization.
+         *
+         * @param launch Explicit producer stream and persistent workspace.
+         * @param runtime_layers First contiguous device-resident per-layer runtime.
+         * @param layer_count Number of contiguous layers to commit (>= 1).
+         * @param layer_stride_bytes Byte stride between consecutive layer runtimes.
+         * @param accepted_state_counts_device Per-request committed row counts.
+         * @param publication_ok_flags_device Per-request metadata validity flags.
+         * @param request_count Number of active request rows.
+         * @param rows_per_request Physical padded verifier rows per request.
+         * @param total_rows Total physical rows represented by routing scratch.
+         * @param num_experts Number of routed experts per layer.
+         * @param top_k Number of route slots per physical row.
+         * @return true when the batched commit kernel was enqueued successfully.
+         */
+        virtual bool commitGroupedVerifierHistogramsBatch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layers,
+            int layer_count,
+            size_t layer_stride_bytes,
+            const int32_t *accepted_state_counts_device,
+            const int32_t *publication_ok_flags_device,
+            int request_count,
+            int rows_per_request,
+            int total_rows,
+            int num_experts,
+            int top_k)
+        {
+            (void)launch;
+            (void)runtime_layers;
+            (void)layer_count;
+            (void)layer_stride_bytes;
+            (void)accepted_state_counts_device;
+            (void)publication_ok_flags_device;
+            (void)request_count;
+            (void)rows_per_request;
+            (void)total_rows;
+            (void)num_experts;
+            (void)top_k;
+            return false;
+        }
+
+        /**
          * @brief Assign prefill routes to least-loaded resident participants.
          *
          * This is the graph-capturable resident-expert bridge used by grouped

@@ -1626,7 +1626,8 @@ namespace
      * atomics make the result independent of thread execution order.
      */
     __global__ void commit_grouped_verifier_histograms_runtime_kernel(
-        DeviceMoELayerRuntimeView *__restrict__ runtime,
+        void *__restrict__ runtime_layers,
+        size_t layer_stride_bytes,
         const int32_t *__restrict__ accepted_state_counts,
         const int32_t *__restrict__ publication_ok_flags,
         int request_count,
@@ -1635,6 +1636,11 @@ namespace
         int num_experts,
         int top_k)
     {
+        auto *const runtime = runtime_layers != nullptr
+            ? reinterpret_cast<DeviceMoELayerRuntimeView *>(
+                  static_cast<uint8_t *>(runtime_layers) +
+                  static_cast<size_t>(blockIdx.y) * layer_stride_bytes)
+            : nullptr;
         const int slot = blockIdx.x * blockDim.x + threadIdx.x;
         const int total_slots = total_rows * top_k;
         const bool ledger_is_complete =
@@ -3589,8 +3595,10 @@ extern "C"
             "cudaMoE_prefill_regroup_and_plan_scalable_runtime", cuda_stream);
     }
 
-    bool cudaMoE_commit_grouped_verifier_histograms(
-        void *runtime,
+    bool cudaMoE_commit_grouped_verifier_histograms_batch(
+        void *runtime_layers,
+        int layer_count,
+        size_t layer_stride_bytes,
         const int32_t *accepted_state_counts,
         const int32_t *publication_ok_flags,
         int request_count,
@@ -3601,7 +3609,9 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!runtime ||
+        if (!runtime_layers ||
+            layer_count <= 0 ||
+            (layer_count > 1 && layer_stride_bytes < sizeof(DeviceMoELayerRuntimeView)) ||
             !accepted_state_counts ||
             !publication_ok_flags ||
             !stream ||
@@ -3618,12 +3628,17 @@ extern "C"
 
         cudaSetDevice(device_idx);
         const int total_slots = total_rows * top_k;
+        const dim3 grid(
+            static_cast<unsigned int>(blocksFor(total_slots)),
+            static_cast<unsigned int>(layer_count),
+            1u);
         commit_grouped_verifier_histograms_runtime_kernel<<<
-            blocksFor(total_slots),
+            grid,
             kThreads,
             0,
             static_cast<cudaStream_t>(stream)>>>(
-            static_cast<DeviceMoELayerRuntimeView *>(runtime),
+            runtime_layers,
+            layer_stride_bytes,
             accepted_state_counts,
             publication_ok_flags,
             request_count,
@@ -3632,8 +3647,35 @@ extern "C"
             num_experts,
             top_k);
         return finishGroupedPrefillLaunch(
-            "cudaMoE_commit_grouped_verifier_histograms",
+            "cudaMoE_commit_grouped_verifier_histograms_batch",
             static_cast<cudaStream_t>(stream));
+    }
+
+    bool cudaMoE_commit_grouped_verifier_histograms(
+        void *runtime,
+        const int32_t *accepted_state_counts,
+        const int32_t *publication_ok_flags,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k,
+        int device_idx,
+        void *stream)
+    {
+        return cudaMoE_commit_grouped_verifier_histograms_batch(
+            runtime,
+            1,
+            0u,
+            accepted_state_counts,
+            publication_ok_flags,
+            request_count,
+            rows_per_request,
+            total_rows,
+            num_experts,
+            top_k,
+            device_idx,
+            stream);
     }
 
     bool cudaMoE_assign_prefill_routes_least_loaded_resident(
