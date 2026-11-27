@@ -515,7 +515,7 @@ namespace
         }
     }
 
-    inline void gemm_6row_unsigned_nibble_2z(
+    __attribute__((noinline)) void gemm_6row_unsigned_nibble_2z(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *const *rows,
         float (*out_buf)[64],
@@ -541,7 +541,7 @@ namespace
                 packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
     }
 
-    inline void gemm_3row_unsigned_nibble_4z(
+    __attribute__((noinline)) void gemm_3row_unsigned_nibble_4z(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *const *rows,
         float (*out_buf)[64],
@@ -564,6 +564,169 @@ namespace
                 packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
         else
             gemm_3row_unsigned_nibble_4z_impl<false, CPUProjectionNumericalPolicy::BackendNative>(
+                packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+    }
+
+    /**
+     * @brief Two-row 4z single-pass UnsignedNibble AVX-512 kernel (`Q4_K`, `Q4_0`, `Q4_1`).
+     *
+     * Computes all 64 output columns across 2 rows in one single weight pass (16 ZMM accumulators,
+     * split low/high activation live ranges for zero inner-loop register spills).
+     */
+    template <bool Asymmetric, CPUProjectionNumericalPolicy Policy>
+    inline void gemm_2row_unsigned_nibble_4z_impl(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *const *rows,
+        float (*out_buf)[64],
+        int chunk,
+        int k_blocks,
+        int k_tiles,
+        int bpt) noexcept
+    {
+        const NibbleDecodeKind decode_kind = nibbleDecodeKind(packed.codebook_id);
+        const __m512i mask_0F = _mm512_set1_epi8(0x0F);
+        const Q8_1Block *const r0 = rows[0], *const r1 = rows[1];
+        alignas(64) float red_buf[2][64];
+
+        for (int kt = 0; kt < k_tiles; ++kt)
+        {
+            const int kb_start = (k_tiles <= 1) ? 0 : kt * bpt;
+            const int kb_end = (k_tiles <= 1) ? k_blocks : std::min(kb_start + bpt, k_blocks);
+            __m512 fp00 = _mm512_setzero_ps(), fp01 = _mm512_setzero_ps(), fp02 = _mm512_setzero_ps(), fp03 = _mm512_setzero_ps();
+            __m512 fp10 = _mm512_setzero_ps(), fp11 = _mm512_setzero_ps(), fp12 = _mm512_setzero_ps(), fp13 = _mm512_setzero_ps();
+
+            for (int kb = kb_start; kb < kb_end; ++kb)
+            {
+                if (kb + 1 < k_blocks)
+                {
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 0, 0), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 0, 2), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 2, 0), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 2, 2), 0, 3);
+                    __builtin_prefetch(packed.chunkScales(chunk, kb + 1), 0, 3);
+                }
+                const Q8_1Block &a0 = r0[kb], &a1 = r1[kb];
+                __m512i i00 = _mm512_setzero_si512(), i01 = _mm512_setzero_si512(), i02 = _mm512_setzero_si512(), i03 = _mm512_setzero_si512();
+                __m512i i10 = _mm512_setzero_si512(), i11 = _mm512_setzero_si512(), i12 = _mm512_setzero_si512(), i13 = _mm512_setzero_si512();
+
+                for (int group = 0; group < 4; ++group)
+                {
+                    int32_t wl0, wl1, wh0, wh1;
+                    std::memcpy(&wl0, a0.qs + group * 4, 4);
+                    std::memcpy(&wl1, a1.qs + group * 4, 4);
+                    std::memcpy(&wh0, a0.qs + group * 4 + 16, 4);
+                    std::memcpy(&wh1, a1.qs + group * 4 + 16, 4);
+                    const __m512i al0 = _mm512_set1_epi32(wl0), al1 = _mm512_set1_epi32(wl1);
+                    const __m512i ah0 = _mm512_set1_epi32(wh0), ah1 = _mm512_set1_epi32(wh1);
+#define LLAMINAR_UNIB2X4_Z(Z)                                                       \
+                    {                                                               \
+                        const __m512i raw = _mm512_load_si512(packed.interleavedB(chunk, kb, group, Z)); \
+                        const __m512i lo = _mm512_and_si512(raw, mask_0F);          \
+                        i0##Z = _mm512_dpbusd_epi32(i0##Z, lo, al0);                \
+                        i1##Z = _mm512_dpbusd_epi32(i1##Z, lo, al1);                \
+                        const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(raw, 4), mask_0F); \
+                        i0##Z = _mm512_dpbusd_epi32(i0##Z, hi, ah0);                \
+                        i1##Z = _mm512_dpbusd_epi32(i1##Z, hi, ah1);                \
+                    }
+                    LLAMINAR_UNIB2X4_Z(0); LLAMINAR_UNIB2X4_Z(1);
+                    LLAMINAR_UNIB2X4_Z(2); LLAMINAR_UNIB2X4_Z(3);
+#undef LLAMINAR_UNIB2X4_Z
+                }
+                if (decode_kind == NibbleDecodeKind::Q4_0_LINEAR)
+                {
+                    const __m512i u0 = _mm512_set1_epi32(static_cast<int32_t>(a0.sum_qs) * 8);
+                    const __m512i u1 = _mm512_set1_epi32(static_cast<int32_t>(a1.sum_qs) * 8);
+                    i00 = _mm512_sub_epi32(i00, u0); i01 = _mm512_sub_epi32(i01, u0);
+                    i02 = _mm512_sub_epi32(i02, u0); i03 = _mm512_sub_epi32(i03, u0);
+                    i10 = _mm512_sub_epi32(i10, u1); i11 = _mm512_sub_epi32(i11, u1);
+                    i12 = _mm512_sub_epi32(i12, u1); i13 = _mm512_sub_epi32(i13, u1);
+                }
+
+                const uint16_t *const sc_ptr = packed.chunkScales(chunk, kb);
+                const float d0 = nativeQuantisedFP16ScaleToFP32(a0.d);
+                const float d1 = nativeQuantisedFP16ScaleToFP32(a1.d);
+                if constexpr (Asymmetric)
+                {
+                    const uint16_t *const mn_ptr = packed.chunkMins(chunk, kb);
+#define LLAMINAR_UNIB2X4_ASYM(Z)                                                    \
+                    {                                                               \
+                        const __m512 sc = loadScales512(packed, sc_ptr + Z * 16);   \
+                        const __m512 mn = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(mn_ptr + Z * 16))); \
+                        fp0##Z = accumulateCorrectedSingleScaleBlockAVX512(fp0##Z, i0##Z, sc, a0.sum_qs, mn, d0, Policy); \
+                        fp1##Z = accumulateCorrectedSingleScaleBlockAVX512(fp1##Z, i1##Z, sc, a1.sum_qs, mn, d1, Policy); \
+                    }
+                    LLAMINAR_UNIB2X4_ASYM(0); LLAMINAR_UNIB2X4_ASYM(1);
+                    LLAMINAR_UNIB2X4_ASYM(2); LLAMINAR_UNIB2X4_ASYM(3);
+#undef LLAMINAR_UNIB2X4_ASYM
+                }
+                else
+                {
+#define LLAMINAR_UNIB2X4_SYM(Z)                                                     \
+                    {                                                               \
+                        const __m512 sc = loadScales512(packed, sc_ptr + Z * 16);   \
+                        fp0##Z = accumulateSingleScaleBlockAVX512(fp0##Z, i0##Z, sc, d0, Policy); \
+                        fp1##Z = accumulateSingleScaleBlockAVX512(fp1##Z, i1##Z, sc, d1, Policy); \
+                    }
+                    LLAMINAR_UNIB2X4_SYM(0); LLAMINAR_UNIB2X4_SYM(1);
+                    LLAMINAR_UNIB2X4_SYM(2); LLAMINAR_UNIB2X4_SYM(3);
+#undef LLAMINAR_UNIB2X4_SYM
+                }
+            }
+
+            if (k_tiles <= 1)
+            {
+                _mm512_store_ps(out_buf[0] + 0, fp00); _mm512_store_ps(out_buf[0] + 16, fp01);
+                _mm512_store_ps(out_buf[0] + 32, fp02); _mm512_store_ps(out_buf[0] + 48, fp03);
+                _mm512_store_ps(out_buf[1] + 0, fp10); _mm512_store_ps(out_buf[1] + 16, fp11);
+                _mm512_store_ps(out_buf[1] + 32, fp12); _mm512_store_ps(out_buf[1] + 48, fp13);
+            }
+            else if (kt == 0)
+            {
+                _mm512_store_ps(red_buf[0] + 0, fp00); _mm512_store_ps(red_buf[0] + 16, fp01);
+                _mm512_store_ps(red_buf[0] + 32, fp02); _mm512_store_ps(red_buf[0] + 48, fp03);
+                _mm512_store_ps(red_buf[1] + 0, fp10); _mm512_store_ps(red_buf[1] + 16, fp11);
+                _mm512_store_ps(red_buf[1] + 32, fp12); _mm512_store_ps(red_buf[1] + 48, fp13);
+            }
+            else
+            {
+                const bool last = (kt + 1 == k_tiles);
+                float *d0 = last ? out_buf[0] : red_buf[0];
+                float *d1 = last ? out_buf[1] : red_buf[1];
+                _mm512_store_ps(d0 + 0,  addOrderedAVX512(_mm512_load_ps(red_buf[0] + 0),  fp00));
+                _mm512_store_ps(d0 + 16, addOrderedAVX512(_mm512_load_ps(red_buf[0] + 16), fp01));
+                _mm512_store_ps(d0 + 32, addOrderedAVX512(_mm512_load_ps(red_buf[0] + 32), fp02));
+                _mm512_store_ps(d0 + 48, addOrderedAVX512(_mm512_load_ps(red_buf[0] + 48), fp03));
+                _mm512_store_ps(d1 + 0,  addOrderedAVX512(_mm512_load_ps(red_buf[1] + 0),  fp10));
+                _mm512_store_ps(d1 + 16, addOrderedAVX512(_mm512_load_ps(red_buf[1] + 16), fp11));
+                _mm512_store_ps(d1 + 32, addOrderedAVX512(_mm512_load_ps(red_buf[1] + 32), fp12));
+                _mm512_store_ps(d1 + 48, addOrderedAVX512(_mm512_load_ps(red_buf[1] + 48), fp13));
+            }
+        }
+    }
+
+    __attribute__((noinline)) void gemm_2row_unsigned_nibble_4z(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *const *rows,
+        float (*out_buf)[64],
+        int chunk,
+        int k_blocks,
+        int k_tiles,
+        int bpt) noexcept
+    {
+        if (packed.is_asymmetric)
+        {
+            if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                gemm_2row_unsigned_nibble_4z_impl<true, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                    packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+            else
+                gemm_2row_unsigned_nibble_4z_impl<true, CPUProjectionNumericalPolicy::BackendNative>(
+                    packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+        }
+        else if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            gemm_2row_unsigned_nibble_4z_impl<false, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+        else
+            gemm_2row_unsigned_nibble_4z_impl<false, CPUProjectionNumericalPolicy::BackendNative>(
                 packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
     }
 
@@ -737,7 +900,7 @@ namespace
         }
     }
 
-    inline void gemmCompactFiveBitSixRows2zAVX512(
+    __attribute__((noinline)) void gemmCompactFiveBitSixRows2zAVX512(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *const *rows,
         float (*out_buf)[64],
@@ -760,6 +923,163 @@ namespace
                 packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
         else
             sixRowsFiveBit2zAVX512<false, CPUProjectionNumericalPolicy::BackendNative>(
+                packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+    }
+
+    /**
+     * @brief Two-row 4z single-pass CompactFiveBit AVX-512 kernel (`Q5_0`, `Q5_1`, `Q5_K`).
+     *
+     * Computes all 64 output columns across 2 rows in one weight pass (16 ZMM accumulators,
+     * split low/high activation live ranges for zero register spills in the inner K loop).
+     */
+    template <bool Asymmetric, CPUProjectionNumericalPolicy Policy>
+    inline void twoRowsFiveBit4zAVX512(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *const *rows,
+        float (*out_buf)[64],
+        int chunk,
+        int k_blocks,
+        int k_tiles,
+        int bpt) noexcept
+    {
+        const __m512i mask_0F = _mm512_set1_epi8(0x0F);
+        const __m512i bit16 = _mm512_set1_epi8(0x10);
+        const uint8_t *const base = packed.interleavedBase();
+        const size_t stride = static_cast<size_t>(packed.interleaved_block_stride);
+        const size_t chunk_origin = static_cast<size_t>(chunk) * packed.blocks_per_row;
+        const Q8_1Block *const r0 = rows[0], *const r1 = rows[1];
+        alignas(64) float red_buf[2][64];
+
+        for (int kt = 0; kt < k_tiles; ++kt)
+        {
+            const int kb_start = (k_tiles <= 1) ? 0 : kt * bpt;
+            const int kb_end = (k_tiles <= 1) ? k_blocks : std::min(kb_start + bpt, k_blocks);
+            __m512 fp00 = _mm512_setzero_ps(), fp01 = _mm512_setzero_ps(), fp02 = _mm512_setzero_ps(), fp03 = _mm512_setzero_ps();
+            __m512 fp10 = _mm512_setzero_ps(), fp11 = _mm512_setzero_ps(), fp12 = _mm512_setzero_ps(), fp13 = _mm512_setzero_ps();
+
+            for (int kb = kb_start; kb < kb_end; ++kb)
+            {
+                if (kb + 2 < packed.blocks_per_row)
+                    packed.prefetchInterleavedUnitT0(chunk, kb + 2);
+                const Q8_1Block &a0 = r0[kb], &a1 = r1[kb];
+                const uint8_t *const unit = base + (chunk_origin + kb) * stride;
+
+                __m512i d00 = _mm512_setzero_si512(), d01 = _mm512_setzero_si512(), d02 = _mm512_setzero_si512(), d03 = _mm512_setzero_si512();
+                __m512i d10 = _mm512_setzero_si512(), d11 = _mm512_setzero_si512(), d12 = _mm512_setzero_si512(), d13 = _mm512_setzero_si512();
+
+                for (int group = 0; group < 4; ++group)
+                {
+                    const int goff = group * 4;
+                    const int hioff = goff + 16;
+                    const __m512i al0 = _mm512_set1_epi32(fivebit_detail::packSignedActivationWord(a0, goff));
+                    const __m512i al1 = _mm512_set1_epi32(fivebit_detail::packSignedActivationWord(a1, goff));
+                    const __m512i ah0 = _mm512_set1_epi32(fivebit_detail::packSignedActivationWord(a0, hioff));
+                    const __m512i ah1 = _mm512_set1_epi32(fivebit_detail::packSignedActivationWord(a1, hioff));
+#define LLAMINAR_FIVE2X4_Z(Z)                                                       \
+                    {                                                               \
+                        const __m512i raw = _mm512_load_si512(unit + static_cast<size_t>(group) * 256u + static_cast<size_t>(Z) * 64u); \
+                        const __m512i blo = fivebit_detail::mergeFiveBitMaskAVX512( \
+                            _mm512_and_si512(raw, mask_0F),                         \
+                            unit + 1024u + static_cast<size_t>(group) * 32u + static_cast<size_t>(Z) * 8u, bit16); \
+                        d0##Z = _mm512_dpbusd_epi32(d0##Z, blo, al0);               \
+                        d1##Z = _mm512_dpbusd_epi32(d1##Z, blo, al1);               \
+                        const __m512i bhi = fivebit_detail::mergeFiveBitMaskAVX512( \
+                            _mm512_and_si512(_mm512_srli_epi16(raw, 4), mask_0F),   \
+                            unit + 1024u + static_cast<size_t>(group + 4) * 32u + static_cast<size_t>(Z) * 8u, bit16); \
+                        d0##Z = _mm512_dpbusd_epi32(d0##Z, bhi, ah0);               \
+                        d1##Z = _mm512_dpbusd_epi32(d1##Z, bhi, ah1);               \
+                    }
+                    LLAMINAR_FIVE2X4_Z(0); LLAMINAR_FIVE2X4_Z(1);
+                    LLAMINAR_FIVE2X4_Z(2); LLAMINAR_FIVE2X4_Z(3);
+#undef LLAMINAR_FIVE2X4_Z
+                }
+
+                const uint16_t *const scales = reinterpret_cast<const uint16_t *>(unit + 1280u);
+                const float f0 = nativeQuantisedFP16ScaleToFP32(a0.d);
+                const float f1 = nativeQuantisedFP16ScaleToFP32(a1.d);
+                if constexpr (Asymmetric)
+                {
+                    const uint16_t *const mins = reinterpret_cast<const uint16_t *>(unit + 1408u);
+#define LLAMINAR_FIVE2X4_ASYM(Z)                                                    \
+                    {                                                               \
+                        const __m512 sc = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scales + Z * 16))); \
+                        const __m512 mn = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(mins + Z * 16))); \
+                        fp0##Z = fivebit_detail::applyFiveBitBlockAVX512<true, Policy>(fp0##Z, d0##Z, a0, f0, sc, mn); \
+                        fp1##Z = fivebit_detail::applyFiveBitBlockAVX512<true, Policy>(fp1##Z, d1##Z, a1, f1, sc, mn); \
+                    }
+                    LLAMINAR_FIVE2X4_ASYM(0); LLAMINAR_FIVE2X4_ASYM(1);
+                    LLAMINAR_FIVE2X4_ASYM(2); LLAMINAR_FIVE2X4_ASYM(3);
+#undef LLAMINAR_FIVE2X4_ASYM
+                }
+                else
+                {
+                    const __m512 zero = _mm512_setzero_ps();
+#define LLAMINAR_FIVE2X4_SYM(Z)                                                     \
+                    {                                                               \
+                        const __m512 sc = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scales + Z * 16))); \
+                        fp0##Z = fivebit_detail::applyFiveBitBlockAVX512<false, Policy>(fp0##Z, d0##Z, a0, f0, sc, zero); \
+                        fp1##Z = fivebit_detail::applyFiveBitBlockAVX512<false, Policy>(fp1##Z, d1##Z, a1, f1, sc, zero); \
+                    }
+                    LLAMINAR_FIVE2X4_SYM(0); LLAMINAR_FIVE2X4_SYM(1);
+                    LLAMINAR_FIVE2X4_SYM(2); LLAMINAR_FIVE2X4_SYM(3);
+#undef LLAMINAR_FIVE2X4_SYM
+                }
+            }
+
+            if (k_tiles <= 1)
+            {
+                _mm512_store_ps(out_buf[0] + 0, fp00); _mm512_store_ps(out_buf[0] + 16, fp01);
+                _mm512_store_ps(out_buf[0] + 32, fp02); _mm512_store_ps(out_buf[0] + 48, fp03);
+                _mm512_store_ps(out_buf[1] + 0, fp10); _mm512_store_ps(out_buf[1] + 16, fp11);
+                _mm512_store_ps(out_buf[1] + 32, fp12); _mm512_store_ps(out_buf[1] + 48, fp13);
+            }
+            else if (kt == 0)
+            {
+                _mm512_store_ps(red_buf[0] + 0, fp00); _mm512_store_ps(red_buf[0] + 16, fp01);
+                _mm512_store_ps(red_buf[0] + 32, fp02); _mm512_store_ps(red_buf[0] + 48, fp03);
+                _mm512_store_ps(red_buf[1] + 0, fp10); _mm512_store_ps(red_buf[1] + 16, fp11);
+                _mm512_store_ps(red_buf[1] + 32, fp12); _mm512_store_ps(red_buf[1] + 48, fp13);
+            }
+            else
+            {
+                const bool last = (kt + 1 == k_tiles);
+                float *d0 = last ? out_buf[0] : red_buf[0];
+                float *d1 = last ? out_buf[1] : red_buf[1];
+                _mm512_store_ps(d0 + 0,  addOrderedAVX512(_mm512_load_ps(red_buf[0] + 0),  fp00));
+                _mm512_store_ps(d0 + 16, addOrderedAVX512(_mm512_load_ps(red_buf[0] + 16), fp01));
+                _mm512_store_ps(d0 + 32, addOrderedAVX512(_mm512_load_ps(red_buf[0] + 32), fp02));
+                _mm512_store_ps(d0 + 48, addOrderedAVX512(_mm512_load_ps(red_buf[0] + 48), fp03));
+                _mm512_store_ps(d1 + 0,  addOrderedAVX512(_mm512_load_ps(red_buf[1] + 0),  fp10));
+                _mm512_store_ps(d1 + 16, addOrderedAVX512(_mm512_load_ps(red_buf[1] + 16), fp11));
+                _mm512_store_ps(d1 + 32, addOrderedAVX512(_mm512_load_ps(red_buf[1] + 32), fp12));
+                _mm512_store_ps(d1 + 48, addOrderedAVX512(_mm512_load_ps(red_buf[1] + 48), fp13));
+            }
+        }
+    }
+
+    __attribute__((noinline)) void gemmCompactFiveBitTwoRows4zAVX512(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *const *rows,
+        float (*out_buf)[64],
+        int chunk,
+        int k_blocks,
+        int k_tiles,
+        int bpt) noexcept
+    {
+        if (packed.is_asymmetric)
+        {
+            if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                twoRowsFiveBit4zAVX512<true, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                    packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+            else
+                twoRowsFiveBit4zAVX512<true, CPUProjectionNumericalPolicy::BackendNative>(
+                    packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+        }
+        else if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            twoRowsFiveBit4zAVX512<false, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+        else
+            twoRowsFiveBit4zAVX512<false, CPUProjectionNumericalPolicy::BackendNative>(
                 packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
     }
 
@@ -876,7 +1196,7 @@ namespace
         }
     }
 
-    inline void gemm_3row_unsigned_int8_4z(
+    __attribute__((noinline)) void gemm_3row_unsigned_int8_4z(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *const *rows,
         float (*out_buf)[64],
@@ -891,6 +1211,47 @@ namespace
         else
             gemm_3row_unsigned_int8_4z_impl<CPUProjectionNumericalPolicy::BackendNative>(
                 packed, rows, out_buf, chunk, k_blocks, k_tiles, bpt);
+    }
+
+    /** @brief Dedicated zero-spill single-row AVX-512 GEMV fast path for M=1 decode strips. */
+    __attribute__((noinline)) void runSingleRowChunkOrderedAVX512(
+        const PreparedMatrixInfo &m,
+        const Q8_1Block *row,
+        float *out_row,
+        int chunk,
+        int cols) noexcept
+    {
+        const auto &packed = *m.packed;
+        const int k_blocks = m.k_blocks;
+        const int k_tiles = m.k_tiles;
+        const int bpt = m.k_blocks_per_tile;
+        if (k_tiles <= 1)
+        {
+            if (m.is_nibble)
+                gemv_native_quantised_avx512_chunk_native<false>(
+                    packed, row, out_row, chunk, 0, k_blocks, m.lut512, false, kChunkCols);
+            else
+                gemv_native_quantised_avx512_chunk_non_nibble<false>(
+                    packed, row, out_row, chunk, 0, k_blocks, false, kChunkCols);
+            (void)cols;
+            return;
+        }
+        alignas(64) float p0[kChunkCols];
+        for (int kt = 0; kt < k_tiles; ++kt)
+        {
+            const int kb_start = kt * bpt;
+            const int kb_end = std::min(kb_start + bpt, k_blocks);
+            float *dst = (kt == 0) ? out_row : p0;
+            if (m.is_nibble)
+                gemv_native_quantised_avx512_chunk_native<false>(
+                    packed, row, dst, chunk, kb_start, kb_end, m.lut512, false, kChunkCols);
+            else
+                gemv_native_quantised_avx512_chunk_non_nibble<false>(
+                    packed, row, dst, chunk, kb_start, kb_end, false, kChunkCols);
+            if (kt > 0)
+                foldOrderedAVX512Partition<false>(out_row, p0, false, kChunkCols);
+        }
+        (void)cols;
     }
 #endif // __AVX512F__ && __AVX512VNNI__ && __AVX512BW__
 
@@ -982,6 +1343,13 @@ namespace
                 return;
             }
 
+            if (strip_rows == 1)
+            {
+                runSingleRowChunkOrderedAVX512(m, row_ptrs[0], out_buf[0], chunk, cols);
+                (void)bounded;
+                return;
+            }
+
             // Register-resident 2z/4z wide-row fast paths for UnsignedNibble (Q4_K/Q4_0/Q4_1),
             // CompactFiveBit (Q5_0/Q5_1/Q5_K), and symmetric UnsignedInt8 (Q8_0): share each
             // 32-bit activation broadcast across 2 or 4 ZMM weight columns and handle both
@@ -998,6 +1366,12 @@ namespace
                         packed, row_ptrs + row_offset, out_buf + row_offset, chunk, k_blocks, k_tiles, bpt);
                     row_offset += 3;
                 }
+                if (row_offset + 2 <= strip_rows)
+                {
+                    gemm_2row_unsigned_nibble_4z(
+                        packed, row_ptrs + row_offset, out_buf + row_offset, chunk, k_blocks, k_tiles, bpt);
+                    row_offset += 2;
+                }
                 if (row_offset == strip_rows)
                 {
                     (void)bounded;
@@ -1009,6 +1383,12 @@ namespace
                 for (; row_offset + 6 <= strip_rows; row_offset += 6)
                     gemmCompactFiveBitSixRows2zAVX512(
                         packed, row_ptrs + row_offset, out_buf + row_offset, chunk, k_blocks, k_tiles, bpt);
+                if (row_offset + 2 <= strip_rows && (strip_rows - row_offset) != 4)
+                {
+                    gemmCompactFiveBitTwoRows4zAVX512(
+                        packed, row_ptrs + row_offset, out_buf + row_offset, chunk, k_blocks, k_tiles, bpt);
+                    row_offset += 2;
+                }
                 if (row_offset == strip_rows)
                 {
                     (void)bounded;

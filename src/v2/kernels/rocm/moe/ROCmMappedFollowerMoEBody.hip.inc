@@ -1202,8 +1202,13 @@ namespace llaminar2::rocm::mapped_follower_moe
                 const unsigned down_q8_bytes =
                     (((values >> 5) * static_cast<unsigned>(sizeof(FastQ8Block48))) + 63u) & ~63u;
                 auto down_stage = asLds<float>(dynamic_storage + down_q8_bytes);
-                const unsigned group = waveUniform(wave >> 2);
-                const unsigned sub = waveUniform(wave & 3u);
+                // Adapt (groups, subs) to actual live_entries so all 16 waves execute Down
+                // concurrently even when le=1 (1x16) or le=2 (2x8), preserving exact ascending K order.
+                const unsigned sub_shift = waveUniform((le <= 1u) ? 4u : ((le == 2u) ? 3u : 2u));
+                const unsigned subs = waveUniform(1u << sub_shift);
+                const unsigned groups = waveUniform(16u >> sub_shift);
+                const unsigned group = waveUniform(wave >> sub_shift);
+                const unsigned sub = waveUniform(wave & (subs - 1u));
                 const unsigned u_blocks = waveUniform(F >> 5);
                 const bool mapped_out_aligned =
                     waveUniform((reinterpret_cast<std::uintptr_t>(mapped_out) & 15u) == 0u);
@@ -1216,12 +1221,12 @@ namespace llaminar2::rocm::mapped_follower_moe
                     const bool use_vec4_store =
                         waveUniform(mapped_out_aligned && count == 64u && ((first & 3u) == 0u) && ((H & 3u) == 0u));
 
-                    // 4-wave-per-task exact-order Down: up to 4 tasks run concurrently
-                    // with 4 waves/task computing 4 adjacent K-blocks in parallel, then
+                    // Adaptive multi-wave exact-order Down: `groups` tasks run concurrently
+                    // with `subs` waves/task computing `subs` adjacent K-blocks in parallel, then
                     // sub-wave 0 folds them in strict ascending K-block RN order and
                     // flushes 16 coalesced float4 PCIe stores.
 #pragma unroll 1
-                    for (unsigned base_task = 0u; base_task < le; base_task += 4u)
+                    for (unsigned base_task = 0u; base_task < le; base_task += groups)
                     {
                         const unsigned task = waveUniform(base_task + group);
                         const bool has_task = waveUniform(task < le);
@@ -1258,9 +1263,9 @@ namespace llaminar2::rocm::mapped_follower_moe
                         unsigned in_part = 0u;
                         unsigned done_parts = 0u;
 
-                        // When all u_blocks fit in free LDS (e.g. F=640 -> u_blocks=20 -> 20 KB),
-                        // compute all 4-wave K-blocks without inner barriers and perform ONE LDS
-                        // barrier + exact ascending RN fold per 64-col tile (10 barriers -> 1).
+                        // When all groups * u_blocks fit in free LDS (<= 20 KB for F=640),
+                        // compute all subs-wave K-blocks without inner barriers and perform ONE LDS
+                        // barrier + exact ascending RN fold per 64-col tile.
                         // Keep the <255,255> dynamic-switch fallback single-copy for 0 memory spills.
                         const unsigned avail_stage_bytes =
                             (dynamic_bytes > down_q8_bytes) ? (dynamic_bytes - down_q8_bytes) : 0u;
@@ -1268,15 +1273,15 @@ namespace llaminar2::rocm::mapped_follower_moe
                         if constexpr (DownCB != kFastDynamicCodebook)
                         {
                             const bool single_barrier_stage =
-                                waveUniform((std::size_t(u_blocks) * 256u * sizeof(float)) <= avail_stage_bytes);
+                                waveUniform((std::size_t(groups) * u_blocks * 64u * sizeof(float)) <= avail_stage_bytes);
                             if (single_barrier_stage)
                             {
                                 used_single_barrier = true;
-                                const unsigned group_stride = u_blocks * 64u;
+                                const unsigned group_base = waveUniform(group * u_blocks * 64u);
                                 if (valid_ready && lane < count)
                                 {
 #pragma unroll 1
-                                    for (unsigned b = sub; b < u_blocks; b += 4u)
+                                    for (unsigned b = sub; b < u_blocks; b += subs)
                                     {
                                         const std::size_t idx = static_cast<std::size_t>(b) * H + n;
                                         float contrib = 0.0f;
@@ -1303,16 +1308,17 @@ namespace llaminar2::rocm::mapped_follower_moe
                                         {
                                             __builtin_trap();
                                         }
-                                        down_stage[group * group_stride + b * 64u + lane] = contrib;
+                                        down_stage[group_base + b * 64u + lane] = contrib;
                                     }
                                 }
                                 workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
                                 if (sub == 0u && valid_ready && lane < count)
                                 {
+                                    auto group_stage = down_stage + group_base + lane;
 #pragma unroll 1
                                     for (unsigned b = 0u; b < u_blocks; ++b)
                                     {
-                                        const float c = down_stage[group * group_stride + b * 64u + lane];
+                                        const float c = group_stage[b * 64u];
                                         part_acc = rocm_native_quantised_accumulate_rn(part_acc, c);
                                         ++in_part;
                                         if (__builtin_expect(in_part == u_width || (b + 1u) == u_blocks, 0))
@@ -1329,8 +1335,9 @@ namespace llaminar2::rocm::mapped_follower_moe
                         }
                         if (!used_single_barrier)
                         {
+                        const unsigned fallback_stride = subs * 64u;
 #pragma unroll 1
-                        for (unsigned b0 = 0u; b0 < u_blocks; b0 += 4u)
+                        for (unsigned b0 = 0u; b0 < u_blocks; b0 += subs)
                         {
                             const unsigned b = waveUniform(b0 + sub);
                             if (valid_ready && b < u_blocks && lane < count)
@@ -1366,16 +1373,16 @@ namespace llaminar2::rocm::mapped_follower_moe
                                 {
                                     __builtin_trap();
                                 }
-                                down_stage[group * 256u + sub * 64u + lane] = contrib;
+                                down_stage[group * fallback_stride + sub * 64u + lane] = contrib;
                             }
                             workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
                             if (sub == 0u && valid_ready && lane < count)
                             {
-                                const unsigned rem = min(4u, u_blocks - b0);
+                                const unsigned rem = min(subs, u_blocks - b0);
 #pragma unroll 1
                                 for (unsigned s = 0u; s < rem; ++s)
                                 {
-                                    const float c = down_stage[group * 256u + s * 64u + lane];
+                                    const float c = down_stage[group * fallback_stride + s * 64u + lane];
                                     part_acc = rocm_native_quantised_accumulate_rn(part_acc, c);
                                     ++in_part;
                                     if (__builtin_expect(in_part == u_width || (b0 + s + 1u) == u_blocks, 0))
@@ -1411,7 +1418,7 @@ namespace llaminar2::rocm::mapped_follower_moe
                             }
                             if (use_vec4_store)
                             {
-                                auto wave_stage = down_stage + group * (used_single_barrier ? (u_blocks * 64u) : 256u);
+                                auto wave_stage = down_stage + group * (used_single_barrier ? (u_blocks * 64u) : (subs * 64u));
                                 wave_stage[lane] = out_val;
                                 asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
                                 if (lane < 16u)
@@ -1427,7 +1434,7 @@ namespace llaminar2::rocm::mapped_follower_moe
                                 __builtin_nontemporal_store(out_val, mapped_out + std::size_t(orig_slot) * H + n);
                             }
                         }
-                        if (base_task + 4u < le || first + 64u < owned.end)
+                        if (base_task + groups < le || first + 64u < owned.end)
                             workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
                     }
                 }

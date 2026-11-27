@@ -439,8 +439,8 @@ namespace llaminar2::cuda::moe
             }
             const float sum = squareSum(partial, shared.norm, tid, true);
             const float inverse = normalizationInverse(sum, prefix.norm.hidden, prefix.norm.epsilon);
-            const auto *gain = prefix.norm.gain + offset;
-            auto *normalized = prefix.norm.output + offset;
+            const auto *gain = reinterpret_cast<const float4 *>(prefix.norm.gain + offset);
+            auto *normalized = reinterpret_cast<float4 *>(prefix.norm.output + offset);
             auto *codes = prefix.norm_codes + offset;
             auto *scales = prefix.norm_scales + offset / 32;
             const auto *post = reinterpret_cast<const float4 *>(shared.post);
@@ -448,15 +448,13 @@ namespace llaminar2::cuda::moe
             {
                 const unsigned first = 4 * quad;
                 const float4 value = post[quad];
+                const float4 g = gain[quad];
                 const auto output = make_float4(
-                    normalizedElement(value.x, inverse, gain[first]),
-                    normalizedElement(value.y, inverse, gain[first + 1]),
-                    normalizedElement(value.z, inverse, gain[first + 2]),
-                    normalizedElement(value.w, inverse, gain[first + 3]));
-                normalized[first] = output.x;
-                normalized[first + 1] = output.y;
-                normalized[first + 2] = output.z;
-                normalized[first + 3] = output.w;
+                    normalizedElement(value.x, inverse, g.x),
+                    normalizedElement(value.y, inverse, g.y),
+                    normalizedElement(value.z, inverse, g.z),
+                    normalizedElement(value.w, inverse, g.w));
+                normalized[quad] = output;
                 retainedHCNormQ8Quad(output, codes + first, scales + first / 32, tid % 8);
             }
         }
@@ -498,37 +496,71 @@ namespace llaminar2::cuda::moe
             {
                 if (columns % 32 == 0 && prefix.down_partitions.blocks_per_partition <= 32)
                 {
-                    // Full-grid 100% coalesced warp-split HC Down: every CTA owns 32 contiguous
-                    // columns x 1 partition (<=7 blocks across 8 warps -> 1 single pass, zero
-                    // loop-carried dependency, parallel payload+scale loads, 1 barrier/task via
-                    // warp-0 shuffle broadcast of atomicAdd).
+                    // Unified single-wave multi-partition HC Down + overlapped Injection:
+                    // when floor((gridDim.x - inject) / col_tiles) slices fit inside
+                    // shared.down_blocks[32][32], each 32-column tile splits across
+                    // eff_slices CTAs so HC Down + Injection finish in ONE single wave
+                    // with ~37% fewer atomic fences and zero idle warps; otherwise
+                    // eff_slices == partitions degrades seamlessly to 1 partition/task.
                     const unsigned col_tiles = columns >> 5;
-                    const unsigned cta_tasks = partitions * col_tiles;
-                    const bool fuse_down_publish = (hc_down_done != nullptr && col_tiles <= 32u);
-                    const unsigned total_down_tasks =
-                        (SupportOptionalWriteAndInject && prefix.injection_weights != nullptr)
-                            ? (cta_tasks + 4u) : cta_tasks;
-                    const unsigned half_lane = lane >> 1;
-                    const unsigned half_part = lane & 1u;
                     const unsigned bps = static_cast<unsigned>(prefix.down_partitions.blocks_per_partition);
                     const unsigned total_blocks = static_cast<unsigned>(prefix.down.blocks_per_row);
+                    const bool has_inject = SupportOptionalWriteAndInject && (prefix.injection_weights != nullptr);
+                    const unsigned inject_ctas = has_inject ? 4u : 0u;
+                    const bool fuse_down_publish = (hc_down_done != nullptr && col_tiles <= 32u);
+                    const unsigned half_lane = lane >> 1;
+                    const unsigned half_part = lane & 1u;
+
+                    // Compute single-wave slice schedule on tid==0 into shared.norm[0..5]
+                    // so p_begin/p_end/eff_slices/col_tile never consume live registers
+                    // across the peak-pressure int4 dp4a loop (keeps <=64 regs, 0 spills).
+                    unsigned* s_meta = reinterpret_cast<unsigned*>(shared.norm);
+                    if (tid == 0u)
+                    {
+                        const unsigned avail_down_ctas = (gridDim.x > inject_ctas) ? (gridDim.x - inject_ctas) : 0u;
+                        const unsigned cand_slices = (avail_down_ctas >= col_tiles)
+                            ? min(partitions, avail_down_ctas / col_tiles) : 0u;
+                        const unsigned cand_max_parts = (cand_slices > 0u)
+                            ? ((partitions + cand_slices - 1u) / cand_slices) : 0u;
+                        const unsigned eff_slices =
+                            (fuse_down_publish && cand_slices > 0u && cand_max_parts * bps <= 32u)
+                                ? cand_slices : partitions;
+                        const unsigned cta_tasks = eff_slices * col_tiles;
+                        s_meta[5] = eff_slices;
+                        s_meta[6] = cta_tasks;
+                        s_meta[7] = cta_tasks + inject_ctas;
+                    }
+                    __syncthreads();
 #pragma unroll 1
-                    for (unsigned cta_task = blockIdx.x; cta_task < total_down_tasks; cta_task += gridDim.x)
+                    for (unsigned cta_task = blockIdx.x; cta_task < s_meta[7]; cta_task += gridDim.x)
                     {
                         if constexpr (SupportOptionalWriteAndInject)
                         {
-                            if (cta_task >= cta_tasks)
+                            if (cta_task >= s_meta[6])
                             {
-                                retainedHCInjectionRow<Hidden>(prefix, cta_task - cta_tasks, shared.norm);
-                                continue;
+                                retainedHCInjectionRow<Hidden>(prefix, cta_task - s_meta[6], shared.norm);
+                                break;
                             }
                         }
-                        const unsigned partition = cta_task / col_tiles;
-                        const unsigned col_tile = cta_task - partition * col_tiles;
-                        const unsigned col_base = col_tile << 5;
-                        const unsigned first = partition * bps;
-                        const unsigned last = min(total_blocks, first + bps);
-                        const unsigned count = (last > first) ? (last - first) : 0u;
+                        if (tid == 0u)
+                        {
+                            const unsigned eff_slices = s_meta[5];
+                            const unsigned slice = cta_task / col_tiles;
+                            const unsigned col_tile = cta_task - slice * col_tiles;
+                            const unsigned p_begin = (eff_slices == partitions) ? slice : ((slice * partitions) / eff_slices);
+                            const unsigned p_end = (eff_slices == partitions) ? (slice + 1u) : (((slice + 1u) * partitions) / eff_slices);
+                            const unsigned first = p_begin * bps;
+                            const unsigned last = min(total_blocks, p_end * bps);
+                            s_meta[0] = col_tile;
+                            s_meta[1] = p_begin;
+                            s_meta[2] = p_end;
+                            s_meta[3] = first;
+                            s_meta[4] = (last > first) ? (last - first) : 0u;
+                        }
+                        __syncthreads();
+                        const unsigned col_base = s_meta[0] << 5;
+                        const unsigned first = s_meta[3];
+                        const unsigned count = s_meta[4];
 #pragma unroll 1
                         for (unsigned b = warp; b < count; b += 8u)
                         {
@@ -572,30 +604,56 @@ namespace llaminar2::cuda::moe
                         __syncthreads();
                         if (warp == 0u)
                         {
-                            float sum = 0.0f;
+                            const unsigned col_tile = s_meta[0];
+                            const unsigned p_begin = s_meta[1];
+                            const unsigned p_end = s_meta[2];
+                            const unsigned first_b = s_meta[3];
 #pragma unroll 1
-                            for (unsigned b = 0u; b < count; ++b)
-                                sum = __fadd_rn(sum, shared.down_blocks[b][lane]);
-                            prefix.down_partials[partition * columns + col_base + lane] = sum;
+                            for (unsigned p = p_begin; p < p_end; ++p)
+                            {
+                                const unsigned pf = p * bps;
+                                const unsigned pl = min(total_blocks, pf + bps);
+                                const unsigned b_off = pf - first_b;
+                                const unsigned b_cnt = (pl > pf) ? (pl - pf) : 0u;
+                                float sum = 0.0f;
+#pragma unroll 1
+                                for (unsigned b = 0u; b < b_cnt; ++b)
+                                    sum = __fadd_rn(sum, shared.down_blocks[b_off + b][lane]);
+                                prefix.down_partials[p * columns + col_base + lane] = sum;
+                            }
                             if (fuse_down_publish)
                             {
                                 __threadfence();
                                 unsigned finished = (lane == 0u) ? (atomicAdd(hc_down_done + col_tile, 1u) + 1u) : 0u;
                                 finished = __shfl_sync(0xffffffffu, finished, 0);
-                                if (finished == partitions)
+                                if (finished == s_meta[5])
                                 {
                                     const unsigned column = col_base + lane;
+                                    const float* dp_col = prefix.down_partials + column;
                                     float total = 0.0f;
+                                    unsigned part = 0u;
 #pragma unroll 1
-                                    for (unsigned part = 0u; part < partitions; ++part)
-                                        total = __fadd_rn(total, __ldcg(prefix.down_partials + part * columns + column));
+                                    for (; part + 4u <= partitions; part += 4u)
+                                    {
+                                        const float v0 = __ldcg(dp_col + (part + 0u) * columns);
+                                        const float v1 = __ldcg(dp_col + (part + 1u) * columns);
+                                        const float v2 = __ldcg(dp_col + (part + 2u) * columns);
+                                        const float v3 = __ldcg(dp_col + (part + 3u) * columns);
+                                        total = __fadd_rn(total, v0);
+                                        total = __fadd_rn(total, v1);
+                                        total = __fadd_rn(total, v2);
+                                        total = __fadd_rn(total, v3);
+                                    }
+#pragma unroll 1
+                                    for (; part < partitions; ++part)
+                                        total = __fadd_rn(total, __ldcg(dp_col + part * columns));
                                     prefix.raw_down[column] = total;
                                     hc_down_publication::publish<hc_down_publication::OriginalScalePublication, PublishActivated>(
                                         total, prefix.down_publication, column);
                                 }
                             }
                         }
-                        if (cta_task + gridDim.x < total_down_tasks)
+                        if (cta_task + gridDim.x < s_meta[7])
                             __syncthreads();
                     }
                 }

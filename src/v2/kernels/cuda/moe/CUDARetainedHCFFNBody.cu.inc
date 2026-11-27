@@ -610,13 +610,15 @@
                     const bool maybe_local = e >= 0 && e < router.experts && bank.local_compute_mask[e] != 0u;
                     if (lane == 0u)
                         preloaded_local[s] = maybe_local ? 1u : 0u;
-                    if (maybe_local && lane < words_per_mat)
+                    if (maybe_local && lane < 3u * words_per_mat)
                     {
                         const auto& src = bank.experts[e];
                         auto& dst = preloaded_expert[s];
-                        reinterpret_cast<uint64_t*>(&dst.gate)[lane] = reinterpret_cast<const uint64_t*>(&src.gate)[lane];
-                        reinterpret_cast<uint64_t*>(&dst.up)[lane] = reinterpret_cast<const uint64_t*>(&src.up)[lane];
-                        reinterpret_cast<uint64_t*>(&dst.down)[lane] = reinterpret_cast<const uint64_t*>(&src.down)[lane];
+                        const unsigned mat = (lane < words_per_mat) ? 0u : (lane < 2u * words_per_mat ? 1u : 2u);
+                        const unsigned w = lane - mat * words_per_mat;
+                        const auto* s_mat = (mat == 0u) ? &src.gate : (mat == 1u ? &src.up : &src.down);
+                        auto* d_mat = (mat == 0u) ? &dst.gate : (mat == 1u ? &dst.up : &dst.down);
+                        reinterpret_cast<uint64_t*>(d_mat)[w] = reinterpret_cast<const uint64_t*>(s_mat)[w];
                     }
                 }
             }
@@ -714,11 +716,13 @@
                 {
                     const auto& view = preloaded_expert[preloaded_local[packed]];
                     auto& dst = args.selected[packed];
-                    if (lane < words_per_mat)
+                    if (lane < 3u * words_per_mat)
                     {
-                        reinterpret_cast<uint64_t*>(&dst.gate)[lane] = reinterpret_cast<const uint64_t*>(&view.gate)[lane];
-                        reinterpret_cast<uint64_t*>(&dst.up)[lane] = reinterpret_cast<const uint64_t*>(&view.up)[lane];
-                        reinterpret_cast<uint64_t*>(&dst.down)[lane] = reinterpret_cast<const uint64_t*>(&view.down)[lane];
+                        const unsigned mat = (lane < words_per_mat) ? 0u : (lane < 2u * words_per_mat ? 1u : 2u);
+                        const unsigned w = lane - mat * words_per_mat;
+                        const auto* s_mat = (mat == 0u) ? &view.gate : (mat == 1u ? &view.up : &view.down);
+                        auto* d_mat = (mat == 0u) ? &dst.gate : (mat == 1u ? &dst.up : &dst.down);
+                        reinterpret_cast<uint64_t*>(d_mat)[w] = reinterpret_cast<const uint64_t*>(s_mat)[w];
                     }
                 }
             }
@@ -917,13 +921,15 @@
                     if (dispatch.local_compute_flags[s])
                     {
                         const int e = tk.selected[s];
-                        if (e >= 0 && e < router.experts && lane < words_per_mat)
+                        if (e >= 0 && e < router.experts && lane < 3u * words_per_mat)
                         {
                             const auto& src = bank.experts[e];
                             auto& dst = preloaded_expert[s];
-                            reinterpret_cast<uint64_t*>(&dst.gate)[lane] = reinterpret_cast<const uint64_t*>(&src.gate)[lane];
-                            reinterpret_cast<uint64_t*>(&dst.up)[lane] = reinterpret_cast<const uint64_t*>(&src.up)[lane];
-                            reinterpret_cast<uint64_t*>(&dst.down)[lane] = reinterpret_cast<const uint64_t*>(&src.down)[lane];
+                            const unsigned mat = (lane < words_per_mat) ? 0u : (lane < 2u * words_per_mat ? 1u : 2u);
+                            const unsigned w = lane - mat * words_per_mat;
+                            const auto* s_mat = (mat == 0u) ? &src.gate : (mat == 1u ? &src.up : &src.down);
+                            auto* d_mat = (mat == 0u) ? &dst.gate : (mat == 1u ? &dst.up : &dst.down);
+                            reinterpret_cast<uint64_t*>(d_mat)[w] = reinterpret_cast<const uint64_t*>(s_mat)[w];
                         }
                     }
                 }
@@ -999,11 +1005,13 @@
                 {
                     const auto& view = preloaded_expert[packed_slots[packed]];
                     auto& dst = args.selected[packed];
-                    if (lane < words_per_mat)
+                    if (lane < 3u * words_per_mat)
                     {
-                        reinterpret_cast<uint64_t*>(&dst.gate)[lane] = reinterpret_cast<const uint64_t*>(&view.gate)[lane];
-                        reinterpret_cast<uint64_t*>(&dst.up)[lane] = reinterpret_cast<const uint64_t*>(&view.up)[lane];
-                        reinterpret_cast<uint64_t*>(&dst.down)[lane] = reinterpret_cast<const uint64_t*>(&view.down)[lane];
+                        const unsigned mat = (lane < words_per_mat) ? 0u : (lane < 2u * words_per_mat ? 1u : 2u);
+                        const unsigned w = lane - mat * words_per_mat;
+                        const auto* s_mat = (mat == 0u) ? &view.gate : (mat == 1u ? &view.up : &view.down);
+                        auto* d_mat = (mat == 0u) ? &dst.gate : (mat == 1u ? &dst.up : &dst.down);
+                        reinterpret_cast<uint64_t*>(d_mat)[w] = reinterpret_cast<const uint64_t*>(s_mat)[w];
                     }
                 }
             }

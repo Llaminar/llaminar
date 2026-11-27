@@ -296,6 +296,25 @@ __device__ __forceinline__ float orderedAppend(float sum,const float* values,uns
  for(;i<count;++i)sum=device_fp32_contract::add(sum,values[i*stride+column]);
  return sum;
 }
+__device__ __forceinline__ float prefixOrderedAppendLds(
+ float sum, PrefixLdsPtr<const float> values, unsigned stride, unsigned column, unsigned count);
+/** @brief Consume one original signed dot8 using AS3 LDS-staged activation codes and scale. */
+__device__ __forceinline__ float consumePacketLds(
+ const Packet& packet,PrefixLdsPtr<const PrefixRawInt4> codes4_lds,unsigned block,float scale) {
+ const int4 x0=prefixLdsLoadInt4(codes4_lds,block*2u);
+ const int4 x1=prefixLdsLoadInt4(codes4_lds,block*2u+1u);
+ int dot=0;
+ dot=rocm_integer_contract::signedDot4(x0.x,packet.low.x,dot);
+ dot=rocm_integer_contract::signedDot4(x0.y,packet.low.y,dot);
+ dot=rocm_integer_contract::signedDot4(x0.z,packet.low.z,dot);
+ dot=rocm_integer_contract::signedDot4(x0.w,packet.low.w,dot);
+ dot=rocm_integer_contract::signedDot4(x1.x,packet.high.x,dot);
+ dot=rocm_integer_contract::signedDot4(x1.y,packet.high.y,dot);
+ dot=rocm_integer_contract::signedDot4(x1.z,packet.high.z,dot);
+ dot=rocm_integer_contract::signedDot4(x1.w,packet.high.w,dot);
+ const float ws=__half2float(__ushort_as_half(static_cast<unsigned short>(packet.scale_bits)));
+ return device_native_quantised_contract::singleScaleBlock(dot,ws,scale);
+}
 /**
  * @brief Complete every original down leaf, partition and raw output for one owner.
  * @param a Original HC binding. @param owner Unique live column interval.
@@ -304,64 +323,102 @@ __device__ __forceinline__ float orderedAppend(float sum,const float* values,uns
  * @param arena Exclusive dynamic phase arena. @param words Admitted float capacity.
  * @details One thread retains each partition accumulator across bounded K32
  * windows; one column thread retains the raw accumulator across partition
- * windows. Every append remains increasing, including original empty-partition
- * +0 and terminal multiply1. Only memory issue is batched. Initial two packets
- * are reused once; counted continuation loads all remaining real packets.
+ * windows. Stages Q8 activation codes and scales in AS3 LDS when space allows,
+ * uses wave-uniform FastDiv16 instead of integer division, and reads/writes
+ * leaf planes via explicit AS3 LDS pointers while keeping idle-CTA early
+ * prefetch and zero global down_partials round-trips.
  */
 __device__ __forceinline__ void down(const PersistentHCReadArgs& a,FullHCDownOwnership owner,
  DownPanel panel,const Packet& first,const Packet& second,bool prefetched,float* arena,unsigned words) {
- (void)words;
  const unsigned tid=threadIdx.x;
  if(!owner.columns) {__syncthreads();__syncthreads();return;}
+ auto arena_lds=prefixAsLds<float>(arena);
+ const unsigned panel_leaf_words=panel.parts*panel.window*panel.columns;
+ const unsigned panel_total_words=(panel_leaf_words+panel.parts*panel.columns+3u)&~3u;
+ const unsigned input_codes_words=panel.blocks*8u;
+ const unsigned input_scales_words=panel.blocks;
+ const bool stage_inputs=prefixWaveUniform(
+  panel.blocks>0u&&(panel_total_words+input_codes_words+input_scales_words)<=words);
+ PrefixLdsPtr<PrefixRawInt4> lds_codes4=nullptr;
+ PrefixLdsPtr<float> lds_scales=nullptr;
+ if(stage_inputs) {
+  lds_codes4=prefixAsLds<PrefixRawInt4>(arena+panel_total_words);
+  lds_scales=arena_lds+panel_total_words+input_codes_words;
+  const auto* g_codes4=reinterpret_cast<const int4*>(prefixWaveUniform(a.input_codes));
+  const auto* g_scales=prefixWaveUniform(a.input_scales);
+  const unsigned num_int4=panel.blocks*2u;
+  for(unsigned i=tid;i<num_int4;i+=1024u) {
+   const int4 v=weightRead<int4>(g_codes4+i);
+   PrefixRawInt4 raw;raw[0]=v.x;raw[1]=v.y;raw[2]=v.z;raw[3]=v.w;
+   lds_codes4[i]=raw;
+  }
+  for(unsigned i=tid;i<panel.blocks;i+=1024u)
+   lds_scales[i]=weightRead<float>(g_scales+i);
+  workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+ }
+ auto lds_codes4_ro=reinterpret_cast<PrefixLdsPtr<const PrefixRawInt4>>(lds_codes4);
+ auto arena_lds_ro=reinterpret_cast<PrefixLdsPtr<const float>>(arena_lds);
+ const unsigned a_partitions=prefixWaveUniform(unsigned(a.partitions));
  for(unsigned begin_col=0;begin_col<owner.columns;begin_col+=panel.columns) {
-  const unsigned columns=unsigned(fullHCMin(panel.columns,owner.columns-begin_col));
+  const unsigned columns=prefixWaveUniform(unsigned(fullHCMin(panel.columns,owner.columns-begin_col)));
+  const PrefixFastDiv16 col_div=PrefixFastDiv16::make(columns);
   float raw=0.0f;
-  for(unsigned begin_part=0;begin_part<unsigned(a.partitions);begin_part+=panel.parts) {
-   const unsigned parts=unsigned(fullHCMin(panel.parts,unsigned(a.partitions)-begin_part));
+  for(unsigned begin_part=0;begin_part<a_partitions;begin_part+=panel.parts) {
+   const unsigned parts=prefixWaveUniform(unsigned(fullHCMin(panel.parts,a_partitions-begin_part)));
    float sum=0.0f;
    for(unsigned begin_k=0;begin_k<panel.per;begin_k+=panel.window) {
-    const unsigned window=unsigned(fullHCMin(panel.window,panel.per-begin_k));
+    const unsigned window=prefixWaveUniform(unsigned(fullHCMin(panel.window,panel.per-begin_k)));
+    const PrefixFastDiv16 win_div=PrefixFastDiv16::make(window);
     const unsigned items=parts*window*columns;
-    for(unsigned item=tid;item<items;item+=1024) {
-     const unsigned leaf=item/columns,part=begin_part+leaf/window;
-     const unsigned offset=begin_k+leaf%window,block=part*panel.per+offset;
+    for(unsigned item=tid;item<items;item+=1024u) {
+     unsigned leaf,col_off,part_off,k_off;
+     col_div.divmod(item,leaf,col_off);
+     win_div.divmod(leaf,part_off,k_off);
+     const unsigned part=begin_part+part_off;
+     const unsigned offset=begin_k+k_off;
+     const unsigned block=part*panel.per+offset;
      // Invalid partition tails publish no padded leaf and are never consumed.
      if(block<panel.blocks) {
       Packet packet;
       if(prefetched&&begin_col==0&&begin_part==0&&begin_k==0&&item==tid)packet=first;
-      else if(prefetched&&begin_col==0&&begin_part==0&&begin_k==0&&item==tid+1024)packet=second;
-      else packet=loadPacket(a.down_weights,owner.first+begin_col+item%columns,block);
-      arena[item]=consumePacket(packet,a.input_codes+block*32,a.input_scales[block]);
+      else if(prefetched&&begin_col==0&&begin_part==0&&begin_k==0&&item==tid+1024u)packet=second;
+      else packet=loadPacket(a.down_weights,owner.first+begin_col+col_off,block);
+      arena_lds[item]=stage_inputs
+       ?consumePacketLds(packet,lds_codes4_ro,block,lds_scales[block])
+       :consumePacket(packet,a.input_codes+block*32u,a.input_scales[block]);
      }
     }
-    __syncthreads();
+    workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
     if(tid<parts*columns) {
-     const unsigned part=begin_part+tid/columns,column=tid%columns;
+     unsigned part_off,column;
+     col_div.divmod(tid,part_off,column);
+     const unsigned part=begin_part+part_off;
      const unsigned first_block=part*panel.per+begin_k;
      const unsigned count=first_block<panel.blocks?
-      unsigned(fullHCMin(window,panel.blocks-first_block)):0;
-     sum=orderedAppend(sum,arena+(tid/columns)*window*columns,columns,column,count);
+      unsigned(fullHCMin(window,panel.blocks-first_block)):0u;
+     sum=prefixOrderedAppendLds(sum,arena_lds_ro+part_off*window*columns,columns,column,count);
     }
     // All leaf consumers retire before the next window overwrites its arena.
-    __syncthreads();
+    workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
    }
-   float* partition_values=arena+panel.parts*panel.window*panel.columns;
+   auto partition_values=arena_lds+panel_leaf_words;
+   auto partition_values_ro=arena_lds_ro+panel_leaf_words;
    if(tid<parts*columns) {
     // The old global P plane is retired internal scratch. Only the
     // owner-local terminal values feed the identical final fold.
     partition_values[tid]=__fmul_rn(sum,1.0f);
    }
-   __syncthreads();
+   workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
    if(tid<columns) {
     // P1 originally publishes its terminal product directly, without an
     // added +0 edge; preserve signed-zero and exceptional operand behavior.
-    raw=a.partitions==1?partition_values[tid]:orderedAppend(raw,partition_values,columns,tid,parts);
+    raw=a_partitions==1u?partition_values_ro[tid]:prefixOrderedAppendLds(raw,partition_values_ro,columns,tid,parts);
    }
    // The completed P window is retired before any next K32 leaf publication.
-   __syncthreads();
+   workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
   }
-  if(tid<columns)a.raw_down[owner.first+begin_col+tid]=raw;
-  __syncthreads();
+  if(tid<columns)prefixAsGlobal(a.raw_down)[owner.first+begin_col+tid]=raw;
+  workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
  }
 }
 /**

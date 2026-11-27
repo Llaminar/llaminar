@@ -39,6 +39,15 @@
 #define LLAMINAR_MOE_PACKET_GRID_CONSTANT const
 #endif
 
+// Keep cold stage-0 handshake, failure-publication, and multi-row fallback
+// paths out-of-line so hot single-row dispatch kernels stay compact in L1i
+// and low-register rather than inlining 128-bit digest loops multiple times.
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LLAMINAR_MOE_PACKET_NOINLINE __noinline__
+#else
+#define LLAMINAR_MOE_PACKET_NOINLINE
+#endif
+
 #include "execution/moe/MoEOverlaySharedDispatchSelection.h"
 
 namespace llaminar2::moe_activation_packet_device
@@ -1060,7 +1069,7 @@ namespace llaminar2::moe_activation_packet_device
     }
 
     /** @brief Publish a terminal semantic failure without trapping peer streams. */
-    __device__ __forceinline__ void publishFailure(
+    static __device__ LLAMINAR_MOE_PACKET_NOINLINE void publishFailure(
         MoEOverlayActivationEpochControl *control,
         MoEOverlayActivationDeviceEpochGrant *grant,
         MoEOverlayActivationEndpoint endpoint,
@@ -1301,6 +1310,104 @@ namespace llaminar2::moe_activation_packet_device
     }
 
     /**
+     * @brief Cold stage-zero admission loop kept out-of-line from hot layers.
+     *
+     * Runs once per request on layer 0 (`stage_ordinal == 0`). Outlining it keeps
+     * the 128-bit identity digest and mapped-control snapshots out of the hot
+     * per-layer dispatch kernels so L1i and register pressure stay minimal.
+     */
+    static __device__ __forceinline__ bool acquireStage0GrantCold(
+        MoEOverlayActivationEpochControl *control,
+        MoEOverlayActivationDeviceEpochGrant *grant,
+        MoEOverlayActivationEndpoint endpoint,
+        std::uint32_t stage_ordinal,
+        std::int32_t physical_rows,
+        std::int32_t expected_target_participant,
+        const MoEOverlayRoutePlacementDeviceBinding &placement) noexcept
+    {
+        const std::uint64_t previous_generation = grant->generation;
+        MoEOverlayActivationEpochIdentity identity{};
+        for (;;)
+        {
+            if (validControl(
+                    control,
+                    endpoint,
+                    stage_ordinal,
+                    physical_rows,
+                    expected_target_participant))
+            {
+                identity = snapshotPeerPublished(&control->identity);
+                if (identity.epoch_generation > previous_generation)
+                    break;
+            }
+            if (moeOverlayActivationAdmissionWaitAborted(
+                    loadSystemAcquire64(&control->admission.ready_signal),
+                    [&]() { return loadSystemAcquire32(&control->admission.state); }))
+            {
+                return false;
+            }
+#if defined(__CUDA_ARCH__)
+            __nanosleep(64u);
+#elif defined(__HIP_DEVICE_COMPILE__)
+            __builtin_amdgcn_s_sleep(1u);
+#endif
+        }
+        if (!placement.valid())
+            return false;
+
+        const DeviceMoEOverlayEpochTicket placement_ticket{
+            .epoch = placement.ticket->epoch,
+            .selector = placement.ticket->selector,
+        };
+        const std::uint32_t placement_bank =
+            static_cast<std::uint32_t>(
+                placement_ticket.selector & 1u);
+        const std::uint64_t placement_generation =
+            placement_ticket.selector >> 1u;
+        const auto selected_placement_bank =
+            placement_bank < kDeviceMoEOverlayEpochBankCount
+                ? selectPlacementBank(placement, placement_bank)
+                : MoEOverlayRoutePlacementBankDeviceView{};
+        if (placement_ticket.epoch == 0u ||
+            placement_ticket.epoch < identity.placement_epoch_floor ||
+            placement_generation == 0u ||
+            placement_bank >= kDeviceMoEOverlayEpochBankCount ||
+            !selected_placement_bank.valid() ||
+            static_cast<std::uint64_t>(
+                *selected_placement_bank.epoch) !=
+                placement_ticket.epoch)
+        {
+            return false;
+        }
+        *grant = MoEOverlayActivationDeviceEpochGrant{
+            .digest = identity.digest,
+            .generation = identity.epoch_generation,
+            .placement_epoch = placement_ticket.epoch,
+            .published_payload_bytes = 0u,
+            .published_live_rows = 0u,
+            .published_live_entries = 0u,
+            .published_stage_count = 0u,
+            .published_shared_hidden_bytes = 0u,
+            .live_rows = 0u,
+            .live_entries = 0u,
+            .stage_count = identity.stage_count,
+            .physical_rows = physical_rows,
+            .last_published_stage = -1,
+            .last_consumed_stage = -1,
+            .single_row_id = -1,
+            .endpoint = raw(endpoint),
+            .state = raw(MoEOverlayActivationEndpointState::Active),
+            .code = raw(MoEOverlayActivationStatusCode::Success),
+            .graph_role = static_cast<MoEOverlayInferenceGraphRole>(
+                identity.graph_role),
+            .original_slot_index = identity.original_slot_index,
+            .channel_cohort_target = identity.cohort_target,
+            .channel_return_role = identity.return_role,
+        };
+        return true;
+    }
+
+    /**
      * @brief Acquire mapped admission once, then validate only local epoch state.
      *
      * Stage zero is ordered after the scheduler's mapped admission signal and
@@ -1325,114 +1432,17 @@ namespace llaminar2::moe_activation_packet_device
             operation == MoEOverlayActivationOperation::ConsumeDispatch;
         if (stage_ordinal == 0u && begins_epoch)
         {
-            /*
-             * The capture-stable admission wait uses a reusable non-zero
-             * threshold. It can therefore pass on transaction N's still-live
-             * publication when transaction N+1 has already been submitted by
-             * the continuation host. The endpoint-private grant is the device
-             * anti-ABA authority: an epoch-opening operation must observe a
-             * fully authenticated scheduler identity strictly newer than the
-             * generation it last consumed. Later stage-zero operations reuse
-             * the active grant and never enter this loop.
-             *
-             * This wait is normally one iteration. Under intentional host
-             * submission overlap it suspends only this endpoint's graph block;
-             * the peer device retires N and publishes N+1 independently. No
-             * host fence, graph mutation, or mutable execution-state mirror is
-             * introduced.
-             */
-            const std::uint64_t previous_generation = grant->generation;
-            MoEOverlayActivationEpochIdentity identity{};
-            for (;;)
-            {
-                if (validControl(
-                        control,
-                        endpoint,
-                        stage_ordinal,
-                        physical_rows,
-                        expected_target_participant))
-                {
-                    identity = snapshotPeerPublished(&control->identity);
-                    if (identity.epoch_generation > previous_generation)
-                        break;
-                }
-                // An aborted channel can never acquire another generation.
-                // Drain its retained graph so teardown does not leave a block
-                // polling an identity that the scheduler will never publish.
-                // Successful first-iteration admission performs no extra load.
-                if (moeOverlayActivationAdmissionWaitAborted(
-                        loadSystemAcquire64(&control->admission.ready_signal),
-                        [&]() { return loadSystemAcquire32(&control->admission.state); }))
-                {
-                    return false;
-                }
-#if defined(__CUDA_ARCH__)
-                __nanosleep(64u);
-#elif defined(__HIP_DEVICE_COMPILE__)
-                __builtin_amdgcn_s_sleep(1u);
-#endif
-            }
-            if (!placement.valid())
-                return false;
-
-            /*
-             * The host ticket carries only a lower bound because background
-             * device maintenance may publish after scheduler admission. Read
-             * the endpoint's request ticket on its exact graph stream and
-             * authenticate the selected durable bank before making that exact
-             * epoch part of the private grant. Continuation and follower use
-             * the same device-owned admission epoch, while the mapped packet
-             * descriptor proves cross-device equality without a host shadow.
-             */
-            const DeviceMoEOverlayEpochTicket placement_ticket{
-                .epoch = placement.ticket->epoch,
-                .selector = placement.ticket->selector,
-            };
-            const std::uint32_t placement_bank =
-                static_cast<std::uint32_t>(
-                    placement_ticket.selector & 1u);
-            const std::uint64_t placement_generation =
-                placement_ticket.selector >> 1u;
-            const auto selected_placement_bank =
-                placement_bank < kDeviceMoEOverlayEpochBankCount
-                    ? selectPlacementBank(placement, placement_bank)
-                    : MoEOverlayRoutePlacementBankDeviceView{};
-            if (placement_ticket.epoch == 0u ||
-                placement_ticket.epoch < identity.placement_epoch_floor ||
-                placement_generation == 0u ||
-                placement_bank >= kDeviceMoEOverlayEpochBankCount ||
-                !selected_placement_bank.valid() ||
-                static_cast<std::uint64_t>(
-                    *selected_placement_bank.epoch) !=
-                    placement_ticket.epoch)
+            if (!acquireStage0GrantCold(
+                    control,
+                    grant,
+                    endpoint,
+                    stage_ordinal,
+                    physical_rows,
+                    expected_target_participant,
+                    placement))
             {
                 return false;
             }
-            *grant = MoEOverlayActivationDeviceEpochGrant{
-                .digest = identity.digest,
-                .generation = identity.epoch_generation,
-                .placement_epoch = placement_ticket.epoch,
-                .published_payload_bytes = 0u,
-                .published_live_rows = 0u,
-                .published_live_entries = 0u,
-                .published_stage_count = 0u,
-                .published_shared_hidden_bytes = 0u,
-                .live_rows = 0u,
-                .live_entries = 0u,
-                .stage_count = identity.stage_count,
-                .physical_rows = physical_rows,
-                .last_published_stage = -1,
-                .last_consumed_stage = -1,
-                .single_row_id = -1,
-                .endpoint = raw(endpoint),
-                .state = raw(MoEOverlayActivationEndpointState::Active),
-                .code = raw(MoEOverlayActivationStatusCode::Success),
-                .graph_role = static_cast<MoEOverlayInferenceGraphRole>(
-                    identity.graph_role),
-                .original_slot_index = identity.original_slot_index,
-                .channel_cohort_target = identity.cohort_target,
-                .channel_return_role = identity.return_role,
-            };
         }
         return grant->digest.valid() && grant->generation != 0u &&
                grant->placement_epoch != 0u &&
@@ -5245,7 +5255,7 @@ namespace llaminar2::moe_activation_packet_device
               (sizeof(float4) - 1u)) == 0u))
         {
             if (threadIdx.x < entries)
-                orig_slots[threadIdx.x] = packet.dispatch.original_route_slots[threadIdx.x];
+                orig_slots[threadIdx.x] = validate_shared.orig_chunk[1u + threadIdx.x];
             __syncthreads();
             const std::size_t vecs_per_row = width / 4u;
             const std::size_t total_vecs = static_cast<std::size_t>(entries) * vecs_per_row;
@@ -5342,3 +5352,4 @@ namespace llaminar2::moe_activation_packet_device
 } // namespace llaminar2::moe_activation_packet_device
 
 #undef LLAMINAR_MOE_PACKET_GRID_CONSTANT
+#undef LLAMINAR_MOE_PACKET_NOINLINE

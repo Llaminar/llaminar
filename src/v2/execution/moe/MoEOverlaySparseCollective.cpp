@@ -1388,26 +1388,59 @@ namespace llaminar2
                 const __m512 v_scale = _mm512_set1_ps(kCPUPrefillFixedPointScale);
                 const __m512 v_pos = _mm512_set1_ps(kCPUPrefillFixedPointClamp);
                 const __m512 v_neg = _mm512_set1_ps(-kCPUPrefillFixedPointClamp);
-                for (; c + 16u <= width; c += 16u)
+                if (population == 2u)
                 {
-                    __m512 sum = _mm512_loadu_ps(participant_rows[0] + c);
-                    for (size_t p = 1u; p < population; ++p)
-                        sum = _mm512_add_ps(sum, _mm512_loadu_ps(participant_rows[p] + c));
-                    const __m512 x = _mm512_mul_ps(sum, v_w);
-                    const __m512 cl = _mm512_max_ps(v_neg, _mm512_min_ps(v_pos, x));
-                    const __m512i q = _mm512_cvt_roundps_epi32(
-                        _mm512_mul_ps(cl, v_scale),
-                        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    const float *__restrict__ r0 = participant_rows[0];
+                    const float *__restrict__ r1 = participant_rows[1];
                     if (first_route)
                     {
-                        _mm512_storeu_si512(reinterpret_cast<__m512i *>(acc + c), q);
+                        for (; c + 16u <= width; c += 16u)
+                        {
+                            const __m512 sum = _mm512_add_ps(_mm512_loadu_ps(r0 + c), _mm512_loadu_ps(r1 + c));
+                            const __m512 cl = _mm512_max_ps(v_neg, _mm512_min_ps(v_pos, _mm512_mul_ps(sum, v_w)));
+                            const __m512i q = _mm512_cvt_roundps_epi32(
+                                _mm512_mul_ps(cl, v_scale),
+                                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                            _mm512_storeu_si512(reinterpret_cast<__m512i *>(acc + c), q);
+                        }
                     }
                     else
                     {
-                        const __m512i prev =
-                            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(acc + c));
-                        _mm512_storeu_si512(
-                            reinterpret_cast<__m512i *>(acc + c), _mm512_add_epi32(prev, q));
+                        for (; c + 16u <= width; c += 16u)
+                        {
+                            const __m512 sum = _mm512_add_ps(_mm512_loadu_ps(r0 + c), _mm512_loadu_ps(r1 + c));
+                            const __m512 cl = _mm512_max_ps(v_neg, _mm512_min_ps(v_pos, _mm512_mul_ps(sum, v_w)));
+                            const __m512i q = _mm512_cvt_roundps_epi32(
+                                _mm512_mul_ps(cl, v_scale),
+                                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                            const __m512i prev = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(acc + c));
+                            _mm512_storeu_si512(reinterpret_cast<__m512i *>(acc + c), _mm512_add_epi32(prev, q));
+                        }
+                    }
+                }
+                else
+                {
+                    for (; c + 16u <= width; c += 16u)
+                    {
+                        __m512 sum = _mm512_loadu_ps(participant_rows[0] + c);
+                        for (size_t p = 1u; p < population; ++p)
+                            sum = _mm512_add_ps(sum, _mm512_loadu_ps(participant_rows[p] + c));
+                        const __m512 x = _mm512_mul_ps(sum, v_w);
+                        const __m512 cl = _mm512_max_ps(v_neg, _mm512_min_ps(v_pos, x));
+                        const __m512i q = _mm512_cvt_roundps_epi32(
+                            _mm512_mul_ps(cl, v_scale),
+                            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                        if (first_route)
+                        {
+                            _mm512_storeu_si512(reinterpret_cast<__m512i *>(acc + c), q);
+                        }
+                        else
+                        {
+                            const __m512i prev =
+                                _mm512_loadu_si512(reinterpret_cast<const __m512i *>(acc + c));
+                            _mm512_storeu_si512(
+                                reinterpret_cast<__m512i *>(acc + c), _mm512_add_epi32(prev, q));
+                        }
                     }
                 }
             }
@@ -1829,15 +1862,27 @@ namespace llaminar2
                                 shard_scratch[j].first, shard_scratch[j].second))
                         return false;
             }
+            constexpr int kFastExpertMaskCap = 1024;
+            std::array<uint8_t, kFastExpertMaskCap> selected_mask{};
+            const bool use_fast_mask = (original.original_expert_count <= kFastExpertMaskCap);
+            if(use_fast_mask)
+            {
+                for(const int expert : original.selected_expert_ids)
+                    selected_mask[static_cast<size_t>(expert)] = 1u;
+            }
             for(size_t entry = 0u; entry < count; ++entry)
             {
                 const auto slot = sparse.original_slots[entry];
                 const auto expert = sparse.expert_ids[entry];
+                const bool in_selected = use_fast_mask
+                    ? (expert >= 0 && expert < original.original_expert_count &&
+                       selected_mask[static_cast<size_t>(expert)] != 0u)
+                    : std::binary_search(original.selected_expert_ids.begin(),
+                                         original.selected_expert_ids.end(), expert);
                 if(static_cast<size_t>(slot) >= slots || expert < 0 ||
                    expert >= original.original_expert_count ||
                    !std::isfinite(sparse.weights[entry]) || sparse.weights[entry] == 0.0f ||
-                   !std::binary_search(original.selected_expert_ids.begin(),
-                                       original.selected_expert_ids.end(), expert))
+                   !in_selected)
                     return false;
             }
             std::fill_n(original.participant_route_maps.data(), slots * population, int32_t{-1});
@@ -1855,6 +1900,8 @@ namespace llaminar2
                     range.first_record * rec_width, range.record_count * rec_width);
                 for(size_t rec = 0u; rec < range.record_count; ++rec)
                 {
+                    if(rec + 8u < range.record_count)
+                        __builtin_prefetch(recs.data() + (rec + 8u) * rec_width + original.columns, 0, 0);
                     const auto slot = canonical_moe_route_record::readFlatRouteSlot(
                         recs.data() + rec * rec_width, original.columns);
                     if(slot >= slots || original.required_route_weights[slot] == 0.0f || map[slot] != -1)
@@ -1910,6 +1957,19 @@ namespace llaminar2
                                     original.participant_route_maps[p * slots + slot]);
                                 inline_rows[p] = original.records.data() +
                                     (original.source_ranges[p].first_record + rec_idx) * rec_width;
+                            }
+                            if(e + 1u < end)
+                            {
+                                const size_t next_slot = static_cast<size_t>(sparse.original_slots[e + 1u]);
+                                for(size_t p = 0u; p < population; ++p)
+                                {
+                                    const auto nrec = static_cast<size_t>(
+                                        original.participant_route_maps[p * slots + next_slot]);
+                                    __builtin_prefetch(
+                                        original.records.data() +
+                                            (original.source_ranges[p].first_record + nrec) * rec_width,
+                                        0, 3);
+                                }
                             }
                             accumulateShardCombinedFixed32Row(
                                 acc_ptr, inline_rows.data(), population, weight, width,

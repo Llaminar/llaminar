@@ -2142,6 +2142,8 @@ void native_quantised_gemm_skinny_splitk_kernel(
             int32_t a[2][4][16][9];
             int32_t b[2][4][8][32];
             float scale[2][4][32];
+            float min_val[2][4][32];
+            int32_t sum_a[2][4][16];
         } tile;
         float part[4][16][32];
     };
@@ -2183,7 +2185,7 @@ void native_quantised_gemm_skinny_splitk_kernel(
                 const size_t linear = static_cast<size_t>(blk) * N + b_ncol;
                 load_payload<PB>(d_payload + linear * PB, b_dw);
                 s_bits = d_block_scales[linear];
-                if constexpr (Traits::needs_aux_compute)
+                if constexpr (Traits::needs_aux_compute || Traits::is_asymmetric)
                     aux_bits = d_block_mins[linear];
             } else {
                 s_bits = 0;
@@ -2200,6 +2202,16 @@ void native_quantised_gemm_skinny_splitk_kernel(
             smem.tile.a[buf][wave][a_r][base_kg + 1] = static_cast<int32_t>(a_pref.y);
             smem.tile.a[buf][wave][a_r][base_kg + 2] = static_cast<int32_t>(a_pref.z);
             smem.tile.a[buf][wave][a_r][base_kg + 3] = static_cast<int32_t>(a_pref.w);
+            if constexpr (Traits::is_asymmetric) {
+                constexpr int32_t ones = 0x01010101;
+                int32_t hs = ::llaminar2::rocm_integer_contract::signedDot4(static_cast<int32_t>(a_pref.x), ones, 0);
+                hs = ::llaminar2::rocm_integer_contract::signedDot4(static_cast<int32_t>(a_pref.y), ones, hs);
+                hs = ::llaminar2::rocm_integer_contract::signedDot4(static_cast<int32_t>(a_pref.z), ones, hs);
+                hs = ::llaminar2::rocm_integer_contract::signedDot4(static_cast<int32_t>(a_pref.w), ones, hs);
+                hs += __shfl_xor(hs, 1, 64);
+                if (a_half == 0)
+                    smem.tile.sum_a[buf][wave][a_r] = hs;
+            }
         } else {
             if (n_full || b_ncol < N) {
                 int32_t packed[8];
@@ -2207,13 +2219,20 @@ void native_quantised_gemm_skinny_splitk_kernel(
                 #pragma unroll
                 for (int kg = 0; kg < 8; ++kg)
                     smem.tile.b[buf][wave][kg][b_col] = packed[kg];
-                smem.tile.scale[buf][wave][b_col] =
-                    rocm_native_quantised_load_single_weight_scale<FMT>(s_bits, aux_bits);
+                if constexpr (Traits::is_asymmetric) {
+                    smem.tile.scale[buf][wave][b_col] = __half2float(*reinterpret_cast<const __half*>(&s_bits));
+                    smem.tile.min_val[buf][wave][b_col] = __half2float(*reinterpret_cast<const __half*>(&aux_bits));
+                } else {
+                    smem.tile.scale[buf][wave][b_col] =
+                        rocm_native_quantised_load_single_weight_scale<FMT>(s_bits, aux_bits);
+                }
             } else {
                 #pragma unroll
                 for (int kg = 0; kg < 8; ++kg)
                     smem.tile.b[buf][wave][kg][b_col] = 0;
                 smem.tile.scale[buf][wave][b_col] = 0.0f;
+                if constexpr (Traits::is_asymmetric)
+                    smem.tile.min_val[buf][wave][b_col] = 0.0f;
             }
         }
         asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
@@ -2276,17 +2295,40 @@ void native_quantised_gemm_skinny_splitk_kernel(
 
                 const float bs0 = smem.tile.scale[cur][wave][n_local + 0];
                 const float bs1 = smem.tile.scale[cur][wave][n_local + 1];
-                #pragma unroll
-                for (int mm = 0; mm < 4; ++mm)
+                if constexpr (Traits::is_asymmetric)
                 {
-                    const int gm = m_block + m_base + mm;
-                    const float sa = d_scales_A_blockwise
-                        ? ((m_full || gm < M)
-                               ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + blk]
-                               : 0.0f)
-                        : 1.0f;
-                    acc[mm][0] = rocm_native_quantised_commit_single_scale_block(acc[mm][0], block_acc[mm][0], bs0, sa);
-                    acc[mm][1] = rocm_native_quantised_commit_single_scale_block(acc[mm][1], block_acc[mm][1], bs1, sa);
+                    const float bm0 = smem.tile.min_val[cur][wave][n_local + 0];
+                    const float bm1 = smem.tile.min_val[cur][wave][n_local + 1];
+                    #pragma unroll
+                    for (int mm = 0; mm < 4; ++mm)
+                    {
+                        const int gm = m_block + m_base + mm;
+                        const float sa = d_scales_A_blockwise
+                            ? ((m_full || gm < M)
+                                   ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + blk]
+                                   : 0.0f)
+                            : 1.0f;
+                        const int32_t sum_a = smem.tile.sum_a[cur][wave][m_base + mm];
+                        acc[mm][0] = rocm_native_quantised_commit_corrected_single_scale_block(
+                            acc[mm][0], block_acc[mm][0], bs0, sum_a, bm0, sa);
+                        acc[mm][1] = rocm_native_quantised_commit_corrected_single_scale_block(
+                            acc[mm][1], block_acc[mm][1], bs1, sum_a, bm1, sa);
+                    }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int mm = 0; mm < 4; ++mm)
+                    {
+                        const int gm = m_block + m_base + mm;
+                        const float sa = d_scales_A_blockwise
+                            ? ((m_full || gm < M)
+                                   ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + blk]
+                                   : 0.0f)
+                            : 1.0f;
+                        acc[mm][0] = rocm_native_quantised_commit_single_scale_block(acc[mm][0], block_acc[mm][0], bs0, sa);
+                        acc[mm][1] = rocm_native_quantised_commit_single_scale_block(acc[mm][1], block_acc[mm][1], bs1, sa);
+                    }
                 }
 
                 if (has_next) {
@@ -3176,6 +3218,37 @@ static bool launch_native_quantised_gemm(
         // Above 128 WGs the GPU has enough parallelism for M32/M64 tiles to
         // win via better A-data reuse.  Verified: keeps 0.5B/3B M=64 wins
         // (+0.02..+0.42) while avoiding 7B M=64 regressions (224 WGs > 128).
+        // Skinny-N long-K asymmetric projections (e.g. TP4 Shared_GU N=160 K=2560 Q4_K):
+        // N64/M32 under-saturates 60-CU MI50 (48 CTAs with 50% tail waste on tile 2).
+        // 4-wave in-CTA Split-K (N32xM16) yields 160 full CTAs with zero column waste
+        // and bitwise serial-M1 equivalence.
+        if constexpr (NATIVE_QUANTISEDGemmTraits<FMT>::is_asymmetric) {
+            const int n64_mt32_ctas = ((N + 63) / 64) * ((M + 31) / 32);
+            const int cu_floor = std::max(1, actual_hardware.compute_units);
+            if (N <= 256 && K >= 2048 && serial_m1_kblocks >= 4 &&
+                n64_mt32_ctas < cu_floor) {
+                dim3 grid((N + 31) / 32, (M + 15) / 16, 1);
+                dim3 block(BLOCK_SIZE, 1, 1);
+                const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+                    native_quantised_gemm_skinny_splitk_kernel<FMT>));
+                clear_launch_error();
+                native_quantised_gemm_skinny_splitk_kernel<FMT>
+                    <<<grid, block, 0, hip_stream>>>(
+                        d_A_int8, d_payload, d_block_scales, d_block_mins,
+                        d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
+                        serial_m1_kblocks);
+                return complete_launch(
+                    llaminar2::rocm::VNNIPrefillProducer::NativeCooperative,
+                    "skinny_splitk4_asym_n32_m16",
+                    32,
+                    16,
+                    1,
+                    4,
+                    /*full_tiles=*/false,
+                    function);
+            }
+        }
+
         if (M <= 64) {
             const int n64_blocks = (N + 63) / 64;
             const int m16_blocks = (M + 15) / 16;

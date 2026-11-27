@@ -354,6 +354,9 @@ namespace llaminar2
     {
         using Unsigned = std::make_unsigned_t<Value>;
         Unsigned bits = static_cast<Unsigned>(value);
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#pragma unroll 1
+#endif
         for (std::size_t byte = 0; byte < sizeof(Unsigned); ++byte)
         {
             mixMoEOverlayActivationDigestByte(
