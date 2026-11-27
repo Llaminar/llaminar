@@ -606,6 +606,232 @@ TEST(PooledDenseDecode, RunnerTruncateExportImportRoundTrip)
     }
 }
 
+/** @test R3: truncate/import on ONE grouped member re-seats only that
+ * member's typed cursor epoch — the sibling member's epoch and publication
+ * stay independent, and the DGO adopts the truncated member's publication
+ * position in a later grouped forward. */
+TEST(PooledDenseDecode, GroupedMemberTruncateReseatsOnlyThatMember)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 3> prompt_a{1, 5, 3};
+    const std::array<int32_t, 4> prompt_b{2, 3, 5};
+    const int truncated_rows = 3; // A: prefill 3 + 2 decodes = 5 then truncate to 3.
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out,
+                           int batch)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, batch,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(batch, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 16;
+
+    PagedKVPoolBudget budget;
+    budget.remaining_budget_bytes = 3 * 1024 * 1024;
+    budget.frame_bytes = 4 * 1024;
+    // Enough live grant records for two steps + the truncate's private bank.
+    budget.request_records = 8;
+    budget.max_pages_per_request = 64;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+        /*layers=*/fx.config.n_layers, /*admitted_issuances=*/16, /*readers_per_bank=*/4);
+    auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+    ASSERT_TRUE(plan);
+    auto table_geom = plan->table_geometry;
+    table_geom.bank_count = 2 * table_geom.bank_count;
+    table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+    table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+    // The R3 truncation admits ONE private frame for the materialized bank
+    // plus per-step grants for two live requests; give the physical pool
+    // generous frame headroom (only frames, never the geometry policy) so
+    // the admissions stay deterministic.
+    auto pool_geom = plan->pool_geometry;
+    pool_geom.frames = 64 + 8 * pool_geom.frames;
+    // Multiple live grants coexist: per-step grants, the truncate's private
+    // publication grant (held for the bank lifetime) and the evergreen
+    // reservation records. Do NOT derive records from the tiny policy here.
+    pool_geom.request_records = 8;
+    auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+    widened->pool_geometry = pool_geom;
+    widened->table_geometry = table_geom;
+    widened->total_bytes = PhysicalPagePool::physicalBytes(pool_geom, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+    PhysicalMemoryPlanBuilder mbuilder;
+    mbuilder.add({.world_rank=0, .device=device,
+        .total_bytes=widened->total_bytes,
+        .admission_available_bytes=widened->total_bytes},
+        PhysicalMemoryOwner::KVCache, widened->total_bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mbuilder.build()), 0);
+    auto created = PagedKVInstance::create(authority, *widened, device);
+    ASSERT_TRUE(created);
+    PagedKVInstance instance = std::move(*created);
+
+    std::unique_ptr<DeviceGraphOrchestrator> grouped_owner;
+    PreparedWeightStore grouped_store;
+    std::shared_ptr<QwenStandardGraph> grouped_builder;
+    make_runner(fx, grouped_owner, grouped_store, grouped_builder, 2);
+    // Truncation independence is the R3 contract; exercise it on the COW
+    // arm (two binding tail grants would participate in the same frame count
+    // and the truncate admission is a normal grant — persistent_tail=false
+    // matches the round-trip test's geometry and keeps the truncate grant
+    // admission deterministic).
+    PooledKVDecodeBinding binding_a(&instance.pool(), &instance.table(),
+        /*request_id=*/311, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/16,
+        /*persistent_tail=*/false);
+    PooledKVDecodeBinding binding_b(&instance.pool(), &instance.table(),
+        /*request_id=*/312, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/16,
+        /*persistent_tail=*/false);
+    grouped_owner->setPooledDecodeBinding(&binding_a);
+    grouped_owner->setPooledDecodePositions({0, 0});
+    ASSERT_OK("pooled A prefill", grouped_owner->forward(prompt_a.data(), 3, 1) != nullptr);
+    grouped_owner->setPooledDecodeBinding(nullptr);
+    grouped_owner->setPooledDecodeBinding(&binding_b);
+    grouped_owner->setPooledDecodePositions({0, 0});
+    ASSERT_OK("pooled B prefill", grouped_owner->forward(prompt_b.data(), 4, 1) != nullptr);
+    grouped_owner->setPooledDecodeBinding(nullptr);
+    grouped_owner->setPooledDecodeGroup({&binding_a, &binding_b});
+
+    // Two grouped decode steps: A rows 3+2=5, B rows 4+2=6.
+    const int32_t tk_a[2] = {2, 4};
+    const int32_t tk_b[2] = {1, 3};
+    for (int s = 0; s < 2; ++s)
+    {
+        grouped_owner->setPooledDecodePositions({3 + s, 4 + s});
+        const int32_t batch[2] = {tk_a[s], tk_b[s]};
+        ASSERT_OK("grouped decode", grouped_owner->forward(batch, 1, 2) != nullptr);
+    }
+    ASSERT_EQ(binding_a.priorFor(0)->snapshot.view().rows(), 5);
+    ASSERT_EQ(binding_b.priorFor(0)->snapshot.view().rows(), 6);
+    // Truncate ONLY member A to its prefill length (3 rows): its epoch
+    // advances; B keeps epoch 0 and its 6-row publication untouched.
+    EXPECT_EQ(binding_a.cursorEpoch(), 0u);
+    EXPECT_EQ(binding_b.cursorEpoch(), 0u);
+    ASSERT_TRUE(binding_a.truncateLayer(0, truncated_rows));
+    EXPECT_EQ(binding_a.cursorEpoch(), 1u);
+    EXPECT_EQ(binding_b.cursorEpoch(), 0u);
+    EXPECT_EQ(binding_b.priorFor(0)->snapshot.view().rows(), 6);
+    // A grouped forward with BOTH members: the DGO adopts A's re-seated
+    // position (3, not 5) from the publication while B stays at 6.
+    grouped_owner->setPooledDecodePositions({3, 6});
+    const int32_t batch[2] = {6, 5};
+    ASSERT_OK("grouped decode after member truncate",
+        grouped_owner->forward(batch, 1, 2) != nullptr);
+    EXPECT_EQ(binding_a.priorFor(0)->snapshot.view().rows(), 4);
+    EXPECT_EQ(binding_b.priorFor(0)->snapshot.view().rows(), 7);
+}
+/** @test R2: the grouped gate refuses when the host cursor vector is too
+ * small for the batch — the indexed positions access is guarded BEFORE any
+ * out-of-range read (adoption only re-seats existing entries). */
+TEST(PooledDenseDecode, GroupedGateRefusesShortCursorVector)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 3> prompt_a{1, 5, 3};
+    const std::array<int32_t, 4> prompt_b{2, 3, 5};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out,
+                           int batch)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, batch,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(batch, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 16;
+
+    PagedKVPoolBudget budget;
+    budget.remaining_budget_bytes = 3 * 1024 * 1024;
+    budget.frame_bytes = 4 * 1024;
+    budget.request_records = 8;
+    budget.max_pages_per_request = 64;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+        /*layers=*/fx.config.n_layers, /*admitted_issuances=*/16, /*readers_per_bank=*/4);
+    auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+    ASSERT_TRUE(plan);
+    auto table_geom = plan->table_geometry;
+    table_geom.bank_count = 2 * table_geom.bank_count;
+    table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+    table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+    auto pool_geom = plan->pool_geometry;
+    pool_geom.frames = 64 + 8 * pool_geom.frames;
+    pool_geom.request_records = 8;
+    auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+    widened->pool_geometry = pool_geom;
+    widened->table_geometry = table_geom;
+    widened->total_bytes = PhysicalPagePool::physicalBytes(pool_geom, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+    PhysicalMemoryPlanBuilder mbuilder;
+    mbuilder.add({.world_rank=0, .device=device,
+        .total_bytes=widened->total_bytes,
+        .admission_available_bytes=widened->total_bytes},
+        PhysicalMemoryOwner::KVCache, widened->total_bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mbuilder.build()), 0);
+    auto created = PagedKVInstance::create(authority, *widened, device);
+    ASSERT_TRUE(created);
+    PagedKVInstance instance = std::move(*created);
+
+    std::unique_ptr<DeviceGraphOrchestrator> grouped_owner;
+    PreparedWeightStore grouped_store;
+    std::shared_ptr<QwenStandardGraph> grouped_builder;
+    make_runner(fx, grouped_owner, grouped_store, grouped_builder, 2);
+    PooledKVDecodeBinding binding_a(&instance.pool(), &instance.table(),
+        /*request_id=*/321, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/16,
+        /*persistent_tail=*/false);
+    PooledKVDecodeBinding binding_b(&instance.pool(), &instance.table(),
+        /*request_id=*/322, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/16,
+        /*persistent_tail=*/false);
+    grouped_owner->setPooledDecodeBinding(&binding_a);
+    grouped_owner->setPooledDecodePositions({0, 0});
+    ASSERT_OK("pooled A prefill", grouped_owner->forward(prompt_a.data(), 3, 1) != nullptr);
+    grouped_owner->setPooledDecodeBinding(nullptr);
+    grouped_owner->setPooledDecodeBinding(&binding_b);
+    grouped_owner->setPooledDecodePositions({0, 0});
+    ASSERT_OK("pooled B prefill", grouped_owner->forward(prompt_b.data(), 4, 1) != nullptr);
+    grouped_owner->setPooledDecodeBinding(nullptr);
+    grouped_owner->setPooledDecodeGroup({&binding_a, &binding_b});
+    // Shrink the host cursor vector BELOW the batch: the grouped gate must
+    // refuse (indexed access would be out of range).
+    grouped_owner->setPooledDecodePositions({3});
+    const int32_t batch[2] = {2, 1};
+    EXPECT_EQ(grouped_owner->forward(batch, 1, 2), nullptr)
+        << "grouped forward must refuse with a short host cursor vector";
+}
+
 /** @test P2 cancellation under a running pooled step + exact borrower
  * retirement: a request cancelled between steps publishes nothing new, its
  * accepted-work envelope and tail frames retire to the pool, and a resolved

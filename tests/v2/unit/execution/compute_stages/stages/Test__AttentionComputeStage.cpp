@@ -2055,6 +2055,92 @@ TEST(PooledStageConsumption, StepGrantExhaustionRefusesBeforeAnyLayerPublishes)
     (void)policy;
 }
 
+/** @test R1: grouped pooled decode refuses duplicate / aliased ref cells.
+ * Two decode rows must consume DISTINCT publications (one per request); a
+ * cell naming the same publication as another cell, a cell duplicating the
+ * single ref, or an invalid cell is refused BEFORE any resolve or borrow —
+ * no row ever runs under ambiguous identity. */
+TEST(PooledStageConsumption, GroupedRefCellsMustBeDistinct)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{4,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 4};
+    const CPUFP32PagedKVTableGeometry table_geometry{4, 4, 4, page_tokens, 32, 8};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+
+    // Publish one snapshot (4 rows) for request 7 / slot 0.
+    auto update = table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    auto grant = pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    const auto frame = grant->assignFrame();
+    std::vector<float> payload(4 * 2 * heads * dimension);
+    auto write = grant->prepareAppend(frame, payload.size() * sizeof(float));
+    ASSERT_TRUE(write);
+    write->copyFrom(std::as_bytes(std::span(payload)));
+    update->append(CPUFP32KVPage(write->commit(), heads, dimension));
+    auto snapshot = update->commit();
+    ASSERT_TRUE(table->bindPublication(snapshot, /*request_id=*/7, /*slot=*/0));
+    const auto ref = table->refFor(snapshot, 7, 0);
+    ASSERT_TRUE(ref.valid());
+
+    auto ref_copy = ref; // Same identity, always.
+    MPIContext local_mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory tf(local_mpi);
+    auto Q = tf.createFP32({2, static_cast<size_t>(heads * dimension)}, device);
+    auto output = tf.createFP32({2, static_cast<size_t>(heads * dimension)}, device);
+    AttentionComputeStage::Params params;
+    params.Q = Q.get();
+    params.output = output.get();
+    params.batch_size = 2;
+    params.seq_len = 1;
+    params.kv_len = 4;
+    params.n_heads = heads;
+    params.n_kv_heads = kv_heads;
+    params.head_dim = dimension;
+    params.causal = true;
+    params.window_size = -1;
+    params.position_offset = 3;
+    params.device_id = device;
+    params.kv_cache = nullptr;
+    params.mpi_ctx = &local_mpi;
+    params.pooled_table = table.get();
+    CPUDeviceContext ctx(device);
+
+    // Duplicate cell pair: the two rows would attend the SAME publication.
+    {
+        AttentionComputeStage::Params dup = params;
+        dup.pooled_ref_cells = {&ref, &ref_copy};
+        AttentionComputeStage stage(dup);
+        EXPECT_FALSE(stage.execute(&ctx)) << "duplicate grouped ref cells must refuse";
+    }
+    // Cell aliasing the single-ref path is also refused.
+    {
+        AttentionComputeStage::Params alias = params;
+        alias.pooled_ref = ref;
+        alias.pooled_ref_cells = {&ref};
+        AttentionComputeStage stage(alias);
+        EXPECT_FALSE(stage.execute(&ctx)) << "grouped cell duplicating the single ref must refuse";
+    }
+    // An invalid cell is refused before resolve.
+    {
+        AttentionComputeStage::Params bad = params;
+        const PagedKVSnapshotRef invalid{};
+        bad.pooled_ref_cells = {&ref, &invalid};
+        AttentionComputeStage stage(bad);
+        EXPECT_FALSE(stage.execute(&ctx)) << "invalid grouped ref cell must refuse";
+    }
+}
+
 /** @test R25 N1: a step guard cancels on ANY unwind — the step grant returns
  * and no next publication becomes visible. */
 /** @test R25 N1: a step guard cancels on ANY unwind — the step grant returns

@@ -528,12 +528,23 @@ public:
         const std::size_t layers = cells_.size();
         // N2: the accepted-work version envelope must cover THIS step.
         if (reservation_->remaining() < layers)
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Step admission refused: version envelope exhausted"
+                      << " (remaining=" << reservation_->remaining()
+                      << " layers=" << layers << ")");
             return StepGuard{};
+        }
         // N2: bank headroom — every layer holds its prior bank plus this
         // step's next bank; readers share existing banks, never new ones.
         const auto demand = table_->liveClassDemand();
         if (demand.occupied_banks + kRequiredBanksPerLayer * layers > table_->bankCount())
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Step admission refused: bank headroom"
+                      << " (occupied=" << demand.occupied_banks
+                      << " required=" << kRequiredBanksPerLayer * layers
+                      << " banks=" << table_->bankCount() << ")");
             return StepGuard{};
+        }
         // Page demand: fresh pages only. The exclusive tail extends the
         // request's PERSISTENT tail frames (already admitted at binding); a
         // step fully covered by the tail admits NO step grant. A step with a
@@ -546,6 +557,11 @@ public:
             if (!step_grant_ || step_grant_->remainingCommitment() <
                 static_cast<std::size_t>(fresh))
             {
+                LOG_ERROR("[PooledKVDecodeBinding] Step admission refused: page pressure"
+                          << " (fresh=" << fresh
+                          << " frames=" << pool_->geometry().frames
+                          << " max_per_request=" << pool_->geometry().max_pages_per_request
+                          << " records=" << pool_->geometry().request_records << ")");
                 step_grant_.reset();
                 return StepGuard{};
             }
@@ -796,6 +812,13 @@ private:
     std::optional<PhysicalPagePool::Grant> tail_grant_;
     std::vector<std::optional<PhysicalPagePool::FrameHandle>> tail_frames_;
     std::vector<std::optional<PhysicalPagePool::FrameHandle>> fresh_tail_frames_;
-    bool persistent_tail_ = false;
+    /**
+     * Persistent exclusive-tail mode. The production default is true
+     * (measured: 268 vs 1280 bytes/step — TailCopyBytesMeasurement); the
+     * default-constructed binding (which is only ever moved-from / stored
+     * in containers before real construction) keeps the SAME default so
+     * no code path silently observes the COW arm.
+     */
+    bool persistent_tail_ = true;
 };
 } // namespace llaminar2

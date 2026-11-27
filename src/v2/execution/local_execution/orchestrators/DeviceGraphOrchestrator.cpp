@@ -18480,6 +18480,19 @@ namespace llaminar2
             for (int r = 0; r < batch_size; ++r)
             {
                 auto *member = pooled_kv_binding_group_[static_cast<std::size_t>(r)];
+                // R2: the host cursor vector must seat every grouped row.
+                // The adoption loop only re-seats indices STATE ALREADY SEATS;
+                // this gate indexes positions[r] directly, so refuse BEFORE
+                // any out-of-range access if the cursor vector is shorter
+                // than the batch.
+                if (static_cast<std::size_t>(r) >= state_.positions.size())
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Pooled grouped host cursor vector is too small "
+                        "(positions=" << state_.positions.size()
+                        << " request=" << r << "); refusing pooled forward");
+                    return std::nullopt;
+                }
                 // M4: a continued/chunked prefill with live pooled history is
                 // refused (decode-only; per-request gate).
                 if (input.execution_phase == ForwardExecutionPhase::Prefill &&

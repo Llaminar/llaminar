@@ -1453,6 +1453,48 @@ namespace llaminar2
                           << " batch=" << params_.batch_size
                           << " seq=" << params_.seq_len << ")");
             }
+            else
+            {
+                // R1: distinct-publication validation. Each cell must name
+                // the exact publication of a DISTINCT request; two rows
+                // sharing one publication would double-attend the same
+                // rows (silent cross-request aliasing) and a cell also
+                // named by the single ref is a caller error. Duplicates are
+                // refused BEFORE any resolve or borrow — no row ever runs
+                // under ambiguous identity.
+                bool refs_distinct = true;
+                for (std::size_t r = 0; r < params_.pooled_ref_cells.size() && refs_distinct; ++r)
+                {
+                    const auto *cell = params_.pooled_ref_cells[r];
+                    if (!cell || !cell->valid())
+                    {
+                        refs_distinct = false;
+                        LOG_ERROR("[AttentionComputeStage] Pooled grouped ref cell " << r
+                                  << " is null or invalid");
+                        break;
+                    }
+                    if (params_.pooled_ref_cell && *cell == *params_.pooled_ref_cell)
+                    {
+                        refs_distinct = false;
+                        LOG_ERROR("[AttentionComputeStage] Pooled grouped ref cell " << r
+                                  << " duplicates the single pooled ref");
+                        break;
+                    }
+                    for (std::size_t q = r + 1; q < params_.pooled_ref_cells.size(); ++q)
+                    {
+                        const auto *other = params_.pooled_ref_cells[q];
+                        if (other && *cell == *other)
+                        {
+                            refs_distinct = false;
+                            LOG_ERROR("[AttentionComputeStage] Pooled grouped ref cells " << r
+                                      << " and " << q << " name the same publication");
+                            break;
+                        }
+                    }
+                }
+                if (!refs_distinct)
+                    pooled_ok = false;
+            }
         }
         else if (pooled_mode)
         {
