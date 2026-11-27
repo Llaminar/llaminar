@@ -4,6 +4,7 @@
 The native class is never silently skipped: its separate integration registration
 fails if GNU14 is missing. Parser controls are not native qualification evidence.
 """
+import contextlib
 import importlib.util
 import os
 from pathlib import Path
@@ -73,6 +74,31 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
         self.assertEqual([m[4] for m in members], [b"aa", b"bb"])
 
 
+    def test_wrapped_map_kept_and_discarded_are_distinct(self):
+        name = ".text." + "long_mangled_name" * 12
+        text = ("Discarded input sections\n " + name + "\n  0x0 0x8 loser.a(loser.o)\n"
+                "Memory Configuration\nLinker script and memory map\n " + name +
+                "\n  0x1000 0x8 winner.a(winner.o)\n")
+        discarded, kept = C._static_map_records(text)
+        self.assertEqual(discarded, [(name, 0, 8, "loser.a(loser.o)")])
+        self.assertEqual(kept, [(name, 4096, 8, "winner.a(winner.o)")])
+        for broken in (text + "Linker script and memory map", text.replace("  0x1000", "not an address")):
+            with self.assertRaises(ValueError):
+                C._static_map_records(broken)
+
+    def test_trace_member_forms_canonicalize_and_unknown_records_fail(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            header = b"m.o/            " + b"0           0     0     100644  " + b"2         " + b"`\n"
+            archive = root / "a.a"
+            archive.write_bytes(b"!<arch>\n" + header + b"aa")
+            for line in (str(archive), f"({archive})m.o", f"{archive}(m.o)"):
+                self.assertEqual(C._static_trace_paths(line, root), {archive})
+            for line in (f"{archive}(absent.o)", "ld: warning: unknown", f"({archive})m.o(extra)"):
+                with self.assertRaises(ValueError):
+                    C._static_trace_paths(line, root)
+
+
 class StaticSelectionNativeTest(unittest.TestCase):
     """Real linker acquisition; host acquisition is not AArch64 selection qualification."""
 
@@ -80,8 +106,12 @@ class StaticSelectionNativeTest(unittest.TestCase):
         compiler = os.environ.get("LLAMINAR_STATIC_TEST_GXX", "g++-14")
         compiler = shutil.which(compiler)
         self.assertIsNotNone(compiler, "native static acquisition requires GNU14 g++ (LLAMINAR_STATIC_TEST_GXX)")
-        with tempfile.TemporaryDirectory() as root:
+        base = os.environ.get("LLAMINAR_STATIC_TEST_ARTIFACTS")
+        if base:
+            Path(base).mkdir(parents=True, exist_ok=True)
+        with contextlib.nullcontext(tempfile.mkdtemp(prefix="static-native-", dir=base)) as root:
             root = Path(root)
+            print(f"Retained native static artifacts: {root}", flush=True)
             (root / "f.cpp").write_text('extern "C" __attribute__((weak)) int f(){return 7;}\n')
             (root / "g.cpp").write_text('extern "C" __attribute__((weak)) int f(){return 9;}\n')
             (root / "main.cpp").write_text('extern "C" int f(); int main(){return f();}\n')
