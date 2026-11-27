@@ -180,6 +180,7 @@ measurement conditions:
 | register-broadcast packed 16×24 | 0.93 TF/s |
 | .S hardware-broadcast packed 16×24 (Intel-syntax `{1to16}`) | 0.85 TF/s |
 | .S oneDNN-shape broadcast-reuse 32×12 (0.67 load-slots/FMA) | 0.85-0.91 TF/s |
+| .S exact reference-shape 48×8 (3 A regs + 8 broadcasts + 24 FMAs/pair) | 0.66-1.01 TF/s |
 
 oneDNN's reference microkernel (jit_avx512_core_gemm_bf16bf16f32_kern.cpp)
 uses the same instruction family with an equivalent load:FMA ratio
