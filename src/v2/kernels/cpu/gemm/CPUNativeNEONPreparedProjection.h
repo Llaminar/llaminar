@@ -42,6 +42,9 @@ namespace llaminar2::cpu::native_quantised
 #define LLAMINAR_NEON_PROJECTION_EXACT_UNSCHEDULED
 #define LLAMINAR_NEON_PROJECTION_CODED_UNSCHEDULED
 #endif
+// The exact programs listed in kUnthreadedPrograms compile like the coded programs (no-thread-jumps).
+#define LLAMINAR_NEON_PROJECTION_EXACT_UNTHREADED LLAMINAR_NEON_PROJECTION_CODED
+#define LLAMINAR_NEON_PROJECTION_EXACT_UNSCHEDULED_UNTHREADED LLAMINAR_NEON_PROJECTION_CODED_UNSCHEDULED
 
     class CPUNativeNEONProjectionBatch;
 
@@ -1438,27 +1441,99 @@ namespace llaminar2::cpu::native_quantised
             "4:2:0:3:11:0", "4:2:0:4:2:0", "4:2:1:3:11:0", "4:2:1:4:2:0", "4:2:1:6:1:1",
         };
 
+        /**
+         * @brief Exact (non-coded) tile programs compiled without GCC's jump threading, like every coded program.
+         * @details Same key format as kUnscheduledPrograms. Jump threading duplicates the partition and block
+         * walks' exit tests into extra copies of the K loop, each holding its own copy of the column and partition
+         * state in registers; in these programs that state then spills around the block walk. Threading only
+         * duplicates control flow: operations, operands and rounding are unchanged. Each entry was measured per
+         * program with the GCC 14 tile register and stack-traffic witness.
+         */
+        static constexpr std::string_view kUnthreadedPrograms[] = {
+            "1:1:0:0:1:1", "1:1:0:1:0:0", "1:1:0:2:0:0", "2:0:0:4:2:0", "2:1:0:2:0:0", "3:0:0:4:2:0",
+            "3:0:0:7:0:0", "3:1:0:7:0:0", "3:1:1:4:2:0", "4:0:0:4:2:0", "4:0:0:6:1:1", "4:0:0:7:0:0",
+            "4:0:1:4:2:0", "4:1:0:4:2:0", "4:1:0:7:0:0", "4:1:1:4:2:0", "4:1:1:6:1:1", "4:2:1:6:1:1",
+        };
+
+        /** @brief Program-key fields rows:family:policy:encoding:map:minimum of one listed key; -1 if malformed. */
+        static consteval std::array<int, 6> programKeyFields(std::string_view key) noexcept
+        {
+            std::array<int, 6> fields{};
+            std::size_t at = 0;
+            for (int &field : fields)
+            {
+                if (at >= key.size() || key[at] < '0' || key[at] > '9')
+                    return {-1, -1, -1, -1, -1, -1};
+                while (at < key.size() && key[at] >= '0' && key[at] <= '9') field = field * 10 + (key[at++] - '0');
+                if (&field != &fields.back() && (at >= key.size() || key[at++] != ':'))
+                    return {-1, -1, -1, -1, -1, -1};
+            }
+            if (at != key.size())
+                return {-1, -1, -1, -1, -1, -1};
+            return fields;
+        }
+
+        /**
+         * @brief Whether every key of @p Programs is a well-formed, unique program key of an instantiable tile program.
+         * @details Instantiable: rows 1-4; family ASIMD, SDOT or SMMLA (SMMLA only for two or more rows: a lone
+         * row is the SDOT leaf); either policy; and an (encoding, map, minimum) that dispatch() or the coded
+         * dispatch selects. The tile witness additionally checks the keys against the programs it audits.
+         */
+        template <const auto &Programs> static consteval bool wellFormedProgramList() noexcept
+        {
+            constexpr int dispatched[][3] = {{1, 0, 0}, {2, 0, 0}, {4, 2, 0}, {0, 0, 0}, {0, 2, 0}, {0, 1, 1},
+                                             {0, 3, 0}, {6, 1, 1}, {7, 0, 0}, {7, 1, 1}, {3, 7, 1}, {3, 11, 0}};
+            for (std::size_t index = 0; index < std::size(Programs); ++index)
+            {
+                const auto key = programKeyFields(Programs[index]);
+                if (key[0] < 1 || key[0] > 4 || key[1] < 0 || key[1] > 2 || (key[1] == 2 && key[0] < 2) ||
+                    key[2] < 0 || key[2] > 1)
+                    return false;
+                bool known = false;
+                for (const auto &tuple : dispatched)
+                    known = known || (tuple[0] == key[3] && tuple[1] == key[4] && tuple[2] == key[5]);
+                if (!known)
+                    return false;
+                for (std::size_t other = 0; other < index; ++other)
+                    if (Programs[other] == Programs[index])
+                        return false;
+            }
+            return true;
+        }
+        static_assert(wellFormedProgramList<kUnscheduledPrograms>(), "kUnscheduledPrograms holds a malformed key");
+        static_assert(wellFormedProgramList<kUnthreadedPrograms>(), "kUnthreadedPrograms holds a malformed key");
+        static_assert([] {
+            for (const std::string_view key : kUnthreadedPrograms)
+                if (programKeyFields(key)[3] == static_cast<int>(Encoding::CompactMultiScale))
+                    return false;
+            return true;
+        }(), "coded programs always compile without jump threading (runCoded)");
+
+        /** @brief Whether the program of these tile arguments is listed in @p Programs. */
+        template <const auto &Programs, typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical, int Map,
+                  bool WithMinimum>
+        static consteval bool listedProgram() noexcept
+        {
+            const std::array<int, 6> fields{static_cast<int>(Rows), static_cast<int>(Ops::instruction),
+                                            static_cast<int>(Policy), static_cast<int>(Physical), Map, WithMinimum ? 1 : 0};
+            for (const std::string_view key : Programs)
+                if (programKeyFields(key) == fields)
+                    return true;
+            return false;
+        }
+
+        /** @brief Codegen profile of one exact program: bit 0 unscheduled, bit 1 unthreaded. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical, int Map, bool WithMinimum>
+        static consteval int exactProfile() noexcept
+        {
+            return (listedProgram<kUnscheduledPrograms, Ops, Policy, Physical, Map, WithMinimum>() ? 1 : 0) |
+                   (listedProgram<kUnthreadedPrograms, Ops, Policy, Physical, Map, WithMinimum>() ? 2 : 0);
+        }
+
         /** @brief Whether the program of these tile arguments is listed in kUnscheduledPrograms. */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical, int Map, bool WithMinimum>
         static consteval bool unscheduledProgram() noexcept
-        {
-            const int fields[] = {static_cast<int>(Rows), static_cast<int>(Ops::instruction), static_cast<int>(Policy),
-                                  static_cast<int>(Physical), Map, WithMinimum ? 1 : 0};
-            for (const std::string_view key : kUnscheduledPrograms)
-            {
-                std::size_t at = 0;
-                bool same = true;
-                for (const int field : fields)
-                {
-                    int value = 0;
-                    while (at < key.size() && key[at] != ':') value = value * 10 + (key[at++] - '0');
-                    ++at;
-                    same = same && value == field;
-                }
-                if (same) return true;
-            }
-            return false;
-        }
+        { return listedProgram<kUnscheduledPrograms, Ops, Policy, Physical, Map, WithMinimum>(); }
 
         /**
          * @brief Execute the source's exact block program with a fixed serial/grouped K tree.
@@ -1470,7 +1545,7 @@ namespace llaminar2::cpu::native_quantised
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
                   NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
-            requires(!unscheduledProgram<Ops, Policy, Physical, static_cast<int>(Map), WithMinimum>())
+            requires(exactProfile<Ops, Policy, Physical, static_cast<int>(Map), WithMinimum>() == 0)
         LLAMINAR_NEON_PROJECTION_EXACT void run() const noexcept
         {
             executeBlockProgram<Ops, Policy, Physical, Map, WithMinimum, Strips, 0>();
@@ -1479,8 +1554,26 @@ namespace llaminar2::cpu::native_quantised
         /** @brief run() of a program listed in kUnscheduledPrograms: the same body without pre-allocation scheduling. */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
                   NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
-            requires(unscheduledProgram<Ops, Policy, Physical, static_cast<int>(Map), WithMinimum>())
+            requires(exactProfile<Ops, Policy, Physical, static_cast<int>(Map), WithMinimum>() == 1)
         LLAMINAR_NEON_PROJECTION_EXACT_UNSCHEDULED void run() const noexcept
+        {
+            executeBlockProgram<Ops, Policy, Physical, Map, WithMinimum, Strips, 0>();
+        }
+
+        /** @brief run() of a program listed in kUnthreadedPrograms: the same body without jump threading. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
+                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
+            requires(exactProfile<Ops, Policy, Physical, static_cast<int>(Map), WithMinimum>() == 2)
+        LLAMINAR_NEON_PROJECTION_EXACT_UNTHREADED void run() const noexcept
+        {
+            executeBlockProgram<Ops, Policy, Physical, Map, WithMinimum, Strips, 0>();
+        }
+
+        /** @brief run() of a program in both lists: without pre-allocation scheduling and jump threading. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
+                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
+            requires(exactProfile<Ops, Policy, Physical, static_cast<int>(Map), WithMinimum>() == 3)
+        LLAMINAR_NEON_PROJECTION_EXACT_UNSCHEDULED_UNTHREADED void run() const noexcept
         {
             executeBlockProgram<Ops, Policy, Physical, Map, WithMinimum, Strips, 0>();
         }

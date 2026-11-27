@@ -133,7 +133,15 @@ GCC 14 witness in the pinned toolchain:
 - the backend-native row-pair accumulator carry, and `no-thread-jumps` on
   `runCoded()`;
 - the single-row SDOT barriers around the Q5_K/IQ3_S group decodes and the
-  coded factor phase.
+  coded factor phase;
+- `kUnscheduledPrograms` (compiled with `no-schedule-insns`) and
+  `kUnthreadedPrograms` (exact programs compiled with `no-thread-jumps`), keyed
+  by the witness's program key. Static assertions require well-formed, unique
+  keys of instantiable programs. The register-evidence unit test requires every
+  key to name a program the witness audits, so a stale key fails. The
+  `CPUCodegenAttributeSourcePolicy` gate admits only these arithmetic-preserving
+  `optimize` options, always together with `fp-contract=off` and
+  `no-associative-math`.
 
 None of these choices changes arithmetic, but each one depends on the
 compiler's register allocation. On a compiler or flag change, measure them

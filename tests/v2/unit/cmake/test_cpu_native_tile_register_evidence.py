@@ -3305,6 +3305,32 @@ class PolicyTest(unittest.TestCase):
                 self.assertEqual(sum(key.split(":")[3] == "3" for key in limits), coded)
                 self.assertTrue(all(not key.startswith("1:") and value >= 0 for key, value in limits.items()))
 
+    def test_codegen_profile_lists_name_audited_programs(self) -> None:
+        """kUnscheduledPrograms/kUnthreadedPrograms: well-formed unique keys of programs the witness audits."""
+        source = (REPO / "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h").read_text()
+        audited = set()
+        for mode, entries in CHECKER.ENVELOPE_PROGRAMS.items():
+            for entry in entries:
+                rows, dot = entry.split(":")
+                leaf = 1 if dot == "I8MM" and rows == "1" else CHECKER.DOTS[dot]
+                for policy in (0, 1):
+                    for encoding, nibble_map, minimum in CHECKER.DISPATCH:
+                        audited.add(f"{rows}:{leaf}:{policy}:{encoding}:{nibble_map}:{minimum}")
+                    for codebook, minimum in CHECKER.CODED_DISPATCH:
+                        audited.add(f"{rows}:{leaf}:{policy}:{CHECKER.CODED_ENCODING}:{codebook}:{minimum}")
+        for name in ("kUnscheduledPrograms", "kUnthreadedPrograms"):
+            with self.subTest(name=name):
+                match = re.search(name + r"\[\] = \{(.*?)\};", source, re.S)
+                self.assertIsNotNone(match)
+                body = re.sub(r"//[^\n]*", "", match.group(1))
+                keys = re.findall(r'"([^"]*)"', body)
+                self.assertTrue(keys)
+                self.assertEqual(re.sub(r'"[^"]*"|[\s,]', "", body), "")
+                self.assertEqual(len(keys), len(set(keys)))
+                self.assertEqual(sorted(key for key in keys if key not in audited), [])
+                if name == "kUnthreadedPrograms":
+                    self.assertFalse(any(key.split(":")[3] == str(CHECKER.CODED_ENCODING) for key in keys))
+
     def test_compiler_identity_is_derived_from_the_compiler(self) -> None:
         self.assertEqual(CHECKER.compiler_identity("Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64"),
                          "AppleClang-21")
