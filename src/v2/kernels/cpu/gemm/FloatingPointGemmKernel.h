@@ -142,6 +142,7 @@ inline constexpr bool fmlalFpcrProfileAdmitted(std::uint64_t) noexcept { return 
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../common/FloatingExpertNumericalContract.h"
 #include "../../common/FloatingOutputPartitionScope.h"
+#include "CPUBF16Gemm.h"
 #include "../CPUInvocationWorkspace.h"
 #include "../primitives/SwiGLUPrimitives.h"
 #include "../primitives/SoftmaxPrimitives_New.h"
@@ -3464,6 +3465,23 @@ namespace llaminar2
                         LOG_ERROR("[FloatingPointGemmKernel] Failed to cast BF16 activations");
                         return false;
                     }
+                    cpu_bf16::Engine selected_bf16 = cpu_bf16::Engine::Library;
+                    if (cpu_bf16::run_bf16_gemm(
+                            A_bf16->typed_data() + row_offset,
+                            B_bf16->typed_data(),
+                            C_data,
+                            m,
+                            n,
+                            k,
+                            transpose_B,
+                            alpha,
+                            beta,
+                            cpu_bf16::Engine::Automatic,
+                            &selected_bf16))
+                        return true;
+                    // The automatic BF16 policy resolved the existing library /
+                    // serial-exact route; it remains the production route until
+                    // the native kernels are certified and measured.
                     return run_onednn_bf16_matmul(
                         A_bf16->typed_data() + row_offset,
                         B_bf16->typed_data(),
@@ -3702,6 +3720,23 @@ namespace llaminar2
                         LOG_ERROR("[FloatingPointGemmKernel] Failed to cast BF16 activations");
                         return false;
                     }
+                    cpu_bf16::Engine selected_bf16 = cpu_bf16::Engine::Library;
+                    if (cpu_bf16::run_bf16_gemm(
+                            A_bf16->typed_data() + row_offset,
+                            B_bf16->typed_data(),
+                            C_data,
+                            m,
+                            n,
+                            k,
+                            transpose_B,
+                            alpha,
+                            beta,
+                            cpu_bf16::Engine::Automatic,
+                            &selected_bf16))
+                        return true;
+                    // The automatic BF16 policy resolved the existing library /
+                    // serial-exact route; it remains the production route until
+                    // the native kernels are certified and measured.
                     return run_onednn_bf16_matmul(
                         A_bf16->typed_data() + row_offset,
                         B_bf16->typed_data(),
@@ -4870,6 +4905,11 @@ namespace llaminar2
 
                     if (!B_ptr)
                         return false;
+                    cpu_bf16::Engine selected_bf16 = cpu_bf16::Engine::Library;
+                    if (cpu_bf16::run_bf16_gemm(A_ptr, B_ptr, C, m, n, k, transpose_B,
+                                                alpha, beta, cpu_bf16::Engine::Automatic,
+                                                &selected_bf16))
+                        return true;
                     return run_onednn_bf16_matmul(A_ptr, B_ptr, C, m, n, k, transpose_B, alpha, beta);
                 }
 
@@ -5000,6 +5040,12 @@ namespace llaminar2
                     const auto *B_bf16 = dynamic_cast<const BF16Tensor *>(B);
                     if (A_bf16 && B_bf16)
                     {
+                        cpu_bf16::Engine selected_bf16 = cpu_bf16::Engine::Library;
+                        if (cpu_bf16::run_bf16_gemm(
+                                A_bf16->typed_data(), B_bf16->typed_data(), C->mutable_data(),
+                                m, n, k, transpose_B, alpha, beta,
+                                cpu_bf16::Engine::Automatic, &selected_bf16))
+                            return true;
                         return run_onednn_bf16_matmul(
                             A_bf16->typed_data(), B_bf16->typed_data(), C->mutable_data(),
                             m, n, k, transpose_B, alpha, beta);

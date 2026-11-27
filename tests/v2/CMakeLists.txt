@@ -20966,6 +20966,18 @@ if(USE_ONEDNN AND ONEDNN_FOUND)
     list(APPEND V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
         V2_Integration_CPU_FloatingSkinnySerialRows)
 endif()
+if(V2_CPU_TARGET_X86)
+    add_executable(v2_integration_cpu_bf16_gemm
+        integration/kernels/cpu/gemm/Test__CPUBF16Gemm.cpp)
+    target_link_libraries(v2_integration_cpu_bf16_gemm PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_CPU_BF16GemmNativeRoutes
+        COMMAND $<TARGET_FILE:v2_integration_cpu_bf16_gemm> --gtest_brief=1
+        LABELS "V2;Integration;CPU;GEMM;BF16;AMX;AVX512;Determinism;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+endif()
 if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillCacheKTile_AVX512
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
