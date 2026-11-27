@@ -557,8 +557,8 @@ namespace llaminar2::cpu::native_quantised
             typename Ops::I (&dots)[Rows]) const noexcept
         {
             using I = typename Ops::I;
-            const auto *nibbles = unit + column * 4;
-            const auto *planes = unit + 1024 + column / 2;
+            const std::uint8_t *nibbles = unit + column * 4;
+            const std::uint8_t *planes = unit + 1024 + column / 2;
             // The three-row tile uses one shared SDOT group rather than keeping
             // row-pair and odd-row accumulators live through both group decodes.
             if constexpr (multi_scale::usesRowPairs<Ops> && Rows != 3)
@@ -591,6 +591,9 @@ namespace llaminar2::cpu::native_quantised
                     const auto high = q5KMerge<true>(vshrq_n_u8(raw, 4), planes + (Group + 4) * 32);
                     lo = Ops::template dotLane<Group>(lo, std::bit_cast<I>(low), a);
                     hi = Ops::template dotLane<Group + 4>(hi, std::bit_cast<I>(high), a);
+                    // Retire this group's decode before the next group's loads: GCC
+                    // otherwise decodes all eight groups at once and spills.
+                    asm("" : "+w"(lo), "+w"(hi), "+r"(nibbles), "+r"(planes));
                 });
                 dots[0] = lo + hi;
             }
@@ -735,6 +738,8 @@ namespace llaminar2::cpu::native_quantised
                     const auto indices = iq3PairIndices<Pair, Ops>(qs, packed_qh);
                     even = Ops::template dotLane<group>(even, std::bit_cast<I>(iq3PairGroup<0, Ops>(indices, signs)), a);
                     odd = Ops::template dotLane<group + 1>(odd, std::bit_cast<I>(iq3PairGroup<1, Ops>(indices, signs)), a);
+                    // Retire this pair before the next pair's loads (see q5KBlock()).
+                    asm("" : "+w"(even), "+w"(odd), "+r"(unit));
                 });
                 dots[0] = even + odd;
             }
@@ -781,9 +786,22 @@ namespace llaminar2::cpu::native_quantised
                 else
                 {
                     using F = typename Ops::F;
-                    const auto sources = vld2_u16(reinterpret_cast<const std::uint16_t *>(header) + column * 2);
-                    return coded_metadata::Q4KBaseFactors<F>{std::bit_cast<F>(neon_fp16::widen(sources.val[0])),
-                        std::bit_cast<F>(neon_fp16::widen(sources.val[1]))};
+                    const auto *words = reinterpret_cast<const std::uint16_t *>(header) + column * 2;
+                    if constexpr (Rows == 1)
+                    {
+                        // Deinterleave the four (d, dmin) words in registers: the 1-row
+                        // tile materialises a vld2 structure through the stack.
+                        const uint16x8_t packed = vld1q_u16(words);
+                        return coded_metadata::Q4KBaseFactors<F>{
+                            std::bit_cast<F>(neon_fp16::widen(vget_low_u16(vuzp1q_u16(packed, packed)))),
+                            std::bit_cast<F>(neon_fp16::widen(vget_low_u16(vuzp2q_u16(packed, packed))))};
+                    }
+                    else
+                    {
+                        const auto sources = vld2_u16(words);
+                        return coded_metadata::Q4KBaseFactors<F>{std::bit_cast<F>(neon_fp16::widen(sources.val[0])),
+                            std::bit_cast<F>(neon_fp16::widen(sources.val[1]))};
+                    }
                 }
             }
             else
@@ -849,6 +867,14 @@ namespace llaminar2::cpu::native_quantised
         template <typename Ops, Encoding Physical> static constexpr bool hoistsSourceHeader() noexcept
         { return Physical == Encoding::NibbleLUTSourceScale && Ops::instruction != Dot::ASIMD; }
 
+        /**
+         * @brief Whether a coded tile walks its K blocks flat, widening the header factors per block.
+         * @tparam Coded Coded source codebook (Q5_K 7 or IQ3_S 11).
+         * @return True for Q5_K; IQ3_S widens once per superblock intersection because
+         *         its decode leaves no register to widen the header again in every block.
+         */
+        template <int Coded> static constexpr bool flatCodedWalk() noexcept { return Coded == 7; }
+
         /** @brief Visit increasing-K blocks without recomputing addresses or header factors in the K loop.
          * @tparam Physical Prepared encoding.
          * @tparam Coded Codebook of a coded source, or zero for the generic per-block tile.
@@ -913,7 +939,7 @@ namespace llaminar2::cpu::native_quantised
                 // Tile binding already admitted the resident geometry. A wire
                 // intersection is never passed directly to this execution ABI.
                 const auto *root = weights_.interleavedBase() + std::size_t(chunk_) * geometry.rowBytes();
-                if constexpr (Coded == 7)
+                if constexpr (flatCodedWalk<Coded>())
                 {
                     // Q5_K: one flat, branch-free increasing-K walk. Each block
                     // addresses its unit and source superblock header from the
@@ -925,8 +951,8 @@ namespace llaminar2::cpu::native_quantised
                 else
                 {
                     // IQ3_S: one header per superblock intersection, widened once outside
-                    // its blocks; the three- and four-row decodes leave no register to
-                    // widen it again in every block.
+                    // its blocks; its decode leaves no register to widen it again in every
+                    // block.
                     for (int block = first; block < last; )
                     {
                         const int end = std::min(last, static_cast<int>(geometry.superblockEnd(block)));
@@ -1456,7 +1482,8 @@ namespace llaminar2::cpu::native_quantised
                 for (int column = 0; column < columns_; column += 4)
                 {
                     float32x4_t reduced[Rows]{};
-                    constexpr bool seeded = ordered && !(multi_scale::usesRowPairs<Ops> && Rows == 3 && Coded == 0);
+                    constexpr bool seeded = ordered && !(multi_scale::usesRowPairs<Ops> && Rows == 3 && Coded == 0) &&
+                                           !(Coded == 11 && Rows == 1 && Ops::instruction == Dot::DotProd);
                     if constexpr (seeded)
                     {
 #pragma GCC unroll 4
@@ -1598,12 +1625,24 @@ namespace llaminar2::cpu::native_quantised
                             F scale0, scale1{};
                             if constexpr (Coded != 0)
                             {
-                                const auto factors = [&]() __attribute__((always_inline)) {
-                                    // Q5_K's flat walk passes the header; IQ3_S's walk the widened base.
-                                    if constexpr (Coded == 7)
-                                        return codedFactors<Coded, Ops>(unit, codedBase<Coded, Ops>(base, strip), strip);
+                                // The single-row SDOT decode leaves no register for the factor
+                                // program: make its addresses depend on the finished dot so GCC
+                                // cannot hoist the factor loads and widening into the decode.
+                                const std::uint8_t *factor_unit = unit;
+                                [[maybe_unused]] auto factor_base = base;
+                                if constexpr (Rows == 1 && Ops::instruction == Dot::DotProd)
+                                {
+                                    if constexpr (flatCodedWalk<Coded>())
+                                        asm("" : "+r"(factor_unit), "+r"(factor_base) : "w"(low[0]));
                                     else
-                                        return codedFactors<Coded, Ops>(unit, base, strip);
+                                        asm("" : "+r"(factor_unit) : "w"(low[0]));
+                                }
+                                const auto factors = [&]() __attribute__((always_inline)) {
+                                    // A flat walk passes the header; the grouped IQ3_S walk the widened base.
+                                    if constexpr (flatCodedWalk<Coded>())
+                                        return codedFactors<Coded, Ops>(factor_unit, codedBase<Coded, Ops>(factor_base, strip), strip);
+                                    else
+                                        return codedFactors<Coded, Ops>(factor_unit, base, strip);
                                 }();
                                 scale0 = factors.primary;
                                 scale1 = factors.secondary;
