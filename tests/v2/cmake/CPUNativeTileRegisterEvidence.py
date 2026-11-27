@@ -675,6 +675,8 @@ class ObjectImage(NamedTuple):
     # carry none: a landing pad there stays unreachable code and fails.
     landing: dict[str, list[tuple[int, int, int]]] = {}
 
+    object_sha256: bytes = b""  # Exact source object bytes, including code and non-code sections.
+
     @property
     def prefix(self) -> str:
         """The C linker-name prefix of the object format (Mach-O prepends an underscore)."""
@@ -753,7 +755,8 @@ def _memo(key: tuple, compute):
 def read_object(data: bytes) -> ObjectImage:
     """Sections (with executable extents) and the complete symbol table, read from the object itself."""
     return copy.deepcopy(_memo(("object", hashlib.sha256(data).digest()),
-                               lambda: _read_macho(data) if object_format(data) else _read_elf(data)))
+                               lambda: _read_macho(data) if object_format(data) else _read_elf(data)))._replace(
+                                   object_sha256=hashlib.sha256(data).digest())
 
 
 def image_fingerprint(image: ObjectImage) -> bytes:
@@ -2183,12 +2186,16 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
         raise ValueError("static executable requires ET_EXEC or PIE with PT_INTERP and DF_1_PIE")
     if any(s[0] == target for s in _static_symbols(data, headers, 11)):
         raise ValueError("static selected target appears in dynsym")
-    symbols = [s for s in _static_symbols(data, headers, 2) if s[0] == target]
+    final_symbols = _static_symbols(data, headers, 2)
+    symbols = [s for s in final_symbols if s[0] == target]
     if len(symbols) != 1:
         raise ValueError("ambiguous final static symbol")
     _, info, visibility, section, address, size = symbols[0]
     if info != 0x22 or visibility != 0 or not 0 < section < len(headers) or size == 0:
         raise ValueError("static final symbol is not unique weak/default STT_FUNC")
+    if any(s[0] != target and s[1] & 15 in (2, 10) and s[3] == section and
+           s[4] < address + size and address < s[4] + s[5] for s in final_symbols):
+        raise ValueError("static final function has overlapping aliases")
     final = headers[section]
     if not final["flags"] & 4 or not final["address"] <= address < address+size <= final["address"]+final["size"]:
         raise ValueError("static final symbol outside executable section")

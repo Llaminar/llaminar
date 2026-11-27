@@ -42,7 +42,7 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
             (root / "args").write_text("-Wl,--gc-sections")
             files = {}
             expanded = C._static_response(["@args"], root, files)
-            self.assertEqual(files[str(root / "args")], C._static_hash((root / "args").read_bytes()))
+            self.assertEqual(files[str((root / "args").resolve())], C._static_hash((root / "args").read_bytes()))
             with self.assertRaisesRegex(ValueError, "unsupported static"):
                 C._static_options(expanded)
             (root / "args").write_text("@args")
