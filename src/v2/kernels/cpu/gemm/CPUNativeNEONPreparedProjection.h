@@ -1193,7 +1193,7 @@ namespace llaminar2::cpu::native_quantised
                 constexpr bool ordered = Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert;
                 // The three- and four-row SMMLA tiles keep the partition-0 select: the
                 // seed's live register spills there (orderedPartitionSeedNEON()).
-                constexpr bool seeded = ordered && !(multi_scale::usesRowPairs<Ops> && Rows >= 3);
+                constexpr bool seeded = ordered && !(multi_scale::usesRowPairs<Ops> && Rows >= 3) && !(Rows == 4 && Ops::instruction == Dot::ASIMD);
                 float32x4_t reduced[Rows][S]{};
                 if constexpr (seeded)
                 {
