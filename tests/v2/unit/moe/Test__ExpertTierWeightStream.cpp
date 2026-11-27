@@ -170,6 +170,34 @@ namespace llaminar2
             return gpu;
         }
 
+        /** @test Every source retains its canonical GPU tuple; no physical-plane mutation is dispatchable. */
+        TEST(ExpertTierWeightStream, CanonicalGpuDispatchRejectsPhysicalTupleMutations)
+        {
+            constexpr std::array physical_fields{
+                &ExpertTierWeightDeviceLayout::gpu_codebook_id,
+                &ExpertTierWeightDeviceLayout::gpu_payload_bytes_per_block,
+                &ExpertTierWeightDeviceLayout::gpu_is_asymmetric,
+                &ExpertTierWeightDeviceLayout::gpu_has_emins};
+            for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+            {
+                SCOPED_TRACE(entry.quant_type);
+                const auto layout = makeGpuToCpuExpertTierWeightStreamManifest(*entry.metadata,
+                    70, 512, 1, 0, 0, ExpertTierWeightProjection::Down, 3).deviceLayout();
+                ASSERT_TRUE(layout.valid());
+                ASSERT_TRUE(layout.gpuFormatMatchesSource());
+                for (const auto field : physical_fields)
+                {
+                    auto mutation = layout;
+                    mutation.*field ^= 1u;
+                    EXPECT_FALSE(mutation.gpuFormatMatchesSource());
+                    EXPECT_FALSE(mutation.valid());
+                }
+                auto unsupported = layout;
+                unsupported.gpu_codebook_id = 255u;
+                EXPECT_FALSE(unsupported.gpuFormatMatchesSource());
+            }
+        }
+
         /** @test Native Q5 never enters the retired expanded GPU migration ABI. */
         TEST(ExpertTierWeightStream, NativeQ5RejectsExpandedGpuDescriptor)
         {
