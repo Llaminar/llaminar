@@ -17,6 +17,7 @@
  */
 
 #include "GEMMStage.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #endif
@@ -439,6 +440,92 @@ namespace llaminar2
                 validateQ8ResidualStorage(writes,reads);
             }
         }
+    }
+
+    struct GEMMStage::RetainedCPUSingleRowState
+    {
+        const cpu::native_quantised::CPUNativeQuantisedGemmKernel *kernel = nullptr;
+        cpu::native_quantised::CPUNativeQuantisedGemmKernel::RetainedSingleRowBinding binding{};
+        int effective_n = 0;
+        bool ready = false;
+    };
+
+    GEMMStage::~GEMMStage() = default;
+
+    IComputeStage::CPURetainedTeamMode GEMMStage::cpuRetainedTeamMode() const noexcept
+    {
+        const bool static_single_verifier_row =
+            !params_.verifier_row_range.has_value() ||
+            (params_.verifier_row_range->physicalRows() == 1 &&
+             params_.verifier_row_range->capacity() == 1 &&
+             params_.verifier_row_range->countOwner() == nullptr);
+        if (params_.device_id.is_gpu() || params_.m != 1 ||
+            params_.projection_row_work || params_.request_rows ||
+            !static_single_verifier_row ||
+            params_.gated_norm || params_.hc_branch_norm_input || params_.hc_down_output ||
+            params_.hc_prepublished_down || params_.hc_short_k_read ||
+            params_.gate_input || params_.do_swiglu ||
+            params_.bias || params_.bias_tensor ||
+            params_.alpha != 1.0f || params_.beta != 0.0f ||
+            !params_.A || !params_.B || !params_.C ||
+            params_.A->native_type() != TensorType::FP32 ||
+            params_.C->native_type() != TensorType::FP32 ||
+            !params_.prepared_store || !params_.prepared_ref.has_value() ||
+            !getWorkspace())
+        {
+            return CPURetainedTeamMode::None;
+        }
+        if (!native_quantised_formats::forQuantType(tensorTypeName(params_.B->native_type())))
+            return CPURetainedTeamMode::None;
+        const auto *b_base = dynamic_cast<const TensorBase *>(params_.B);
+        if (!b_base || b_base->activationRotation() != nullptr)
+            return CPURetainedTeamMode::None;
+        if (params_.hc_residual_down &&
+            params_.hc_residual_down->verifier_kernel_policy != LocalGPUExpertKernelPolicy::Generic)
+        {
+            return CPURetainedTeamMode::None;
+        }
+        return CPURetainedTeamMode::CollectiveTeam;
+    }
+
+    void GEMMStage::prepareForRetainedTeam(IDeviceContext *)
+    {
+        if (cpuRetainedTeamMode() != CPURetainedTeamMode::CollectiveTeam)
+        {
+            if (retained_cpu_state_)
+                retained_cpu_state_->ready = false;
+            return;
+        }
+        if (!retained_cpu_state_)
+            retained_cpu_state_ = std::make_unique<RetainedCPUSingleRowState>();
+        retained_cpu_state_->ready = false;
+
+        const bool is_sliced = !params_.output_range.empty();
+        const int effective_n = is_sliced ? static_cast<int>(params_.output_range.size()) : params_.n;
+        if (!cache_resolved_)
+        {
+            cached_gemm_ = resolvePreparedGemmForStage("GEMMStage", params_, is_sliced);
+            if (!cached_gemm_)
+                return;
+            cache_resolved_ = true;
+        }
+        auto *native_kernel = dynamic_cast<cpu::native_quantised::CPUNativeQuantisedGemmKernel *>(cached_gemm_);
+        if (!native_kernel)
+            return;
+        const auto *a_base = dynamic_cast<const TensorBase *>(params_.A);
+        auto *c_base = dynamic_cast<TensorBase *>(params_.C);
+        TensorBase *hc_activated = params_.hc_residual_down ? params_.hc_residual_down->activated : nullptr;
+        const bool two_term =
+            params_.quantized_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8;
+        if (!native_kernel->prepareSingleRowRetainedBinding(
+                a_base, c_base, hc_activated, effective_n, params_.k,
+                two_term, getWorkspace(), retained_cpu_state_->binding))
+        {
+            return;
+        }
+        retained_cpu_state_->kernel = native_kernel;
+        retained_cpu_state_->effective_n = effective_n;
+        retained_cpu_state_->ready = true;
     }
 
     /** @copydoc GEMMStage::hcActivatedOutput */
@@ -989,6 +1076,25 @@ namespace llaminar2
 
     bool GEMMStage::execute(IDeviceContext *ctx)
     {
+        if (llaminar::v2::inLexicalWorkshare() &&
+            retained_cpu_state_ && retained_cpu_state_->ready && retained_cpu_state_->kernel)
+        {
+            retained_cpu_state_->kernel->executeSingleRowInTeam(retained_cpu_state_->binding);
+            if (omp_get_thread_num() == 0)
+            {
+                if (retained_cpu_state_->binding.two_term)
+                {
+                    recordHCUpSubmission(retained_cpu_state_->effective_n, HCUpSubmissionOperation::ResidualCorrected);
+                    recordGDNOutputResidualSubmission(retained_cpu_state_->effective_n);
+                }
+                else
+                {
+                    recordHCUpSubmission(retained_cpu_state_->effective_n, HCUpSubmissionOperation::Ordinary);
+                }
+            }
+            return true;
+        }
+
         ScopedGemmContext gemm_ctx(params_.gemm_context);
 
         if (!ctx)

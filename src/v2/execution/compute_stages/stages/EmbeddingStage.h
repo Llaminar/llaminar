@@ -177,6 +177,36 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
+        /**
+         * @brief Opt single-row CPU FP32 embedding into the retained team's MasterSingle lane.
+         *
+         * Single-token CPU embedding lookup uses no OpenMP pragmas and copies one
+         * row, so running it on Thread 0 inside the enclosing retained OpenMP team
+         * avoids an extra team fork/join per decode step.
+         */
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override
+        {
+            if (!params_.device_id.is_gpu() &&
+                params_.num_tokens == 1 &&
+                !params_.token_batches &&
+                !params_.token_ids_device &&
+                params_.token_ids &&
+                params_.embed_table &&
+                params_.output &&
+                params_.output->native_type() == TensorType::FP32)
+            {
+                return CPURetainedTeamMode::MasterSingle;
+            }
+            return CPURetainedTeamMode::None;
+        }
+
+        /** @brief Pre-resolve the cached CPU embedding kernel on Thread 0 before team entry. */
+        void prepareForRetainedTeam(IDeviceContext *) override
+        {
+            if (cpuRetainedTeamMode() == CPURetainedTeamMode::MasterSingle)
+                (void)getOrCreateKernel();
+        }
+
         // IWorkspaceConsumerStage Implementation
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 

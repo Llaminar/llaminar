@@ -218,6 +218,50 @@ namespace llaminar2
                 device_state_publication_stream, routed_live_rows, absolute_position_ids_device, predictor, phase);
         }
 
+        const bool cpu_homogeneous_intermediate_shards = [&]() -> bool {
+            if (!device.is_cpu() || !use_expert_overlay || !overlay_plan || !layer.moe_gate || batch_size != 1)
+                return false;
+            if (overlay_plan->domains.size() != 1u || overlay_plan->routed_tiers.size() != 1u)
+                return false;
+            const auto &domain = overlay_plan->domains.front();
+            if (domain.routed_compute_policy != RoutedExpertComputePolicy::TensorSharded ||
+                domain.participants.size() < 2u)
+                return false;
+            if (overlay_plan->continuation_domain != domain.name ||
+                overlay_plan->routed_tiers.front().domain != domain.name ||
+                overlay_plan->shared_expert_domain != domain.name)
+                return false;
+            if (!std::all_of(domain.participants.begin(), domain.participants.end(),
+                    [](const GlobalDeviceAddress &participant) { return participant.isCPU(); }))
+                return false;
+            auto *gtp = dynamic_cast<IGlobalTPContext *>(config_.tp_ctx);
+            if (!gtp || gtp->degree() != static_cast<int>(domain.participants.size()))
+                return false;
+            const auto &authority = config_.moe.expert_overlay_residency_authority;
+            const auto &residency = config_.moe.expert_overlay_participant_residency;
+            if (!residency || !prepared_weight_store_)
+                return false;
+            const bool stationary =
+                config_.moe.rebalance_config.mode == MoERebalanceRuntimeMode::Off ||
+                (config_.moe.rebalance_config.mode == MoERebalanceRuntimeMode::Dynamic &&
+                 authority && (authority->stationaryTensorShardResidency() || authority->noPeerResidency()));
+            if (!stationary)
+                return false;
+            return true;
+        }();
+        if (cpu_homogeneous_intermediate_shards)
+        {
+            auto phase = routed_service_phase;
+            if (!mtp_sidecar_context && !config_.grouped_mtp_verifier && !config_.live_mtp_request_batch_condition &&
+                forward_execution_phase_)
+            {
+                phase = *forward_execution_phase_ == ForwardExecutionPhase::Prefill
+                    ? MoEOverlayServicePhaseHint::Prefill : MoEOverlayServicePhaseHint::Decode;
+            }
+            return buildCPUIntermediateShardFFNGraphForLayer(
+                layer, buffers, identity, total_tokens, device, predictor, phase);
+        }
+
         /*
          * Tiered ExpertOverlay routes every expert parent through the prepared
          * participant registry. A continuation rank may own no local expert

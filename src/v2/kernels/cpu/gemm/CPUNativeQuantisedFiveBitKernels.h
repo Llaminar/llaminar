@@ -425,7 +425,7 @@ namespace llaminar2::cpu::native_quantised
 
                 for (int kb = kb_start; kb < kb_end; ++kb)
                 {
-                    if (kb + 1 < packed.blocks_per_row)
+                    if (zbase == 0 && kb + 1 < packed.blocks_per_row)
                         packed.prefetchInterleavedUnitT0(chunk, kb + 1);
                     const Q8_1Block &a0 = A0[kb];
                     const Q8_1Block &a1 = A1[kb];
@@ -547,7 +547,7 @@ namespace llaminar2::cpu::native_quantised
 
                 for (int kb = kb_start; kb < kb_end; ++kb)
                 {
-                    if (kb + 1 < packed.blocks_per_row)
+                    if (z == 0 && kb + 1 < packed.blocks_per_row)
                         packed.prefetchInterleavedUnitT0(chunk, kb + 1);
                     const Q8_1Block &a0 = A0[kb];
                     const Q8_1Block &a1 = A1[kb];

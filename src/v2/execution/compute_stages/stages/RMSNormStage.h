@@ -95,6 +95,18 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
+        /**
+         * @brief Opt single-row CPU FP32 RMSNorm into the retained team's MasterSingle lane.
+         *
+         * Single-row FP32 normalization invokes the serial active-ISA row leaf
+         * (`rmsnorm_fused_vectorized_row`) with zero OpenMP pragmas, avoiding an
+         * OpenMP fork/join at the model's final norm.
+         */
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override;
+
+        /** @brief Pre-materialize subtract-one gamma and raw FP32 pointers on Thread 0. */
+        void prepareForRetainedTeam(IDeviceContext *ctx) override;
+
         /// Target device for coherence management
 
         const Params &getParams() const { return params_; }
@@ -107,6 +119,12 @@ namespace llaminar2
         /// Lazily-allocated gamma with subtract_one transform applied.
         /// Only populated when params_.subtract_one is true.
         mutable std::shared_ptr<FP32Tensor> subtract_one_gamma_;
+
+        // Pre-resolved raw FP32 pointers populated by prepareForRetainedTeam().
+        const float *retained_in_ = nullptr;
+        const float *retained_gamma_ = nullptr;
+        float *retained_out_ = nullptr;
+        size_t retained_hidden_dim_ = 0;
     };
 
 } // namespace llaminar2

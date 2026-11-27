@@ -982,13 +982,30 @@ bool CPUNativeQuantisedGemmKernel::executePreparedStandaloneMoEOneRowInTeam(
             active_down_plans = std::span<const PlanRow>(local_down_plans.data(), plan.route_count);
         }
         const int route_count_local = static_cast<int>(plan.route_count);
-#pragma omp for schedule(static)
-        for (int task = 0; task < down_tasks; ++task)
+        if (down_tiles_per_route >= 4 && (down_tiles_per_route % 2) == 0)
         {
-            const int chunk = task / route_count_local;
-            const int route = task % route_count_local;
-            const auto &row = active_down_plans[route];
-            row.tile(row, chunk);
+            const int chunk_pairs = down_tiles_per_route / 2;
+            const int pair_tasks = chunk_pairs * route_count_local;
+#pragma omp for schedule(static)
+            for (int task = 0; task < pair_tasks; ++task)
+            {
+                const int pair = task / route_count_local;
+                const int route = task % route_count_local;
+                const auto &row = active_down_plans[static_cast<size_t>(route)];
+                row.tile(row, pair * 2);
+                row.tile(row, pair * 2 + 1);
+            }
+        }
+        else
+        {
+#pragma omp for schedule(static)
+            for (int task = 0; task < down_tasks; ++task)
+            {
+                const int chunk = task / route_count_local;
+                const int route = task % route_count_local;
+                const auto &row = active_down_plans[static_cast<size_t>(route)];
+                row.tile(row, chunk);
+            }
         }
     };
 
@@ -1081,7 +1098,7 @@ bool CPUNativeQuantisedGemmKernel::executePreparedStandaloneMoEOneRowInTeam(
         {
             const int chunk = task / gate_row_count;
             const int row_idx = task % gate_row_count;
-            const auto &row = active_gate_plans[row_idx];
+            const auto &row = active_gate_plans[static_cast<size_t>(row_idx)];
             row.tile(row, chunk);
         }
 #pragma omp for schedule(static)

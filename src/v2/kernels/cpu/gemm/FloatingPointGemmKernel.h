@@ -73,6 +73,10 @@ inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
 #include <atomic>
 #include "utils/ARMCPUFeatures.h"
 #endif
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+#include "../../../utils/CPUFeatures.h"
 #include "../../FloatingActivationOperandPrecision.h"
 /**
  * @brief Test-visible route evidence for the FMLAL leaf, evidence-only by
@@ -229,6 +233,88 @@ namespace llaminar2
         /** @brief Row height of the decode-equivalent skinny FP32 tile. */
         inline constexpr int kSkinnyFP32RowTile = 4;
 
+        /** @brief Fixed K-partition count for narrow wide-K FP32 projections (e.g. HC inject [4, 10240]). */
+        inline constexpr int kSkinnyFP32FixedKTiles = 4;
+        /** @brief Maximum output width admitted by the fixed-K 16-lane SIMD tree. */
+        inline constexpr int kSkinnyFP32FixedTreeMaxN = 8;
+        /** @brief Cache-line float stride per partial slot (64 bytes) to eliminate multi-core false sharing. */
+        inline constexpr int kSkinnyFP32PartialStrideFloats = 16;
+
+        /**
+         * @brief Return whether an FP32 transposed skinny projection uses the fixed 4x16 SIMD tree.
+         *
+         * Narrow wide-K projections like QFN `hc_inject` (`N=4, K=10240`) leave 24/28
+         * cores idle under N-only scalar loops. Using 4 fixed K-partitions of 16-lane
+         * FMA vectors gives 16 single-wave parallel tasks across all memory channels
+         * with a deterministic reduction order that is bitwise identical across Scalar,
+         * AVX2, AVX-512, every thread count, and M=1 vs grouped verifier execution.
+         * Narrow GDN projections (`N=24/48`) stay outside this predicate.
+         */
+        inline constexpr bool usesFixedTreeSkinnyFP32(int N, int K, bool transpose_B) noexcept
+        {
+            return transpose_B && N > 0 && N <= kSkinnyFP32FixedTreeMaxN &&
+                   K >= 2048 && (K % 64) == 0;
+        }
+
+        /**
+         * @brief Evaluate one 16-element-aligned `[begin, end)` FP32 dot tile with fixed 16-lane order.
+         * @pre `(end - begin) % 16 == 0`.
+         * @return Deterministic sum of lanes `0..15`, bit-identical across Scalar, AVX2, and AVX-512.
+         */
+        inline float dotFP32Fixed16LaneRange(
+            const float *a, const float *b, int begin, int end, ISALevel isa) noexcept
+        {
+            alignas(64) float lanes[16] = {};
+#if defined(__AVX512F__)
+            if (isa == ISALevel::AVX512)
+            {
+                __m512 acc = _mm512_setzero_ps();
+                for (int i = begin; i < end; i += 16)
+                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+                _mm512_store_ps(lanes, acc);
+            }
+            else
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+            if (isa >= ISALevel::AVX2)
+            {
+                __m256 acc0 = _mm256_setzero_ps();
+                __m256 acc1 = _mm256_setzero_ps();
+                for (int i = begin; i < end; i += 16)
+                {
+                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), acc1);
+                }
+                _mm256_store_ps(lanes, acc0);
+                _mm256_store_ps(lanes + 8, acc1);
+            }
+            else
+#endif
+            {
+                (void)isa;
+                for (int i = begin; i < end; i += 16)
+                {
+                    for (int l = 0; l < 16; ++l)
+                        lanes[l] = std::fma(a[i + l], b[i + l], lanes[l]);
+                }
+            }
+            float sum = lanes[0];
+            for (int l = 1; l < 16; ++l)
+                sum += lanes[l];
+            return sum;
+        }
+
+        /** @brief Evaluate a complete `[0, K)` FP32 dot in the exact fixed 8x16 partition tree. */
+        inline float dotFP32FixedTreeComplete(
+            const float *a, const float *b, int K, ISALevel isa) noexcept
+        {
+            const int tile_k = K / kSkinnyFP32FixedKTiles;
+            float total = 0.0f;
+            for (int t = 0; t < kSkinnyFP32FixedKTiles; ++t)
+                total += dotFP32Fixed16LaneRange(a, b, t * tile_k, (t + 1) * tile_k, isa);
+            return total;
+        }
+
         /**
          * @brief Compute one skinny FP32 tile's dot products in serial decode order.
          *
@@ -365,6 +451,119 @@ namespace llaminar2
             if(selection) {
                 if(selection->physicalRows()!=M)throw std::invalid_argument("Floating projection selection exceeds matrix rows");
                 selection->validateHostPublications();
+            }
+
+            if (usesFixedTreeSkinnyFP32(N, K, transpose_B))
+            {
+                const ISALevel isa = activeISALevel();
+                const int tile_k = K / kSkinnyFP32FixedKTiles;
+                constexpr int kStackMaxRows = 16;
+                if (M <= kStackMaxRows)
+                {
+                    // Pad each task slot to a full 64-byte cache line so concurrent workers
+                    // never trigger RFO false-sharing storms on adjacent partial floats.
+                    alignas(64) float tile_partials[kStackMaxRows * kSkinnyFP32FixedTreeMaxN *
+                                                    kSkinnyFP32FixedKTiles * kSkinnyFP32PartialStrideFloats];
+                    const int total_tasks = M * N * kSkinnyFP32FixedKTiles;
+                    auto run_k_tiles = [&]()
+                    {
+#pragma omp for schedule(static)
+                        for (int task = 0; task < total_tasks; ++task)
+                        {
+                            const int tile = task % kSkinnyFP32FixedKTiles;
+                            const int rc = task / kSkinnyFP32FixedKTiles;
+                            const int col = rc % N;
+                            const int row = rc / N;
+                            if (selection && !selection->hostRowIsActive(row))
+                                continue;
+                            tile_partials[task * kSkinnyFP32PartialStrideFloats] = dotFP32Fixed16LaneRange(
+                                A + static_cast<size_t>(row) * K,
+                                B + static_cast<size_t>(col) * K,
+                                tile * tile_k, (tile + 1) * tile_k, isa);
+                        }
+                    };
+                    OMP_WORKSHARE_REGION(run_k_tiles);
+                    for (int row = 0; row < M; ++row)
+                    {
+                        if (selection && !selection->hostRowIsActive(row))
+                            continue;
+                        for (int col = 0; col < N; ++col)
+                        {
+                            const int base = (row * N + col) * kSkinnyFP32FixedKTiles;
+                            float acc = 0.0f;
+                            for (int tile = 0; tile < kSkinnyFP32FixedKTiles; ++tile)
+                                acc += tile_partials[(base + tile) * kSkinnyFP32PartialStrideFloats];
+                            float *output = C + static_cast<size_t>(row) * N + col;
+                            *output = completeSkinnyMatmulValue(acc, alpha, beta, output,
+                                bias ? bias + col : nullptr);
+                        }
+                    }
+                    return true;
+                }
+                auto run_large_m = [&]()
+                {
+                    // Stream each activation row A[row] ONCE into L1 across all N <= 8 columns
+                    // (e.g. QFN hc_write_projection [512, 10240] x [4, 10240]), cutting DRAM traffic
+                    // by N-fold while preserving the exact fixed 4x16 per-column reduction tree.
+#pragma omp for schedule(static)
+                    for (int row = 0; row < M; ++row)
+                    {
+                        if (selection && !selection->hostRowIsActive(row))
+                            continue;
+                        const float *a_row = A + static_cast<size_t>(row) * K;
+                        float col_acc[kSkinnyFP32FixedTreeMaxN] = {};
+                        for (int t = 0; t < kSkinnyFP32FixedKTiles; ++t)
+                        {
+                            const int begin = t * tile_k;
+                            const int end = begin + tile_k;
+#if defined(__AVX512F__)
+                            if (isa == ISALevel::AVX512 && N == 4)
+                            {
+                                const float *b0 = B;
+                                const float *b1 = B + static_cast<size_t>(K);
+                                const float *b2 = B + static_cast<size_t>(2) * K;
+                                const float *b3 = B + static_cast<size_t>(3) * K;
+                                __m512 acc0 = _mm512_setzero_ps();
+                                __m512 acc1 = _mm512_setzero_ps();
+                                __m512 acc2 = _mm512_setzero_ps();
+                                __m512 acc3 = _mm512_setzero_ps();
+                                for (int i = begin; i < end; i += 16)
+                                {
+                                    const __m512 av = _mm512_loadu_ps(a_row + i);
+                                    acc0 = _mm512_fmadd_ps(av, _mm512_loadu_ps(b0 + i), acc0);
+                                    acc1 = _mm512_fmadd_ps(av, _mm512_loadu_ps(b1 + i), acc1);
+                                    acc2 = _mm512_fmadd_ps(av, _mm512_loadu_ps(b2 + i), acc2);
+                                    acc3 = _mm512_fmadd_ps(av, _mm512_loadu_ps(b3 + i), acc3);
+                                }
+                                alignas(64) float lanes[4][16];
+                                _mm512_store_ps(lanes[0], acc0);
+                                _mm512_store_ps(lanes[1], acc1);
+                                _mm512_store_ps(lanes[2], acc2);
+                                _mm512_store_ps(lanes[3], acc3);
+                                for (int col = 0; col < 4; ++col)
+                                {
+                                    float sum = lanes[col][0];
+                                    for (int l = 1; l < 16; ++l)
+                                        sum += lanes[col][l];
+                                    col_acc[col] += sum;
+                                }
+                                continue;
+                            }
+#endif
+                            for (int col = 0; col < N; ++col)
+                                col_acc[col] += dotFP32Fixed16LaneRange(
+                                    a_row, B + static_cast<size_t>(col) * K, begin, end, isa);
+                        }
+                        for (int col = 0; col < N; ++col)
+                        {
+                            float *output = C + static_cast<size_t>(row) * N + col;
+                            *output = completeSkinnyMatmulValue(col_acc[col], alpha, beta, output,
+                                bias ? bias + col : nullptr);
+                        }
+                    }
+                };
+                OMP_WORKSHARE_REGION(run_large_m);
+                return true;
             }
 
             /*
@@ -827,6 +1026,120 @@ namespace llaminar2
                                                 float beta = 0.0f,
                                                 const FloatingProjectionRows *selection = nullptr)
         {
+            // Fast SIMD 4x4 register-blocked FP32xBF16 GEMM for non-verifier prefill (e.g. QFN
+            // qsa_key_proj [512, 2560] x [128, 2560] BF16), eliminating the scalar K loop.
+            const auto scoped_sel = cpuFloatingProjectionRows(M);
+            if (transpose_B && M >= 16 && N > 0 && K >= 16 && !selection && !scoped_sel &&
+                !ITensorGemm::VerifierKernelModeScope::active())
+            {
+                const ISALevel isa = activeISALevel();
+                if (isa >= ISALevel::AVX2)
+                {
+                    const int row_tiles = (M + 3) / 4;
+                    const int col_tiles = (N + 3) / 4;
+                    auto simd_bf16 = [&]()
+                    {
+#pragma omp for collapse(2) schedule(static)
+                        for (int rt = 0; rt < row_tiles; ++rt)
+                        {
+                            for (int ct = 0; ct < col_tiles; ++ct)
+                            {
+                                const int r0 = rt * 4;
+                                const int c0 = ct * 4;
+                                const int mr = std::min(4, M - r0);
+                                const int nc = std::min(4, N - c0);
+                                float res[4][4] = {};
+#if defined(__AVX512F__)
+                                if (isa == ISALevel::AVX512 && mr == 4 && nc == 4)
+                                {
+                                    __m512 acc[4][4];
+                                    for (int r = 0; r < 4; ++r)
+                                        for (int c = 0; c < 4; ++c)
+                                            acc[r][c] = _mm512_setzero_ps();
+                                    const float *ap[4] = {
+                                        A + static_cast<size_t>(r0 + 0) * K,
+                                        A + static_cast<size_t>(r0 + 1) * K,
+                                        A + static_cast<size_t>(r0 + 2) * K,
+                                        A + static_cast<size_t>(r0 + 3) * K};
+                                    const uint16_t *bp[4] = {
+                                        B + static_cast<size_t>(c0 + 0) * K,
+                                        B + static_cast<size_t>(c0 + 1) * K,
+                                        B + static_cast<size_t>(c0 + 2) * K,
+                                        B + static_cast<size_t>(c0 + 3) * K};
+                                    int kk = 0;
+                                    for (; kk + 16 <= K; kk += 16)
+                                    {
+                                        __m512 av0 = _mm512_loadu_ps(ap[0] + kk);
+                                        __m512 av1 = _mm512_loadu_ps(ap[1] + kk);
+                                        __m512 av2 = _mm512_loadu_ps(ap[2] + kk);
+                                        __m512 av3 = _mm512_loadu_ps(ap[3] + kk);
+                                        for (int c = 0; c < 4; ++c)
+                                        {
+                                            __m512 bv = _mm512_castsi512_ps(_mm512_slli_epi32(
+                                                _mm512_cvtepu16_epi32(_mm256_loadu_si256(
+                                                    reinterpret_cast<const __m256i *>(bp[c] + kk))), 16));
+                                            acc[0][c] = _mm512_fmadd_ps(av0, bv, acc[0][c]);
+                                            acc[1][c] = _mm512_fmadd_ps(av1, bv, acc[1][c]);
+                                            acc[2][c] = _mm512_fmadd_ps(av2, bv, acc[2][c]);
+                                            acc[3][c] = _mm512_fmadd_ps(av3, bv, acc[3][c]);
+                                        }
+                                    }
+                                    for (int r = 0; r < 4; ++r)
+                                    {
+                                        for (int c = 0; c < 4; ++c)
+                                        {
+                                            float s = _mm512_reduce_add_ps(acc[r][c]);
+                                            for (int k2 = kk; k2 < K; ++k2)
+                                                s = std::fma(ap[r][k2], simd::bf16_to_fp32(bp[c][k2]), s);
+                                            res[r][c] = s;
+                                        }
+                                    }
+                                }
+                                else
+#endif
+                                {
+                                    for (int r = 0; r < mr; ++r)
+                                    {
+                                        const float *ar = A + static_cast<size_t>(r0 + r) * K;
+                                        for (int c = 0; c < nc; ++c)
+                                        {
+                                            const uint16_t *bc = B + static_cast<size_t>(c0 + c) * K;
+                                            int kk = 0;
+                                            float s = 0.0f;
+#if defined(__AVX2__) && defined(__FMA__)
+                                            __m256 vacc = _mm256_setzero_ps();
+                                            for (; kk + 8 <= K; kk += 8)
+                                            {
+                                                __m256 bv = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                                    _mm256_cvtepu16_epi32(_mm_loadu_si128(
+                                                        reinterpret_cast<const __m128i *>(bc + kk))), 16));
+                                                vacc = _mm256_fmadd_ps(_mm256_loadu_ps(ar + kk), bv, vacc);
+                                            }
+                                            alignas(32) float lanes[8];
+                                            _mm256_store_ps(lanes, vacc);
+                                            for (int l = 0; l < 8; ++l) s += lanes[l];
+#endif
+                                            for (; kk < K; ++kk)
+                                                s = std::fma(ar[kk], simd::bf16_to_fp32(bc[kk]), s);
+                                            res[r][c] = s;
+                                        }
+                                    }
+                                }
+                                for (int r = 0; r < mr; ++r)
+                                {
+                                    for (int c = 0; c < nc; ++c)
+                                    {
+                                        float *out = C + static_cast<size_t>(r0 + r) * N + (c0 + c);
+                                        *out = completeSkinnyMatmulValue(res[r][c], alpha, beta, out);
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    OMP_WORKSHARE_REGION(simd_bf16);
+                    return true;
+                }
+            }
             return run_fp32x16_skinny_matmul(
                 A, B, C, M, N, K, transpose_B,
                 [](uint16_t value)
@@ -2108,13 +2421,153 @@ namespace llaminar2
                         }
             };
 
-            // For large M (prefill) and wide N (e.g. 512-expert router), row-outer
-            // evicts the entire multi-MiB weight matrix B from L2 on every 4-row tile.
-            // Blocking 8 columns (40 KiB FP16) in the outer parallel axis keeps B hot
-            // in L1d/L2 across all row_tiles while calling the identical per-cell dot.
+            // For large M (prefill) and wide N (e.g. 512-expert FP16 router), use exact 2D
+            // 16x16 per-lane_offset L1d-resident blocking: for each 16-lane slice of the
+            // 256-lane GPU tree, pack 16 rows of A (FP32->FP16RNE->FP32) and 16 cols of B
+            // (FP16->FP32) once into ~20 KiB of L1d stack panels, then compute all 16 4x4
+            // ZMM micro-tiles purely from L1d into L2-hot partials[16][16][256].
+            // Cuts both A and B bandwidth and conversions by 16x with zero heap allocation
+            // and 100% bit-identical 256-lane GPU tree arithmetic.
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            if constexpr (ISA == ISALevel::AVX512 && HalfRNE && !HalfStorage && WeightType == TensorType::FP16)
+            {
+                constexpr int kMaxStackRoundedK = 4096;
+                constexpr int kLanes = floating_expert_numerical_contract::kReductionLanes;
+                constexpr int kMaxKSteps = kMaxStackRoundedK / kLanes;
+                constexpr int kMTile = 16;
+                constexpr int kNTile = 16;
+                if (M >= kMTile && N >= 32 && K <= kMaxStackRoundedK && (K % kLanes) == 0 && !selection)
+                {
+                    const int m_tiles = M / kMTile;
+                    const int n_tiles = N / kNTile;
+                    const int total_tiles = m_tiles * n_tiles;
+                    const int k_steps = K / kLanes;
+                    const std::size_t k_stride = static_cast<std::size_t>(K);
+                    const auto *b_u16 = static_cast<const std::uint16_t *>(B);
+                    const int full_m = m_tiles * kMTile;
+                    const int full_n = n_tiles * kNTile;
+                    auto prefill_2d_work = [&]()
+                    {
+#pragma omp for schedule(static)
+                        for (int tile = 0; tile < total_tiles; ++tile)
+                        {
+                            const int mt = tile / n_tiles;
+                            const int nt = tile % n_tiles;
+                            const int row0 = mt * kMTile;
+                            const int col0 = nt * kNTile;
+
+                            alignas(64) float partials[kMTile][kNTile][kLanes];
+                            alignas(64) float a_lane[kMTile][kMaxKSteps][16];
+                            alignas(64) float b_lane[kNTile][kMaxKSteps][16];
+
+                            for (int lane_offset = 0; lane_offset < kLanes; lane_offset += 16)
+                            {
+                                // Pack 16 rows of A for this 16-lane slice (10 KiB for K=2560).
+                                for (int r = 0; r < kMTile; ++r)
+                                {
+                                    const float *ar = A + static_cast<std::size_t>(row0 + r) * k_stride +
+                                                      static_cast<std::size_t>(lane_offset);
+                                    for (int step = 0; step < k_steps; ++step)
+                                    {
+                                        const __m512 v = _mm512_loadu_ps(ar + static_cast<std::size_t>(step) * kLanes);
+                                        const __m512 rounded = _mm512_cvtph_ps(
+                                            _mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                                        _mm512_store_ps(a_lane[r][step], rounded);
+                                    }
+                                }
+                                // Pack 16 cols of B for this 16-lane slice (10 KiB for K=2560).
+                                for (int c = 0; c < kNTile; ++c)
+                                {
+                                    const std::uint16_t *bc = b_u16 + static_cast<std::size_t>(col0 + c) * k_stride +
+                                                              static_cast<std::size_t>(lane_offset);
+                                    for (int step = 0; step < k_steps; ++step)
+                                    {
+                                        const __m512 w = _mm512_cvtph_ps(_mm256_loadu_si256(
+                                            reinterpret_cast<const __m256i *>(bc + static_cast<std::size_t>(step) * kLanes)));
+                                        _mm512_store_ps(b_lane[c][step], w);
+                                    }
+                                }
+
+                                // 4x4 grid of 4x4 ZMM micro-tiles purely from L1d (21 ZMMs, zero spills).
+                                for (int br = 0; br < kMTile; br += 4)
+                                {
+                                    for (int bc = 0; bc < kNTile; bc += 4)
+                                    {
+                                        __m512 acc[4][4];
+#pragma GCC unroll 4
+                                        for (int r = 0; r < 4; ++r)
+#pragma GCC unroll 4
+                                            for (int c = 0; c < 4; ++c)
+                                                acc[r][c] = _mm512_setzero_ps();
+
+                                        for (int step = 0; step < k_steps; ++step)
+                                        {
+                                            const __m512 a0 = _mm512_load_ps(a_lane[br + 0][step]);
+                                            const __m512 a1 = _mm512_load_ps(a_lane[br + 1][step]);
+                                            const __m512 a2 = _mm512_load_ps(a_lane[br + 2][step]);
+                                            const __m512 a3 = _mm512_load_ps(a_lane[br + 3][step]);
+#pragma GCC unroll 4
+                                            for (int c = 0; c < 4; ++c)
+                                            {
+                                                const __m512 w = _mm512_load_ps(b_lane[bc + c][step]);
+                                                acc[0][c] = _mm512_fmadd_ps(a0, w, acc[0][c]);
+                                                acc[1][c] = _mm512_fmadd_ps(a1, w, acc[1][c]);
+                                                acc[2][c] = _mm512_fmadd_ps(a2, w, acc[2][c]);
+                                                acc[3][c] = _mm512_fmadd_ps(a3, w, acc[3][c]);
+                                            }
+                                        }
+#pragma GCC unroll 4
+                                        for (int r = 0; r < 4; ++r)
+#pragma GCC unroll 4
+                                            for (int c = 0; c < 4; ++c)
+                                                _mm512_store_ps(partials[br + r][bc + c] + lane_offset, acc[r][c]);
+                                    }
+                                }
+                            }
+
+                            for (int r = 0; r < kMTile; ++r)
+                            {
+                                const std::size_t row_out = static_cast<std::size_t>(row0 + r) * N;
+                                for (int c = 0; c < kNTile; ++c)
+                                {
+                                    const int cc = col0 + c;
+                                    const std::size_t out_idx = row_out + static_cast<std::size_t>(cc);
+                                    const float reduced =
+                                        reduce_gpu_aligned_expert_partials_avx512(partials[r][c]);
+                                    C[out_idx] = completeSkinnyMatmulValue(
+                                        reduced, alpha, beta, C + out_idx, bias ? bias + cc : nullptr);
+                                }
+                            }
+                        }
+
+                        // Tail rows (M % 16 != 0) across all N columns, and tail columns (N % 16 != 0) across full_m rows.
+                        const int full_rt = full_m / kRowTile;
+                        if (full_rt < row_tiles)
+                        {
+                            const int tail_rt_count = row_tiles - full_rt;
+                            const int tail_tasks = tail_rt_count * N;
+#pragma omp for schedule(static)
+                            for (int t = 0; t < tail_tasks; ++t)
+                                run_tile_col(full_rt + (t / N), t % N);
+                        }
+                        if (full_n < N)
+                        {
+                            const int tail_cols = N - full_n;
+                            const int tail_tasks = full_rt * tail_cols;
+#pragma omp for schedule(static)
+                            for (int t = 0; t < tail_tasks; ++t)
+                                run_tile_col(t / tail_cols, full_n + (t % tail_cols));
+                        }
+                    };
+                    OMP_WORKSHARE_REGION(prefill_2d_work);
+                    return true;
+                }
+            }
+#endif
+            // General fallback for non-FP16 or small-M / selected-row invocations.
             constexpr int kPrefillColBlock = 8;
-            const int col_blocks = (N + kPrefillColBlock - 1) / kPrefillColBlock;
             const int workers = std::max(1, omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads());
+            const int col_blocks = (N + kPrefillColBlock - 1) / kPrefillColBlock;
             const bool use_col_block_outer = (row_tiles >= 8 && col_blocks >= workers);
 
             auto run_tile_col_range = [&](int row_tile, int col_begin, int col_end)

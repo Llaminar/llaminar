@@ -182,6 +182,8 @@ namespace llaminar2
         }
 
         my_epoch_ = 0;
+        has_deferred_slot_barrier_ = false;
+        next_double_buffer_slot_ = 0;
         abort_requested_.store(false, std::memory_order_release);
         initialized_ = true;
 
@@ -206,6 +208,8 @@ namespace llaminar2
         }
 
         initialized_ = false;
+        has_deferred_slot_barrier_ = false;
+        next_double_buffer_slot_ = 0;
         teardownSharedMemory();
 
         if (general_backend_)
@@ -554,6 +558,30 @@ namespace llaminar2
 
     bool ShmemSpinBackend::waitForPeerEpoch(int peer_rank, uint64_t target_epoch, const char *phase, size_t count)
     {
+        // Fast path: observe ready peer epochs without paying steady_clock::now() or
+        // reading timeout policy when the peer already published (common in tight TP2 decode).
+        const auto &peer_atomic = arena_->epoch_at(peer_rank)->epoch;
+        for (int quick = 0; quick < 64; ++quick)
+        {
+            const uint64_t peer_epoch = peer_atomic.load(std::memory_order_acquire);
+            if (__builtin_expect(peer_epoch >= target_epoch, 1))
+            {
+                if (__builtin_expect(peer_epoch == kAbortEpoch, 0))
+                    break;
+                if (__builtin_expect(abort_requested_.load(std::memory_order_acquire), 0))
+                    break;
+                return true;
+            }
+            if (quick >= 2)
+            {
+#if defined(__x86_64__) || defined(__i386__)
+                _mm_pause();
+#elif defined(__aarch64__)
+                asm volatile("yield" ::: "memory");
+#endif
+            }
+        }
+
         const int timeout_ms = shmemSpinTimeoutMs();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         uint64_t spins = 0;
@@ -569,7 +597,7 @@ namespace llaminar2
                 abort();
                 return false;
             }
-            const uint64_t peer_epoch = arena_->epoch_at(peer_rank)->epoch.load(std::memory_order_acquire);
+            const uint64_t peer_epoch = peer_atomic.load(std::memory_order_acquire);
             if (peer_epoch == kAbortEpoch)
             {
                 last_error_ = "peer rank " + std::to_string(peer_rank) +
@@ -610,6 +638,24 @@ namespace llaminar2
         }
     }
 
+    bool ShmemSpinBackend::drainDeferredSlotBarrier(const char *phase)
+    {
+        if (!has_deferred_slot_barrier_)
+            return true;
+        if (!publishNextEpoch())
+            return false;
+        for (int rank = 0; rank < num_ranks_; ++rank)
+        {
+            if (rank == my_rank_)
+                continue;
+            if (!waitForPeerEpoch(rank, my_epoch_, phase, 0))
+                return false;
+        }
+        has_deferred_slot_barrier_ = false;
+        next_double_buffer_slot_ = 0;
+        return true;
+    }
+
     // =========================================================================
     // Collective Operations
     // =========================================================================
@@ -630,8 +676,8 @@ namespace llaminar2
         }
 
         // The native SUM path is total over payload size. Large tensors are
-        // reduced in bounded chunks so geometry never selects a different
-        // protocol merely because it crossed an arena-size threshold.
+        // reduced in bounded double-buffered half-arena slots so every chunk
+        // requires only one cross-socket barrier (no trailing release barrier).
         if (usesSharedMemoryAllreduce(count, dtype, op))
         {
             // Element size depends on dtype; the support predicate admits only
@@ -659,6 +705,7 @@ namespace llaminar2
                 return false;
             }
 
+            constexpr size_t kSlotElements = ShmemSpinArena::DOUBLE_BUFFER_SLOT_CAPACITY;
             auto *payload = static_cast<std::byte *>(buffer);
             const auto publish_epoch = [&](const char *phase,
                                            size_t chunk_count) {
@@ -682,6 +729,7 @@ namespace llaminar2
 
             const auto reduce_range = [&](
                                           void *chunk_output,
+                                          uint64_t slot,
                                           size_t range_begin,
                                           size_t range_count) {
                 switch (dtype)
@@ -689,17 +737,19 @@ namespace llaminar2
                 case CollectiveDataType::FLOAT32:
                 {
                     auto *out = static_cast<float *>(chunk_output) + range_begin;
-                    reduce(
-                        out,
-                        arena_->buffer_at(0) + range_begin,
-                        arena_->buffer_at(1) + range_begin,
-                        range_count);
+                    const float *buf0 = (my_rank_ == 0)
+                        ? out
+                        : (arena_->double_buffer_slot_at(0, slot) + range_begin);
+                    const float *buf1 = (my_rank_ == 1)
+                        ? out
+                        : (arena_->double_buffer_slot_at(1, slot) + range_begin);
+                    reduce(out, buf0, buf1, range_count);
                     for (int rank = 2; rank < num_ranks_; ++rank)
                     {
                         reduce(
                             out,
                             out,
-                            arena_->buffer_at(rank) + range_begin,
+                            arena_->double_buffer_slot_at(rank, slot) + range_begin,
                             range_count);
                     }
                     return;
@@ -708,14 +758,14 @@ namespace llaminar2
                 {
                     auto *out = static_cast<uint16_t *>(chunk_output) + range_begin;
                     const auto *buffer0 =
-                        reinterpret_cast<const uint16_t *>(arena_->buffer_at(0)) + range_begin;
+                        reinterpret_cast<const uint16_t *>(arena_->double_buffer_slot_at(0, slot)) + range_begin;
                     const auto *buffer1 =
-                        reinterpret_cast<const uint16_t *>(arena_->buffer_at(1)) + range_begin;
+                        reinterpret_cast<const uint16_t *>(arena_->double_buffer_slot_at(1, slot)) + range_begin;
                     reduce_fp16(out, buffer0, buffer1, range_count);
                     for (int rank = 2; rank < num_ranks_; ++rank)
                     {
                         const auto *rank_buffer =
-                            reinterpret_cast<const uint16_t *>(arena_->buffer_at(rank)) + range_begin;
+                            reinterpret_cast<const uint16_t *>(arena_->double_buffer_slot_at(rank, slot)) + range_begin;
                         reduce_fp16(out, out, rank_buffer, range_count);
                     }
                     return;
@@ -724,14 +774,14 @@ namespace llaminar2
                 {
                     auto *out = static_cast<uint16_t *>(chunk_output) + range_begin;
                     const auto *buffer0 =
-                        reinterpret_cast<const uint16_t *>(arena_->buffer_at(0)) + range_begin;
+                        reinterpret_cast<const uint16_t *>(arena_->double_buffer_slot_at(0, slot)) + range_begin;
                     const auto *buffer1 =
-                        reinterpret_cast<const uint16_t *>(arena_->buffer_at(1)) + range_begin;
+                        reinterpret_cast<const uint16_t *>(arena_->double_buffer_slot_at(1, slot)) + range_begin;
                     reduce_bf16(out, buffer0, buffer1, range_count);
                     for (int rank = 2; rank < num_ranks_; ++rank)
                     {
                         const auto *rank_buffer =
-                            reinterpret_cast<const uint16_t *>(arena_->buffer_at(rank)) + range_begin;
+                            reinterpret_cast<const uint16_t *>(arena_->double_buffer_slot_at(rank, slot)) + range_begin;
                         reduce_bf16(out, out, rank_buffer, range_count);
                     }
                     return;
@@ -743,41 +793,48 @@ namespace llaminar2
             };
 
             constexpr size_t kParallelThresholdElements = 64u * 1024u;
-            constexpr size_t kWorkSliceElements = 16u * 1024u;
             const bool parallelize =
                 count >= kParallelThresholdElements && omp_in_parallel() == 0;
 
             if (parallelize)
             {
                 bool protocol_ok = true;
+                uint64_t slot = next_double_buffer_slot_;
 ::llaminar::v2::noteOpenMPTeamFork();
-#pragma omp parallel shared(payload, protocol_ok)
+#pragma omp parallel shared(payload, protocol_ok, slot)
                 {
+                    const int tid = omp_get_thread_num();
+                    const int nt = std::max(1, omp_get_num_threads());
                     for (size_t chunk_offset = 0;
                          chunk_offset < count && protocol_ok;)
                     {
                         const size_t chunk_count = std::min(
-                            ShmemSpinArena::CHUNK_CAPACITY,
+                            kSlotElements,
                             count - chunk_offset);
+                        const uint64_t cur_slot = slot;
                         void *chunk_output = payload + chunk_offset * elem_size;
-                        const size_t work_slices =
-                            (chunk_count + kWorkSliceElements - 1u) /
-                            kWorkSliceElements;
+                        // Partition chunk_count directly across the active team in 16-element
+                        // vector-aligned contiguous slices so every worker gets balanced work
+                        // (eliminating the 32-slice on 28-core 2x tail imbalance in prefill).
+                        const size_t total_vecs = (chunk_count + 15u) / 16u;
+                        const size_t range_begin = std::min(
+                            chunk_count,
+                            ((static_cast<size_t>(tid) * total_vecs) / static_cast<size_t>(nt)) * 16u);
+                        const size_t range_end = std::min(
+                            chunk_count,
+                            ((static_cast<size_t>(tid + 1) * total_vecs) / static_cast<size_t>(nt)) * 16u);
+                        const size_t range_count = (range_end > range_begin) ? (range_end - range_begin) : 0u;
 
-#pragma omp for schedule(static)
-                        for (size_t slice = 0; slice < work_slices; ++slice)
+                        if (range_count > 0u)
                         {
-                            const size_t range_begin = slice * kWorkSliceElements;
-                            const size_t range_count = std::min(
-                                kWorkSliceElements,
-                                chunk_count - range_begin);
                             std::memcpy(
-                                reinterpret_cast<std::byte *>(arena_->buffer_at(my_rank_)) +
+                                reinterpret_cast<std::byte *>(arena_->double_buffer_slot_at(my_rank_, cur_slot)) +
                                     range_begin * elem_size,
                                 static_cast<std::byte *>(chunk_output) +
                                     range_begin * elem_size,
                                 range_count * elem_size);
                         }
+#pragma omp barrier
 
 #pragma omp master
                         {
@@ -787,31 +844,22 @@ namespace llaminar2
                         }
 #pragma omp barrier
 
-                        if (protocol_ok)
+                        if (protocol_ok && range_count > 0u)
                         {
-#pragma omp for schedule(static)
-                            for (size_t slice = 0; slice < work_slices; ++slice)
-                            {
-                                const size_t range_begin = slice * kWorkSliceElements;
-                                const size_t range_count = std::min(
-                                    kWorkSliceElements,
-                                    chunk_count - range_begin);
-                                reduce_range(
-                                    chunk_output,
-                                    range_begin,
-                                    range_count);
-                            }
+                            reduce_range(
+                                chunk_output,
+                                cur_slot,
+                                range_begin,
+                                range_count);
                         }
+#pragma omp barrier
 
-                        // No participant may overwrite its sole staging buffer
-                        // until every peer has completed the reduction reads.
 #pragma omp master
                         {
                             if (protocol_ok)
                             {
-                                protocol_ok = publish_epoch(
-                                    "leaving parallel chunked allreduce",
-                                    chunk_count);
+                                slot ^= 1u;
+                                has_deferred_slot_barrier_ = true;
                             }
                         }
 #pragma omp barrier
@@ -819,18 +867,20 @@ namespace llaminar2
                         chunk_offset += chunk_count;
                     }
                 }
-
+                if (protocol_ok)
+                    next_double_buffer_slot_ = slot;
                 return protocol_ok;
             }
 
             for (size_t chunk_offset = 0; chunk_offset < count;)
             {
                 const size_t chunk_count = std::min(
-                    ShmemSpinArena::CHUNK_CAPACITY,
+                    kSlotElements,
                     count - chunk_offset);
+                const uint64_t cur_slot = next_double_buffer_slot_;
                 void *chunk_output = payload + chunk_offset * elem_size;
                 std::memcpy(
-                    arena_->buffer_at(my_rank_),
+                    arena_->double_buffer_slot_at(my_rank_, cur_slot),
                     chunk_output,
                     chunk_count * elem_size);
                 if (!publish_epoch(
@@ -838,11 +888,24 @@ namespace llaminar2
                         chunk_count))
                     return false;
 
-                reduce_range(chunk_output, 0, chunk_count);
-                if (!publish_epoch(
-                        "leaving chunked allreduce",
-                        chunk_count))
-                    return false;
+                // For FP32 allreduce on rank 0 or rank 1, chunk_output already holds this rank's
+                // exact payload in L1d; reading it directly instead of re-reading our shared-memory
+                // staging slot preserves identical rank-0 + rank-1 operand order while halving reads.
+                if (dtype == CollectiveDataType::FLOAT32 && (my_rank_ == 0 || my_rank_ == 1))
+                {
+                    auto *out = static_cast<float *>(chunk_output);
+                    const float *buf0 = (my_rank_ == 0) ? out : arena_->double_buffer_slot_at(0, cur_slot);
+                    const float *buf1 = (my_rank_ == 1) ? out : arena_->double_buffer_slot_at(1, cur_slot);
+                    reduce(out, buf0, buf1, chunk_count);
+                    for (int rank = 2; rank < num_ranks_; ++rank)
+                        reduce(out, out, arena_->double_buffer_slot_at(rank, cur_slot), chunk_count);
+                }
+                else
+                {
+                    reduce_range(chunk_output, cur_slot, 0, chunk_count);
+                }
+                next_double_buffer_slot_ = cur_slot ^ 1u;
+                has_deferred_slot_barrier_ = true;
                 chunk_offset += chunk_count;
             }
             return true;
@@ -861,6 +924,222 @@ namespace llaminar2
     bool ShmemSpinBackend::allgather(const void *send_buf, void *recv_buf,
                                      size_t send_count, CollectiveDataType dtype)
     {
+        if (abort_requested_.load(std::memory_order_acquire))
+        {
+            last_error_ = "ShmemSpinBackend abort has been requested";
+            return false;
+        }
+        const size_t elem_size = collectiveElementSize(dtype);
+        if (initialized_ && arena_ && elem_size > 0u)
+        {
+            if (send_count == 0u)
+                return true;
+            if (!send_buf || !recv_buf ||
+                send_count > std::numeric_limits<size_t>::max() / elem_size)
+            {
+                last_error_ = "invalid native shared-memory allgather contract";
+                LOG_ERROR("ShmemSpinBackend::allgather - " << last_error_);
+                return false;
+            }
+            const size_t total_send_bytes = send_count * elem_size;
+            if (num_ranks_ == 1)
+            {
+                if (recv_buf != send_buf)
+                    std::memcpy(recv_buf, send_buf, total_send_bytes);
+                return true;
+            }
+            constexpr size_t kArenaBytes = ShmemSpinArena::CHUNK_CAPACITY * sizeof(float);
+            constexpr size_t kSlotBytes = ShmemSpinArena::DOUBLE_BUFFER_SLOT_CAPACITY * sizeof(float);
+            constexpr size_t kParallelThresholdBytes = 128u * 1024u;
+            constexpr size_t kWorkSliceBytes = 32u * 1024u;
+            const auto *src = static_cast<const std::byte *>(send_buf);
+            auto *dst = static_cast<std::byte *>(recv_buf);
+
+            const auto publish_epoch = [&](const char *phase, size_t chunk_bytes) {
+                if (!publishNextEpoch())
+                    return false;
+                for (int rank = 0; rank < num_ranks_; ++rank)
+                {
+                    if (rank == my_rank_)
+                        continue;
+                    if (!waitForPeerEpoch(rank, my_epoch_, phase, chunk_bytes))
+                        return false;
+                }
+                return true;
+            };
+
+            const bool in_team = ::llaminar::v2::inLexicalWorkshare();
+            const bool parallelize =
+                total_send_bytes * static_cast<size_t>(num_ranks_) >= kParallelThresholdBytes &&
+                (in_team || omp_get_max_threads() > 1);
+
+            // Fast single-barrier double-buffered path when each rank's payload fits in one
+            // half-arena slot (<= 2 MiB, e.g. LM-head vocabulary allgather). Shares the exact
+            // alternating-slot invariant with allreduce so no drain or trailing barrier is needed.
+            if (total_send_bytes <= kSlotBytes)
+            {
+                const uint64_t cur_slot = next_double_buffer_slot_;
+                if (parallelize)
+                {
+                    // Use member-safe shared protocol status via atomic when invoked collectively
+                    // by every thread of a retained OpenMP team (zero fork/join).
+                    const size_t send_slices = (total_send_bytes + kWorkSliceBytes - 1u) / kWorkSliceBytes;
+                    const size_t total_recv_slices = send_slices * static_cast<size_t>(num_ranks_);
+                    auto *my_staging = reinterpret_cast<std::byte *>(
+                        arena_->double_buffer_slot_at(my_rank_, cur_slot));
+                    auto run_slot_allgather = [&]() {
+#pragma omp for schedule(static)
+                        for (size_t s = 0u; s < send_slices; ++s)
+                        {
+                            const size_t off = s * kWorkSliceBytes;
+                            const size_t len = std::min(kWorkSliceBytes, total_send_bytes - off);
+                            std::memcpy(my_staging + off, src + off, len);
+                        }
+#pragma omp master
+                        {
+                            const bool ok = publish_epoch("entering double-buffered parallel allgather", total_send_bytes);
+                            if (ok)
+                            {
+                                next_double_buffer_slot_ = cur_slot ^ 1u;
+                                has_deferred_slot_barrier_ = true;
+                            }
+                            in_team_allgather_ok_.store(ok, std::memory_order_release);
+                        }
+#pragma omp barrier
+                        if (in_team_allgather_ok_.load(std::memory_order_acquire))
+                        {
+#pragma omp for schedule(static)
+                            for (size_t task = 0u; task < total_recv_slices; ++task)
+                            {
+                                const int rank = static_cast<int>(task / send_slices);
+                                const size_t s = task % send_slices;
+                                const size_t off = s * kWorkSliceBytes;
+                                const size_t len = std::min(kWorkSliceBytes, total_send_bytes - off);
+                                const auto *peer_staging = reinterpret_cast<const std::byte *>(
+                                    arena_->double_buffer_slot_at(rank, cur_slot));
+                                std::memcpy(
+                                    dst + static_cast<size_t>(rank) * total_send_bytes + off,
+                                    peer_staging + off, len);
+                            }
+                        }
+                    };
+                    OMP_WORKSHARE_REGION(run_slot_allgather);
+                    return in_team_allgather_ok_.load(std::memory_order_acquire);
+                }
+                else
+                {
+                    if (in_team)
+                    {
+#pragma omp master
+                        {
+                            std::memcpy(arena_->double_buffer_slot_at(my_rank_, cur_slot), src, total_send_bytes);
+                            const bool ok = publish_epoch("entering double-buffered allgather", total_send_bytes);
+                            if (ok)
+                            {
+                                for (int rank = 0; rank < num_ranks_; ++rank)
+                                {
+                                    std::memcpy(
+                                        dst + static_cast<size_t>(rank) * total_send_bytes,
+                                        arena_->double_buffer_slot_at(rank, cur_slot),
+                                        total_send_bytes);
+                                }
+                                next_double_buffer_slot_ = cur_slot ^ 1u;
+                                has_deferred_slot_barrier_ = true;
+                            }
+                            in_team_allgather_ok_.store(ok, std::memory_order_release);
+                        }
+#pragma omp barrier
+                        return in_team_allgather_ok_.load(std::memory_order_acquire);
+                    }
+                    bool protocol_ok = true;
+                    std::memcpy(arena_->double_buffer_slot_at(my_rank_, cur_slot), src, total_send_bytes);
+                    protocol_ok = publish_epoch("entering double-buffered allgather", total_send_bytes);
+                    if (protocol_ok)
+                    {
+                        for (int rank = 0; rank < num_ranks_; ++rank)
+                        {
+                            std::memcpy(
+                                dst + static_cast<size_t>(rank) * total_send_bytes,
+                                arena_->double_buffer_slot_at(rank, cur_slot),
+                                total_send_bytes);
+                        }
+                        next_double_buffer_slot_ = cur_slot ^ 1u;
+                        has_deferred_slot_barrier_ = true;
+                    }
+                    return protocol_ok;
+                }
+            }
+
+            if (!drainDeferredSlotBarrier("draining deferred slot before multi-chunk native allgather"))
+                return false;
+
+            if (parallelize)
+            {
+                bool protocol_ok = true;
+                auto run_allgather = [&]() {
+                    for (size_t byte_offset = 0u; byte_offset < total_send_bytes && protocol_ok;)
+                    {
+                        const size_t chunk_bytes = std::min(kArenaBytes, total_send_bytes - byte_offset);
+                        const size_t send_slices = (chunk_bytes + kWorkSliceBytes - 1u) / kWorkSliceBytes;
+                        auto *my_staging = reinterpret_cast<std::byte *>(arena_->buffer_at(my_rank_));
+#pragma omp for schedule(static)
+                        for (size_t s = 0u; s < send_slices; ++s)
+                        {
+                            const size_t off = s * kWorkSliceBytes;
+                            const size_t len = std::min(kWorkSliceBytes, chunk_bytes - off);
+                            std::memcpy(my_staging + off, src + byte_offset + off, len);
+                        }
+#pragma omp master
+                        {
+                            protocol_ok = publish_epoch("entering parallel native allgather", chunk_bytes);
+                        }
+#pragma omp barrier
+                        if (!protocol_ok)
+                            break;
+                        const size_t total_recv_slices = send_slices * static_cast<size_t>(num_ranks_);
+#pragma omp for schedule(static)
+                        for (size_t task = 0u; task < total_recv_slices; ++task)
+                        {
+                            const int rank = static_cast<int>(task / send_slices);
+                            const size_t s = task % send_slices;
+                            const size_t off = s * kWorkSliceBytes;
+                            const size_t len = std::min(kWorkSliceBytes, chunk_bytes - off);
+                            const auto *peer_staging = reinterpret_cast<const std::byte *>(arena_->buffer_at(rank));
+                            std::memcpy(
+                                dst + static_cast<size_t>(rank) * total_send_bytes + byte_offset + off,
+                                peer_staging + off, len);
+                        }
+#pragma omp master
+                        {
+                            protocol_ok = publish_epoch("leaving parallel native allgather", chunk_bytes);
+                        }
+#pragma omp barrier
+                        byte_offset += chunk_bytes;
+                    }
+                };
+                OMP_WORKSHARE_REGION(run_allgather);
+                return protocol_ok;
+            }
+
+            for (size_t byte_offset = 0u; byte_offset < total_send_bytes;)
+            {
+                const size_t chunk_bytes = std::min(kArenaBytes, total_send_bytes - byte_offset);
+                std::memcpy(arena_->buffer_at(my_rank_), src + byte_offset, chunk_bytes);
+                if (!publish_epoch("entering native allgather", chunk_bytes))
+                    return false;
+                for (int rank = 0; rank < num_ranks_; ++rank)
+                {
+                    std::memcpy(
+                        dst + static_cast<size_t>(rank) * total_send_bytes + byte_offset,
+                        arena_->buffer_at(rank),
+                        chunk_bytes);
+                }
+                if (!publish_epoch("leaving native allgather", chunk_bytes))
+                    return false;
+                byte_offset += chunk_bytes;
+            }
+            return true;
+        }
         if (general_backend_)
         {
             return general_backend_->allgather(send_buf, recv_buf, send_count, dtype);
@@ -951,6 +1230,8 @@ namespace llaminar2
 
         const size_t local_elements =
             local_record_count * record_width_elements;
+        if (!drainDeferredSlotBarrier("draining deferred slot before rooted packed-record gather"))
+            return false;
         auto *const my_slot = arena_->epoch_at(my_rank_);
 
         /*
@@ -1455,6 +1736,8 @@ namespace llaminar2
         }
         if (count == 0u || num_ranks_ == 1)
             return true;
+        if (!drainDeferredSlotBarrier("draining deferred slot before native broadcast"))
+            return false;
 
         constexpr size_t kArenaBytes =
             ShmemSpinArena::CHUNK_CAPACITY * sizeof(float);
@@ -1613,6 +1896,8 @@ namespace llaminar2
             if (!waitForPeerEpoch(r, my_epoch_, "synchronizing", 0))
                 return false;
         }
+        has_deferred_slot_barrier_ = false;
+        next_double_buffer_slot_ = 0;
         return true;
     }
 
@@ -1771,6 +2056,16 @@ namespace llaminar2
     {
 #if defined(__AVX512F__)
         size_t i = 0;
+        const size_t vec32_end = count & ~size_t(31);
+        for (; i < vec32_end; i += 32)
+        {
+            __m512 va0 = _mm512_loadu_ps(a + i);
+            __m512 vb0 = _mm512_loadu_ps(b + i);
+            __m512 va1 = _mm512_loadu_ps(a + i + 16);
+            __m512 vb1 = _mm512_loadu_ps(b + i + 16);
+            _mm512_storeu_ps(out + i, _mm512_add_ps(va0, vb0));
+            _mm512_storeu_ps(out + i + 16, _mm512_add_ps(va1, vb1));
+        }
         const size_t vec_end = count & ~size_t(15); // Round down to multiple of 16
         for (; i < vec_end; i += 16)
         {

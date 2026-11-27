@@ -1150,8 +1150,62 @@ TEST_F(ShmemSpinMPITest, RepeatedAllreduce)
         }
     }
 
-    // Each allreduce publishes both ready-to-read and read-complete epochs.
-    EXPECT_EQ(backend_->currentEpoch(), 200u);
+    // Double-buffered allreduce uses one cross-socket ready epoch per call (no trailing release barrier).
+    EXPECT_EQ(backend_->currentEpoch(), 100u);
+}
+
+TEST_F(ShmemSpinMPITest, DoubleBufferedAllreduceInterleavedWithAllgatherBroadcastGather)
+{
+    const size_t ar_count = 2560;
+    const size_t ag_count = 1024;
+    std::vector<float> ar_buf(ar_count);
+    std::vector<float> ag_send(ag_count);
+    std::vector<float> ag_recv(ag_count * static_cast<size_t>(size_), -1.0f);
+    std::vector<float> bcast_buf(ar_count);
+
+    for (int round = 0; round < 6; ++round)
+    {
+        // 3 consecutive single-barrier allreduces across alternating double-buffer slots
+        for (int k = 0; k < 3; ++k)
+        {
+            const float val = static_cast<float>(rank_ + 1) * static_cast<float>(round * 10 + k + 1);
+            std::fill(ar_buf.begin(), ar_buf.end(), val);
+            ASSERT_TRUE(backend_->allreduce(ar_buf.data(), ar_count,
+                                            CollectiveDataType::FLOAT32,
+                                            CollectiveOp::ALLREDUCE_SUM));
+            const float expected = rank_sum_ * static_cast<float>(round * 10 + k + 1);
+            EXPECT_FLOAT_EQ(ar_buf.front(), expected);
+            EXPECT_FLOAT_EQ(ar_buf.back(), expected);
+        }
+
+        // Native allgather must drain the deferred slot barrier cleanly before using the full arena.
+        for (size_t i = 0; i < ag_count; ++i)
+            ag_send[i] = static_cast<float>(rank_ * 1000 + round * 17) + static_cast<float>(i % 13);
+        ASSERT_TRUE(backend_->allgather(ag_send.data(), ag_recv.data(), ag_count,
+                                        CollectiveDataType::FLOAT32));
+        for (int r = 0; r < size_; ++r)
+        {
+            const float expected0 = static_cast<float>(r * 1000 + round * 17);
+            const float expected_last = expected0 + static_cast<float>((ag_count - 1) % 13);
+            EXPECT_FLOAT_EQ(ag_recv[static_cast<size_t>(r) * ag_count], expected0);
+            EXPECT_FLOAT_EQ(ag_recv[static_cast<size_t>(r) * ag_count + ag_count - 1], expected_last);
+        }
+
+        // Another allreduce followed immediately by native broadcast.
+        std::fill(ar_buf.begin(), ar_buf.end(), static_cast<float>(rank_ + 2));
+        ASSERT_TRUE(backend_->allreduce(ar_buf.data(), ar_count,
+                                        CollectiveDataType::FLOAT32,
+                                        CollectiveOp::ALLREDUCE_SUM));
+        EXPECT_FLOAT_EQ(ar_buf[0], rank_sum_ + static_cast<float>(size_));
+
+        const int root = round % size_;
+        std::fill(bcast_buf.begin(), bcast_buf.end(),
+                  rank_ == root ? static_cast<float>(77 + round) : -99.0f);
+        ASSERT_TRUE(backend_->broadcast(bcast_buf.data(), ar_count,
+                                        CollectiveDataType::FLOAT32, root));
+        EXPECT_FLOAT_EQ(bcast_buf.front(), static_cast<float>(77 + round));
+        EXPECT_FLOAT_EQ(bcast_buf.back(), static_cast<float>(77 + round));
+    }
 }
 
 /**
@@ -1642,7 +1696,7 @@ TEST_F(ShmemSpinMPITest, StressTest1000)
         EXPECT_FLOAT_EQ(data[count - 1], rank_sum_) << "Last element wrong at iter " << iter;
     }
 
-    EXPECT_EQ(backend_->currentEpoch(), 2000u);
+    EXPECT_EQ(backend_->currentEpoch(), 1000u);
 }
 
 TEST_F(ShmemSpinMPITest, NegativeAndZeroValues)

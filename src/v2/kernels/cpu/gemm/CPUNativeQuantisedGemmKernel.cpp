@@ -344,6 +344,109 @@ namespace llaminar2::cpu::native_quantised
         return true;
     }
 
+    bool CPUNativeQuantisedGemmKernel::prepareSingleRowRetainedBinding(
+        const TensorBase *A,
+        TensorBase *C,
+        TensorBase *hc_activated,
+        int n,
+        int k,
+        bool two_term,
+        DeviceWorkspaceManager *workspace,
+        RetainedSingleRowBinding &out,
+        int serial_partition_n) const
+    {
+        out = {};
+        if (!valid_ || activation_rotation_ != nullptr ||
+            !A || !C || !workspace ||
+            n != packed_.N || k != packed_.K ||
+            A->native_type() != TensorType::FP32 || C->native_type() != TensorType::FP32 ||
+            !A->isHostValid() || !C->isHostValid() ||
+            A->numel() < static_cast<size_t>(k) || C->numel() < static_cast<size_t>(n))
+        {
+            return false;
+        }
+        if (serial_partition_n < 0 || serial_partition_n > packed_.N)
+            return false;
+
+        out.input = A->data();
+        out.output = C->mutable_data();
+        out.serial_partition_n = serial_partition_n;
+        out.two_term = two_term;
+        if (!out.input || !out.output)
+            return false;
+
+        if (!two_term)
+        {
+            std::optional<CPUNativeQuantisedOutputPartitionEquivalenceScope> partition_scope;
+            if (serial_partition_n > 0)
+                partition_scope.emplace(serial_partition_n);
+            out.q8_primary = q8Workspace(workspace, 1, k);
+            out.partials = partialWorkspace(workspace, 1);
+            return !out.q8_primary.empty();
+        }
+
+        validateCPUQ8ResidualSource(packed_, 1, n, k);
+        validateQ8ResidualTensorCapacities(1, n, k, A->numel(), C->numel());
+        out.q8_primary = CPUInvocationWorkspace::require<Q8_1Block>(
+            workspace, kCPUProjectionQ8, cpuProjectionQ8Blocks(1, k));
+        out.q8_residual = CPUInvocationWorkspace::require<Q8_1Block>(
+            workspace, kCPUProjectionResidualQ8, cpuProjectionQ8Blocks(1, k));
+        if (hc_activated)
+        {
+            if (hc_activated == C ||
+                hc_activated->native_type() != TensorType::FP32 ||
+                !hc_activated->isHostValid() ||
+                hc_activated->numel() < static_cast<size_t>(k))
+            {
+                return false;
+            }
+            out.hc_activated = hc_activated->mutable_data();
+            if (!out.hc_activated)
+                return false;
+        }
+        return true;
+    }
+
+    void CPUNativeQuantisedGemmKernel::executeSingleRowInTeam(
+        const RetainedSingleRowBinding &binding) const
+    {
+        std::optional<CPUNativeQuantisedOutputPartitionEquivalenceScope> partition_scope;
+        if (binding.serial_partition_n > 0)
+            partition_scope.emplace(binding.serial_partition_n);
+
+        if (!binding.two_term)
+        {
+            gemv_native_quantised(
+                packed_,
+                binding.input,
+                binding.output,
+                binding.partials,
+                binding.q8_primary);
+            return;
+        }
+
+        if (binding.hc_activated)
+        {
+            cpuHCResidualDownQ8Projection(
+                packed_,
+                binding.input,
+                binding.hc_activated,
+                binding.output,
+                DeviceRowRange::fullyActive(1),
+                binding.q8_primary,
+                binding.q8_residual);
+            return;
+        }
+
+        cpuQ8ResidualCorrectedProjection(
+            packed_,
+            binding.input,
+            binding.output,
+            DeviceRowRange::fullyActive(1),
+            binding.q8_primary,
+            binding.q8_residual);
+    }
+
     const CPUNativeQuantisedPackedWeights *
     CPUNativeQuantisedGemmKernel::exportCPUNativeQuantisedPackedWeights() const
 {
@@ -1827,5 +1930,379 @@ namespace llaminar2::cpu::native_quantised
             std::move(tags));
     }
 
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    namespace
+    {
+        template <CPUProjectionNumericalPolicy Policy>
+        inline void gemm_unsigned_int8_avx512_l1_strip_chunk_impl(
+            const CPUNativeQuantisedPackedWeights &packed,
+            const Q8_1Block *A_q8_strip,
+            int strip_rows,
+            int k_blocks_stride,
+            float *dst_base,
+            size_t dst_row_stride_floats,
+            int chunk,
+            int kb_start,
+            int kb_end,
+            int cols) noexcept
+        {
+            constexpr int kMaxStripRows = 48;
+            constexpr int kKbBlock = 8; // 8 k-blocks = 16 KiB weights, fits in 32 KiB L1d alongside 12 KiB tile.
+            alignas(64) float tile[kMaxStripRows][64];
+
+            const uint8_t *const base = packed.interleavedBase();
+            const size_t block_stride = static_cast<size_t>(packed.interleaved_block_stride);
+            const size_t chunk_origin = static_cast<size_t>(chunk) * static_cast<size_t>(packed.blocks_per_row);
+            const size_t kb_stride_q8 = static_cast<size_t>(k_blocks_stride);
+
+            for (int kb0 = kb_start; kb0 < kb_end; kb0 += kKbBlock)
+            {
+                const int kb1 = std::min(kb0 + kKbBlock, kb_end);
+                const bool first = (kb0 == kb_start);
+                int rr = 0;
+
+                // 3row x 4z: 12 FP32 + 12 INT32 accumulators + 3 broadcasts + 1 weight = 28 ZMMs (zero spills),
+                // 4:1 vpdpbusd:vpbroadcastd reuse and 100% L1d-hot weights across all strip rows.
+                for (; rr + 3 <= strip_rows; rr += 3)
+                {
+                    const Q8_1Block *r0 = A_q8_strip + static_cast<size_t>(rr + 0) * kb_stride_q8;
+                    const Q8_1Block *r1 = A_q8_strip + static_cast<size_t>(rr + 1) * kb_stride_q8;
+                    const Q8_1Block *r2 = A_q8_strip + static_cast<size_t>(rr + 2) * kb_stride_q8;
+                    __m512 fp00 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 0] + 0);
+                    __m512 fp01 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 0] + 16);
+                    __m512 fp02 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 0] + 32);
+                    __m512 fp03 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 0] + 48);
+                    __m512 fp10 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 1] + 0);
+                    __m512 fp11 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 1] + 16);
+                    __m512 fp12 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 1] + 32);
+                    __m512 fp13 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 1] + 48);
+                    __m512 fp20 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 2] + 0);
+                    __m512 fp21 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 2] + 16);
+                    __m512 fp22 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 2] + 32);
+                    __m512 fp23 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 2] + 48);
+
+                    for (int kb = kb0; kb < kb1; ++kb)
+                    {
+                        const Q8_1Block &a0 = r0[kb], &a1 = r1[kb], &a2 = r2[kb];
+                        const uint8_t *const unit = base + (chunk_origin + static_cast<size_t>(kb)) * block_stride;
+                        __m512i i00 = _mm512_setzero_si512(), i01 = _mm512_setzero_si512();
+                        __m512i i02 = _mm512_setzero_si512(), i03 = _mm512_setzero_si512();
+                        __m512i i10 = _mm512_setzero_si512(), i11 = _mm512_setzero_si512();
+                        __m512i i12 = _mm512_setzero_si512(), i13 = _mm512_setzero_si512();
+                        __m512i i20 = _mm512_setzero_si512(), i21 = _mm512_setzero_si512();
+                        __m512i i22 = _mm512_setzero_si512(), i23 = _mm512_setzero_si512();
+
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            int32_t w0, w1, w2;
+                            std::memcpy(&w0, a0.qs + g * 4, 4);
+                            std::memcpy(&w1, a1.qs + g * 4, 4);
+                            std::memcpy(&w2, a2.qs + g * 4, 4);
+                            const __m512i a0_bc = _mm512_set1_epi32(w0);
+                            const __m512i a1_bc = _mm512_set1_epi32(w1);
+                            const __m512i a2_bc = _mm512_set1_epi32(w2);
+                            const uint8_t *const gp = unit + static_cast<size_t>(g) * 256u;
+
+                            const __m512i b0 = _mm512_load_si512(gp + 0);
+                            i00 = _mm512_dpbusd_epi32(i00, b0, a0_bc);
+                            i10 = _mm512_dpbusd_epi32(i10, b0, a1_bc);
+                            i20 = _mm512_dpbusd_epi32(i20, b0, a2_bc);
+
+                            const __m512i b1 = _mm512_load_si512(gp + 64);
+                            i01 = _mm512_dpbusd_epi32(i01, b1, a0_bc);
+                            i11 = _mm512_dpbusd_epi32(i11, b1, a1_bc);
+                            i21 = _mm512_dpbusd_epi32(i21, b1, a2_bc);
+
+                            const __m512i b2 = _mm512_load_si512(gp + 128);
+                            i02 = _mm512_dpbusd_epi32(i02, b2, a0_bc);
+                            i12 = _mm512_dpbusd_epi32(i12, b2, a1_bc);
+                            i22 = _mm512_dpbusd_epi32(i22, b2, a2_bc);
+
+                            const __m512i b3 = _mm512_load_si512(gp + 192);
+                            i03 = _mm512_dpbusd_epi32(i03, b3, a0_bc);
+                            i13 = _mm512_dpbusd_epi32(i13, b3, a1_bc);
+                            i23 = _mm512_dpbusd_epi32(i23, b3, a2_bc);
+                        }
+                        const __m512i ub0 = _mm512_set1_epi32(static_cast<int32_t>(a0.sum_qs) * 128);
+                        const __m512i ub1 = _mm512_set1_epi32(static_cast<int32_t>(a1.sum_qs) * 128);
+                        const __m512i ub2 = _mm512_set1_epi32(static_cast<int32_t>(a2.sum_qs) * 128);
+                        const uint16_t *const sc_ptr = packed.chunkScales(chunk, kb);
+                        const float d0 = nativeQuantisedFP16ScaleToFP32(a0.d);
+                        const float d1 = nativeQuantisedFP16ScaleToFP32(a1.d);
+                        const float d2 = nativeQuantisedFP16ScaleToFP32(a2.d);
+
+                        const __m512 s0 = loadScales512(packed, sc_ptr + 0);
+                        fp00 = accumulateSingleScaleBlockAVX512(fp00, _mm512_sub_epi32(i00, ub0), s0, d0, Policy);
+                        fp10 = accumulateSingleScaleBlockAVX512(fp10, _mm512_sub_epi32(i10, ub1), s0, d1, Policy);
+                        fp20 = accumulateSingleScaleBlockAVX512(fp20, _mm512_sub_epi32(i20, ub2), s0, d2, Policy);
+
+                        const __m512 s1 = loadScales512(packed, sc_ptr + 16);
+                        fp01 = accumulateSingleScaleBlockAVX512(fp01, _mm512_sub_epi32(i01, ub0), s1, d0, Policy);
+                        fp11 = accumulateSingleScaleBlockAVX512(fp11, _mm512_sub_epi32(i11, ub1), s1, d1, Policy);
+                        fp21 = accumulateSingleScaleBlockAVX512(fp21, _mm512_sub_epi32(i21, ub2), s1, d2, Policy);
+
+                        const __m512 s2 = loadScales512(packed, sc_ptr + 32);
+                        fp02 = accumulateSingleScaleBlockAVX512(fp02, _mm512_sub_epi32(i02, ub0), s2, d0, Policy);
+                        fp12 = accumulateSingleScaleBlockAVX512(fp12, _mm512_sub_epi32(i12, ub1), s2, d1, Policy);
+                        fp22 = accumulateSingleScaleBlockAVX512(fp22, _mm512_sub_epi32(i22, ub2), s2, d2, Policy);
+
+                        const __m512 s3 = loadScales512(packed, sc_ptr + 48);
+                        fp03 = accumulateSingleScaleBlockAVX512(fp03, _mm512_sub_epi32(i03, ub0), s3, d0, Policy);
+                        fp13 = accumulateSingleScaleBlockAVX512(fp13, _mm512_sub_epi32(i13, ub1), s3, d1, Policy);
+                        fp23 = accumulateSingleScaleBlockAVX512(fp23, _mm512_sub_epi32(i23, ub2), s3, d2, Policy);
+                    }
+                    _mm512_store_ps(tile[rr + 0] + 0, fp00); _mm512_store_ps(tile[rr + 0] + 16, fp01);
+                    _mm512_store_ps(tile[rr + 0] + 32, fp02); _mm512_store_ps(tile[rr + 0] + 48, fp03);
+                    _mm512_store_ps(tile[rr + 1] + 0, fp10); _mm512_store_ps(tile[rr + 1] + 16, fp11);
+                    _mm512_store_ps(tile[rr + 1] + 32, fp12); _mm512_store_ps(tile[rr + 1] + 48, fp13);
+                    _mm512_store_ps(tile[rr + 2] + 0, fp20); _mm512_store_ps(tile[rr + 2] + 16, fp21);
+                    _mm512_store_ps(tile[rr + 2] + 32, fp22); _mm512_store_ps(tile[rr + 2] + 48, fp23);
+                }
+
+                // 2-row tail in exact same 4z pass
+                if (rr + 2 <= strip_rows)
+                {
+                    const Q8_1Block *r0 = A_q8_strip + static_cast<size_t>(rr + 0) * kb_stride_q8;
+                    const Q8_1Block *r1 = A_q8_strip + static_cast<size_t>(rr + 1) * kb_stride_q8;
+                    __m512 fp00 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 0] + 0);
+                    __m512 fp01 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 0] + 16);
+                    __m512 fp02 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 0] + 32);
+                    __m512 fp03 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 0] + 48);
+                    __m512 fp10 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 1] + 0);
+                    __m512 fp11 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 1] + 16);
+                    __m512 fp12 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 1] + 32);
+                    __m512 fp13 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr + 1] + 48);
+                    for (int kb = kb0; kb < kb1; ++kb)
+                    {
+                        const Q8_1Block &a0 = r0[kb], &a1 = r1[kb];
+                        const uint8_t *const unit = base + (chunk_origin + static_cast<size_t>(kb)) * block_stride;
+                        __m512i i00 = _mm512_setzero_si512(), i01 = _mm512_setzero_si512();
+                        __m512i i02 = _mm512_setzero_si512(), i03 = _mm512_setzero_si512();
+                        __m512i i10 = _mm512_setzero_si512(), i11 = _mm512_setzero_si512();
+                        __m512i i12 = _mm512_setzero_si512(), i13 = _mm512_setzero_si512();
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            int32_t w0, w1;
+                            std::memcpy(&w0, a0.qs + g * 4, 4);
+                            std::memcpy(&w1, a1.qs + g * 4, 4);
+                            const __m512i a0_bc = _mm512_set1_epi32(w0);
+                            const __m512i a1_bc = _mm512_set1_epi32(w1);
+                            const uint8_t *const gp = unit + static_cast<size_t>(g) * 256u;
+                            const __m512i b0 = _mm512_load_si512(gp + 0);
+                            i00 = _mm512_dpbusd_epi32(i00, b0, a0_bc); i10 = _mm512_dpbusd_epi32(i10, b0, a1_bc);
+                            const __m512i b1 = _mm512_load_si512(gp + 64);
+                            i01 = _mm512_dpbusd_epi32(i01, b1, a0_bc); i11 = _mm512_dpbusd_epi32(i11, b1, a1_bc);
+                            const __m512i b2 = _mm512_load_si512(gp + 128);
+                            i02 = _mm512_dpbusd_epi32(i02, b2, a0_bc); i12 = _mm512_dpbusd_epi32(i12, b2, a1_bc);
+                            const __m512i b3 = _mm512_load_si512(gp + 192);
+                            i03 = _mm512_dpbusd_epi32(i03, b3, a0_bc); i13 = _mm512_dpbusd_epi32(i13, b3, a1_bc);
+                        }
+                        const __m512i ub0 = _mm512_set1_epi32(static_cast<int32_t>(a0.sum_qs) * 128);
+                        const __m512i ub1 = _mm512_set1_epi32(static_cast<int32_t>(a1.sum_qs) * 128);
+                        const uint16_t *const sc_ptr = packed.chunkScales(chunk, kb);
+                        const float d0 = nativeQuantisedFP16ScaleToFP32(a0.d);
+                        const float d1 = nativeQuantisedFP16ScaleToFP32(a1.d);
+                        const __m512 s0 = loadScales512(packed, sc_ptr + 0);
+                        fp00 = accumulateSingleScaleBlockAVX512(fp00, _mm512_sub_epi32(i00, ub0), s0, d0, Policy);
+                        fp10 = accumulateSingleScaleBlockAVX512(fp10, _mm512_sub_epi32(i10, ub1), s0, d1, Policy);
+                        const __m512 s1 = loadScales512(packed, sc_ptr + 16);
+                        fp01 = accumulateSingleScaleBlockAVX512(fp01, _mm512_sub_epi32(i01, ub0), s1, d0, Policy);
+                        fp11 = accumulateSingleScaleBlockAVX512(fp11, _mm512_sub_epi32(i11, ub1), s1, d1, Policy);
+                        const __m512 s2 = loadScales512(packed, sc_ptr + 32);
+                        fp02 = accumulateSingleScaleBlockAVX512(fp02, _mm512_sub_epi32(i02, ub0), s2, d0, Policy);
+                        fp12 = accumulateSingleScaleBlockAVX512(fp12, _mm512_sub_epi32(i12, ub1), s2, d1, Policy);
+                        const __m512 s3 = loadScales512(packed, sc_ptr + 48);
+                        fp03 = accumulateSingleScaleBlockAVX512(fp03, _mm512_sub_epi32(i03, ub0), s3, d0, Policy);
+                        fp13 = accumulateSingleScaleBlockAVX512(fp13, _mm512_sub_epi32(i13, ub1), s3, d1, Policy);
+                    }
+                    _mm512_store_ps(tile[rr + 0] + 0, fp00); _mm512_store_ps(tile[rr + 0] + 16, fp01);
+                    _mm512_store_ps(tile[rr + 0] + 32, fp02); _mm512_store_ps(tile[rr + 0] + 48, fp03);
+                    _mm512_store_ps(tile[rr + 1] + 0, fp10); _mm512_store_ps(tile[rr + 1] + 16, fp11);
+                    _mm512_store_ps(tile[rr + 1] + 32, fp12); _mm512_store_ps(tile[rr + 1] + 48, fp13);
+                    rr += 2;
+                }
+
+                // 1-row tail
+                if (rr < strip_rows)
+                {
+                    const Q8_1Block *r0 = A_q8_strip + static_cast<size_t>(rr) * kb_stride_q8;
+                    __m512 fp00 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr] + 0);
+                    __m512 fp01 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr] + 16);
+                    __m512 fp02 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr] + 32);
+                    __m512 fp03 = first ? _mm512_setzero_ps() : _mm512_load_ps(tile[rr] + 48);
+                    for (int kb = kb0; kb < kb1; ++kb)
+                    {
+                        const Q8_1Block &a0 = r0[kb];
+                        const uint8_t *const unit = base + (chunk_origin + static_cast<size_t>(kb)) * block_stride;
+                        __m512i i00 = _mm512_setzero_si512(), i01 = _mm512_setzero_si512();
+                        __m512i i02 = _mm512_setzero_si512(), i03 = _mm512_setzero_si512();
+                        for (int g = 0; g < 8; ++g)
+                        {
+                            int32_t w0;
+                            std::memcpy(&w0, a0.qs + g * 4, 4);
+                            const __m512i a0_bc = _mm512_set1_epi32(w0);
+                            const uint8_t *const gp = unit + static_cast<size_t>(g) * 256u;
+                            i00 = _mm512_dpbusd_epi32(i00, _mm512_load_si512(gp + 0), a0_bc);
+                            i01 = _mm512_dpbusd_epi32(i01, _mm512_load_si512(gp + 64), a0_bc);
+                            i02 = _mm512_dpbusd_epi32(i02, _mm512_load_si512(gp + 128), a0_bc);
+                            i03 = _mm512_dpbusd_epi32(i03, _mm512_load_si512(gp + 192), a0_bc);
+                        }
+                        const __m512i ub0 = _mm512_set1_epi32(static_cast<int32_t>(a0.sum_qs) * 128);
+                        const uint16_t *const sc_ptr = packed.chunkScales(chunk, kb);
+                        const float d0 = nativeQuantisedFP16ScaleToFP32(a0.d);
+                        fp00 = accumulateSingleScaleBlockAVX512(fp00, _mm512_sub_epi32(i00, ub0), loadScales512(packed, sc_ptr + 0), d0, Policy);
+                        fp01 = accumulateSingleScaleBlockAVX512(fp01, _mm512_sub_epi32(i01, ub0), loadScales512(packed, sc_ptr + 16), d0, Policy);
+                        fp02 = accumulateSingleScaleBlockAVX512(fp02, _mm512_sub_epi32(i02, ub0), loadScales512(packed, sc_ptr + 32), d0, Policy);
+                        fp03 = accumulateSingleScaleBlockAVX512(fp03, _mm512_sub_epi32(i03, ub0), loadScales512(packed, sc_ptr + 48), d0, Policy);
+                    }
+                    _mm512_store_ps(tile[rr] + 0, fp00); _mm512_store_ps(tile[rr] + 16, fp01);
+                    _mm512_store_ps(tile[rr] + 32, fp02); _mm512_store_ps(tile[rr] + 48, fp03);
+                }
+            }
+
+            const size_t copy_bytes = static_cast<size_t>(cols) * sizeof(float);
+            for (int rr = 0; rr < strip_rows; ++rr)
+                std::memcpy(dst_base + static_cast<size_t>(rr) * dst_row_stride_floats, tile[rr], copy_bytes);
+        }
+
+        template <CPUProjectionNumericalPolicy Policy>
+        inline void gemm_6row_unsigned_int8_2z_sum_pairs_impl(
+            const CPUNativeQuantisedPackedWeights &packed,
+            const Q8_1Block *a0_row, const Q8_1Block *a1_row,
+            const Q8_1Block *a2_row, const Q8_1Block *a3_row,
+            const Q8_1Block *a4_row, const Q8_1Block *a5_row,
+            float *out0, float *out1, float *out2,
+            int chunk, int kb_start, int kb_end) noexcept
+        {
+            const uint8_t *const base = packed.interleavedBase();
+            const size_t block_stride = static_cast<size_t>(packed.interleaved_block_stride);
+            const size_t chunk_origin = static_cast<size_t>(chunk) * static_cast<size_t>(packed.blocks_per_row);
+            const int combined_columns = packed.N - chunk * 64;
+
+            for (int zbase = 0; zbase < 4; zbase += 2)
+            {
+                __m512 fp0_0 = _mm512_setzero_ps(), fp0_1 = _mm512_setzero_ps();
+                __m512 fp1_0 = _mm512_setzero_ps(), fp1_1 = _mm512_setzero_ps();
+                __m512 fp2_0 = _mm512_setzero_ps(), fp2_1 = _mm512_setzero_ps();
+                __m512 fp3_0 = _mm512_setzero_ps(), fp3_1 = _mm512_setzero_ps();
+                __m512 fp4_0 = _mm512_setzero_ps(), fp4_1 = _mm512_setzero_ps();
+                __m512 fp5_0 = _mm512_setzero_ps(), fp5_1 = _mm512_setzero_ps();
+
+                for (int kb = kb_start; kb < kb_end; ++kb)
+                {
+                    const Q8_1Block &a0 = a0_row[kb], &a1 = a1_row[kb];
+                    const Q8_1Block &a2 = a2_row[kb], &a3 = a3_row[kb];
+                    const Q8_1Block &a4 = a4_row[kb], &a5 = a5_row[kb];
+                    const uint8_t *const unit = base + (chunk_origin + static_cast<size_t>(kb)) * block_stride;
+
+                    __m512i i0_0 = _mm512_setzero_si512(), i0_1 = _mm512_setzero_si512();
+                    __m512i i1_0 = _mm512_setzero_si512(), i1_1 = _mm512_setzero_si512();
+                    __m512i i2_0 = _mm512_setzero_si512(), i2_1 = _mm512_setzero_si512();
+                    __m512i i3_0 = _mm512_setzero_si512(), i3_1 = _mm512_setzero_si512();
+                    __m512i i4_0 = _mm512_setzero_si512(), i4_1 = _mm512_setzero_si512();
+                    __m512i i5_0 = _mm512_setzero_si512(), i5_1 = _mm512_setzero_si512();
+
+                    for (int g = 0; g < 8; ++g)
+                    {
+                        int32_t w0, w1, w2, w3, w4, w5;
+                        std::memcpy(&w0, a0.qs + g * 4, 4); std::memcpy(&w1, a1.qs + g * 4, 4);
+                        std::memcpy(&w2, a2.qs + g * 4, 4); std::memcpy(&w3, a3.qs + g * 4, 4);
+                        std::memcpy(&w4, a4.qs + g * 4, 4); std::memcpy(&w5, a5.qs + g * 4, 4);
+                        const __m512i a0_bc = _mm512_set1_epi32(w0), a1_bc = _mm512_set1_epi32(w1);
+                        const __m512i a2_bc = _mm512_set1_epi32(w2), a3_bc = _mm512_set1_epi32(w3);
+                        const __m512i a4_bc = _mm512_set1_epi32(w4), a5_bc = _mm512_set1_epi32(w5);
+                        const uint8_t *const gp = unit + static_cast<size_t>(g) * 256u + static_cast<size_t>(zbase) * 64u;
+                        const __m512i b0 = _mm512_load_si512(gp);
+                        i0_0 = _mm512_dpbusd_epi32(i0_0, b0, a0_bc); i1_0 = _mm512_dpbusd_epi32(i1_0, b0, a1_bc);
+                        i2_0 = _mm512_dpbusd_epi32(i2_0, b0, a2_bc); i3_0 = _mm512_dpbusd_epi32(i3_0, b0, a3_bc);
+                        i4_0 = _mm512_dpbusd_epi32(i4_0, b0, a4_bc); i5_0 = _mm512_dpbusd_epi32(i5_0, b0, a5_bc);
+                        const __m512i b1 = _mm512_load_si512(gp + 64);
+                        i0_1 = _mm512_dpbusd_epi32(i0_1, b1, a0_bc); i1_1 = _mm512_dpbusd_epi32(i1_1, b1, a1_bc);
+                        i2_1 = _mm512_dpbusd_epi32(i2_1, b1, a2_bc); i3_1 = _mm512_dpbusd_epi32(i3_1, b1, a3_bc);
+                        i4_1 = _mm512_dpbusd_epi32(i4_1, b1, a4_bc); i5_1 = _mm512_dpbusd_epi32(i5_1, b1, a5_bc);
+                    }
+                    const __m512i u0 = _mm512_set1_epi32(static_cast<int32_t>(a0.sum_qs) * 128);
+                    const __m512i u1 = _mm512_set1_epi32(static_cast<int32_t>(a1.sum_qs) * 128);
+                    const __m512i u2 = _mm512_set1_epi32(static_cast<int32_t>(a2.sum_qs) * 128);
+                    const __m512i u3 = _mm512_set1_epi32(static_cast<int32_t>(a3.sum_qs) * 128);
+                    const __m512i u4 = _mm512_set1_epi32(static_cast<int32_t>(a4.sum_qs) * 128);
+                    const __m512i u5 = _mm512_set1_epi32(static_cast<int32_t>(a5.sum_qs) * 128);
+                    const uint16_t *const sc_ptr = packed.chunkScales(chunk, kb) + zbase * 16;
+                    const __m512 sc0 = loadScales512(packed, sc_ptr);
+                    const __m512 sc1 = loadScales512(packed, sc_ptr + 16);
+                    const float d0 = nativeQuantisedFP16ScaleToFP32(a0.d), d1 = nativeQuantisedFP16ScaleToFP32(a1.d);
+                    const float d2 = nativeQuantisedFP16ScaleToFP32(a2.d), d3 = nativeQuantisedFP16ScaleToFP32(a3.d);
+                    const float d4 = nativeQuantisedFP16ScaleToFP32(a4.d), d5 = nativeQuantisedFP16ScaleToFP32(a5.d);
+
+                    fp0_0 = accumulateSingleScaleBlockAVX512(fp0_0, _mm512_sub_epi32(i0_0, u0), sc0, d0, Policy);
+                    fp0_1 = accumulateSingleScaleBlockAVX512(fp0_1, _mm512_sub_epi32(i0_1, u0), sc1, d0, Policy);
+                    fp1_0 = accumulateSingleScaleBlockAVX512(fp1_0, _mm512_sub_epi32(i1_0, u1), sc0, d1, Policy);
+                    fp1_1 = accumulateSingleScaleBlockAVX512(fp1_1, _mm512_sub_epi32(i1_1, u1), sc1, d1, Policy);
+                    fp2_0 = accumulateSingleScaleBlockAVX512(fp2_0, _mm512_sub_epi32(i2_0, u2), sc0, d2, Policy);
+                    fp2_1 = accumulateSingleScaleBlockAVX512(fp2_1, _mm512_sub_epi32(i2_1, u2), sc1, d2, Policy);
+                    fp3_0 = accumulateSingleScaleBlockAVX512(fp3_0, _mm512_sub_epi32(i3_0, u3), sc0, d3, Policy);
+                    fp3_1 = accumulateSingleScaleBlockAVX512(fp3_1, _mm512_sub_epi32(i3_1, u3), sc1, d3, Policy);
+                    fp4_0 = accumulateSingleScaleBlockAVX512(fp4_0, _mm512_sub_epi32(i4_0, u4), sc0, d4, Policy);
+                    fp4_1 = accumulateSingleScaleBlockAVX512(fp4_1, _mm512_sub_epi32(i4_1, u4), sc1, d4, Policy);
+                    fp5_0 = accumulateSingleScaleBlockAVX512(fp5_0, _mm512_sub_epi32(i5_0, u5), sc0, d5, Policy);
+                    fp5_1 = accumulateSingleScaleBlockAVX512(fp5_1, _mm512_sub_epi32(i5_1, u5), sc1, d5, Policy);
+                }
+                storeNativeQuantisedLiveAVX512(out0, combined_columns, zbase * 16, _mm512_add_ps(fp0_0, fp1_0));
+                storeNativeQuantisedLiveAVX512(out0, combined_columns, (zbase + 1) * 16, _mm512_add_ps(fp0_1, fp1_1));
+                storeNativeQuantisedLiveAVX512(out1, combined_columns, zbase * 16, _mm512_add_ps(fp2_0, fp3_0));
+                storeNativeQuantisedLiveAVX512(out1, combined_columns, (zbase + 1) * 16, _mm512_add_ps(fp2_1, fp3_1));
+                storeNativeQuantisedLiveAVX512(out2, combined_columns, zbase * 16, _mm512_add_ps(fp4_0, fp5_0));
+                storeNativeQuantisedLiveAVX512(out2, combined_columns, (zbase + 1) * 16, _mm512_add_ps(fp4_1, fp5_1));
+            }
+        }
+    } // namespace
+#endif
+
+    void gemm_unsigned_int8_avx512_l1_strip_chunk(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8_strip,
+        int strip_rows,
+        int k_blocks_stride,
+        float *dst_base,
+        size_t dst_row_stride_floats,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        int cols) noexcept
+    {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            gemm_unsigned_int8_avx512_l1_strip_chunk_impl<CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed, A_q8_strip, strip_rows, k_blocks_stride, dst_base, dst_row_stride_floats, chunk, kb_start, kb_end, cols);
+        else
+            gemm_unsigned_int8_avx512_l1_strip_chunk_impl<CPUProjectionNumericalPolicy::BackendNative>(
+                packed, A_q8_strip, strip_rows, k_blocks_stride, dst_base, dst_row_stride_floats, chunk, kb_start, kb_end, cols);
+#else
+        (void)packed; (void)A_q8_strip; (void)strip_rows; (void)k_blocks_stride;
+        (void)dst_base; (void)dst_row_stride_floats; (void)chunk; (void)kb_start; (void)kb_end; (void)cols;
+#endif
+    }
+
+    void gemm_6row_unsigned_int8_2z_sum_pairs(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *p0, const Q8_1Block *r0,
+        const Q8_1Block *p1, const Q8_1Block *r1,
+        const Q8_1Block *p2, const Q8_1Block *r2,
+        float *out0, float *out1, float *out2,
+        int chunk, int kb_start, int kb_end) noexcept
+    {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            gemm_6row_unsigned_int8_2z_sum_pairs_impl<CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed, p0, r0, p1, r1, p2, r2, out0, out1, out2, chunk, kb_start, kb_end);
+        else
+            gemm_6row_unsigned_int8_2z_sum_pairs_impl<CPUProjectionNumericalPolicy::BackendNative>(
+                packed, p0, r0, p1, r1, p2, r2, out0, out1, out2, chunk, kb_start, kb_end);
+#else
+        (void)packed; (void)p0; (void)r0; (void)p1; (void)r1; (void)p2; (void)r2;
+        (void)out0; (void)out1; (void)out2; (void)chunk; (void)kb_start; (void)kb_end;
+#endif
+    }
 
 } // namespace llaminar2::cpu::native_quantised

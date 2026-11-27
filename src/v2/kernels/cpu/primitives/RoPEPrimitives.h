@@ -86,6 +86,28 @@ namespace llaminar2::primitives
         const RoPEAngleRows &angles);
 
     /**
+     * @brief Populate one absolute-position RoPE angle row without spawning or synchronizing OpenMP.
+     *
+     * Uses the exact `get_inv_freq_cached` + `fill_rope_angle_row` program as @ref apply_rope_partial
+     * so fused QNorm/KNorm+RoPE decode loops retain bitwise-identical coefficients while eliminating
+     * redundant team barriers.
+     */
+    void prepare_rope_single_position_angles(
+        int rotary_dim,
+        int position,
+        float freq_base,
+        const RoPEAngleRows &angles);
+
+    /**
+     * @brief Rotate a single head in-place using precomputed cos/sin rows under runtime ISA dispatch.
+     */
+    void rotate_rope_head_in_place(
+        float *head_ptr,
+        const float *cos_ptr,
+        const float *sin_ptr,
+        int half_rotary);
+
+    /**
      * @brief Apply the MTP verifier RoPE contract for every supported row count.
      *
      * The all-position verifier must publish state that is numerically

@@ -3183,11 +3183,110 @@ namespace llaminar2
 
         auto total_start = std::chrono::high_resolution_clock::now();
 
+        // Coalesce contiguous CPU retained-team megakernel + small CPU collective runs into ONE
+        // single OpenMP parallel region during pure-CPU fast decode, eliminating ~95 inter-stage
+        // OpenMP fork/joins per token (e.g. all 48 QFN layers execute inside 1 team).
+        const bool all_cpu_schedule = !ctx->isGPU() && std::all_of(
+            schedule.begin(), schedule.end(),
+            [](const auto &entry) {
+                if (!entry.node || !entry.node->stage)
+                    return false;
+                const DeviceId dev = entry.node->device.is_valid()
+                    ? entry.node->device
+                    : entry.node->stage->device();
+                return dev.is_cpu();
+            });
+        const bool retained_cpu_team_eligible =
+            all_cpu_schedule && !cpu_stage_timing_active && !collective_ctx_ &&
+            !isGraphCaptureActive() && !policy.coherence && !policy.weight_coherence &&
+            !policy.validation && !policy.profiling && !policy.stage_dump &&
+            !policy.snapshot_callback && !config_.snapshot_callback &&
+            !debugEnv().execution.trace_stages && !debugEnv().validation.sync_each_stage;
+
         // =====================================================================
         // Main execution loop — every path goes through here
         // =====================================================================
         for (size_t i = 0; i < schedule.size(); ++i)
         {
+            if (retained_cpu_team_eligible &&
+                schedule[i].node && schedule[i].node->stage &&
+                schedule[i].node->stage->cpuRetainedTeamMode() != IComputeStage::CPURetainedTeamMode::None)
+            {
+                size_t run_end = i;
+                bool has_collective_team = false;
+                while (run_end < schedule.size() && schedule[run_end].node && schedule[run_end].node->stage)
+                {
+                    const auto mode = schedule[run_end].node->stage->cpuRetainedTeamMode();
+                    if (mode == IComputeStage::CPURetainedTeamMode::None)
+                        break;
+                    if (mode == IComputeStage::CPURetainedTeamMode::CollectiveTeam)
+                        has_collective_team = true;
+                    ++run_end;
+                }
+                if (has_collective_team && run_end - i >= 2u)
+                {
+                    for (size_t k = i; k < run_end; ++k)
+                    {
+                        auto *run_node = schedule[k].node;
+                        if (cancellationRequested(run_node->name))
+                            return false;
+                        if (run_node->stage->graphLaunchPreparationPolicy() ==
+                                GraphLaunchPreparationPolicy::HostEntry &&
+                            !run_node->stage->prepareGraphLaunch(ctx, nullptr))
+                        {
+                            notifyStageFailure(run_node->name, "CPU stage metadata preparation failed");
+                            return false;
+                        }
+                        run_node->stage->prepareForRetainedTeam(ctx);
+                    }
+                    std::atomic<bool> run_ok{true};
+                    std::atomic<size_t> failed_idx{run_end};
+                    OMP_LAYER_PARALLEL({
+                        for (size_t k = i; k < run_end; ++k)
+                        {
+                            if (!run_ok.load(std::memory_order_relaxed))
+                                break;
+                            auto *st = schedule[k].node->stage.get();
+                            if (st->cpuRetainedTeamMode() == IComputeStage::CPURetainedTeamMode::CollectiveTeam)
+                            {
+                                // Every CollectiveTeam stage ends on an implicit OpenMP barrier
+                                // that publishes both its output writes and identical status across
+                                // all workers, so no redundant second barrier is needed here.
+                                if (!st->execute(ctx))
+                                {
+                                    failed_idx.store(k, std::memory_order_relaxed);
+                                    run_ok.store(false, std::memory_order_relaxed);
+                                    _Pragma("omp barrier")
+                                }
+                            }
+                            else
+                            {
+                                if (omp_get_thread_num() == 0)
+                                {
+                                    if (!st->execute(ctx))
+                                    {
+                                        failed_idx.store(k, std::memory_order_relaxed);
+                                        run_ok.store(false, std::memory_order_relaxed);
+                                    }
+                                }
+                                _Pragma("omp barrier")
+                            }
+                        }
+                    });
+                    if (!run_ok.load(std::memory_order_relaxed))
+                    {
+                        const size_t fidx = std::min(failed_idx.load(std::memory_order_relaxed), run_end - 1u);
+                        LOG_ERROR("[DeviceGraphExecutor] Retained CPU team stage failed: "
+                                  << schedule[fidx].node->name);
+                        notifyStageFailure(schedule[fidx].node->name, "retained CPU team stage execution returned false");
+                        return false;
+                    }
+                    stats_.total_stages_executed += (run_end - i);
+                    i = run_end - 1u;
+                    continue;
+                }
+            }
+
             auto *node = schedule[i].node;
             const bool is_coll = schedule[i].is_collective;
 

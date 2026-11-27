@@ -7,11 +7,13 @@
  */
 
 #include "LMHeadStage.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "kernels/common/VerifierProjectionBundle.h"
@@ -28,6 +30,74 @@ namespace llaminar2
     LMHeadStage::LMHeadStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    struct LMHeadStage::RetainedCPUSingleRowState
+    {
+        const cpu::native_quantised::CPUNativeQuantisedGemmKernel *kernel = nullptr;
+        cpu::native_quantised::CPUNativeQuantisedGemmKernel::RetainedSingleRowBinding binding{};
+        bool ready = false;
+    };
+
+    LMHeadStage::~LMHeadStage() = default;
+
+    IComputeStage::CPURetainedTeamMode LMHeadStage::cpuRetainedTeamMode() const noexcept
+    {
+        const bool static_single_verifier_row =
+            !params_.verifier_row_range.has_value() ||
+            (params_.verifier_row_range->physicalRows() == 1 &&
+             params_.verifier_row_range->capacity() == 1 &&
+             params_.verifier_row_range->countOwner() == nullptr);
+        if (params_.device_id.is_gpu() || params_.seq_len != 1 ||
+            params_.compute_all_positions ||
+            !static_single_verifier_row ||
+            params_.bias_tensor != nullptr ||
+            params_.effective_last_row_idx > 0 ||
+            !params_.hidden_states || !params_.lm_head_weight || !params_.logits ||
+            params_.hidden_states->native_type() != TensorType::FP32 ||
+            params_.logits->native_type() != TensorType::FP32 ||
+            !params_.prepared_store || !params_.prepared_ref.has_value() ||
+            !bound_workspace_)
+        {
+            return CPURetainedTeamMode::None;
+        }
+        if (!native_quantised_formats::forQuantType(tensorTypeName(params_.lm_head_weight->native_type())))
+            return CPURetainedTeamMode::None;
+        const auto *w_base = dynamic_cast<const TensorBase *>(params_.lm_head_weight);
+        if (!w_base || w_base->activationRotation() != nullptr)
+            return CPURetainedTeamMode::None;
+        return CPURetainedTeamMode::CollectiveTeam;
+    }
+
+    void LMHeadStage::prepareForRetainedTeam(IDeviceContext *)
+    {
+        if (cpuRetainedTeamMode() != CPURetainedTeamMode::CollectiveTeam)
+        {
+            if (retained_cpu_state_)
+                retained_cpu_state_->ready = false;
+            return;
+        }
+        if (!retained_cpu_state_)
+            retained_cpu_state_ = std::make_unique<RetainedCPUSingleRowState>();
+        retained_cpu_state_->ready = false;
+
+        ITensorGemm *lm_gemm = resolvePreparedKernel("LMHeadStage");
+        auto *native_kernel = dynamic_cast<cpu::native_quantised::CPUNativeQuantisedGemmKernel *>(lm_gemm);
+        if (!native_kernel)
+            return;
+        const auto *hidden_base = dynamic_cast<const TensorBase *>(params_.hidden_states);
+        auto *logits_base = dynamic_cast<TensorBase *>(params_.logits);
+        if (!native_kernel->prepareSingleRowRetainedBinding(
+                hidden_base, logits_base, nullptr,
+                params_.vocab_size, params_.d_model,
+                /*two_term=*/false, bound_workspace_,
+                retained_cpu_state_->binding,
+                params_.serial_equivalent_partition_width))
+        {
+            return;
+        }
+        retained_cpu_state_->kernel = native_kernel;
+        retained_cpu_state_->ready = true;
     }
 
     bool LMHeadStage::validatePreparedWeights(std::string *error) const
@@ -76,6 +146,13 @@ namespace llaminar2
 
     bool LMHeadStage::execute(IDeviceContext *ctx)
     {
+        if (llaminar::v2::inLexicalWorkshare() &&
+            retained_cpu_state_ && retained_cpu_state_->ready && retained_cpu_state_->kernel)
+        {
+            retained_cpu_state_->kernel->executeSingleRowInTeam(retained_cpu_state_->binding);
+            return true;
+        }
+
         ScopedGemmContext gemm_ctx(GemmContext::LM_HEAD);
 
         LOG_TRACE("[LMHeadStage] Execute: seq_len=" << params_.seq_len

@@ -27,6 +27,7 @@
 #include <span>
 #include <type_traits>
 #include <atomic>
+#include <limits>
 #include "kernels/cpu/qwen4exp/CPUQwen4ExpSIMD.h"
 namespace llaminar2::cpu::native_quantised {
 #if defined(__aarch64__) && defined(__ARM_NEON)
@@ -47,7 +48,22 @@ inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1
 #if defined(__aarch64__) && defined(__ARM_NEON)
  quantizeResidualBlockNEON(input,primary,residual,policy);
 #else
- alignas(64)float values[32];const auto scale=_mm256_set1_ps(nativeQuantisedFP16ScaleToFP32(primary.d));
+ alignas(64)float values[32];
+ const float scale_f = nativeQuantisedFP16ScaleToFP32(primary.d);
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+ if (activeISALevel() >= ISALevel::AVX512) {
+  const __m512 scale = _mm512_set1_ps(scale_f);
+  for (int i = 0; i < 32; i += 16) {
+   const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(primary.qs + i));
+   __m512 decoded = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes)), scale);
+   asm volatile("" : "+v"(decoded));
+   _mm512_store_ps(values + i, _mm512_sub_ps(_mm512_loadu_ps(input + i), decoded));
+  }
+  quantizeActivationBlock(values, residual, 32, policy);
+  return;
+ }
+#endif
+ const auto scale=_mm256_set1_ps(scale_f);
  for(int i=0;i<32;i+=8) {
   const auto bytes=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(primary.qs+i));
   const auto decoded=persistRoundedAVX2(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)),scale));
@@ -190,7 +206,7 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
  // the freshly published Q8 banks once into thread-private stack storage in
  // staggered order so all workers read from private L1d instead of contending
  // on writer-private Modified cache lines across the non-inclusive L3 mesh.
- constexpr int kMaxLocalBlocks = 128;
+ constexpr int kMaxLocalBlocks = 64;
  alignas(64) Q8_1Block local_primary[kMaxLocalBlocks];
  alignas(64) Q8_1Block local_residual[kMaxLocalBlocks];
  const Q8_1Block *primary_base = primary.data();
@@ -208,6 +224,76 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
   primary_base = local_primary;
   residual_base = local_residual;
  }
+#if !defined(__aarch64__)
+ // For narrow single-row Q8_0 projections (e.g. QFN hc_down N=320 -> 5 chunks on 28 cores),
+ // split each 64-column chunk into its four independent 16-column ZMM sub-chunks so 20+
+ // cores saturate all DDR4 memory channels with bitwise-identical K-reduction order.
+ const bool is_q8_0_direct =
+     packed.codebook_id == native_quantised_formats::Q8_0.codebook_id &&
+     !packed.is_superblock && !packed.is_asymmetric &&
+     (packed.usesExpandedInt8() || packed.usesUnsignedInt8());
+ if (live == 1 && is_q8_0_direct && chunks * 2 <= omp_get_num_threads())
+ {
+  const std::int64_t subchunks = chunks * 4;
+#pragma omp for schedule(static)
+  for (std::int64_t task = 0; task < subchunks; ++task)
+  {
+   const int chunk = static_cast<int>(task / 4);
+   const int z = static_cast<int>(task % 4);
+   if (chunk * 64 + z * 16 >= n)
+    continue;
+   float *destination = output + chunk * 64;
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+   if (avx512)
+    gemm_2row_q8_subchunk_avx512<true>(packed, primary_base, residual_base,
+     destination, nullptr, chunk, z, 0, bpr, false);
+   else
+#endif
+    gemm_2row_q8_subchunk_avx2<true>(packed, primary_base, residual_base,
+     destination, nullptr, chunk, z, 0, bpr, false);
+  }
+  return;
+ }
+#endif
+#if !defined(__aarch64__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+ if (avx512 && live >= 6 && is_q8_0_direct && packed.usesUnsignedInt8())
+ {
+  const std::int64_t tiles3 = (static_cast<std::int64_t>(live) + 2) / 3;
+#pragma omp for schedule(static)
+  for (std::int64_t task = 0; task < tiles3 * chunks; ++task)
+  {
+   const auto row = (task % tiles3) * 3;
+   const auto chunk = static_cast<int>(task / tiles3);
+   float *destination0 = output + row * n + chunk * 64;
+   if (row + 2 < live)
+   {
+    gemm_6row_unsigned_int8_2z_sum_pairs(
+        packed,
+        primary_base + row * bpr, residual_base + row * bpr,
+        primary_base + (row + 1) * bpr, residual_base + (row + 1) * bpr,
+        primary_base + (row + 2) * bpr, residual_base + (row + 2) * bpr,
+        destination0, destination0 + n, destination0 + 2 * n,
+        chunk, 0, bpr);
+   }
+   else if (row + 1 < live)
+   {
+    gemm_4row_non_nibble_2z_chunk<true>(
+        packed,
+        primary_base + row * bpr, residual_base + row * bpr,
+        primary_base + (row + 1) * bpr, residual_base + (row + 1) * bpr,
+        destination0, nullptr, destination0 + n, nullptr,
+        chunk, 0, bpr, false);
+   }
+   else
+   {
+    gemm_2row_non_nibble_chunk<true>(
+        packed, primary_base + row * bpr, residual_base + row * bpr,
+        destination0, nullptr, chunk, 0, bpr, false, 64, -1);
+   }
+  }
+  return;
+ }
+#endif
 #pragma omp for schedule(static)
   for(std::int64_t task=0;task<tiles*chunks;++task) {
    const auto row=task%tiles*2,chunk=task/tiles;
@@ -240,9 +326,10 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
 #endif
    for(auto current=row;current<std::min<std::int64_t>(row+2,live);++current) {
     float*destination=destination0+(current-row)*n;
+    const int next_c = (live == 1 && chunk + 1 < chunks) ? static_cast<int>(chunk + 1) : -1;
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
     if(avx512)gemm_2row_non_nibble_chunk<true>(packed,primary_base+current*bpr,residual_base+current*bpr,
-      destination,nullptr,chunk,0,bpr,false);
+      destination,nullptr,chunk,0,bpr,false,64,next_c);
     else
 #endif
       gemm_2row_non_nibble_chunk_avx2<true>(packed,primary_base+current*bpr,residual_base+current*bpr,
@@ -313,23 +400,26 @@ inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeQuantisedPackedW
  constexpr bool hcPublication=std::is_same_v<Publication,HCDownQ8Publication>;
  // For single-row M=1 HC decode (e.g. bpr=10, K=320), split across 2-block
  // (72-byte) pairs so 5 workers quantize in parallel with minimal cache-line
- // sharing instead of serializing 8+2 blocks onto only 2 cores.
- const int hcBlocksPerTask=(hcPublication && live==1 && bpr>2)?2:8;
- const std::int64_t publicationTilesPerRow=hcPublication?(static_cast<std::int64_t>(bpr)+hcBlocksPerTask-1)/hcBlocksPerTask:1;
- // Only completion status is shared here. Validation reads finish before
- // the last team edge; no caller rescans a bank already released for reuse.
+ // sharing; for single-row wide-K ActivatedQ8Publication (e.g. hc_down bpr=320,
+ // K=10240), split into 16-block chunks so 20 workers quantize in parallel
+ // instead of serializing all 10,240 floats on one core.
+ const int pubBlocksPerTask = hcPublication
+     ? ((live == 1 && bpr > 2) ? 2 : 8)
+     : ((live == 1 && bpr >= 16) ? 16 : bpr);
+ const std::int64_t publicationTilesPerRow =
+     (pubBlocksPerTask > 0 && pubBlocksPerTask < bpr)
+         ? (static_cast<std::int64_t>(bpr) + pubBlocksPerTask - 1) / pubBlocksPerTask
+         : 1;
+ // Shared nonfinite flag published inside the quantization workshare; the
+ // workshare's implicit barrier guarantees every thread observes the complete
+ // validity decision in O(1) without rescanning all live*bpr blocks.
  std::atomic<bool> failed{false};
- const auto finitePublication=[&]() {
-  for(std::size_t block=0;block<static_cast<std::size_t>(live)*bpr;++block)
-   if((primary[block].d&0x7c00u)==0x7c00u)return false;
-  return true;
- };
  auto work=[&]() {
 #pragma omp for schedule(static)
   for(std::int64_t task=0;task<static_cast<std::int64_t>(live)*publicationTilesPerRow;++task) {
    const auto row=task/publicationTilesPerRow;
-   const int firstBlock=hcPublication?static_cast<int>(task%publicationTilesPerRow)*hcBlocksPerTask:0;
-   const int lastBlock=hcPublication?std::min(firstBlock+hcBlocksPerTask,bpr):bpr;
+   const int firstBlock=publicationTilesPerRow>1?static_cast<int>(task%publicationTilesPerRow)*pubBlocksPerTask:0;
+   const int lastBlock=publicationTilesPerRow>1?std::min(firstBlock+pubBlocksPerTask,bpr):bpr;
    if constexpr(std::is_same_v<Publication,HCDownQ8Publication>) {
     //256 and every admitted K are multiples of32, hence each SIMD vector has
     // the same original row/channel boundary. Exact input/activated alias is
@@ -338,27 +428,55 @@ inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeQuantisedPackedW
     qwen4exp::cpu_detail::residualDownChannels(input+base,publication.activated+base,
       firstBlock*32,lastBlock*32,publicationWidth);
    }
+   bool tile_failed = false;
    for(int block=firstBlock;block<lastBlock;++block) {
    const auto offset=static_cast<std::size_t>(row)*bpr+block;
    const auto*source=input+static_cast<std::size_t>(row)*k+block*32;
    if constexpr(std::is_same_v<Publication,HCDownQ8Publication>) {
     source=publication.activated+static_cast<std::size_t>(row)*k+block*32;
    }
-   bool finite=true;for(int element=0;element<32;++element)finite=finite&&std::isfinite(source[element]);
-   if(!finite){primary[offset].d=0x7c00u;continue;}
+   bool finite=true;
+#if defined(__AVX512F__)
+   if(avx512) {
+    const __m512 abs_mask=_mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+    const __m512 inf_v=_mm512_set1_ps(std::numeric_limits<float>::infinity());
+    const __mmask16 m0=_mm512_cmp_ps_mask(_mm512_and_ps(_mm512_loadu_ps(source),abs_mask),inf_v,_CMP_LT_OQ);
+    const __mmask16 m1=_mm512_cmp_ps_mask(_mm512_and_ps(_mm512_loadu_ps(source+16),abs_mask),inf_v,_CMP_LT_OQ);
+    finite=((m0&m1)==0xffffu);
+   } else
+#endif
+   {
+    for(int element=0;element<32;++element)finite=finite&&std::isfinite(source[element]);
+   }
+   if(!finite){primary[offset].d=0x7c00u;tile_failed=true;continue;}
    quantizeActivationBlock(source,primary[offset],32,packed.numerical_policy);
    if((primary[offset].d&0x7c00u)!=0x7c00u)
     quantizeResidualBlock(source,primary[offset],residual[offset],packed.numerical_policy);
+   else
+    tile_failed=true;
    }
+   if(tile_failed)failed.store(true,std::memory_order_relaxed);
   }
   // The first workshare's implicit barrier authenticates every active primary
-  // scale. All workers observe the same bank and skip output on any invalid
-  // block, without a second flag authority or a throw inside this workshare.
-  const bool valid=finitePublication();
-  if(valid) {
+  // scale. All workers observe the same status without a throw inside this
+  // workshare. When called inside an enclosing lexical workshare, `failed` is
+  // stack-local per thread, so scan the shared primary half-scales instead.
+  bool any_failed = false;
+  if (llaminar::v2::inLexicalWorkshare()) {
+   const int total_blocks = live * bpr;
+   for (int i = 0; i < total_blocks; ++i) {
+    if ((primary[i].d & 0x7c00u) == 0x7c00u) {
+     any_failed = true;
+     break;
+    }
+   }
+   if (any_failed) failed.store(true, std::memory_order_relaxed);
+  } else {
+   any_failed = failed.load(std::memory_order_relaxed);
+  }
+  if(!any_failed) {
    cpuQ8ResidualProjectionWorkshare(packed,output,live,primary,residual,avx512);
   } else {
-   failed.store(true,std::memory_order_relaxed);
    (void)llaminar::v2::beginWorkshare(false);
   }
  };

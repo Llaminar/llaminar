@@ -17,6 +17,7 @@
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include "../simd/NEONHelpers.h"
 #endif
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -103,5 +104,196 @@ inline void residualDownChannels(const float* input,float* output,int begin,int 
                 const float scaled = input[channel] * 0.25f;
                 output[channel] = scaled * (1.0f / (1.0f + std::exp(-scaled)));
             }
+}
+
+/**
+ * @brief Normalize one already-rounded branch through the canonical SIMD 256-lane tree.
+ * @param hidden Branch width.
+ * @param epsilon Authenticated positive RMS epsilon.
+ * @param input Original published branch bytes.
+ * @param gain Actual branch gain.
+ * @param output Normalized destination.
+ * @param vectorWidth Selected native CPU SIMD width.
+ */
+inline void normalizeBranch(int hidden, float epsilon, const float *input, const float *gain,
+                            float *output, int vectorWidth)
+{
+    alignas(64) float partial[256]{};
+#if defined(__AVX512F__)
+    if (vectorWidth == 16 && (hidden % 256) == 0)
+    {
+        __m512 acc[16];
+#pragma GCC unroll 16
+        for (int b = 0; b < 16; ++b)
+            acc[b] = _mm512_setzero_ps();
+        for (int seg = 0; seg < hidden; seg += 256)
+        {
+#pragma GCC unroll 16
+            for (int b = 0; b < 16; ++b)
+            {
+                const __m512 val = _mm512_loadu_ps(input + seg + b * 16);
+                acc[b] = _mm512_fmadd_ps(val, val, acc[b]);
+            }
+        }
+#pragma GCC unroll 8
+        for (int b = 0; b < 8; ++b)
+            acc[b] = _mm512_add_ps(acc[b], acc[b + 8]);
+#pragma GCC unroll 4
+        for (int b = 0; b < 4; ++b)
+            acc[b] = _mm512_add_ps(acc[b], acc[b + 4]);
+        acc[0] = _mm512_add_ps(acc[0], acc[2]);
+        acc[1] = _mm512_add_ps(acc[1], acc[3]);
+        acc[0] = _mm512_add_ps(acc[0], acc[1]);
+        _mm512_store_ps(partial, acc[0]);
+        for (int stride = 8; stride > 0; stride /= 2)
+            for (int lane = 0; lane < stride; ++lane)
+                partial[lane] += partial[lane + stride];
+        const float inverse = 1.0f / std::sqrt(partial[0] / static_cast<float>(hidden) + epsilon);
+        const __m512 vinv = _mm512_set1_ps(inverse);
+        for (int c = 0; c < hidden; c += 16)
+            _mm512_storeu_ps(output + c,
+                _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(input + c), vinv),
+                              _mm512_loadu_ps(gain + c)));
+        return;
+    }
+#endif
+    for (int segment = 0; segment < hidden; segment += 256)
+    {
+        const int count = std::min(256, hidden - segment);
+        int lane = 0;
+#if defined(__AVX512F__)
+        if (vectorWidth == 16)
+            for (; lane + 16 <= count; lane += 16)
+            {
+                const auto value = _mm512_loadu_ps(input + segment + lane);
+                _mm512_store_ps(partial + lane, _mm512_fmadd_ps(value, value, _mm512_load_ps(partial + lane)));
+            }
+#endif
+#if defined(__AVX2__)
+        if (vectorWidth >= 8)
+            for (; lane + 8 <= count; lane += 8)
+            {
+                const auto value = _mm256_loadu_ps(input + segment + lane);
+                _mm256_store_ps(partial + lane, _mm256_fmadd_ps(value, value, _mm256_load_ps(partial + lane)));
+            }
+#endif
+        for (; lane < count; ++lane)
+        {
+            const auto value = input[segment + lane];
+            partial[lane] = std::fma(value, value, partial[lane]);
+        }
+    }
+    for (int stride = 128; stride > 0; stride /= 2)
+        for (int lane = 0; lane < stride; ++lane)
+            partial[lane] += partial[lane + stride];
+    const float inverse = 1.0f / std::sqrt(partial[0] / static_cast<float>(hidden) + epsilon);
+    int channel = 0;
+#if defined(__AVX512F__)
+    if (vectorWidth == 16)
+        for (; channel + 16 <= hidden; channel += 16)
+            _mm512_storeu_ps(output + channel, _mm512_mul_ps(
+                _mm512_mul_ps(_mm512_loadu_ps(input + channel), _mm512_set1_ps(inverse)),
+                _mm512_loadu_ps(gain + channel)));
+#endif
+#if defined(__AVX2__)
+    if (vectorWidth >= 8)
+        for (; channel + 8 <= hidden; channel += 8)
+            _mm256_storeu_ps(output + channel, _mm256_mul_ps(
+                _mm256_mul_ps(_mm256_loadu_ps(input + channel), _mm256_set1_ps(inverse)),
+                _mm256_loadu_ps(gain + channel)));
+#endif
+    for (; channel < hidden; ++channel)
+        output[channel] = (input[channel] * inverse) * gain[channel];
+}
+
+/**
+ * @brief Fused single-branch ResidualWrite + BranchRMSNorm through the canonical 256-lane tree.
+ * @param hidden Branch width.
+ * @param epsilon Authenticated positive RMS epsilon.
+ * @param gate Precomputed scalar branch gate `2.0f * sigmoid(gateLogit * 0.25f)`.
+ * @param res Prior residual branch input.
+ * @param blk Block output row to inject.
+ * @param gain Branch RMSNorm gain.
+ * @param out Updated residual branch destination.
+ * @param norm Normalized branch destination.
+ * @param vectorWidth Selected native CPU SIMD width.
+ */
+inline void residualWriteAndNormalizeBranch(int hidden, float epsilon, float gate,
+                                            const float *__restrict res, const float *__restrict blk,
+                                            const float *__restrict gain, float *__restrict out,
+                                            float *__restrict norm, int vectorWidth)
+{
+    alignas(64) float partial[256]{};
+#if defined(__AVX512F__)
+    if (vectorWidth == 16 && (hidden % 256) == 0)
+    {
+        const __m512 vgate = _mm512_set1_ps(gate);
+        const __m512 vzero = _mm512_setzero_ps();
+        __m512 acc[16];
+#pragma GCC unroll 16
+        for (int b = 0; b < 16; ++b)
+            acc[b] = _mm512_setzero_ps();
+        for (int seg = 0; seg < hidden; seg += 256)
+        {
+#pragma GCC unroll 16
+            for (int b = 0; b < 16; ++b)
+            {
+                const int off = seg + b * 16;
+                const __m512 upd = _mm512_fmadd_ps(vgate, _mm512_loadu_ps(blk + off), vzero);
+                const __m512 val = _mm512_add_ps(_mm512_loadu_ps(res + off), upd);
+                _mm512_storeu_ps(out + off, val);
+                acc[b] = _mm512_fmadd_ps(val, val, acc[b]);
+            }
+        }
+#pragma GCC unroll 8
+        for (int b = 0; b < 8; ++b)
+            acc[b] = _mm512_add_ps(acc[b], acc[b + 8]);
+#pragma GCC unroll 4
+        for (int b = 0; b < 4; ++b)
+            acc[b] = _mm512_add_ps(acc[b], acc[b + 4]);
+        acc[0] = _mm512_add_ps(acc[0], acc[2]);
+        acc[1] = _mm512_add_ps(acc[1], acc[3]);
+        acc[0] = _mm512_add_ps(acc[0], acc[1]);
+        _mm512_store_ps(partial, acc[0]);
+        for (int stride = 8; stride > 0; stride /= 2)
+            for (int lane = 0; lane < stride; ++lane)
+                partial[lane] += partial[lane + stride];
+        const float inverse = 1.0f / std::sqrt(partial[0] / static_cast<float>(hidden) + epsilon);
+        const __m512 vinv = _mm512_set1_ps(inverse);
+        for (int c = 0; c < hidden; c += 16)
+        {
+            _mm512_storeu_ps(norm + c,
+                _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(out + c), vinv),
+                              _mm512_loadu_ps(gain + c)));
+        }
+        return;
+    }
+#endif
+#if defined(__AVX2__)
+    if (vectorWidth >= 8)
+    {
+        const __m256 vgate = _mm256_set1_ps(gate);
+        const __m256 vzero = _mm256_setzero_ps();
+        int c = 0;
+        for (; c + 8 <= hidden; c += 8)
+        {
+            const __m256 upd = _mm256_fmadd_ps(vgate, _mm256_loadu_ps(blk + c), vzero);
+            _mm256_storeu_ps(out + c, _mm256_add_ps(_mm256_loadu_ps(res + c), upd));
+        }
+        for (; c < hidden; ++c)
+        {
+            const float update = std::fma(gate, blk[c], 0.0f);
+            out[c] = res[c] + update;
+        }
+        normalizeBranch(hidden, epsilon, out, gain, norm, vectorWidth);
+        return;
+    }
+#endif
+    for (int channel = 0; channel < hidden; ++channel)
+    {
+        const float update = std::fma(gate, blk[channel], 0.0f);
+        out[channel] = res[channel] + update;
+    }
+    normalizeBranch(hidden, epsilon, out, gain, norm, vectorWidth);
 }
 } // namespace llaminar2::qwen4exp::cpu_detail

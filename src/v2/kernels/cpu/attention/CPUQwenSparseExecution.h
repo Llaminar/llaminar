@@ -199,6 +199,76 @@ public:
     [[nodiscard]] int queryHeadStart()const noexcept{return p_.query_head_start;}
     /** @return Cold-admitted execution ISA for register-group sizing. */
     [[nodiscard]] ISALevel isa()const noexcept{return isa_;}
+    /** @return Whether either key or value bank uses a rotated basis (TQ4/TQ8). */
+    [[nodiscard]] bool isRotated()const noexcept{return detail::isRotated(p_.kv.keys)||detail::isRotated(p_.kv.values);}
+    /** @return Selected token count for admitted live row @p row. */
+    [[nodiscard]] int selectedCount(int row)const noexcept{return p_.selected_count[row];}
+    /**
+     * @brief Execute up to 4 single-row GQA KV groups together in ONE 3-barrier cooperative pass.
+     *
+     * Fuses K-scoring across `group_count * count`, softmax+transpose across all `total_heads`
+     * (e.g. 24 on 2xCPU TP2, 48 on 1xCPU), and V-accumulation across `group_count * 16` AVX-512
+     * strips (`32` on 2xCPU TP2 -> all 28 cores busy; `64` on 1xCPU) while preserving exact
+     * increasing-token order. Bitwise identical to @ref executeHeadGroup.
+     */
+    struct CooperativeGroupSpan { int begin; int count; };
+
+    void executeSingleRowGroupsCooperativeInTeam(
+        int row,
+        const CooperativeGroupSpan *groups,
+        int groupCount,
+        float *shared_logits) const noexcept
+    {
+        if (row < 0 || row >= replay_.live_rows || !groups || groupCount <= 0 || groupCount > 4 || !shared_logits)
+            native::rejectCodec();
+        if (groupCount == 1)
+        {
+            executeSingleRowGroupCooperativeInTeam(row, groups[0].begin, groups[0].count, shared_logits);
+            return;
+        }
+        bool all_twelve = true;
+        int total_heads = 0;
+        for (int g = 0; g < groupCount; ++g)
+        {
+            if (groups[g].count != 12)
+                all_twelve = false;
+            total_heads += groups[g].count;
+        }
+        if (!all_twelve)
+        {
+            for (int g = 0; g < groupCount; ++g)
+                executeSingleRowGroupCooperativeInTeam(row, groups[g].begin, groups[g].count, shared_logits);
+            return;
+        }
+        executeSingleRowMultiGroup12CooperativeInTeam(row, groups, groupCount, shared_logits);
+    }
+
+    /**
+     * @brief Execute one single-row GQA head group cooperatively across the entire active OpenMP team.
+     *
+     * Must be called identically by every thread of an active team (no internal fork).
+     * Parallelizes K-scoring across `0..count` (decoding each K row ONCE for all `headCount` heads),
+     * softmax across heads, and V-accumulation across independent 16-float (AVX-512) or 8-float (AVX2)
+     * coordinate strips while walking `i = 0..count-1` in exact original order. Bitwise identical to
+     * @ref executeHeadGroup.
+     */
+    void executeSingleRowGroupCooperativeInTeam(int row,int headBegin,int headCount,float*shared_logits)const noexcept
+    {
+        if(row<0||row>=replay_.live_rows||headBegin<0||headCount<=0||headCount>12||
+           headBegin+headCount>p_.query_heads||!shared_logits)native::rejectCodec();
+        switch(headCount)
+        {
+        case 1: return executeSingleRowGroupCooperativeFixed<1>(row,headBegin,shared_logits);
+        case 2: return executeSingleRowGroupCooperativeFixed<2>(row,headBegin,shared_logits);
+        case 3: return executeSingleRowGroupCooperativeFixed<3>(row,headBegin,shared_logits);
+        case 4: return executeSingleRowGroupCooperativeFixed<4>(row,headBegin,shared_logits);
+        case 6: return executeSingleRowGroupCooperativeFixed<6>(row,headBegin,shared_logits);
+        case 12: return executeSingleRowGroupCooperativeFixed<12>(row,headBegin,shared_logits);
+        default:
+            for(int h=0;h<headCount;++h)executeSingleRowGroupCooperativeFixed<1>(row,headBegin+h,shared_logits);
+            return;
+        }
+    }
     /** @brief Execute one admitted contiguous GQA head group sharing a single KV head.
      * @param row Original invocation-local live row index.
      * @param headBegin Starting local query-head index within this row.
@@ -481,6 +551,629 @@ private:
                 if(!std::isfinite(output[c]))native::rejectCodec();
             }
             if(p_.observations)p_.observations[rowHead]={std::uint64_t(count)*256,std::uint64_t(count)*256,std::uint32_t(count)};
+        }
+    }
+
+    /**
+     * @brief Fused 3-barrier cooperative decode across `groupCount` (2..4) full 12-head GQA KV groups.
+     *
+     * Uses 64-byte-padded per-head contiguous logits/probs inside `shared_logits` (capacity >=
+     * `4 * 12 * 2064` floats) so Phase 2 normalizes in-place with ZERO false sharing across heads.
+     */
+    void executeSingleRowMultiGroup12CooperativeInTeam(
+        int row,
+        const CooperativeGroupSpan *groups,
+        int groupCount,
+        float *shared_logits) const noexcept
+    {
+        constexpr int HeadCount = 12;
+        constexpr std::size_t kMaxHeadStride = (static_cast<std::size_t>(QwenSparseSelected) + 15u) & ~std::size_t{15u};
+        constexpr std::size_t kGroupStride = static_cast<std::size_t>(HeadCount) * kMaxHeadStride;
+        const auto count = p_.selected_count[row];
+        if (count <= 0 || count > QwenSparseSelected)
+            native::rejectCodec();
+        const std::size_t head_stride = (static_cast<std::size_t>(count) + 15u) & ~std::size_t{15u};
+        const auto *selected = p_.selected + std::size_t(row) * QwenSparseSelected;
+        int origin = 0, capacity = 0;
+        if (!detail::resolveMapping(p_.kv, replay_, row, p_.token_capacity, origin, capacity))
+            native::rejectCodec();
+
+        int kvHeads[4] = {};
+        for (int g = 0; g < groupCount; ++g)
+        {
+            const int headBegin = groups[g].begin;
+            if (headBegin < 0 || headBegin + HeadCount > p_.query_heads)
+                native::rejectCodec();
+            kvHeads[g] = (p_.query_head_start + headBegin) / 12 - p_.kv_head_start;
+            if ((p_.query_head_start + headBegin + HeadCount - 1) / 12 - p_.kv_head_start != kvHeads[g])
+                native::rejectCodec();
+        }
+
+        // Phase 1: Parallel K-scoring in 16-token blocks (zero boundary false sharing) with
+        // codec dispatch hoisted outside the workshare and real L1 prefetch on selected[i+2].
+        const int blocks16 = (count + 15) / 16;
+        const int total_k_blocks = groupCount * blocks16;
+        withDecoder(keys_, kvHeads[0], [&](const auto &proto_decoder) {
+            using DecoderT = std::remove_cvref_t<decltype(proto_decoder)>;
+#pragma omp for schedule(static)
+            for (int task = 0; task < total_k_blocks; ++task)
+            {
+                const int g = task / blocks16;
+                const int bi = (task % blocks16) * 16;
+                const int bend = std::min(bi + 16, count);
+                const int headBegin = groups[g].begin;
+                const auto decoder = DecoderT::bind(keys_, kvHeads[g]);
+                float *g_logits = shared_logits + static_cast<std::size_t>(g) * kGroupStride;
+                const float *queries[HeadCount];
+                for (int h = 0; h < HeadCount; ++h)
+                    queries[h] = p_.query + std::size_t(row * p_.query_heads + headBegin + h) * 256;
+
+                for (int i = bi; i < bend; ++i)
+                {
+#if defined(__AVX512F__) || defined(__AVX2__)
+                    if (i + 2 < bend)
+                    {
+                        const auto *pb = decoder.row(detail::physicalRow(selected[i + 2], origin, capacity)).rawBytes();
+                        _mm_prefetch(reinterpret_cast<const char *>(pb), _MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char *>(pb + 128), _MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char *>(pb + 256), _MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char *>(pb + 384), _MM_HINT_T0);
+                    }
+#endif
+                    const auto nativeRow = decoder.row(detail::physicalRow(selected[i], origin, capacity));
+#if defined(__AVX512F__)
+                    if (isa_ == ISALevel::AVX512)
+                    {
+                        __m512 totals[HeadCount];
+                        for (int h = 0; h < HeadCount; ++h) totals[h] = _mm512_setzero_ps();
+                        for (int c = 0; c < 256; c += 16)
+                        {
+                            const __m512 k = nativeRow.read16AVX512(c);
+                            for (int h = 0; h < HeadCount; ++h)
+                                totals[h] = _mm512_fmadd_ps(_mm512_loadu_ps(queries[h] + c), k, totals[h]);
+                        }
+                        for (int h = 0; h < HeadCount; ++h)
+                        {
+                            const float s = native::fold16(totals[h]) * 0.0625f;
+                            if (!std::isfinite(s)) native::rejectCodec();
+                            g_logits[static_cast<std::size_t>(h) * head_stride + i] = s;
+                        }
+                        continue;
+                    }
+#endif
+                    for (int half = 0; half < HeadCount; half += 6)
+                    {
+                        native::Fragment8 totals[6];
+                        for (int h = 0; h < 6; ++h) totals[h] = native::zero8();
+                        for (int c = 0; c < 256; c += 8)
+                        {
+                            const auto k = nativeRow.read(c);
+                            for (int h = 0; h < 6; ++h)
+                                totals[h] = native::fma8(totals[h], native::load8(queries[half + h] + c), k);
+                        }
+                        for (int h = 0; h < 6; ++h)
+                        {
+                            const float s = native::fold8(totals[h]) * 0.0625f;
+                            if (!std::isfinite(s)) native::rejectCodec();
+                            g_logits[static_cast<std::size_t>(half + h) * head_stride + i] = s;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Phase 2: In-place exact softmax across ALL groupCount * 12 heads (64B-disjoint rows, ZERO false sharing).
+        const int total_heads = groupCount * HeadCount;
+#pragma omp for schedule(static)
+        for (int gh = 0; gh < total_heads; ++gh)
+        {
+            const int g = gh / HeadCount;
+            const int h = gh % HeadCount;
+            float *g_logits = shared_logits + static_cast<std::size_t>(g) * kGroupStride;
+            float *row_logits = g_logits + static_cast<std::size_t>(h) * head_stride;
+            float m = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < count; ++i) m = std::max(m, row_logits[i]);
+            float denominator = 0.0f;
+            for (int i = 0; i < count; ++i) { row_logits[i] = std::exp(row_logits[i] - m); denominator += row_logits[i]; }
+            if (!std::isfinite(denominator) || denominator <= 0.0f) native::rejectCodec();
+            for (int i = 0; i < count; ++i) row_logits[i] = row_logits[i] / denominator;
+        }
+
+        // Phase 3: Parallel V-accumulation across ALL groupCount * 16 strips * 3 4-head slices
+        // (AVX-512 reads only 4 contiguous streams directly from g_logits, eliminating Phase 2b transpose & barrier!).
+#if defined(__AVX512F__)
+        if (isa_ == ISALevel::AVX512)
+        {
+            constexpr int kHeadSlices = 3;
+            constexpr int kSliceHeads = HeadCount / kHeadSlices; // 4
+            const int total_tasks = groupCount * 16 * kHeadSlices;
+            withDecoder(values_, kvHeads[0], [&](const auto &proto_decoder) {
+                using DecoderT = std::remove_cvref_t<decltype(proto_decoder)>;
+                if constexpr (!DecoderT::rotatedBasis)
+                {
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_tasks; ++task)
+                    {
+                        const int g = task / (16 * kHeadSlices);
+                        const int rem = task % (16 * kHeadSlices);
+                        const int c = (rem / kHeadSlices) * 16;
+                        const int h0 = (rem % kHeadSlices) * kSliceHeads;
+                        const int headBegin = groups[g].begin;
+                        const auto decoder = DecoderT::bind(values_, kvHeads[g]);
+                        const float *g_logits = shared_logits + static_cast<std::size_t>(g) * kGroupStride;
+                        const float *p_rows[kSliceHeads];
+                        float *outputs[kSliceHeads];
+                        for (int h = 0; h < kSliceHeads; ++h)
+                        {
+                            p_rows[h] = g_logits + static_cast<std::size_t>(h0 + h) * head_stride;
+                            outputs[h] = p_.output + std::size_t(row * p_.query_heads + headBegin + h0 + h) * 256;
+                        }
+                        __m512 acc[kSliceHeads];
+                        for (int h = 0; h < kSliceHeads; ++h) acc[h] = _mm512_setzero_ps();
+                        for (int i = 0; i < count; ++i)
+                        {
+                            if (i + 2 < count)
+                            {
+                                const auto *pb = decoder.row(detail::physicalRow(selected[i + 2], origin, capacity)).rawBytes();
+                                _mm_prefetch(reinterpret_cast<const char *>(pb + (c * 2)), _MM_HINT_T0);
+                            }
+                            const auto source = decoder.row(detail::physicalRow(selected[i], origin, capacity));
+                            const __m512 v = source.read16AVX512(c);
+#pragma GCC unroll 4
+                            for (int h = 0; h < kSliceHeads; ++h)
+                                acc[h] = _mm512_fmadd_ps(_mm512_set1_ps(p_rows[h][i]), v, acc[h]);
+                        }
+                        const __m512i abs_mask = _mm512_set1_epi32(0x7fffffff);
+                        const __m512 flt_max = _mm512_set1_ps(std::numeric_limits<float>::max());
+                        for (int h = 0; h < kSliceHeads; ++h)
+                        {
+                            float *out = outputs[h] + c;
+                            _mm512_storeu_ps(out, acc[h]);
+                            if (__builtin_expect(p_.gate != nullptr, 0))
+                            {
+                                const int rowHead = row * p_.query_heads + headBegin + h0 + h;
+                                for (int lane_i = 0; lane_i < 16; ++lane_i)
+                                {
+                                    const auto gv = p_.gate[std::size_t(rowHead) * 256 + c + lane_i];
+                                    if (!std::isfinite(gv)) native::rejectCodec();
+                                    out[lane_i] *= 1.0f / (1.0f + std::exp(-gv));
+                                    if (!std::isfinite(out[lane_i])) native::rejectCodec();
+                                }
+                            }
+                            else
+                            {
+                                const __m512 mag = _mm512_castsi512_ps(_mm512_and_epi32(_mm512_castps_si512(acc[h]), abs_mask));
+                                if (__builtin_expect(_mm512_cmp_ps_mask(mag, flt_max, _CMP_LE_OQ) != 0xffffu, 0))
+                                    native::rejectCodec();
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        else
+#endif
+        {
+            // AVX2/NEON: transpose into probs_t for 6-head L1d locality.
+            const int total_t_blocks = groupCount * blocks16;
+#pragma omp for schedule(static)
+            for (int task = 0; task < total_t_blocks; ++task)
+            {
+                const int g = task / blocks16;
+                const int bi = (task % blocks16) * 16;
+                const int bend = std::min(bi + 16, count);
+                const float *g_logits = shared_logits + static_cast<std::size_t>(g) * kGroupStride;
+                float *g_probs_t = shared_logits + static_cast<std::size_t>(4 + g) * kGroupStride;
+                for (int i = bi; i < bend; ++i)
+                {
+                    float *dst = g_probs_t + static_cast<std::size_t>(i) * static_cast<std::size_t>(HeadCount);
+#pragma GCC unroll 12
+                    for (int h = 0; h < HeadCount; ++h)
+                        dst[h] = g_logits[static_cast<std::size_t>(h) * head_stride + i];
+                }
+            }
+            const int total_strips = groupCount * 32;
+            withDecoder(values_, kvHeads[0], [&](const auto &proto_decoder) {
+                using DecoderT = std::remove_cvref_t<decltype(proto_decoder)>;
+                if constexpr (!DecoderT::rotatedBasis)
+                {
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_strips; ++task)
+                    {
+                        const int g = task / 32;
+                        const int c = (task % 32) * 8;
+                        const int headBegin = groups[g].begin;
+                        const auto decoder = DecoderT::bind(values_, kvHeads[g]);
+                        const float *g_probs_t = shared_logits + static_cast<std::size_t>(4 + g) * kGroupStride;
+                        float *outputs[HeadCount];
+                        for (int h = 0; h < HeadCount; ++h)
+                            outputs[h] = p_.output + std::size_t(row * p_.query_heads + headBegin + h) * 256;
+
+                        for (int half = 0; half < HeadCount; half += 6)
+                        {
+                            native::Fragment8 acc[6];
+                            for (int h = 0; h < 6; ++h) acc[h] = native::zero8();
+                            for (int i = 0; i < count; ++i)
+                            {
+                                const auto source = decoder.row(detail::physicalRow(selected[i], origin, capacity));
+                                const auto v = source.read(c);
+                                const float *pi = g_probs_t + static_cast<std::size_t>(i) * static_cast<std::size_t>(HeadCount) + half;
+                                for (int h = 0; h < 6; ++h)
+                                    acc[h] = native::fma8(acc[h], native::broadcast8(pi[h]), v);
+                            }
+                            for (int h = 0; h < 6; ++h)
+                            {
+                                const int rowHead = row * p_.query_heads + headBegin + half + h;
+                                float *out = outputs[half + h] + c;
+                                native::store8(out, acc[h]);
+                                for (int lane_i = 0; lane_i < 8; ++lane_i)
+                                {
+                                    if (p_.gate)
+                                    {
+                                        const auto gv = p_.gate[std::size_t(rowHead) * 256 + c + lane_i];
+                                        if (!std::isfinite(gv)) native::rejectCodec();
+                                        out[lane_i] *= 1.0f / (1.0f + std::exp(-gv));
+                                    }
+                                    if (!std::isfinite(out[lane_i])) native::rejectCodec();
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if (p_.observations)
+        {
+#pragma omp single
+            {
+                for (int g = 0; g < groupCount; ++g)
+                {
+                    for (int h = 0; h < HeadCount; ++h)
+                    {
+                        const int rowHead = row * p_.query_heads + groups[g].begin + h;
+                        p_.observations[rowHead] = {std::uint64_t(count) * 256, std::uint64_t(count) * 256, std::uint32_t(count)};
+                    }
+                }
+            }
+        }
+    }
+
+    template<int HeadCount>
+    void executeSingleRowGroupCooperativeFixed(int row,int headBegin,float*shared_logits)const noexcept
+    {
+        static_assert(HeadCount>=1&&HeadCount<=12);
+        const int kvHead=(p_.query_head_start+headBegin)/12-p_.kv_head_start;
+        if((p_.query_head_start+headBegin+HeadCount-1)/12-p_.kv_head_start!=kvHead)native::rejectCodec();
+        const auto count=p_.selected_count[row];if(count<=0||count>QwenSparseSelected)native::rejectCodec();
+        const std::size_t head_stride=(static_cast<std::size_t>(count)+15u)&~std::size_t{15u};
+        const auto*selected=p_.selected+std::size_t(row)*QwenSparseSelected;
+        int origin=0,capacity=0;if(!detail::resolveMapping(p_.kv,replay_,row,p_.token_capacity,origin,capacity))native::rejectCodec();
+
+        const float*queries[HeadCount];
+        float*outputs[HeadCount];
+        for(int h=0;h<HeadCount;++h)
+        {
+            const int rowHead=row*p_.query_heads+headBegin+h;
+            queries[h]=p_.query+std::size_t(rowHead)*256;
+            outputs[h]=p_.output+std::size_t(rowHead)*256;
+        }
+
+        // Phase 1: Parallel K-scoring in 16-token blocks (zero boundary false sharing on shared_logits!)
+        // with real L1 prefetch on selected[i+2]; each KV row is decoded ONCE for all HeadCount heads.
+        const int blocks16 = (count + 15) / 16;
+        withDecoder(keys_,kvHead,[&](const auto&decoder)
+        {
+#pragma omp for schedule(static)
+            for(int blk=0;blk<blocks16;++blk)
+            {
+                const int bi=blk*16;
+                const int bend=std::min(bi+16,count);
+                for(int i=bi;i<bend;++i)
+                {
+#if defined(__AVX512F__) || defined(__AVX2__)
+                    if(i+2<bend)
+                    {
+                        const auto*pb=decoder.row(detail::physicalRow(selected[i+2],origin,capacity)).rawBytes();
+                        _mm_prefetch(reinterpret_cast<const char*>(pb),_MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char*>(pb+128),_MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char*>(pb+256),_MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char*>(pb+384),_MM_HINT_T0);
+                    }
+#endif
+                    const auto nativeRow=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+#if defined(__AVX512F__)
+                    if(isa_==ISALevel::AVX512)
+                    {
+                        __m512 totals[HeadCount];
+                        for(int h=0;h<HeadCount;++h)totals[h]=_mm512_setzero_ps();
+                        for(int c=0;c<256;c+=16)
+                        {
+                            const __m512 k=nativeRow.read16AVX512(c);
+                            for(int h=0;h<HeadCount;++h)
+                                totals[h]=_mm512_fmadd_ps(_mm512_loadu_ps(queries[h]+c),k,totals[h]);
+                        }
+                        for(int h=0;h<HeadCount;++h)
+                        {
+                            const float s=native::fold16(totals[h])*0.0625f;
+                            if(!std::isfinite(s))native::rejectCodec();
+                            shared_logits[static_cast<std::size_t>(h)*head_stride+i]=s;
+                        }
+                        continue;
+                    }
+#endif
+                    if constexpr(HeadCount<=6)
+                    {
+                        native::Fragment8 totals[HeadCount];
+                        for(int h=0;h<HeadCount;++h)totals[h]=native::zero8();
+                        for(int c=0;c<256;c+=8)
+                        {
+                            const auto k=nativeRow.read(c);
+                            for(int h=0;h<HeadCount;++h)
+                                totals[h]=native::fma8(totals[h],native::load8(queries[h]+c),k);
+                        }
+                        for(int h=0;h<HeadCount;++h)
+                        {
+                            const float s=native::fold8(totals[h])*0.0625f;
+                            if(!std::isfinite(s))native::rejectCodec();
+                            shared_logits[static_cast<std::size_t>(h)*head_stride+i]=s;
+                        }
+                    }
+                    else
+                    {
+                        for(int half=0;half<HeadCount;half+=6)
+                        {
+                            native::Fragment8 totals[6];
+                            for(int h=0;h<6;++h)totals[h]=native::zero8();
+                            for(int c=0;c<256;c+=8)
+                            {
+                                const auto k=nativeRow.read(c);
+                                for(int h=0;h<6;++h)
+                                    totals[h]=native::fma8(totals[h],native::load8(queries[half+h]+c),k);
+                            }
+                            for(int h=0;h<6;++h)
+                            {
+                                const float s=native::fold8(totals[h])*0.0625f;
+                                if(!std::isfinite(s))native::rejectCodec();
+                                shared_logits[static_cast<std::size_t>(half+h)*head_stride+i]=s;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Phase 2: In-place exact softmax across heads on 64-byte-padded rows (ZERO cross-head false sharing).
+#pragma omp for schedule(static)
+        for(int h=0;h<HeadCount;++h)
+        {
+            float*row_logits=shared_logits+static_cast<std::size_t>(h)*head_stride;
+            float m=-std::numeric_limits<float>::infinity();
+            for(int i=0;i<count;++i)m=std::max(m,row_logits[i]);
+            float denominator=0.0f;
+            for(int i=0;i<count;++i){row_logits[i]=std::exp(row_logits[i]-m);denominator+=row_logits[i];}
+            if(!std::isfinite(denominator)||denominator<=0.0f)native::rejectCodec();
+            for(int i=0;i<count;++i)row_logits[i]=row_logits[i]/denominator;
+        }
+
+        // Phase 3 (AVX-512 HeadCount==12 fast path): 48 tasks reading ONLY 4 contiguous head streams
+        // directly from shared_logits -> skips Phase 2b transpose & eliminates 1 full barrier per layer!
+#if defined(__AVX512F__)
+        if constexpr(HeadCount==12)
+        {
+            if(isa_==ISALevel::AVX512)
+            {
+                withDecoder(values_,kvHead,[&](const auto&decoder)
+                {
+                    if constexpr(!std::remove_cvref_t<decltype(decoder)>::rotatedBasis)
+                    {
+                        constexpr int kHeadSlices=3;
+                        constexpr int kSliceHeads=4;
+#pragma omp for schedule(static)
+                        for(int task=0;task<16*kHeadSlices;++task)
+                        {
+                            const int c=(task/kHeadSlices)*16;
+                            const int h0=(task%kHeadSlices)*kSliceHeads;
+                            const float*p_rows[kSliceHeads];
+                            for(int h=0;h<kSliceHeads;++h)
+                                p_rows[h]=shared_logits+static_cast<std::size_t>(h0+h)*head_stride;
+                            __m512 acc[kSliceHeads];
+                            for(int h=0;h<kSliceHeads;++h)acc[h]=_mm512_setzero_ps();
+                            for(int i=0;i<count;++i)
+                            {
+                                if(i+2<count)
+                                {
+                                    const auto*pb=decoder.row(detail::physicalRow(selected[i+2],origin,capacity)).rawBytes();
+                                    _mm_prefetch(reinterpret_cast<const char*>(pb+(c*2)),_MM_HINT_T0);
+                                }
+                                const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+                                const __m512 v=source.read16AVX512(c);
+#pragma GCC unroll 4
+                                for(int h=0;h<kSliceHeads;++h)
+                                    acc[h]=_mm512_fmadd_ps(_mm512_set1_ps(p_rows[h][i]),v,acc[h]);
+                            }
+                            const __m512i abs_mask=_mm512_set1_epi32(0x7fffffff);
+                            const __m512 flt_max=_mm512_set1_ps(std::numeric_limits<float>::max());
+                            for(int h=0;h<kSliceHeads;++h)
+                            {
+                                float*out=outputs[h0+h]+c;
+                                _mm512_storeu_ps(out,acc[h]);
+                                if(__builtin_expect(p_.gate!=nullptr,0))
+                                {
+                                    const int rowHead=row*p_.query_heads+headBegin+h0+h;
+                                    for(int lane_i=0;lane_i<16;++lane_i)
+                                    {
+                                        const auto g=p_.gate[std::size_t(rowHead)*256+c+lane_i];
+                                        if(!std::isfinite(g))native::rejectCodec();
+                                        out[lane_i]*=1.0f/(1.0f+std::exp(-g));
+                                        if(!std::isfinite(out[lane_i]))native::rejectCodec();
+                                    }
+                                }
+                                else
+                                {
+                                    const __m512 mag=_mm512_castsi512_ps(_mm512_and_epi32(_mm512_castps_si512(acc[h]),abs_mask));
+                                    if(__builtin_expect(_mm512_cmp_ps_mask(mag,flt_max,_CMP_LE_OQ)!=0xffffu,0))
+                                        native::rejectCodec();
+                                }
+                            }
+                        }
+                    }
+                });
+                if(p_.observations)
+                {
+#pragma omp single
+                    {
+                        for(int h=0;h<HeadCount;++h)
+                        {
+                            const int rowHead=row*p_.query_heads+headBegin+h;
+                            p_.observations[rowHead]={std::uint64_t(count)*256,std::uint64_t(count)*256,std::uint32_t(count)};
+                        }
+                    }
+                }
+                return;
+            }
+        }
+#endif
+
+        // Phase 2b (AVX2 / non-12-head): Disjoint 16-token parallel transpose into contiguous probs_t[i * HeadCount + h].
+        constexpr std::size_t kMaxPaddedSelected=(static_cast<std::size_t>(QwenSparseSelected)+15u)&~std::size_t{15u};
+        float*probs_t=shared_logits+12u*kMaxPaddedSelected;
+#pragma omp for schedule(static)
+        for(int blk=0;blk<blocks16;++blk)
+        {
+            const int bi=blk*16;
+            const int bend=std::min(bi+16,count);
+            for(int i=bi;i<bend;++i)
+            {
+                float*dst=probs_t+static_cast<std::size_t>(i)*static_cast<std::size_t>(HeadCount);
+                for(int h=0;h<HeadCount;++h)
+                    dst[h]=shared_logits[static_cast<std::size_t>(h)*head_stride+i];
+            }
+        }
+
+        // Phase 3: Parallel V-accumulation across independent coordinate strips, walking i=0..count-1
+        // in exact original order so outputs are 100% bitwise identical to executeHeadGroupFixed.
+        withDecoder(values_,kvHead,[&](const auto&decoder)
+        {
+            if constexpr(!std::remove_cvref_t<decltype(decoder)>::rotatedBasis)
+            {
+#if defined(__AVX512F__)
+                if(isa_==ISALevel::AVX512)
+                {
+#pragma omp for schedule(static)
+                    for(int strip=0;strip<16;++strip)
+                    {
+                        const int c=strip*16;
+                        __m512 acc[HeadCount];
+                        for(int h=0;h<HeadCount;++h)acc[h]=_mm512_setzero_ps();
+                        for(int i=0;i<count;++i)
+                        {
+                            const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+                            const __m512 v=source.read16AVX512(c);
+                            const float*pi=probs_t+static_cast<std::size_t>(i)*static_cast<std::size_t>(HeadCount);
+#pragma GCC unroll 12
+                            for(int h=0;h<HeadCount;++h)
+                                acc[h]=_mm512_fmadd_ps(_mm512_set1_ps(pi[h]),v,acc[h]);
+                        }
+                        for(int h=0;h<HeadCount;++h)
+                        {
+                            const int rowHead=row*p_.query_heads+headBegin+h;
+                            float*out=outputs[h]+c;
+                            _mm512_storeu_ps(out,acc[h]);
+                            for(int lane_i=0;lane_i<16;++lane_i)
+                            {
+                                if(p_.gate)
+                                {
+                                    const auto g=p_.gate[std::size_t(rowHead)*256+c+lane_i];
+                                    if(!std::isfinite(g))native::rejectCodec();
+                                    out[lane_i]*=1.0f/(1.0f+std::exp(-g));
+                                }
+                                if(!std::isfinite(out[lane_i]))native::rejectCodec();
+                            }
+                        }
+                    }
+                    return;
+                }
+#endif
+#pragma omp for schedule(static)
+                for(int strip=0;strip<32;++strip)
+                {
+                    const int c=strip*8;
+                    if constexpr(HeadCount<=6)
+                    {
+                        native::Fragment8 acc[HeadCount];
+                        for(int h=0;h<HeadCount;++h)acc[h]=native::zero8();
+                        for(int i=0;i<count;++i)
+                        {
+                            const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+                            const auto v=source.read(c);
+                            const float*pi=probs_t+static_cast<std::size_t>(i)*static_cast<std::size_t>(HeadCount);
+                            for(int h=0;h<HeadCount;++h)
+                                acc[h]=native::fma8(acc[h],native::broadcast8(pi[h]),v);
+                        }
+                        for(int h=0;h<HeadCount;++h)
+                        {
+                            const int rowHead=row*p_.query_heads+headBegin+h;
+                            float*out=outputs[h]+c;
+                            native::store8(out,acc[h]);
+                            for(int lane_i=0;lane_i<8;++lane_i)
+                            {
+                                if(p_.gate)
+                                {
+                                    const auto g=p_.gate[std::size_t(rowHead)*256+c+lane_i];
+                                    if(!std::isfinite(g))native::rejectCodec();
+                                    out[lane_i]*=1.0f/(1.0f+std::exp(-g));
+                                }
+                                if(!std::isfinite(out[lane_i]))native::rejectCodec();
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for(int half=0;half<HeadCount;half+=6)
+                        {
+                            native::Fragment8 acc[6];
+                            for(int h=0;h<6;++h)acc[h]=native::zero8();
+                            for(int i=0;i<count;++i)
+                            {
+                                const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+                                const auto v=source.read(c);
+                                const float*pi=probs_t+static_cast<std::size_t>(i)*static_cast<std::size_t>(HeadCount)+half;
+                                for(int h=0;h<6;++h)
+                                    acc[h]=native::fma8(acc[h],native::broadcast8(pi[h]),v);
+                            }
+                            for(int h=0;h<6;++h)
+                            {
+                                const int rowHead=row*p_.query_heads+headBegin+half+h;
+                                float*out=outputs[half+h]+c;
+                                native::store8(out,acc[h]);
+                                for(int lane_i=0;lane_i<8;++lane_i)
+                                {
+                                    if(p_.gate)
+                                    {
+                                        const auto g=p_.gate[std::size_t(rowHead)*256+c+lane_i];
+                                        if(!std::isfinite(g))native::rejectCodec();
+                                        out[lane_i]*=1.0f/(1.0f+std::exp(-g));
+                                    }
+                                    if(!std::isfinite(out[lane_i]))native::rejectCodec();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        if(p_.observations)
+        {
+#pragma omp single
+            {
+                for(int h=0;h<HeadCount;++h)
+                {
+                    const int rowHead=row*p_.query_heads+headBegin+h;
+                    p_.observations[rowHead]={std::uint64_t(count)*256,std::uint64_t(count)*256,std::uint32_t(count)};
+                }
+            }
         }
     }
 private:

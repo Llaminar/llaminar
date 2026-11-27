@@ -454,6 +454,17 @@ namespace llaminar2
 
     bool TPAllreduceStage::execute(IDeviceContext *ctx)
     {
+        // Zero-allocation fast path for small CPU ShmemSpin allreduces inside a retained decode team.
+        if (cached_cpu_allreduce_data_ != nullptr &&
+            !debugEnv().skip_allreduce &&
+            !debugEnv().tp_collective_contract_trace &&
+            !PerfStatsCollector::isDomainEnabled("tp_allreduce_bom") &&
+            !KernelProfiler::isEnabled())
+        {
+            if (params_.tp_ctx->allreduceFloats(cached_cpu_allreduce_data_, cached_cpu_allreduce_count_))
+                return true;
+        }
+
         KERNEL_PROFILE_SCOPE(KernelType::ALLREDUCE);
 
         (void)ctx; // Device context not directly used - TP context handles devices

@@ -99,6 +99,7 @@ namespace llaminar2
         };
 
         explicit LMHeadStage(Params params);
+        ~LMHeadStage() override;
 
         /**
          * @return Exact source/prepared owner and arithmetic declaration for terminal composition.
@@ -109,6 +110,8 @@ namespace llaminar2
 
 
         bool execute(IDeviceContext *ctx) override;
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override;
+        void prepareForRetainedTeam(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::LM_HEAD; }
         size_t estimatedFlops() const override;
@@ -199,6 +202,9 @@ namespace llaminar2
             TensorBase *logits,
             ITensorGemm *lm_gemm,
             int lm_m);
+
+        struct RetainedCPUSingleRowState;
+        std::unique_ptr<RetainedCPUSingleRowState> retained_cpu_state_;
     };
 
 } // namespace llaminar2

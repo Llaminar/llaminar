@@ -1259,6 +1259,37 @@ namespace llaminar2
         }
 
         /**
+         * @brief Execution mode when a pure-CPU fast-decode loop holds a retained OpenMP team.
+         *
+         * - @c None: stage executes outside any executor-owned outer parallel region.
+         * - @c CollectiveTeam: stage's @c execute(ctx) is invoked collectively by every thread
+         *   of the active OpenMP team (reusing it with zero fork/join).
+         * - @c MasterSingle: stage's @c execute(ctx) runs inside @c OMP_SINGLE (one thread while
+         *   workers wait at the implicit team barrier, e.g. small CPU ShmemSpin allreduces).
+         */
+        enum class CPURetainedTeamMode : uint8_t
+        {
+            None = 0,
+            CollectiveTeam,
+            MasterSingle,
+        };
+
+        /** @return Opt-in retained-team execution mode for pure-CPU fast decode. */
+        virtual CPURetainedTeamMode cpuRetainedTeamMode() const noexcept
+        {
+            return CPURetainedTeamMode::None;
+        }
+
+        /**
+         * @brief Master-thread preparation executed once before entering a retained OpenMP team.
+         * @param ctx Active CPU device context.
+         */
+        virtual void prepareForRetainedTeam(IDeviceContext *ctx)
+        {
+            (void)ctx;
+        }
+
+        /**
          * @brief Variant signature for graph-captured launch topology.
          *
          * Most stages have a single stable graph-capture topology and return 0.

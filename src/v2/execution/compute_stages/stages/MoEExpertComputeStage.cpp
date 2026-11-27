@@ -4208,8 +4208,8 @@ namespace llaminar2
                 }
             }
         }
-        else if (!(params_.canonical_route_contributions &&
-                   params_.canonical_route_layout ==
+        else if (params_.canonical_route_contributions &&
+                 !(params_.canonical_route_layout ==
                        MoECanonicalRoutePublicationLayout::
                            DenseOriginalRouteSlots &&
                    sparse_overlay_binding_kind_ ==
@@ -4223,6 +4223,8 @@ namespace llaminar2
                 : PerfStatsCollector::Clock::time_point{};
         if (cpu_grouped_route_slots_.empty())
         {
+            if (!params_.canonical_route_contributions)
+                kernel->zeroBuffer(publication, publication_bytes);
             // Consult the original immutable domain policy BEFORE constructing
             // counter strings/tags; the collector cannot undo argument work.
             if (PerfStatsCollector::isDomainEnabled(verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill")))
@@ -4891,6 +4893,7 @@ namespace llaminar2
                 float *row_output =
                     output + static_cast<size_t>(row) *
                         static_cast<size_t>(d_model);
+                std::fill_n(row_output, d_model, 0.0f);
                 for (int route = 0; route < top_k; ++route)
                 {
                     const size_t flat_slot =

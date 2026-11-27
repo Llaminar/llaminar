@@ -933,6 +933,8 @@ namespace llaminar2
             params.local_input = request.local_logits;
             params.full_output = request.full_logits;
             params.mpi_ctx = mpi_ctx_.get();
+            if (request.device.is_cpu() && config_.tp_ctx && config_.tp_ctx->degree() > 1)
+                params.tp_ctx = config_.tp_ctx;
             params.actual_seq_len = request.rows.capacity();
             params.domain = nullptr;
             params.input_buffer_id = request.input_id;

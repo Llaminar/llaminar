@@ -24,6 +24,7 @@ namespace llaminar2
 
     // Forward declarations
     class CollectiveContext;
+    class ITPContext;
 
     /**
      * @brief MPI AllGather stage for collecting distributed tensor slices
@@ -48,6 +49,7 @@ namespace llaminar2
             ITensor *full_output = nullptr;
             size_t actual_seq_len = 0;
             CollectiveContext *collective_ctx = nullptr; ///< Collective context (preferred over direct MPI)
+            ITPContext *tp_ctx = nullptr;                ///< TP context for native shared-memory CPU allgather
             const TPDomain *domain = nullptr;            ///< Domain for routing (nullptr = use mpi_ctx legacy path)
             std::optional<BufferId> input_buffer_id;     ///< Arena BufferId for local_input (enables contract-based coherence)
             std::optional<BufferId> output_buffer_id;    ///< Arena BufferId for full_output (enables contract-based coherence)
@@ -75,8 +77,16 @@ namespace llaminar2
         /// Get the stage parameters (for DeviceGraphExecutor strided allgather path)
         const Params &getParams() const { return params_; }
 
+        /** @brief Contiguous single-row FP32 CPU vocabulary gathers join a retained OpenMP team. */
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override;
+        /** @brief Pre-resolve raw FP32 pointers once on master before entering a retained team. */
+        void prepareForRetainedTeam(IDeviceContext *ctx) override;
+
     private:
         Params params_;
+        const float *retained_in_ptr_ = nullptr;
+        float *retained_out_ptr_ = nullptr;
+        size_t retained_send_count_ = 0;
 
         /// Execute using new CollectiveContext infrastructure
         bool executeViaCollectiveContext();

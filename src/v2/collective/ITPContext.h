@@ -168,6 +168,19 @@ namespace llaminar2
         }
 
         /**
+         * @brief In-place FP32 sum all-reduce on a pre-resolved host float buffer.
+         * @param data Host-resident float buffer modified in-place across all participants.
+         * @param count Live float elements to reduce.
+         * @return True on success; false if unsupported or failed.
+         */
+        virtual bool allreduceFloats(float *data, size_t count)
+        {
+            (void)data;
+            (void)count;
+            return false;
+        }
+
+        /**
          * @brief All-reduce sum on a specific GPU stream (graph-capturable)
          *
          * Like allreduce() but issues the collective directly on the provided
@@ -219,6 +232,21 @@ namespace llaminar2
          * @return true on success, false on error
          */
         virtual bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) = 0;
+
+        /**
+         * @brief All-gather a contiguous live float slice from each participant.
+         * @param send_data Local participant's contiguous @p send_count floats.
+         * @param recv_data Output buffer receiving @c degree() * @p send_count floats.
+         * @param send_count Live float count contributed by each participant.
+         * @return True on success; false if unsupported or failed.
+         */
+        virtual bool allgatherFloats(const float *send_data, float *recv_data, size_t send_count)
+        {
+            (void)send_data;
+            (void)recv_data;
+            (void)send_count;
+            return false;
+        }
 
         // =========================================================================
         // Abort (for failure propagation)

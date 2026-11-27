@@ -171,12 +171,13 @@ namespace llaminar2::cpu_gdn_epoch
      *        scalar tails store only for the first row to retain each value once.
      */
     template<int Rows, bool Retain = false>
-    __attribute__((noinline)) inline void project(const CPUGDNStateLayout &layout,
-        const float *matrix, const float *history, const float *x, const float *c, int phase, float *output, int stride, float *retained = nullptr)
+    __attribute__((noinline)) inline void projectRange(const CPUGDNStateLayout &layout,
+        const float *matrix, const float *history, const float *x, const float *c, int phase,
+        float *output, int stride, int v_begin, int v_end, float *retained = nullptr)
     {
         if constexpr (Retain)
             if (!retained) throw std::invalid_argument("CPU GDN initial readout requires retained checkpoint storage");
-        int vi = 0;
+        int vi = v_begin;
         constexpr int vectors = Rows == 1 ? 8 : Rows == 2 ? 4 : 2;
 #if defined(__AVX512F__)
         if (activeISALevel() == ISALevel::AVX512)
@@ -185,15 +186,15 @@ namespace llaminar2::cpu_gdn_epoch
             // Only independent value columns are regrouped; every output keeps
             // exactly the same ascending-key and forward-history FMA chain.
             constexpr int vectors512 = Rows <= 2 ? 8 : 4;
-            for (; vi + vectors512 * 16 <= layout.valueWidth(); vi += vectors512 * 16)
+            for (; vi + vectors512 * 16 <= v_end; vi += vectors512 * 16)
                 projectTile<SIMD512, Rows, vectors512, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
             // Keep the old blocked remainder for smaller admitted widths;
             // a wider full tile must not turn its old64/32-column tile into
             // several single-vector passes.
             if constexpr (vectors512 != vectors)
-                for (; vi + vectors * 16 <= layout.valueWidth(); vi += vectors * 16)
+                for (; vi + vectors * 16 <= v_end; vi += vectors * 16)
                     projectTile<SIMD512, Rows, vectors, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
-            for (; vi + 16 <= layout.valueWidth(); vi += 16)
+            for (; vi + 16 <= v_end; vi += 16)
                 projectTile<SIMD512, Rows, 1, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
         }
 #endif
@@ -205,20 +206,20 @@ namespace llaminar2::cpu_gdn_epoch
         constexpr int vectors256 = Rows == 3 ? 4 : vectors;
         if (activeISALevel() >= ISALevel::AVX2)
         {
-            for (; vi + vectors256 * 8 <= layout.valueWidth(); vi += vectors256 * 8)
+            for (; vi + vectors256 * 8 <= v_end; vi += vectors256 * 8)
                 projectTile<SIMD256, Rows, vectors256, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
-            for (; vi + 8 <= layout.valueWidth(); vi += 8)
+            for (; vi + 8 <= v_end; vi += 8)
                 projectTile<SIMD256, Rows, 1, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
         }
 #endif
 #if LLAMINAR_COMPILED_WITH_NEON
         constexpr int nz = Rows <= 2 ? 8 : 4;
-        for (; vi+nz*4 <= layout.valueWidth(); vi+=nz*4)
+        for (; vi+nz*4 <= v_end; vi+=nz*4)
             projectTile<Probe128,Rows,nz,Retain>(layout,matrix,history,x,c,phase,vi,output,stride,retained);
-        for (; vi+4 <= layout.valueWidth(); vi+=4)
+        for (; vi+4 <= v_end; vi+=4)
             projectTile<Probe128,Rows,1,Retain>(layout,matrix,history,x,c,phase,vi,output,stride,retained);
 #endif
-        for (; vi < layout.valueWidth(); ++vi)
+        for (; vi < v_end; ++vi)
             for (int r = 0; r < Rows; ++r)
             {
                 float sum = 0;
@@ -234,6 +235,13 @@ namespace llaminar2::cpu_gdn_epoch
                         (history + static_cast<size_t>(p) * layout.recordFloats())[layout.keyWidth() + vi], sum);
                 output[r * stride + vi] = sum;
             }
+    }
+
+    template<int Rows, bool Retain = false>
+    inline void project(const CPUGDNStateLayout &layout,
+        const float *matrix, const float *history, const float *x, const float *c, int phase, float *output, int stride, float *retained = nullptr)
+    {
+        projectRange<Rows, Retain>(layout, matrix, history, x, c, phase, output, stride, 0, layout.valueWidth(), retained);
     }
 
     /**
@@ -337,30 +345,120 @@ namespace llaminar2::cpu_gdn_epoch
      *        destination; only update seven publishes canonical checkpoint bits.
      *        SIMD lanes and scalar value tails execute the same FP32 sequence.
      */
-    inline void flushCheckpoint(const CPUGDNStateLayout &layout, float *matrix, const float *history, const float *initial_source)
+    /**
+     * @brief L1d-staged variant of @ref flushTile for keyWidth <= 128 that eliminates
+     *        power-of-two L1d set-conflict thrashing across the 9 passes of an 8-update epoch.
+     *
+     * Copies the `keyWidth x (Vectors * SIMD::width)` slice (<= 16 KiB contiguous for
+     * `Vectors == 2, SIMD512`) once into a compact stack tile on pass 0, executes all 7
+     * intermediate updates purely in L1d, and writes the canonical checkpoint back to
+     * `matrix` once on update 7 with 100% bit-identical FP32 rounding and order.
+     */
+    template<class SIMD, int Vectors>
+    inline void flushTileL1(const CPUGDNStateLayout &layout, float *matrix, const float *history, int first, const float *initial_source)
     {
-        int vi = 0;
+        constexpr int kTileWidth = Vectors * SIMD::width;
+        alignas(64) float local[128 * kTileWidth];
+        const int kw = layout.keyWidth();
+        const int vw = layout.valueWidth();
+        const float *raw = history;
+        const auto first_decay = SIMD::broadcast(raw[kw + vw]);
+        typename SIMD::Value sums[Vectors];
+#pragma GCC unroll 4
+        for (int z = 0; z < Vectors; ++z) sums[z] = SIMD::zero();
+        for (int j = 0; j < kw; ++j)
+        {
+            const auto key = SIMD::broadcast(raw[j]);
+            const float *src = initial_source + j * vw + first;
+            float *dst = local + j * kTileWidth;
+#pragma GCC unroll 4
+            for (int z = 0; z < Vectors; ++z)
+            {
+                const auto decayed = SIMD::mul(SIMD::load(src + z * SIMD::width), first_decay);
+                SIMD::store(dst + z * SIMD::width, decayed);
+                sums[z] = SIMD::fma(decayed, key, sums[z]);
+            }
+        }
+        for (int p = 0; p < CPUGDNStateLayout::kPeriod; ++p)
+        {
+            raw = history + static_cast<size_t>(p) * layout.recordFloats();
+            const auto beta = SIMD::broadcast(raw[kw + vw + 1]);
+#pragma GCC unroll 4
+            for (int z = 0; z < Vectors; ++z)
+                sums[z] = SIMD::mul(SIMD::sub(SIMD::load(
+                    raw + kw + first + z * SIMD::width), sums[z]), beta);
+            if (p + 1 < CPUGDNStateLayout::kPeriod)
+            {
+                const float *next = raw + layout.recordFloats();
+                const auto next_decay = SIMD::broadcast(next[kw + vw]);
+                typename SIMD::Value next_sums[Vectors];
+#pragma GCC unroll 4
+                for (int z = 0; z < Vectors; ++z) next_sums[z] = SIMD::zero();
+                for (int j = 0; j < kw; ++j)
+                {
+                    const auto key = SIMD::broadcast(raw[j]);
+                    const auto next_key = SIMD::broadcast(next[j]);
+                    float *row = local + j * kTileWidth;
+#pragma GCC unroll 4
+                    for (int z = 0; z < Vectors; ++z)
+                    {
+                        float *target = row + z * SIMD::width;
+                        const auto updated = SIMD::fma(key, sums[z], SIMD::load(target));
+                        const auto decayed = SIMD::mul(updated, next_decay);
+                        next_sums[z] = SIMD::fma(decayed, next_key, next_sums[z]);
+                        SIMD::store(target, decayed);
+                    }
+                }
+#pragma GCC unroll 4
+                for (int z = 0; z < Vectors; ++z) sums[z] = next_sums[z];
+            }
+            else
+            {
+                for (int j = 0; j < kw; ++j)
+                {
+                    const auto key = SIMD::broadcast(raw[j]);
+                    const float *row = local + j * kTileWidth;
+                    float *out = matrix + j * vw + first;
+#pragma GCC unroll 4
+                    for (int z = 0; z < Vectors; ++z)
+                        SIMD::store(out + z * SIMD::width, SIMD::fma(key, sums[z], SIMD::load(row + z * SIMD::width)));
+                }
+            }
+        }
+    }
+
+    inline void flushCheckpointRange(const CPUGDNStateLayout &layout, float *matrix, const float *history, const float *initial_source, int v_begin, int v_end)
+    {
+        int vi = v_begin;
 #if defined(__AVX512F__)
         if (activeISALevel() == ISALevel::AVX512)
         {
-            for (; vi + 64 <= layout.valueWidth(); vi += 64) flushTile<SIMD512, 4>(layout, matrix, history, vi, initial_source);
-            for (; vi + 16 <= layout.valueWidth(); vi += 16) flushTile<SIMD512, 1>(layout, matrix, history, vi, initial_source);
+            if (layout.keyWidth() <= 128)
+            {
+                for (; vi + 32 <= v_end; vi += 32) flushTileL1<SIMD512, 2>(layout, matrix, history, vi, initial_source);
+            }
+            for (; vi + 64 <= v_end; vi += 64) flushTile<SIMD512, 4>(layout, matrix, history, vi, initial_source);
+            for (; vi + 16 <= v_end; vi += 16) flushTile<SIMD512, 1>(layout, matrix, history, vi, initial_source);
         }
 #endif
 #if defined(__AVX2__)
         if (activeISALevel() >= ISALevel::AVX2)
         {
-            for (; vi + 32 <= layout.valueWidth(); vi += 32) flushTile<SIMD256, 4>(layout, matrix, history, vi, initial_source);
-            for (; vi + 8 <= layout.valueWidth(); vi += 8) flushTile<SIMD256, 1>(layout, matrix, history, vi, initial_source);
+            if (layout.keyWidth() <= 128)
+            {
+                for (; vi + 32 <= v_end; vi += 32) flushTileL1<SIMD256, 4>(layout, matrix, history, vi, initial_source);
+            }
+            for (; vi + 32 <= v_end; vi += 32) flushTile<SIMD256, 4>(layout, matrix, history, vi, initial_source);
+            for (; vi + 8 <= v_end; vi += 8) flushTile<SIMD256, 1>(layout, matrix, history, vi, initial_source);
         }
 #endif
 #if LLAMINAR_COMPILED_WITH_NEON
-        for (; vi+16 <= layout.valueWidth(); vi+=16)
+        for (; vi+16 <= v_end; vi+=16)
             flushTile<Probe128,4>(layout,matrix,history,vi,initial_source);
-        for (; vi+4 <= layout.valueWidth(); vi+=4)
+        for (; vi+4 <= v_end; vi+=4)
             flushTile<Probe128,1>(layout,matrix,history,vi,initial_source);
 #endif
-        for (; vi < layout.valueWidth(); ++vi)
+        for (; vi < v_end; ++vi)
         {
             const float *raw = history;
             const float first_decay = raw[layout.keyWidth() + layout.valueWidth()];
@@ -399,6 +497,11 @@ namespace llaminar2::cpu_gdn_epoch
                     }
             }
         }
+    }
+
+    inline void flushCheckpoint(const CPUGDNStateLayout &layout, float *matrix, const float *history, const float *initial_source)
+    {
+        flushCheckpointRange(layout, matrix, history, initial_source, 0, layout.valueWidth());
     }
 
     /**
@@ -510,6 +613,167 @@ namespace llaminar2::cpu_gdn_epoch
             .projection_groups=static_cast<std::uint64_t>(projection_groups),
             .grouped_rows=static_cast<std::uint64_t>(grouped_rows),
             .checkpoint_flushes=static_cast<std::uint64_t>(checkpoint_flushes)};
+    }
+
+    /** @brief Maximum key width supported by L1d-private value-slice parallel prefill. */
+    inline constexpr int kMaxValueSliceKeyWidth = 128;
+    /** @brief Maximum value-column width per core-private value slice (128x64 = 32 KiB). */
+    inline constexpr int kMaxValueSliceCols = 64;
+    /** @brief Maximum recordFloats for the compact slice layout (kw + 64 + 2 <= 194). */
+    inline constexpr int kMaxValueSliceRecordFloats = kMaxValueSliceKeyWidth + kMaxValueSliceCols + 2;
+
+    /**
+     * @brief Advance one independent value slice `[v_begin, v_end)` in core-private storage.
+     *
+     * Stages the head's `[kw x slice_cols]` checkpoint slice (`<= 32 KiB`) once from `initial + 1`
+     * into a core-private stack buffer, executes all epochs locally (eliminating cross-core MESIF
+     * coherency bouncing), and writes the terminal slice back to `working + 1` once. Preserves
+     * exact bit-for-bit FP32 arithmetic and IEEE subnormals.
+     */
+    inline CPUFixedEpochObservations runValueSlice(const CPUGDNStateLayout &layout, const float *initial, float *working,
+        const float *q, const float *k, const float *v, const float *decay, const float *beta,
+        int rows, int qk_stride, int v_stride, int gate_stride, float *output, int output_stride,
+        int v_begin, int v_end)
+    {
+        const int kw = layout.keyWidth();
+        const int vw = layout.valueWidth();
+        const int slice_cols = v_end - v_begin;
+        const CPUGDNStateLayout slice_layout(1, kw, slice_cols);
+        const int srf = slice_layout.recordFloats();
+
+        alignas(64) float slice_matrix[kMaxValueSliceKeyWidth * kMaxValueSliceCols];
+        alignas(64) float local_records[CPUGDNStateLayout::kPeriod * kMaxValueSliceRecordFloats];
+        alignas(64) float x[4 * 512], coefficients[4 * CPUGDNStateLayout::kPeriod];
+
+        // Stage initial checkpoint slice once from shared state into core-private L1d.
+        const float *src_mat = initial + 1;
+        for (int j = 0; j < kw; ++j)
+            std::memcpy(slice_matrix + static_cast<size_t>(j) * slice_cols,
+                src_mat + static_cast<size_t>(j) * vw + v_begin,
+                static_cast<size_t>(slice_cols) * sizeof(float));
+
+        int phase = static_cast<int>(initial[0]);
+        for (int p = 0; p < phase; ++p)
+        {
+            const float *src_rec = layout.record(initial, p);
+            float *dst_rec = local_records + static_cast<size_t>(p) * srf;
+            std::memcpy(dst_rec, src_rec, static_cast<size_t>(kw) * sizeof(float));
+            std::memcpy(dst_rec + kw, src_rec + kw + v_begin, static_cast<size_t>(slice_cols) * sizeof(float));
+            dst_rec[kw + slice_cols] = src_rec[kw + vw];
+            dst_rec[kw + slice_cols + 1] = src_rec[kw + vw + 1];
+        }
+
+        int projection_groups = 0, grouped_rows = 0, checkpoint_flushes = 0;
+        for (int first = 0; first < rows;)
+        {
+            const int count = std::min({4, rows - first, CPUGDNStateLayout::kPeriod - phase});
+            for (int r = 0; r < count; ++r)
+            {
+                const int row = first + r;
+                float *raw = local_records + static_cast<size_t>(phase + r) * srf;
+                std::memcpy(raw, k + static_cast<std::size_t>(row) * qk_stride, kw * sizeof(float));
+                std::memcpy(raw + kw, v + static_cast<std::size_t>(row) * v_stride + v_begin,
+                    static_cast<std::size_t>(slice_cols) * sizeof(float));
+                raw[kw + slice_cols] = decay[row * gate_stride];
+                raw[kw + slice_cols + 1] = beta[row * gate_stride];
+            }
+            const float *queries = q + static_cast<size_t>(first) * qk_stride;
+            switch (count)
+            {
+                case 1: contractQueries<1>(slice_layout, local_records, queries, qk_stride, phase, x, coefficients); break;
+                case 2: contractQueries<2>(slice_layout, local_records, queries, qk_stride, phase, x, coefficients); break;
+                case 3: contractQueries<3>(slice_layout, local_records, queries, qk_stride, phase, x, coefficients); break;
+                case 4: contractQueries<4>(slice_layout, local_records, queries, qk_stride, phase, x, coefficients); break;
+            }
+            float *out = output + static_cast<std::size_t>(first) * output_stride + v_begin;
+            switch (count)
+            {
+                case 1: projectRange<1>(slice_layout, slice_matrix, local_records, x, coefficients, phase, out, output_stride, 0, slice_cols); break;
+                case 2: projectRange<2>(slice_layout, slice_matrix, local_records, x, coefficients, phase, out, output_stride, 0, slice_cols); break;
+                case 3: projectRange<3>(slice_layout, slice_matrix, local_records, x, coefficients, phase, out, output_stride, 0, slice_cols); break;
+                case 4: projectRange<4>(slice_layout, slice_matrix, local_records, x, coefficients, phase, out, output_stride, 0, slice_cols); break;
+            }
+            ++projection_groups;
+            if (count > 1) grouped_rows += count;
+            if (phase + count == CPUGDNStateLayout::kPeriod)
+            {
+                // slice_matrix is already contiguous 16 KiB in L1d — flush in place with zero copy.
+#if defined(__AVX512F__)
+                if (activeISALevel() == ISALevel::AVX512 && slice_cols == 32)
+                    flushTile<SIMD512, 2>(slice_layout, slice_matrix, local_records, 0, slice_matrix);
+                else
+#endif
+#if defined(__AVX2__)
+                if (activeISALevel() >= ISALevel::AVX2 && slice_cols == 32)
+                    flushTile<SIMD256, 4>(slice_layout, slice_matrix, local_records, 0, slice_matrix);
+                else
+#endif
+                    flushCheckpointRange(slice_layout, slice_matrix, local_records, slice_matrix, 0, slice_cols);
+                phase = 0;
+                ++checkpoint_flushes;
+            }
+            else
+                phase += count;
+            first += count;
+        }
+
+        // Publish final checkpoint slice once back to shared state.
+        float *dst_mat = working + 1;
+        for (int j = 0; j < kw; ++j)
+            std::memcpy(dst_mat + static_cast<size_t>(j) * vw + v_begin,
+                slice_matrix + static_cast<size_t>(j) * slice_cols,
+                static_cast<size_t>(slice_cols) * sizeof(float));
+
+        return {.heads = 1u,
+            .projection_groups = static_cast<std::uint64_t>(projection_groups),
+            .grouped_rows = static_cast<std::uint64_t>(grouped_rows),
+            .checkpoint_flushes = static_cast<std::uint64_t>(checkpoint_flushes)};
+    }
+
+    /**
+     * @brief Publish a head's terminal epoch phase and pending raw history after all value slices join.
+     */
+    inline void finalizeValueSliceState(const CPUGDNStateLayout &layout, float *working,
+        const float *k, const float *v, const float *decay, const float *beta,
+        int rows, int qk_stride, int v_stride, int gate_stride)
+    {
+        const int initial_phase = static_cast<int>(working[0]);
+        const int final_phase = (initial_phase + rows) % CPUGDNStateLayout::kPeriod;
+        const int kw = layout.keyWidth();
+        const int vw = layout.valueWidth();
+        if (final_phase == 0)
+        {
+            std::fill(layout.record(working, 0), working + layout.headFloats(), 0.0f);
+        }
+        else if (rows < final_phase)
+        {
+            // No epoch boundary was crossed; existing [0..initial_phase) records remain valid.
+            for (int r = 0; r < rows; ++r)
+            {
+                float *raw = layout.record(working, initial_phase + r);
+                std::memcpy(raw, k + static_cast<std::size_t>(r) * qk_stride, kw * sizeof(float));
+                std::memcpy(raw + kw, v + static_cast<std::size_t>(r) * v_stride, vw * sizeof(float));
+                raw[kw + vw] = decay[r * gate_stride];
+                raw[kw + vw + 1] = beta[r * gate_stride];
+            }
+            std::fill(layout.record(working, final_phase), working + layout.headFloats(), 0.0f);
+        }
+        else
+        {
+            // At least one epoch flushed; retain exactly the terminal `final_phase` rows.
+            const int start_row = rows - final_phase;
+            for (int r = 0; r < final_phase; ++r)
+            {
+                const int row = start_row + r;
+                float *raw = layout.record(working, r);
+                std::memcpy(raw, k + static_cast<std::size_t>(row) * qk_stride, kw * sizeof(float));
+                std::memcpy(raw + kw, v + static_cast<std::size_t>(row) * v_stride, vw * sizeof(float));
+                raw[kw + vw] = decay[row * gate_stride];
+                raw[kw + vw + 1] = beta[row * gate_stride];
+            }
+            std::fill(layout.record(working, final_phase), working + layout.headFloats(), 0.0f);
+        }
+        working[0] = static_cast<float>(final_phase);
     }
     /**
      * @brief Execute compact capture directly in retained checkpoint/log slots.

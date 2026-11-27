@@ -12,6 +12,7 @@
 #include "../../../../kernels/qwen4exp/ImmutableLookupDecode.h"
 #include "../../../../tensors/Tensors.h"
 #include "../../../../transfer/TransferEngine.h"
+#include "../../../../utils/OpenMPUtils.h"
 #include "../../../local_execution/graph/RetainedStoragePerfStats.h"
 #include <algorithm>
 #include <array>
@@ -162,10 +163,27 @@ const std::int32_t *ImmutableLookupStage::liveCount() const
     if(auto *arena=std::get_if<Qwen4ExpIntBinding>(&value)) return pointer<const std::int32_t>(*arena);
     return std::get<Qwen4ExpNativeIntInput>(value).data;
 }
+IComputeStage::CPURetainedTeamMode ImmutableLookupStage::cpuRetainedTeamMode() const noexcept
+{
+    if (device().is_cpu() && std::holds_alternative<CPUStorage>(params_.storage) &&
+        params_.rows.capacity == 1 && !params_.rows.liveRows.has_value())
+        return CPURetainedTeamMode::CollectiveTeam;
+    return CPURetainedTeamMode::None;
+}
+void ImmutableLookupStage::prepareForRetainedTeam(IDeviceContext *context)
+{
+    (void)context;
+    if (device().is_cpu() && prepared_)
+    {
+        prepared_->seal();
+        prepared_->validate();
+    }
+}
 bool ImmutableLookupStage::execute(IDeviceContext *context)
 {
     require(context && context->deviceId()==device(),"Immutable lookup requires the exact participant execution context");
-    if (device().is_cpu()) prepared_->seal();
+    const bool in_team = device().is_cpu() && ::llaminar::v2::inLexicalWorkshare();
+    if (device().is_cpu() && !in_team) prepared_->seal();
     prepared_->validate();
     if(auto *cpu=std::get_if<CPUStorage>(&params_.storage))
     {
@@ -173,6 +191,19 @@ bool ImmutableLookupStage::execute(IDeviceContext *context)
         require(rows>=0 && rows<=params_.rows.capacity,"Immutable lookup live rows exceed admitted capacity");
         const auto count=static_cast<std::size_t>(rows)*qwen4exp::kNgramHeads;
         auto *native=pointer<std::byte>(cpu->nativeRows);
+        if (in_team)
+        {
+            std::optional<HostImmutableRowGatherObservation> observation;
+#pragma omp single
+            {
+                observation=cpu->table->gather({pointer<const std::int64_t>(params_.ids),count},{native,count*params_.rowBytes});
+                recordCPUImmutableLookup(cpu->table->mode(),device(),count,count*params_.rowBytes,
+                    RetainedStorageCPUOutcome::Completed,observation);
+            }
+            qwen4exp::decodeCPUImmutableLookupRows(params_.format,params_.rowElements,params_.rowBytes,
+                native,count,pointer<float>(params_.output));
+            return true;
+        }
         std::optional<HostImmutableRowGatherObservation> observation;
         try
         {

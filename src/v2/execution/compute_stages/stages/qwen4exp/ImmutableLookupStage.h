@@ -80,6 +80,10 @@ public:
     StageBufferRequirements getBufferRequirements() const override { return {}; }
     /** @brief Declare exact arena identities; table/channel lifetime is retained by Params. */
     StageBufferContract bufferContract() const override;
+    /** @brief CPU M=1 immutable table lookups run gather on one thread and decode collectively in team. */
+    CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override;
+    /** @brief Seal CPU prepared pointers once on master before collective team entry. */
+    void prepareForRetainedTeam(IDeviceContext *context) override;
 private:
     friend class Qwen4ExpEarlyLookupFrame;
     /** @brief Split operations are constructible only through the graph-local exact-once frame. */

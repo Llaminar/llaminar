@@ -175,6 +175,22 @@ namespace llaminar2
             const LayerGraphSourceIdentity &identity, int rows, DeviceId device, void *stream,
             const int32_t *count, const int32_t *positions, const Qwen4ExpPredictorResidualBinding *predictor,
             MoEOverlayServicePhaseHint phase);
+        /**
+         * @brief Declare the static original homogeneous multi-socket CPU F-shard FFN.
+         * @param layer Actual source-bound model or predictor layer weights.
+         * @param buffers Existing admitted per-device activation roles.
+         * @param identity Original source layer and immutable workload identity.
+         * @param rows Exact physical query rows.
+         * @param device Original native CPU participant.
+         * @param predictor Existing QFN HC/residual owner for a shared predictor, when present.
+         * @param phase Explicit arithmetic/service phase, independent of row count.
+         * @return Participant-local norm/router/shared/routed/gate/sum/residual graph with one FFN AllReduce.
+         * @throws std::invalid_argument For unsupported scope/phase, foreign source/domain, or missing shard triplets.
+         * @throws std::logic_error For expired initial construction bank or incomplete expert shard ownership.
+         */
+        ComputeGraph buildCPUIntermediateShardFFNGraphForLayer(const LayerWeights &layer, ActivationBuffers &buffers,
+            const LayerGraphSourceIdentity &identity, int rows, DeviceId device,
+            const Qwen4ExpPredictorResidualBinding *predictor, MoEOverlayServicePhaseHint phase);
 
 
     public:

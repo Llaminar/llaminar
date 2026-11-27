@@ -213,6 +213,43 @@ public:
             }
             if(!finite8(result))rejectCodec();return result;
         }
+#if defined(__AVX512F__)
+        /** @brief Decode 16 aligned coordinates directly into one AVX-512 register.
+         * @param coordinate Original 16-aligned coordinate 0..240.
+         * @return Exact 16-lane FP32 register, bitwise identical to `join16(read(c), read(c+8))`.
+         */
+        [[gnu::always_inline]] __m512 read16AVX512(int coordinate)const noexcept
+        {
+            if constexpr(Encoding==TensorType::Q16_1)
+            {
+                if(owner_.q16_size_>=16)
+                {
+                    if(coordinate<0||coordinate>240||(coordinate&15))rejectCodec();
+                    const int block_idx=owner_.q16_shift_>=0?(coordinate>>owner_.q16_shift_):(coordinate/owner_.q16_size_);
+                    const int block_off=owner_.q16_shift_>=0?(coordinate&owner_.q16_mask_):(coordinate%owner_.q16_size_);
+                    const auto*block=bytes_+std::size_t(block_idx)*owner_.q16_block_bytes_;
+                    const float scale=word(block);
+                    if(!std::isfinite(scale))rejectCodec();
+                    const auto*input=reinterpret_cast<const std::int16_t*>(block+8)+block_off;
+                    const __m512 widened=_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(input))));
+                    const __m512 result=_mm512_mul_ps(_mm512_set1_ps(scale),widened);
+                    // Every int16_t code has magnitude <= 32768; when |scale| <= FLT_MAX / 32768,
+                    // every product is mathematically finite without per-slice vector masks.
+                    constexpr float kSafeScaleMax=std::numeric_limits<float>::max()*(1.0f/32768.0f);
+                    if(__builtin_expect(std::fabs(scale)>kSafeScaleMax,0))
+                    {
+                        const __m512 mag=_mm512_castsi512_ps(_mm512_and_epi32(_mm512_castps_si512(result),_mm512_set1_epi32(0x7fffffff)));
+                        if(_mm512_cmp_ps_mask(mag,_mm512_set1_ps(std::numeric_limits<float>::max()),_CMP_LE_OQ)!=0xffffu)rejectCodec();
+                    }
+                    return result;
+                }
+            }
+            const auto lo=read(coordinate),hi=read(coordinate+8);
+            return _mm512_insertf32x8(_mm512_castps256_ps512(lo),hi,1);
+        }
+#endif
+        /** @brief Return the exact physical head byte base for non-mutating prefetch hints. */
+        [[gnu::always_inline]] const unsigned char* rawBytes()const noexcept{return bytes_;}
     private:
         friend class Decoder;
         /** @brief Seal original per-row metadata, with no payload conversion or shadow.

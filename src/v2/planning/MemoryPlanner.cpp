@@ -2480,10 +2480,39 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             const auto &declaration=*cfg.cpu_serial_expert_storage;
             if(cfg.concurrent_workspace_owners!=declaration.controller_devices.size())
                 throw std::invalid_argument("CPU serial workspace concurrency differs from its admitted controller identities");
-            const auto grouped=declaration.envelope->admitted()->workspaceBytes();
-            workspace_bytes=checkedAdd(workspace_bytes,
-                checkedMultiply(grouped,declaration.participant_ids.size(),"CPU serial grouped endpoint roots"),
-                "CPU serial grouped endpoint roots");
+            const auto &joint = declaration.envelope->admitted()->jointRoutes();
+            const bool direct_cpu_tensor_sharded_continuation =
+                cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+                cfg.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
+                joint.has_value() &&
+                declaration.participant_ids.size() == 1u &&
+                std::all_of(declaration.controller_devices.begin(), declaration.controller_devices.end(),
+                            [](DeviceId controller) { return controller.is_cpu(); });
+            if (direct_cpu_tensor_sharded_continuation)
+            {
+                // Homogeneous stationary multi-socket CPU TensorSharded TP lowers directly
+                // into participant-local MoEExpertComputeStage (sharing one grouped workspace
+                // across all layers for the full activation row envelope with local F/P width).
+                size_t grouped_rows = checkedMultiply(size_t(std::max(1, cfg.batch_size)),
+                    size_t(activation_seq), "CPU F-shard grouped flattened rows");
+                if (cfg.mtp_enabled)
+                    grouped_rows = std::max(grouped_rows, size_t(std::max(1, cfg.mtp_target_query_rows)));
+                grouped_rows = std::max(grouped_rows, declaration.envelope->admitted()->maximumRows());
+                const auto grouped = CPUGroupedMoEStorageLayout::declare(grouped_rows,
+                    profile.d_model, joint->intermediate(),
+                    profile.expert_count, profile.expert_used_count, cfg.device);
+                workspace_bytes = checkedAdd(workspace_bytes,
+                    std::max(declaration.envelope->admitted()->workspaceBytes(), grouped.physicalBytes()),
+                    "CPU F-shard direct grouped expert roots");
+                ordinary_cpu_grouped_roots_charged = true;
+            }
+            else
+            {
+                const auto grouped=declaration.envelope->admitted()->workspaceBytes();
+                workspace_bytes=checkedAdd(workspace_bytes,
+                    checkedMultiply(grouped,declaration.participant_ids.size(),"CPU serial grouped endpoint roots"),
+                    "CPU serial grouped endpoint roots");
+            }
         }
 
         else if (cfg.device.is_cpu() && cfg.routed_expert_compact_buffer_lifetime ==

@@ -64,6 +64,16 @@ namespace llaminar2
          * 434-by-2048 prefill payload in one epoch.
          */
         static constexpr size_t CHUNK_CAPACITY = 1u << 20;
+        /**
+         * @brief Half-arena alternating slot capacity for single-barrier double-buffered allreduce.
+         *
+         * Splits each participant's existing 4 MiB chunk region into two disjoint
+         * 2 MiB slots (`slot & 1`). Because a peer cannot publish epoch `E+1`
+         * (writing the alternate slot) until it has completed all reads of the
+         * previous slot from epoch `E`, consecutive allreduce calls require only
+         * one cross-socket barrier per chunk instead of two, with zero extra RAM.
+         */
+        static constexpr size_t DOUBLE_BUFFER_SLOT_CAPACITY = CHUNK_CAPACITY / 2u;
 
         /// Per-rank epoch counters (each on its own cache line)
         struct alignas(CACHE_LINE) EpochSlot
@@ -108,6 +118,14 @@ namespace llaminar2
                          + static_cast<size_t>(num_ranks) * sizeof(EpochSlot);
             return reinterpret_cast<const float *>(base) +
                    static_cast<size_t>(rank) * CHUNK_CAPACITY;
+        }
+        float *double_buffer_slot_at(int rank, uint64_t slot)
+        {
+            return buffer_at(rank) + (slot & 1u) * DOUBLE_BUFFER_SLOT_CAPACITY;
+        }
+        const float *double_buffer_slot_at(int rank, uint64_t slot) const
+        {
+            return buffer_at(rank) + (slot & 1u) * DOUBLE_BUFFER_SLOT_CAPACITY;
         }
 
         /** @brief Exact original file extent and page-mapped physical span, one creator only. */
@@ -368,10 +386,24 @@ namespace llaminar2
         /// Wait for a peer epoch in the shared-memory protocol, with abort/timeout handling.
         bool waitForPeerEpoch(int peer_rank, uint64_t target_epoch, const char *phase, size_t count = 0);
 
+        /**
+         * @brief Complete any deferred double-buffered allreduce slot release before a full-arena collective.
+         *
+         * Consecutive allreduce calls alternate between two disjoint half-arena
+         * slots and skip the trailing barrier. Any native collective that uses
+         * the full `CHUNK_CAPACITY` region (`broadcast`, `allgather`, rooted
+         * `gatherVariableFloatRecordsToRoot`, or native `synchronize`) calls
+         * this rank-symmetric barrier first so all peers have finished reading
+         * the last allreduce slot.
+         */
+        bool drainDeferredSlotBarrier(const char *phase);
+
         int domain_id_;
         int my_rank_;
         int num_ranks_ = 0;                  ///< Total ranks (set during initialize)
         uint64_t my_epoch_ = 0;
+        bool has_deferred_slot_barrier_ = false;
+        uint64_t next_double_buffer_slot_ = 0;
 
         std::string shm_name_;               ///< Exact root-relative basename published during setup
         MPISessionOwner::SharedFile shared_file_;
@@ -386,6 +418,7 @@ namespace llaminar2
 
         std::unique_ptr<UPICollectiveBackend> general_backend_; ///< UPI implementation for other collective semantics
         std::atomic<bool> abort_requested_{false};       ///< Local abort requested for this backend
+        std::atomic<bool> in_team_allgather_ok_{true};   ///< Shared protocol status for collective in-team allgather
         /** Persistent per-rank element counts for rooted publication. */
         std::vector<size_t> rooted_publication_element_counts_;
         /** Persistent root destination offsets in FP32 elements. */

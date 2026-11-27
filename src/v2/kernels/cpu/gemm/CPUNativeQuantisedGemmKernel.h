@@ -278,6 +278,52 @@ namespace llaminar2::cpu::native_quantised
         int get_n() const override { return packed_.N; }
         int get_k() const override { return packed_.K; }
 
+        /** @brief Return whether this kernel applies an activation rotation before quantization. */
+        bool hasActivationRotation() const noexcept { return activation_rotation_ != nullptr; }
+
+        /**
+         * @brief Pre-resolved single-row pointers and scratch spans for retained OpenMP team execution.
+         *
+         * Populated on Thread 0 before entering an enclosing @c OMP_LAYER_PARALLEL region so
+         * all workers invoke @ref executeSingleRowInTeam without locks, workspace map lookups,
+         * or host tensor metadata queries.
+         */
+        struct RetainedSingleRowBinding
+        {
+            const float *input = nullptr;
+            float *output = nullptr;
+            float *hc_activated = nullptr;
+            std::span<Q8_1Block> q8_primary;
+            std::span<Q8_1Block> q8_residual;
+            std::span<float> partials;
+            int serial_partition_n = 0; ///< Optional mirrored-TP serial partition policy_n (0 = none).
+            bool two_term = false;
+        };
+
+        /**
+         * @brief Validate and pre-resolve raw single-row pointers and workspace spans on Thread 0.
+         * @return True when @p out is complete and safe for collective @ref executeSingleRowInTeam.
+         */
+        bool prepareSingleRowRetainedBinding(
+            const TensorBase *A,
+            TensorBase *C,
+            TensorBase *hc_activated,
+            int n,
+            int k,
+            bool two_term,
+            DeviceWorkspaceManager *workspace,
+            RetainedSingleRowBinding &out,
+            int serial_partition_n = 0) const;
+
+        /**
+         * @brief Execute one single-row projection collectively across an already-active OpenMP team.
+         *
+         * Must be entered by every thread in the active team with an identical @p binding produced
+         * by @ref prepareSingleRowRetainedBinding. Ends on an implicit OpenMP barrier publishing
+         * @c binding.output (and @c binding.hc_activated for HC two-term projections).
+         */
+        void executeSingleRowInTeam(const RetainedSingleRowBinding &binding) const;
+
         // -------------------------------------------------------------------
         // Fused SwiGLU + GEMM: output = W @ (silu(gate) * up)
         // -------------------------------------------------------------------

@@ -1494,7 +1494,70 @@ namespace llaminar2
 
             // Each head owns one canonical checkpoint and ordered raw log.
             // Groups share checkpoint actions; only fixed epoch boundaries flush.
-            if (observe_epoch)
+            // When ordinary prefill has fewer local value heads than active workers
+            // (e.g. 16 heads on a 28-core TP2 socket), split each head into 2 independent
+            // 64-column core-private slices (32 tasks across 28 cores) so all workers stay
+            // utilized, full 4-vector AVX-512 projection tiles stay active, and subnormal-heavy
+            // layers split across 2 cores with zero mesh coherency bounce and bit-exact FP32.
+            const bool use_v_slice_parallel =
+                !capture_state_snapshots &&
+                seq_len >= 16 &&
+                n_heads < active_or_requested_workers &&
+                d_k <= cpu_gdn_epoch::kMaxValueSliceKeyWidth &&
+                d_v >= 128 &&
+                (d_v % 64) == 0;
+            if (use_v_slice_parallel)
+            {
+                const int cols_per_slice = cpu_gdn_epoch::kMaxValueSliceCols;
+                const int v_slices = d_v / cols_per_slice;
+                const int total_tasks = n_heads * v_slices;
+                auto run_slice = [&](int task) -> CPUFixedEpochObservations
+                {
+                    const int head = task / v_slices;
+                    const int slice = task % v_slices;
+                    const int v_begin = slice * cols_per_slice;
+                    const int v_end = v_begin + cols_per_slice;
+                    const size_t offset = static_cast<size_t>(head) * layout.headFloats();
+                    const int prepared_offset = (head % prepared_qk_heads) * d_k;
+                    const float *prepared_q = q_scratch_.data() + prepared_offset;
+                    const float *prepared_k = k_scratch_.data() + prepared_offset;
+                    float *head_state = state + offset;
+                    const auto observed = cpu_gdn_epoch::runValueSlice(
+                        layout, head_state, head_state,
+                        prepared_q, prepared_k, input.v + head * d_v,
+                        gate_scratch_.data() + head, beta_sig_scratch_.data() + head,
+                        seq_len, qk_stride, input.v_row_stride, n_heads,
+                        output + head * d_v, v_stride, v_begin, v_end);
+                    return (slice == 0) ? observed : CPUFixedEpochObservations{};
+                };
+                if (observe_epoch)
+                {
+#pragma omp for schedule(dynamic, 1) reduction(cpu_gdn_epoch_observations : observations)
+                    for (int task = 0; task < total_tasks; ++task)
+                        observations += run_slice(task);
+                }
+                else
+                {
+#pragma omp for schedule(dynamic, 1)
+                    for (int task = 0; task < total_tasks; ++task)
+                        (void)run_slice(task);
+                }
+                // Implicit barrier above ensures every slice finished reading initial[0]
+                // and initial raw history before each head publishes its terminal phase/log.
+#pragma omp for schedule(static)
+                for (int head = 0; head < n_heads; ++head)
+                {
+                    const size_t offset = static_cast<size_t>(head) * layout.headFloats();
+                    const int prepared_offset = (head % prepared_qk_heads) * d_k;
+                    const float *prepared_k = k_scratch_.data() + prepared_offset;
+                    cpu_gdn_epoch::finalizeValueSliceState(
+                        layout, state + offset,
+                        prepared_k, input.v + head * d_v,
+                        gate_scratch_.data() + head, beta_sig_scratch_.data() + head,
+                        seq_len, qk_stride, input.v_row_stride, n_heads);
+                }
+            }
+            else if (observe_epoch)
             {
 #pragma omp for schedule(static) reduction(cpu_gdn_epoch_observations : observations)
                 for (int head = 0; head < n_heads; ++head)

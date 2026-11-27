@@ -242,6 +242,16 @@ namespace llaminar2
         void flushStageTimelineAll();
         /** @return Whether every local stage supports the existing chained-sidecar contract. */
         bool supportsChainedMTPDraftsAll() const;
+        /** @return Whether every local stage preserves main KV/GDN state during MTP sidecar execution. */
+        bool supportsMTPSidecarPreservesMainStateAll() const;
+        /** @return Whether every local stage supports logical MTP verifier base checkpoints. */
+        bool supportsLogicalMTPVerifierBaseCheckpointAll() const;
+        /** @return Whether every local stage supports reusing the first shifted MTP row from sidecar. */
+        bool supportsMTPShiftedRowReuseFromSidecarAll() const;
+        /** @return Whether any local stage requires decode-equivalent grouped verifier replay. */
+        bool requiresMTPDecodeEquivalentVerifierReplayAny() const;
+        /** @return Whether every local stage supports accepted MTP spec-state publication. */
+        bool supportsMTPSpecStatePublicationAll() const;
         /** @copydoc IInferenceRunner::forwardMTP */
         bool forwardMTPAll(int32_t draft_condition_token);
         /** @copydoc IInferenceRunner::forwardMTPFromLastDraft */

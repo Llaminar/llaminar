@@ -244,8 +244,10 @@ namespace llaminar2
         CollectiveBackendType backend() const override { return backend_type_; }
         bool allreduce(TensorBase *tensor) override;
         bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override;
+        bool allreduceFloats(float *data, size_t count) override;
         bool broadcast(TensorBase *tensor, int source_index) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
+        bool allgatherFloats(const float *send_data, float *recv_data, size_t send_count) override;
         void requestAbort() override;
         bool isAbortRequested() const override { return abort_requested_.load(std::memory_order_acquire); }
 

@@ -296,6 +296,10 @@ public:
     StageBufferContract bufferContract() const override;
     /** @brief Inspect sealed configuration; no mutable runtime updates are supported. */
     const Params &getParams() const noexcept { return params_; }
+    /** @brief Pure-CPU M=1 Qwen4Exp primitives reuse the active retained OpenMP team. */
+    CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override;
+    /** @brief Seal CPU hash storage once on master before collective team entry. */
+    void prepareForRetainedTeam(IDeviceContext *context) override;
 
 private:
     /** @brief Access policy of one immutable byte view. */

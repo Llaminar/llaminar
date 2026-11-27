@@ -58,6 +58,7 @@
 #include "kernels/cpu/primitives/RoPEPrimitives.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "kernels/cpu/primitives/VectorPrimitives.h"
+#include "kernels/cpu/qwen4exp/CPUQwen4ExpSIMD.h"
 #include "kernels/qwen4exp/Qwen4ExpKernels.h"
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseReplay.h"
@@ -329,10 +330,11 @@ namespace
     {
         if (num_descs <= 0)
             return;
-        // Stage compact Q8_1 rows (<= 128 blocks = 4.6 KiB, e.g. K=2560) into
-        // thread-private L1d stack memory in staggered order so workers avoid
-        // multi-core HitM snoop convoys without blowing L1d on wide K=10240 rows.
-        constexpr int kMaxLocalQ8Blocks = 128;
+        // Stage full-K Q8_1 activation rows (<= 192 blocks = 6.9 KiB, covering K <= 6144 including
+        // 1xCPU ssm_out/wo) into thread-private L1d stack memory in staggered order so all workers
+        // avoid Modified-state HitM snoop convoys right after quantization. Wide K-partitioned
+        // projections (e.g. K=10240 -> 320 blocks) read only 64 blocks/worker so skip full copy.
+        constexpr int kMaxLocalQ8Blocks = 192;
         alignas(64) Q8_1Block local_q8[kMaxLocalQ8Blocks];
         const Q8_1Block *active_q8 = input_q8;
         const int k_blocks = descs[0].packed ? descs[0].packed->blocks_per_row : 0;
@@ -353,6 +355,115 @@ namespace
         const ISALevel isa = activeISALevel();
         if (isa >= ISALevel::AVX2)
         {
+            // For 1..8 symmetric Q8_0 full-K projections where 64-column chunks leave tail
+            // imbalance across workers (e.g. ssm_out/wo 40 chunks -> 80 32-col half-chunks,
+            // gdn_2_qkvz 128 -> 512 sub-chunks, qsa_2_qkv_key 104 -> 416), flatten into one
+            // uniform static workshare directly (zero per-thread policy overhead).
+            if (num_descs >= 1 && num_descs <= 8 && nt > 1)
+            {
+                const auto &cache = CPUExecutionGeometry::local().cache;
+                bool all_direct_q8_fullk = true;
+                std::array<int, 8> chunk_ends{};
+                int total_chunks = 0;
+                for (int p = 0; p < num_descs; ++p)
+                {
+                    const auto &d = descs[p];
+                    if (!d.packed || !d.output || d.bias != nullptr || d.N <= 0 ||
+                        d.packed->blocks_per_row != k_blocks ||
+                        d.packed->codebook_id != native_quantised_formats::Q8_0.codebook_id ||
+                        d.packed->is_superblock || d.packed->is_asymmetric ||
+                        (!d.packed->usesUnsignedInt8() && !d.packed->usesExpandedInt8()))
+                    {
+                        all_direct_q8_fullk = false;
+                        break;
+                    }
+                    const int policy_n = d.policy_n > 0 ? d.policy_n : d.N;
+                    const auto cfg = cpu::native_quantised::serialTileConfigForPreparedProjection(
+                        d.packed->preparedFootprint(), d.packed->codebook_id,
+                        d.packed->numerical_policy, policy_n, d.packed->K, nt, cache);
+                    if (cpu::native_quantised::nativeQuantisedUsesKPartitions(cfg.k_tiles))
+                    {
+                        all_direct_q8_fullk = false;
+                        break;
+                    }
+                    total_chunks += (d.N + 63) / 64;
+                    chunk_ends[static_cast<size_t>(p)] = total_chunks;
+                }
+                if (all_direct_q8_fullk && total_chunks > 0 &&
+                    total_chunks < 6 * nt && (total_chunks % nt) != 0)
+                {
+                    bool use_avx512 = false;
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    use_avx512 = (isa >= ISALevel::AVX512);
+#endif
+                    // Prefer 32-column half-chunks (2 adjacent ZMMs = 128B contiguous reads matching
+                    // L2 adjacent-line prefetchers with 4 live VNNI chains) when 2x chunk count
+                    // provides >= 2 tasks/worker (e.g. ssm_out/wo 40 -> 80, qsa_2 104 -> 208, gdn_2 128 -> 256).
+                    if (total_chunks <= 160 && total_chunks * 2 >= nt * 2)
+                    {
+                        const int total_halfchunks = total_chunks * 2;
+#pragma omp for schedule(static)
+                        for (int task = 0; task < total_halfchunks; ++task)
+                        {
+                            const int global_chunk = task / 2;
+                            const int half = task % 2;
+                            int p = 0;
+                            while (p + 1 < num_descs && global_chunk >= chunk_ends[static_cast<size_t>(p)])
+                                ++p;
+                            const int prev_end = (p > 0) ? chunk_ends[static_cast<size_t>(p - 1)] : 0;
+                            const int local_chunk = global_chunk - prev_end;
+                            const auto &d = descs[p];
+                            if (local_chunk * 64 + half * 32 >= d.N)
+                                continue;
+                            if (use_avx512)
+                            {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                                cpu::native_quantised::gemv_native_quantised_avx512_halfchunk_q8(
+                                    *d.packed, active_q8, d.output + local_chunk * 64,
+                                    local_chunk, half, 0, k_blocks);
+#endif
+                            }
+                            else
+                            {
+                                cpu::native_quantised::gemv_avx2_halfchunk_q8(
+                                    *d.packed, active_q8, d.output + local_chunk * 64,
+                                    local_chunk, half, 0, k_blocks);
+                            }
+                        }
+                        return;
+                    }
+                    const int total_subchunks = total_chunks * 4;
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_subchunks; ++task)
+                    {
+                        const int global_chunk = task / 4;
+                        const int z = task % 4;
+                        int p = 0;
+                        while (p + 1 < num_descs && global_chunk >= chunk_ends[static_cast<size_t>(p)])
+                            ++p;
+                        const int prev_end = (p > 0) ? chunk_ends[static_cast<size_t>(p - 1)] : 0;
+                        const int local_chunk = global_chunk - prev_end;
+                        const auto &d = descs[p];
+                        if (local_chunk * 64 + z * 16 >= d.N)
+                            continue;
+                        if (use_avx512)
+                        {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                            cpu::native_quantised::gemv_native_quantised_avx512_subchunk_q8(
+                                *d.packed, active_q8, d.output + local_chunk * 64,
+                                local_chunk, z, 0, k_blocks);
+#endif
+                        }
+                        else
+                        {
+                            cpu::native_quantised::gemv_avx2_subchunk_q8(
+                                *d.packed, active_q8, d.output + local_chunk * 64,
+                                local_chunk, z, 0, k_blocks);
+                        }
+                    }
+                    return;
+                }
+            }
             if (num_descs == 1 && descs[0].bias == nullptr &&
                 (descs[0].policy_n == 0 || descs[0].policy_n == descs[0].N))
             {
@@ -504,7 +615,8 @@ namespace
         float *rounded_a,
         float *status_slot,
         DeviceWorkspaceManager *workspace,
-        ISALevel isa)
+        ISALevel isa,
+        std::span<float> tile_partials = {})
     {
         const int N = proj.n;
         const int K = proj.k;
@@ -539,6 +651,45 @@ namespace
                 if (proj.fp_weight_type == TensorType::FP32)
                 {
                     const float *w = static_cast<const float *>(proj.fp_weight_data);
+                    if (gemm::usesFixedTreeSkinnyFP32(N, K, proj.transpose_b))
+                    {
+                        const int total_tasks = N * gemm::kSkinnyFP32FixedKTiles;
+                        constexpr size_t kStride = static_cast<size_t>(gemm::kSkinnyFP32PartialStrideFloats);
+                        if (tile_partials.size() >= static_cast<size_t>(total_tasks) * kStride)
+                        {
+                            const int tile_k = K / gemm::kSkinnyFP32FixedKTiles;
+#pragma omp for schedule(static)
+                            for (int task = 0; task < total_tasks; ++task)
+                            {
+                                const int col = task / gemm::kSkinnyFP32FixedKTiles;
+                                const int tile = task % gemm::kSkinnyFP32FixedKTiles;
+                                tile_partials[static_cast<size_t>(task) * kStride] = gemm::dotFP32Fixed16LaneRange(
+                                    input_ptr, w + static_cast<std::size_t>(col) * static_cast<std::size_t>(K),
+                                    tile * tile_k, (tile + 1) * tile_k, isa);
+                            }
+                            // Only one thread folds the tiny N<=8 cache-line-padded partials;
+                            // hc_inject output is consumed only after the megakernel team exits.
+                            if (omp_get_thread_num() == 0)
+                            {
+                                for (int col = 0; col < N; ++col)
+                                {
+                                    const size_t base = static_cast<size_t>(col * gemm::kSkinnyFP32FixedKTiles);
+                                    float acc = 0.0f;
+                                    for (int tile = 0; tile < gemm::kSkinnyFP32FixedKTiles; ++tile)
+                                        acc += tile_partials[(base + static_cast<size_t>(tile)) * kStride];
+                                    output_ptr[col] = acc;
+                                }
+                            }
+                            return true;
+                        }
+#pragma omp for schedule(static)
+                        for (int col = 0; col < N; ++col)
+                        {
+                            output_ptr[col] = gemm::dotFP32FixedTreeComplete(
+                                input_ptr, w + static_cast<std::size_t>(col) * static_cast<std::size_t>(K), K, isa);
+                        }
+                        return true;
+                    }
 #pragma omp for schedule(static)
                     for (int col = 0; col < N; ++col)
                     {
@@ -966,6 +1117,12 @@ namespace
             const size_t up_q8_blocks = static_cast<size_t>((up_.k + 31) / 32);
             up_primary_q8_.resize(up_q8_blocks);
             up_residual_q8_.resize(up_q8_blocks);
+            if (up_.isTwoTermQ8Native() && up_params_.hc_residual_down)
+            {
+                cpu::native_quantised::validateCPUQ8ResidualSource(
+                    up_.native_engine->packedWeights(), 1, up_.n, up_.k);
+                up_two_term_validated_ = true;
+            }
         }
 
         void appendMemberNames(std::vector<std::string> &members, const CPUHCRegionNodes &r)
@@ -992,10 +1149,14 @@ namespace
             const float *norm_input = nullptr;
             const float *gain = nullptr;
             float *norm_output = nullptr;
+            TensorBase *down_c_tensor = nullptr;
             float *down_out = nullptr;
+            TensorBase *inject_c_tensor = nullptr;
             float *inject_out = nullptr;
             const float *act_input = nullptr;
             float *act_output = nullptr;
+            const TensorBase *up_a_tensor = nullptr;
+            TensorBase *up_c_tensor = nullptr;
             float *up_out = nullptr;
             float *activated_out = nullptr;
             const float *read_normalized = nullptr;
@@ -1019,16 +1180,18 @@ namespace
             }
             p.gain = norm_op_.gain.tensor->data();
             p.norm_output = bindingFloatPtr(norm_op_.output);
-            p.down_out = dynamic_cast<TensorBase *>(down_params_.C)->mutable_data();
-            p.inject_out = inject_params_
-                ? dynamic_cast<TensorBase *>(inject_params_->C)->mutable_data()
-                : nullptr;
+            p.down_c_tensor = dynamic_cast<TensorBase *>(down_params_.C);
+            p.down_out = p.down_c_tensor->mutable_data();
+            p.inject_c_tensor = inject_params_ ? dynamic_cast<TensorBase *>(inject_params_->C) : nullptr;
+            p.inject_out = p.inject_c_tensor ? p.inject_c_tensor->mutable_data() : nullptr;
             if (act_op_)
             {
                 p.act_input = bindingConstFloatPtr(act_op_->input);
                 p.act_output = bindingFloatPtr(act_op_->output);
             }
-            p.up_out = dynamic_cast<TensorBase *>(up_params_.C)->mutable_data();
+            p.up_a_tensor = dynamic_cast<const TensorBase *>(up_params_.A);
+            p.up_c_tensor = dynamic_cast<TensorBase *>(up_params_.C);
+            p.up_out = p.up_c_tensor->mutable_data();
             p.activated_out = (up_.isTwoTermQ8Native() && up_params_.hc_residual_down)
                 ? up_params_.hc_residual_down->activated->mutable_data()
                 : nullptr;
@@ -1038,18 +1201,80 @@ namespace
             return p;
         }
 
+        /** @brief Thread-local optional post-ResidualRead quantization request fused into hc_up+read. */
+        struct PostReadQuant
+        {
+            Q8_1Block *single_q8_dst = nullptr;
+            CPUProjectionNumericalPolicy single_q8_policy = CPUProjectionNumericalPolicy::BackendNative;
+            Q8_1Block *router_q8_dst = nullptr;
+            bool fused_completed = false;
+        };
+
         /** @brief Run the entire HC read prefix inside the caller's already-active OpenMP team. */
         bool executeInTeam(const ResolvedPointers &ptrs, std::span<float> partials,
                            float *rounded_a, DeviceWorkspaceManager *workspace, ISALevel isa,
-                           std::array<std::chrono::steady_clock::time_point, 5> *hc_ts = nullptr)
+                           std::array<std::chrono::steady_clock::time_point, 5> *hc_ts = nullptr,
+                           PostReadQuant *post_quant = nullptr)
         {
             auto hmark = [&](size_t i) noexcept {
                 if (hc_ts && omp_get_thread_num() == 0)
                     (*hc_ts)[i] = std::chrono::steady_clock::now();
             };
             hmark(0);
-            // 1. Optional fused ResidualWrite + BranchRMSNorm (or standalone BranchRMSNorm).
-            if (write_op_)
+            const float *norm_ptr = ptrs.norm_output;
+            float *down_out = ptrs.down_out;
+            float *inject_out = ptrs.inject_out;
+            float *up_out = ptrs.up_out;
+
+            const bool share_norm_q8 =
+                down_.isSingleQ8Native() && inject_params_ && inject_.isSingleQ8Native() &&
+                down_.native_engine->packedWeights().numerical_policy ==
+                    inject_.native_engine->packedWeights().numerical_policy;
+            const bool fuse_norm_q8 =
+                down_.isSingleQ8Native() && (norm_op_.hidden % 64) == 0 &&
+                (!inject_params_ || !inject_.isSingleQ8Native() || share_norm_q8);
+
+            if (omp_get_thread_num() == 0)
+                fused_hc_failed_.store(false, std::memory_order_relaxed);
+            // 1. Optional fused ResidualWrite + BranchRMSNorm [+ norm_q8_ quantization in L1d]
+            //    (Barrier #1; saves a full team barrier + 40 KiB cross-core HitM reload).
+            if (fuse_norm_q8)
+            {
+                const int hidden = norm_op_.hidden;
+                const int vectorWidth = qwen4exp::cpu_detail::vectorWidth();
+                const auto down_policy = down_.native_engine->packedWeights().numerical_policy;
+                const int pairs_per_branch = hidden / 64;
+                const int blocks_per_branch = hidden / 32;
+#pragma omp for schedule(static)
+                for (int branch = 0; branch < 4; ++branch)
+                {
+                    const size_t base = static_cast<size_t>(branch) * static_cast<size_t>(hidden);
+                    float *norm_dst = ptrs.norm_output + base;
+                    if (write_op_)
+                    {
+                        const float gate =
+                            2.0f * (1.0f / (1.0f + std::exp(-(ptrs.write_gate_logits[branch] * 0.25f))));
+                        qwen4exp::cpu_detail::residualWriteAndNormalizeBranch(
+                            hidden, norm_op_.epsilon, gate,
+                            ptrs.write_residual + base, ptrs.write_block,
+                            ptrs.gain + base, ptrs.write_output + base, norm_dst, vectorWidth);
+                    }
+                    else
+                    {
+                        qwen4exp::cpu_detail::normalizeBranch(
+                            hidden, norm_op_.epsilon,
+                            ptrs.norm_input + base, ptrs.gain + base, norm_dst, vectorWidth);
+                    }
+                    const int kb_base = branch * blocks_per_branch;
+                    for (int p = 0; p < pairs_per_branch; ++p)
+                    {
+                        const int kb = kb_base + p * 2;
+                        cpu::native_quantised::quantizeTwoActivationBlocks(
+                            norm_dst + p * 64, norm_q8_[kb], norm_q8_[kb + 1], down_policy);
+                    }
+                }
+            }
+            else if (write_op_)
             {
                 qwen4exp::ResidualWriteBranchRMSNormArgs args{
                     .extent = {1, nullptr},
@@ -1078,165 +1303,497 @@ namespace
             }
             hmark(1);
 
-            // 2. hc_down [R, 4H] + optional hc_inject [4, 4H], sharing one Q8_1 quantization of normalized[4H].
-            const float *norm_ptr = ptrs.norm_output;
-            float *down_out = ptrs.down_out;
-            float *inject_out = ptrs.inject_out;
-
-            const bool share_norm_q8 =
-                down_.isSingleQ8Native() && inject_params_ && inject_.isSingleQ8Native() &&
-                down_.native_engine->packedWeights().numerical_policy ==
-                    inject_.native_engine->packedWeights().numerical_policy;
-
-            if (share_norm_q8)
+            // 2+3. Fast 2-barrier fused HC middle pipeline (hc_down K-par + overlapped hc_inject ->
+            //      zero-barrier staggered thread-local partial reduce + ResidualDown + TwoTermQ8 ->
+            //      noipa contiguous 64-col hc_up, followed by fused ResidualRead + post_quant).
+            bool fused_middle_done = false;
+            constexpr int kMaxFusedLowRank = 512;
+            if (fuse_norm_q8 && isa >= ISALevel::AVX2 &&
+                up_.isTwoTermQ8Native() && up_params_.hc_residual_down &&
+                up_two_term_validated_ && ptrs.activated_out != nullptr &&
+                down_.n == up_.k && down_.n > 0 && down_.n <= kMaxFusedLowRank && (down_.n % 64) == 0)
             {
-                quantizeRowToQ8InTeam(norm_ptr, norm_q8_.data(), down_.k,
-                                      down_.native_engine->packedWeights().numerical_policy);
-                std::array<FusedGemvDesc, 2> descs{{
-                    {.packed = &down_.native_engine->packedWeights(),
-                     .output = down_out,
-                     .bias = nullptr,
-                     .N = down_.n,
-                     .policy_n = down_.policy_n},
-                    {.packed = &inject_.native_engine->packedWeights(),
-                     .output = inject_out,
-                     .bias = nullptr,
-                     .N = inject_.n,
-                     .policy_n = inject_.policy_n},
-                }};
-                runNativeQuantisedBundleInTeam(norm_q8_.data(), descs.data(), 2, partials);
-                hmark(2);
-                hmark(3);
-            }
-            else
-            {
-                // Execute down.
-                if (down_.isSingleQ8Native())
+                const auto &down_packed = down_.native_engine->packedWeights();
+                const auto &up_packed = up_.native_engine->packedWeights();
+                const int nt = std::max(1, omp_get_num_threads());
+                const auto &cache = CPUExecutionGeometry::local().cache;
+                const int down_policy_n = down_.policy_n > 0 ? down_.policy_n : down_.n;
+                const auto down_cfg = cpu::native_quantised::serialTileConfigForPreparedProjection(
+                    down_packed.preparedFootprint(), down_packed.codebook_id,
+                    down_packed.numerical_policy, down_policy_n, down_packed.K, nt, cache);
+                const bool inject_ok = !inject_params_ ||
+                    (inject_.transpose_b && inject_.fp_weight_data != nullptr &&
+                     (inject_.fp_operand_precision == FloatingActivationOperandPrecision::Native ||
+                      inject_.fp_operand_precision == FloatingActivationOperandPrecision::FP32) &&
+                     inject_.fp_weight_type == TensorType::FP32 &&
+                     gemm::usesFixedTreeSkinnyFP32(inject_.n, inject_.k, inject_.transpose_b));
+
+                if (inject_ok && cpu::native_quantised::nativeQuantisedUsesKPartitions(down_cfg.k_tiles))
                 {
-                    quantizeRowToQ8InTeam(norm_ptr, norm_q8_.data(), down_.k,
-                                          down_.native_engine->packedWeights().numerical_policy);
-                    FusedGemvDesc desc{
-                        .packed = &down_.native_engine->packedWeights(),
-                        .output = down_out,
-                        .bias = nullptr,
-                        .N = down_.n,
-                        .policy_n = down_.policy_n};
-                    runNativeQuantisedBundleInTeam(norm_q8_.data(), &desc, 1, partials);
+                    const int down_n = down_.n;
+                    const int down_n_chunks = down_n / 64;
+                    const int down_k_tiles = down_cfg.k_tiles;
+                    const int down_k_blocks = down_packed.blocks_per_row;
+                    const int down_bpt = (down_k_blocks + down_k_tiles - 1) / down_k_tiles;
+                    const int total_down_tasks = down_n_chunks * down_k_tiles;
+                    const size_t down_partials_floats =
+                        static_cast<size_t>(total_down_tasks) * 64u;
+                    const size_t inj_partials_off =
+                        alignUp64(down_partials_floats * sizeof(float)) / sizeof(float);
+                    const int inj_tasks = inject_params_ ? (inject_.n * gemm::kSkinnyFP32FixedKTiles) : 0;
+                    constexpr size_t kInjStride = static_cast<size_t>(gemm::kSkinnyFP32PartialStrideFloats);
+                    const size_t needed_partials = inj_partials_off + static_cast<size_t>(inj_tasks) * kInjStride;
+
+                    if (partials.size() >= needed_partials)
+                    {
+                        bool use_avx512 = false;
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        use_avx512 = (isa >= ISALevel::AVX512);
+#endif
+                        const bool down_nibble = down_packed.usesNibbleLUT();
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        const __m512i decode_lut_512 =
+                            (use_avx512 && down_nibble)
+                                ? cpu::native_quantised::build_decode_lut(down_packed.codebook_id)
+                                : _mm512_setzero_si512();
+#endif
+                        const __m256i decode_lut_256 =
+                            (!use_avx512 && down_nibble)
+                                ? cpu::native_quantised::build_decode_lut_avx2_for_codebook(down_packed.codebook_id)
+                                : _mm256_setzero_si256();
+                        float *down_partials = partials.data();
+                        const Q8_1Block *a_q8 = norm_q8_.data();
+
+                        auto run_down_task = [&](int task) noexcept {
+                            const int chunk_idx = task / down_k_tiles;
+                            const int kt = task % down_k_tiles;
+                            const int kb_start = kt * down_bpt;
+                            const int kb_end = std::min(kb_start + down_bpt, down_k_blocks);
+                            float *dest = down_partials + static_cast<size_t>(task) * 64u;
+                            if (use_avx512)
+                            {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                                if (down_nibble)
+                                    cpu::native_quantised::gemv_native_quantised_avx512_chunk_native(
+                                        down_packed, a_q8, dest, chunk_idx, kb_start, kb_end, decode_lut_512);
+                                else
+                                    cpu::native_quantised::gemv_native_quantised_avx512_chunk_non_nibble(
+                                        down_packed, a_q8, dest, chunk_idx, kb_start, kb_end);
+#endif
+                            }
+                            else if (down_nibble)
+                            {
+                                cpu::native_quantised::gemv_avx2_chunk_native(
+                                    down_packed, a_q8, dest, chunk_idx, kb_start, kb_end, decode_lut_256);
+                            }
+                            else
+                            {
+                                cpu::native_quantised::gemv_avx2_chunk_non_nibble(
+                                    down_packed, a_q8, dest, chunk_idx, kb_start, kb_end);
+                            }
+                        };
+
+                        // Barrier #2: overlap K-partitioned hc_down with skinny FP32 hc_inject!
+                        // Idle cores from hc_down (e.g. 28 - 25 = 3 cores) drain hc_inject immediately.
+                        if (inj_tasks > 0)
+                        {
+                            const float *w_inj = static_cast<const float *>(inject_.fp_weight_data);
+                            const int inj_k = inject_.k;
+                            const int tile_k = inj_k / gemm::kSkinnyFP32FixedKTiles;
+                            float *inj_partials = partials.data() + inj_partials_off;
+#pragma omp for schedule(static, 1) nowait
+                            for (int task = 0; task < total_down_tasks; ++task)
+                                run_down_task(task);
+#pragma omp for schedule(dynamic, 2)
+                            for (int task = 0; task < inj_tasks; ++task)
+                            {
+                                const int col = task / gemm::kSkinnyFP32FixedKTiles;
+                                const int tile = task % gemm::kSkinnyFP32FixedKTiles;
+                                inj_partials[static_cast<size_t>(task) * kInjStride] =
+                                    gemm::dotFP32Fixed16LaneRange(
+                                        norm_ptr,
+                                        w_inj + static_cast<size_t>(col) * static_cast<size_t>(inj_k),
+                                        tile * tile_k, (tile + 1) * tile_k, isa);
+                            }
+                        }
+                        else
+                        {
+#pragma omp for schedule(static, 1)
+                            for (int task = 0; task < total_down_tasks; ++task)
+                                run_down_task(task);
+                        }
+                        hmark(2);
+                        hmark(3);
+
+                        // Zero-barrier thread-local bridge (~0.7 us in private L1d):
+                        // 1) Exact ordered K-tile partial reduction -> local_down[down_n]
+                        // 2) Exact ResidualDown (/4 SiLU) -> local_act[down_n]
+                        // 3) Exact TwoTermQ8 quantization -> local_primary / local_residual in private L1d!
+                        // Barrier #3: 5-chunk fused hc_down partial reduce + ResidualDown +
+                        // TwoTermQ8 quantization into up_primary_q8_/up_residual_q8_ (only 5 cores
+                        // read down_partials -> eliminates 28-way HitM snoop convoy!).
+                        const int vectorWidth = qwen4exp::cpu_detail::vectorWidth();
+                        const int up_bpr = up_packed.blocks_per_row;
+#pragma omp for schedule(static)
+                        for (int chunk_idx = 0; chunk_idx < down_n_chunks; ++chunk_idx)
+                        {
+                            const int col_base = chunk_idx * 64;
+                            const float *base = down_partials +
+                                                static_cast<size_t>(chunk_idx * down_k_tiles) * 64u;
+                            cpu::native_quantised::reduceNativeQuantisedKTilePartialsExact(
+                                base, down_out + col_base, 64, down_k_tiles,
+                                use_avx512, down_packed.numerical_policy);
+                            qwen4exp::cpu_detail::residualDownChannels(
+                                down_out, ptrs.activated_out, col_base, col_base + 64, vectorWidth);
+                            bool chunk_failed = false;
+                            const int blk0 = chunk_idx * 2;
+                            for (int b = 0; b < 2; ++b)
+                            {
+                                const int blk = blk0 + b;
+                                const float *src = ptrs.activated_out + blk * 32;
+                                bool finite = true;
+#if defined(__AVX512F__)
+                                if (use_avx512)
+                                {
+                                    const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+                                    const __m512 inf_v = _mm512_set1_ps(std::numeric_limits<float>::infinity());
+                                    const __mmask16 m0 = _mm512_cmp_ps_mask(
+                                        _mm512_and_ps(_mm512_loadu_ps(src), abs_mask), inf_v, _CMP_LT_OQ);
+                                    const __mmask16 m1 = _mm512_cmp_ps_mask(
+                                        _mm512_and_ps(_mm512_loadu_ps(src + 16), abs_mask), inf_v, _CMP_LT_OQ);
+                                    finite = ((m0 & m1) == 0xffffu);
+                                }
+                                else
+#endif
+                                {
+                                    for (int e = 0; e < 32; ++e)
+                                        finite = finite && std::isfinite(src[e]);
+                                }
+                                if (!finite)
+                                {
+                                    up_primary_q8_[static_cast<size_t>(blk)].d = 0x7c00u;
+                                    chunk_failed = true;
+                                    continue;
+                                }
+                                cpu::native_quantised::quantizeActivationBlock(
+                                    src, up_primary_q8_[static_cast<size_t>(blk)], 32,
+                                    up_packed.numerical_policy);
+                                if ((up_primary_q8_[static_cast<size_t>(blk)].d & 0x7c00u) == 0x7c00u)
+                                {
+                                    chunk_failed = true;
+                                    continue;
+                                }
+                                cpu::native_quantised::quantizeResidualBlock(
+                                    src, up_primary_q8_[static_cast<size_t>(blk)],
+                                    up_residual_q8_[static_cast<size_t>(blk)],
+                                    up_packed.numerical_policy);
+                            }
+                            if (chunk_failed)
+                                fused_hc_failed_.store(true, std::memory_order_relaxed);
+                            if (chunk_idx == 0 && inj_tasks > 0)
+                            {
+                                const float *inj_partials = partials.data() + inj_partials_off;
+                                for (int col = 0; col < inject_.n; ++col)
+                                {
+                                    const size_t ibase = static_cast<size_t>(col * gemm::kSkinnyFP32FixedKTiles);
+                                    float acc = 0.0f;
+                                    for (int tile = 0; tile < gemm::kSkinnyFP32FixedKTiles; ++tile)
+                                        acc += inj_partials[(ibase + static_cast<size_t>(tile)) * kInjStride];
+                                    inject_out[col] = acc;
+                                }
+                            }
+                        }
+
+                        if (fused_hc_failed_.load(std::memory_order_relaxed))
+                            return false;
+
+                        // Barrier #4: canonical noipa TwoTermQ8 hc_up (160 contiguous 64-col chunks,
+                        // staggered 360-byte L1d Q8 staging with zero 28-way HitM). Linear 64-col
+                        // chunk traversal saturates hardware stream prefetchers far better than
+                        // strided 4-branch fusion.
+                        cpu::native_quantised::cpuQ8ResidualProjectionWorkshare(
+                            up_packed, up_out, 1,
+                            std::span<const Q8_1Block>(up_primary_q8_.data(), static_cast<size_t>(up_bpr)),
+                            std::span<const Q8_1Block>(up_residual_q8_.data(), static_cast<size_t>(up_bpr)),
+                            use_avx512);
+                        fused_middle_done = true;
+                    }
                 }
-                else if (down_.isTwoTermQ8Native())
+            }
+
+            if (!fused_middle_done)
+            {
+                // General HC middle path (Scalar, non-K-partitioned down, float weights, or non-TwoTermQ8 up).
+                if (share_norm_q8)
                 {
-                    cpu::native_quantised::cpuQ8ResidualCorrectedProjection(
-                        down_.native_engine->packedWeights(), norm_ptr, down_out,
-                        DeviceRowRange::fullyActive(1),
-                        std::span<Q8_1Block>(norm_q8_.data(), norm_q8_.size()),
-                        std::span<Q8_1Block>(up_residual_q8_.data(), up_residual_q8_.size()));
+                    if (!fuse_norm_q8)
+                    {
+                        quantizeRowToQ8InTeam(norm_ptr, norm_q8_.data(), down_.k,
+                                              down_.native_engine->packedWeights().numerical_policy);
+                    }
+                    std::array<FusedGemvDesc, 2> descs{{
+                        {.packed = &down_.native_engine->packedWeights(),
+                         .output = down_out,
+                         .bias = nullptr,
+                         .N = down_.n,
+                         .policy_n = down_.policy_n},
+                        {.packed = &inject_.native_engine->packedWeights(),
+                         .output = inject_out,
+                         .bias = nullptr,
+                         .N = inject_.n,
+                         .policy_n = inject_.policy_n},
+                    }};
+                    runNativeQuantisedBundleInTeam(norm_q8_.data(), descs.data(), 2, partials);
+                    hmark(2);
+                    hmark(3);
                 }
                 else
                 {
-                    if (!runFloatGemvInTeam(
-                            norm_op_.output.tensor, norm_ptr, down_,
-                            dynamic_cast<TensorBase *>(down_params_.C), down_out,
-                            rounded_a, &float_status_, workspace, isa))
-                        return false;
-                }
-                hmark(2);
-
-                // Execute optional injection projection.
-                if (inject_params_)
-                {
-                    if (inject_.isSingleQ8Native())
+                    if (down_.isSingleQ8Native())
                     {
-                        quantizeRowToQ8InTeam(norm_ptr, norm_q8_.data(), inject_.k,
-                                              inject_.native_engine->packedWeights().numerical_policy);
+                        if (!fuse_norm_q8)
+                        {
+                            quantizeRowToQ8InTeam(norm_ptr, norm_q8_.data(), down_.k,
+                                                  down_.native_engine->packedWeights().numerical_policy);
+                        }
                         FusedGemvDesc desc{
-                            .packed = &inject_.native_engine->packedWeights(),
-                            .output = inject_out,
+                            .packed = &down_.native_engine->packedWeights(),
+                            .output = down_out,
                             .bias = nullptr,
-                            .N = inject_.n,
-                            .policy_n = inject_.policy_n};
+                            .N = down_.n,
+                            .policy_n = down_.policy_n};
                         runNativeQuantisedBundleInTeam(norm_q8_.data(), &desc, 1, partials);
+                    }
+                    else if (down_.isTwoTermQ8Native())
+                    {
+                        cpu::native_quantised::cpuQ8ResidualCorrectedProjection(
+                            down_.native_engine->packedWeights(), norm_ptr, down_out,
+                            DeviceRowRange::fullyActive(1),
+                            std::span<Q8_1Block>(norm_q8_.data(), norm_q8_.size()),
+                            std::span<Q8_1Block>(up_residual_q8_.data(), up_residual_q8_.size()));
                     }
                     else
                     {
                         if (!runFloatGemvInTeam(
-                                norm_op_.output.tensor, norm_ptr, inject_,
-                                dynamic_cast<TensorBase *>(inject_params_->C), inject_out,
+                                norm_op_.output.tensor, norm_ptr, down_,
+                                ptrs.down_c_tensor, down_out,
                                 rounded_a, &float_status_, workspace, isa))
                             return false;
                     }
-                }
-                hmark(3);
-            }
+                    hmark(2);
 
-            // 3. hc_up [4H, R] (either fused TwoTermQ8 + ResidualDown or explicit ResidualDown + up).
-            float *up_out = ptrs.up_out;
-            if (up_.isTwoTermQ8Native() && up_params_.hc_residual_down)
-            {
-                float *activated_out = ptrs.activated_out;
-                cpu::native_quantised::cpuHCResidualDownQ8Projection(
-                    up_.native_engine->packedWeights(),
-                    down_out,
-                    activated_out,
-                    up_out,
-                    DeviceRowRange::fullyActive(1),
-                    std::span<Q8_1Block>(up_primary_q8_.data(), up_primary_q8_.size()),
-                    std::span<Q8_1Block>(up_residual_q8_.data(), up_residual_q8_.size()));
-            }
-            else
-            {
-                const float *up_in_ptr = down_out;
-                const TensorBase *up_in_tensor = dynamic_cast<const TensorBase *>(up_params_.A);
-                if (act_op_)
-                {
-                    qwen4exp::ResidualDownArgs rd_args{
-                        .extent = {1, nullptr},
-                        .lowRank = act_op_->lowRank,
-                        .input = ptrs.act_input,
-                        .output = ptrs.act_output,
-                    };
-                    qwen4exp_kernels_->residualDown(rd_args, nullptr);
-                    up_in_ptr = ptrs.act_output;
-                    up_in_tensor = act_op_->output.tensor;
+                    if (inject_params_)
+                    {
+                        if (inject_.isSingleQ8Native())
+                        {
+                            quantizeRowToQ8InTeam(norm_ptr, norm_q8_.data(), inject_.k,
+                                                  inject_.native_engine->packedWeights().numerical_policy);
+                            FusedGemvDesc desc{
+                                .packed = &inject_.native_engine->packedWeights(),
+                                .output = inject_out,
+                                .bias = nullptr,
+                                .N = inject_.n,
+                                .policy_n = inject_.policy_n};
+                            runNativeQuantisedBundleInTeam(norm_q8_.data(), &desc, 1, partials);
+                        }
+                        else
+                        {
+                            if (!runFloatGemvInTeam(
+                                    norm_op_.output.tensor, norm_ptr, inject_,
+                                    ptrs.inject_c_tensor, inject_out,
+                                    rounded_a, &float_status_, workspace, isa, partials))
+                                return false;
+                        }
+                    }
+                    hmark(3);
                 }
-                if (up_.isSingleQ8Native())
+
+                // 3. hc_up [4H, R] (either fused TwoTermQ8 + ResidualDown or explicit ResidualDown + up).
+                if (up_.isTwoTermQ8Native() && up_params_.hc_residual_down)
                 {
-                    quantizeRowToQ8InTeam(up_in_ptr, up_primary_q8_.data(), up_.k,
-                                          up_.native_engine->packedWeights().numerical_policy);
-                    FusedGemvDesc desc{
-                        .packed = &up_.native_engine->packedWeights(),
-                        .output = up_out,
-                        .bias = nullptr,
-                        .N = up_.n,
-                        .policy_n = up_.policy_n};
-                    runNativeQuantisedBundleInTeam(up_primary_q8_.data(), &desc, 1, partials);
-                }
-                else if (up_.isTwoTermQ8Native())
-                {
-                    cpu::native_quantised::cpuQ8ResidualCorrectedProjection(
-                        up_.native_engine->packedWeights(), up_in_ptr, up_out,
+                    float *activated_out = ptrs.activated_out;
+                    cpu::native_quantised::cpuHCResidualDownQ8Projection(
+                        up_.native_engine->packedWeights(),
+                        down_out,
+                        activated_out,
+                        up_out,
                         DeviceRowRange::fullyActive(1),
                         std::span<Q8_1Block>(up_primary_q8_.data(), up_primary_q8_.size()),
                         std::span<Q8_1Block>(up_residual_q8_.data(), up_residual_q8_.size()));
                 }
                 else
                 {
-                    if (!runFloatGemvInTeam(
-                            up_in_tensor, up_in_ptr, up_,
-                            dynamic_cast<TensorBase *>(up_params_.C), up_out,
-                            rounded_a, &float_status_, workspace, isa))
-                        return false;
+                    const float *up_in_ptr = down_out;
+                    const TensorBase *up_in_tensor = ptrs.up_a_tensor;
+                    if (act_op_)
+                    {
+                        qwen4exp::ResidualDownArgs rd_args{
+                            .extent = {1, nullptr},
+                            .lowRank = act_op_->lowRank,
+                            .input = ptrs.act_input,
+                            .output = ptrs.act_output,
+                        };
+                        qwen4exp_kernels_->residualDown(rd_args, nullptr);
+                        up_in_ptr = ptrs.act_output;
+                        up_in_tensor = act_op_->output.tensor;
+                    }
+                    if (up_.isSingleQ8Native())
+                    {
+                        quantizeRowToQ8InTeam(up_in_ptr, up_primary_q8_.data(), up_.k,
+                                              up_.native_engine->packedWeights().numerical_policy);
+                        FusedGemvDesc desc{
+                            .packed = &up_.native_engine->packedWeights(),
+                            .output = up_out,
+                            .bias = nullptr,
+                            .N = up_.n,
+                            .policy_n = up_.policy_n};
+                        runNativeQuantisedBundleInTeam(up_primary_q8_.data(), &desc, 1, partials);
+                    }
+                    else if (up_.isTwoTermQ8Native())
+                    {
+                        cpu::native_quantised::cpuQ8ResidualCorrectedProjection(
+                            up_.native_engine->packedWeights(), up_in_ptr, up_out,
+                            DeviceRowRange::fullyActive(1),
+                            std::span<Q8_1Block>(up_primary_q8_.data(), up_primary_q8_.size()),
+                            std::span<Q8_1Block>(up_residual_q8_.data(), up_residual_q8_.size()));
+                    }
+                    else
+                    {
+                        if (!runFloatGemvInTeam(
+                                up_in_tensor, up_in_ptr, up_,
+                                ptrs.up_c_tensor, up_out,
+                                rounded_a, &float_status_, workspace, isa))
+                            return false;
+                    }
                 }
             }
 
-            // 4. ResidualRead: mixed[H] = 0.25 * sum_b sigmoid(readLogits[b]) * normalized[b].
-            qwen4exp::ResidualReadArgs rr_args{
-                .extent = {1, nullptr},
-                .hidden = read_op_.hidden,
-                .normalized = ptrs.read_normalized,
-                .gateLogits = ptrs.read_gate_logits,
-                .output = ptrs.read_output,
-            };
-            qwen4exp_kernels_->residualRead(rr_args, nullptr);
+            // 4. ResidualRead [+ fused L1d post-read Q8 publication] (Barrier #5).
+            // Computes each 64-float block in private L1d stack, quantizes Q8 blocks directly
+            // from L1d, and streams mixed_out with non-temporal stores (when aligned) so
+            // subsequent 28-core readers (e.g. FFN router GEMV) suffer ZERO L2 HitM convoys.
+            {
+                const int hidden = read_op_.hidden;
+                if (post_quant && (hidden % 64) == 0)
+                {
+                    const int n_blocks64 = hidden / 64;
+                    const int vectorWidth = qwen4exp::cpu_detail::vectorWidth();
+                    const float *norm_in = ptrs.read_normalized;
+                    const float *gate_in = ptrs.read_gate_logits;
+                    float *mixed_out = ptrs.read_output;
+                    const bool use_nt_store =
+                        (reinterpret_cast<std::uintptr_t>(mixed_out) & 63u) == 0u;
+#pragma omp for schedule(static) nowait
+                    for (int blk = 0; blk < n_blocks64; ++blk)
+                    {
+                        const int begin = blk * 64;
+                        alignas(64) float tmp_mixed[64];
+                        int local_c = 0;
+#if defined(__AVX512F__)
+                        if (vectorWidth == 16)
+                        {
+                            for (; local_c + 16 <= 64; local_c += 16)
+                            {
+                                const int channel = begin + local_c;
+                                __m512 sum = _mm512_setzero_ps();
+                                for (int branch = 0; branch < 4; ++branch)
+                                {
+                                    const size_t off = static_cast<size_t>(branch) * static_cast<size_t>(hidden) + channel;
+                                    sum = _mm512_fmadd_ps(qwen4exp::cpu_detail::sigmoid(_mm512_loadu_ps(gate_in + off)),
+                                                          _mm512_loadu_ps(norm_in + off), sum);
+                                }
+                                const __m512 out_v = _mm512_mul_ps(sum, _mm512_set1_ps(0.25f));
+                                _mm512_store_ps(tmp_mixed + local_c, out_v);
+                                if (use_nt_store)
+                                    _mm512_stream_ps(mixed_out + channel, out_v);
+                                else
+                                    _mm512_storeu_ps(mixed_out + channel, out_v);
+                            }
+                        }
+#endif
+#if defined(__AVX2__)
+                        if (vectorWidth >= 8)
+                        {
+                            for (; local_c + 8 <= 64; local_c += 8)
+                            {
+                                const int channel = begin + local_c;
+                                __m256 sum = _mm256_setzero_ps();
+                                for (int branch = 0; branch < 4; ++branch)
+                                {
+                                    const size_t off = static_cast<size_t>(branch) * static_cast<size_t>(hidden) + channel;
+                                    sum = _mm256_fmadd_ps(avx2::fast_sigmoid(_mm256_loadu_ps(gate_in + off)),
+                                                          _mm256_loadu_ps(norm_in + off), sum);
+                                }
+                                const __m256 out_v = _mm256_mul_ps(sum, _mm256_set1_ps(0.25f));
+                                _mm256_store_ps(tmp_mixed + local_c, out_v);
+                                if (use_nt_store)
+                                    _mm256_stream_ps(mixed_out + channel, out_v);
+                                else
+                                    _mm256_storeu_ps(mixed_out + channel, out_v);
+                            }
+                        }
+#endif
+                        for (; local_c < 64; ++local_c)
+                        {
+                            const int channel = begin + local_c;
+                            float sum = 0.0f;
+                            for (int branch = 0; branch < 4; ++branch)
+                            {
+                                const size_t off = static_cast<size_t>(branch) * static_cast<size_t>(hidden) + channel;
+                                const float g = 1.0f / (1.0f + std::exp(-gate_in[off]));
+                                sum = std::fma(g, norm_in[off], sum);
+                            }
+                            const float out_v = sum * 0.25f;
+                            tmp_mixed[local_c] = out_v;
+                            mixed_out[channel] = out_v;
+                        }
+                        if (post_quant->single_q8_dst)
+                        {
+                            cpu::native_quantised::quantizeTwoActivationBlocks(
+                                tmp_mixed,
+                                post_quant->single_q8_dst[blk * 2],
+                                post_quant->single_q8_dst[blk * 2 + 1],
+                                post_quant->single_q8_policy);
+                        }
+                        if (post_quant->router_q8_dst)
+                        {
+#if defined(__AVX512F__)
+                            if (isa >= ISALevel::AVX512)
+                            {
+                                cpu::gpu_aligned_expert_q8::quantizeTwoBlocks(
+                                    tmp_mixed,
+                                    post_quant->router_q8_dst[blk * 2],
+                                    post_quant->router_q8_dst[blk * 2 + 1]);
+                            }
+                            else
+#endif
+                            {
+                                cpu::gpu_aligned_expert_q8::quantizeBlock(
+                                    tmp_mixed, post_quant->router_q8_dst[blk * 2], 32);
+                                cpu::gpu_aligned_expert_q8::quantizeBlock(
+                                    tmp_mixed + 32, post_quant->router_q8_dst[blk * 2 + 1], 32);
+                            }
+                        }
+                    }
+#if defined(__AVX512F__) || defined(__AVX2__)
+                    if (use_nt_store && vectorWidth >= 8)
+                        _mm_sfence();
+#endif
+#pragma omp barrier
+                    post_quant->fused_completed = true;
+                }
+                else
+                {
+                    qwen4exp::ResidualReadArgs rr_args{
+                        .extent = {1, nullptr},
+                        .hidden = read_op_.hidden,
+                        .normalized = ptrs.read_normalized,
+                        .gateLogits = ptrs.read_gate_logits,
+                        .output = ptrs.read_output,
+                    };
+                    qwen4exp_kernels_->residualRead(rr_args, nullptr);
+                }
+            }
             hmark(4);
             return true;
         }
@@ -1274,6 +1831,8 @@ namespace
         AlignedVector<Q8_1Block> norm_q8_;
         AlignedVector<Q8_1Block> up_primary_q8_;
         AlignedVector<Q8_1Block> up_residual_q8_;
+        bool up_two_term_validated_ = false;
+        std::atomic<bool> fused_hc_failed_{false};
         float float_status_ = 1.0f;
     };
 
@@ -1334,8 +1893,8 @@ namespace
         StageBufferContract bufferContract() const override { return meta_.contract; }
         StageBufferRequirements getBufferRequirements() const override { return meta_.buffer_reqs; }
         WorkspaceRequirements getWorkspaceRequirements(int, int = 0, int = 0) const override { return meta_.workspace_reqs; }
-        void bindWorkspace(DeviceWorkspaceManager *ws) override { workspace_ = ws; }
-        void unbindWorkspace() override { workspace_ = nullptr; }
+        void bindWorkspace(DeviceWorkspaceManager *ws) override { workspace_ = ws; team_resolved_valid_ = false; }
+        void unbindWorkspace() override { workspace_ = nullptr; team_resolved_valid_ = false; }
         bool hasWorkspace() const override { return workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
         bool hasDynamicParams() const override { return true; }
@@ -1347,6 +1906,7 @@ namespace
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
+            team_resolved_valid_ = false;
             conv_kernel_->resetGPUState(nullptr);
             rec_kernel_->resetGPUState(nullptr);
         }
@@ -1357,79 +1917,95 @@ namespace
             return info;
         }
 
-        bool execute(IDeviceContext *ctx) override
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override
         {
-            if (!ctx || ctx->deviceId() != device())
-                return false;
+            return CPURetainedTeamMode::CollectiveTeam;
+        }
 
-            // Master-thread setup before entering the single OpenMP region.
+        void prepareForRetainedTeam(IDeviceContext *ctx) override
+        {
+            (void)ctx;
+            const ISALevel cur_isa = activeISALevel();
+            const int cur_threads = std::max(1, omp_get_max_threads());
+            const bool cur_detail =
+                PerfStatsCollector::isDomainEnabled("mk_sub") ||
+                PerfStatsCollector::isDomainEnabled("stage_cpu_detail");
+            const bool cur_kernel = PerfStatsCollector::isDomainEnabled("kernel");
+            const bool cur_perf = cur_detail || cur_kernel;
+            if (team_resolved_valid_ && team_resolved_.isa == cur_isa &&
+                team_resolved_max_threads_ == cur_threads)
+            {
+                if (cur_perf || team_resolved_perf_enabled_)
+                {
+                    team_resolved_.detail_timing = cur_detail;
+                    team_resolved_.kernel_stats = cur_kernel;
+                    team_resolved_perf_enabled_ = cur_perf;
+                }
+                team_ok_.store(true, std::memory_order_relaxed);
+                return;
+            }
             rec_kernel_->prepareMergedDecodeScratch(
                 decl_.rec.n_k_heads, decl_.rec.n_heads, decl_.rec.d_k);
-
-            std::span<float> partials{};
+            auto &r = team_resolved_;
+            r.partials = {};
             if (workspace_)
-                partials = CPUInvocationWorkspace::available<float>(workspace_, kCPUProjectionPartials);
-            if (partials.size() < required_partials_floats_)
+                r.partials = CPUInvocationWorkspace::available<float>(workspace_, kCPUProjectionPartials);
+            if (r.partials.size() < required_partials_floats_)
             {
-                if (fallback_partials_.size() < std::max(required_partials_floats_, kDefaultPartialScratchFloats))
-                    fallback_partials_.resize(std::max(required_partials_floats_, kDefaultPartialScratchFloats));
-                partials = std::span<float>(fallback_partials_.data(), fallback_partials_.size());
+                const size_t need = std::max(required_partials_floats_, kDefaultPartialScratchFloats);
+                if (fallback_partials_.size() < need)
+                    fallback_partials_.resize(need);
+                r.partials = std::span<float>(fallback_partials_.data(), fallback_partials_.size());
             }
-
-            float *rounded_a = nullptr;
+            r.rounded_a = nullptr;
             if (workspace_)
             {
                 auto ws_ra = CPUInvocationWorkspace::available<float>(workspace_, kCPUMegakernelRoundedA);
                 if (ws_ra.size() >= max_rounded_a_floats_)
-                    rounded_a = ws_ra.data();
+                    r.rounded_a = ws_ra.data();
             }
-            if (!rounded_a)
+            if (!r.rounded_a)
             {
                 if (fallback_rounded_a_.size() < max_rounded_a_floats_)
                     fallback_rounded_a_.resize(max_rounded_a_floats_);
-                rounded_a = fallback_rounded_a_.data();
+                r.rounded_a = fallback_rounded_a_.data();
             }
 
-            const auto *mixed_tensor = dynamic_cast<const TensorBase *>(decl_.proj.input);
-            const float *mixed_ptr = mixed_tensor->data();
-            const std::array<TensorBase *, 4> proj_out_tensors{
+            r.mixed_tensor = dynamic_cast<const TensorBase *>(decl_.proj.input);
+            r.mixed_ptr = r.mixed_tensor->data();
+            r.proj_out_tensors = {
                 dynamic_cast<TensorBase *>(decl_.proj.output_qkv),
                 dynamic_cast<TensorBase *>(decl_.proj.output_z),
                 dynamic_cast<TensorBase *>(decl_.proj.output_a),
                 dynamic_cast<TensorBase *>(decl_.proj.output_b)};
-            const std::array<float *, 4> proj_out_ptrs{
-                proj_out_tensors[0]->mutable_data(),
-                proj_out_tensors[1]->mutable_data(),
-                proj_out_tensors[2]->mutable_data(),
-                proj_out_tensors[3]->mutable_data()};
-
-            const float *conv_weight = dynamic_cast<const TensorBase *>(decl_.conv.weight)->data();
-            const float *conv_bias = decl_.conv.bias ? dynamic_cast<const TensorBase *>(decl_.conv.bias)->data() : nullptr;
-            float *conv_out = dynamic_cast<TensorBase *>(decl_.conv.output)->mutable_data();
-            float *conv_state = decl_.conv.conv_state;
-
-            const float *a_log = dynamic_cast<const TensorBase *>(decl_.rec.A_log)->data();
-            const float *dt_bias = dynamic_cast<const TensorBase *>(decl_.rec.dt_bias)->data();
-            float *rec_out = dynamic_cast<TensorBase *>(decl_.rec.output)->mutable_data();
-            float *rec_state = decl_.rec.recurrence_state;
-
+            r.proj_out_ptrs = {
+                r.proj_out_tensors[0]->mutable_data(),
+                r.proj_out_tensors[1]->mutable_data(),
+                r.proj_out_tensors[2]->mutable_data(),
+                r.proj_out_tensors[3]->mutable_data()};
+            r.conv_weight = dynamic_cast<const TensorBase *>(decl_.conv.weight)->data();
+            r.conv_bias = decl_.conv.bias ? dynamic_cast<const TensorBase *>(decl_.conv.bias)->data() : nullptr;
+            r.conv_out = dynamic_cast<TensorBase *>(decl_.conv.output)->mutable_data();
+            r.conv_state = decl_.conv.conv_state;
+            r.a_log = dynamic_cast<const TensorBase *>(decl_.rec.A_log)->data();
+            r.dt_bias = dynamic_cast<const TensorBase *>(decl_.rec.dt_bias)->data();
+            r.rec_out = dynamic_cast<TensorBase *>(decl_.rec.output)->mutable_data();
+            r.rec_state = decl_.rec.recurrence_state;
             const auto &gn = decl_.norm;
-            const float *gn_gamma = dynamic_cast<const TensorBase *>(gn.gamma)->data();
-            const size_t gn_feature_dim = static_cast<size_t>(gn.feature_dim);
-            const size_t gn_norm_dim = gn.norm_dim > 0 ? static_cast<size_t>(gn.norm_dim) : gn_feature_dim;
+            r.gn_gamma = dynamic_cast<const TensorBase *>(gn.gamma)->data();
+            r.gn_feature_dim = static_cast<size_t>(gn.feature_dim);
+            r.gn_norm_dim = gn.norm_dim > 0 ? static_cast<size_t>(gn.norm_dim) : r.gn_feature_dim;
             const size_t gn_gamma_numel = gn.gamma->numel();
-            const size_t gn_gamma_period = gn_gamma_numel < gn_norm_dim ? gn_gamma_numel : gn_norm_dim;
-            const int gn_groups = static_cast<int>(gn_feature_dim / gn_norm_dim);
+            r.gn_gamma_period = gn_gamma_numel < r.gn_norm_dim ? gn_gamma_numel : r.gn_norm_dim;
+            r.gn_groups = static_cast<int>(r.gn_feature_dim / r.gn_norm_dim);
+            r.out_proj_c_tensor = dynamic_cast<TensorBase *>(decl_.out_proj.C);
+            r.out_proj_dst = r.out_proj_c_tensor->mutable_data();
+            r.out_proj_in_tensor = dynamic_cast<const TensorBase *>(decl_.out_proj.A);
 
-            float *out_proj_dst = dynamic_cast<TensorBase *>(decl_.out_proj.C)->mutable_data();
-            const TensorBase *out_proj_in_tensor = dynamic_cast<const TensorBase *>(decl_.out_proj.A);
-
-            // Classify the 4 GDN projections once before entering the team.
-            std::array<FusedGemvDesc, 4> native_descs{};
-            int native_count = 0;
-            CPUProjectionNumericalPolicy shared_native_policy = CPUProjectionNumericalPolicy::BackendNative;
+            r.native_count = 0;
+            r.shared_native_policy = CPUProjectionNumericalPolicy::BackendNative;
             bool shared_native_policy_set = false;
-            bool all_native_same_policy = true;
+            r.all_native_same_policy = true;
             for (int i = 0; i < 4; ++i)
             {
                 if (projs_[i].isSingleQ8Native())
@@ -1437,36 +2013,68 @@ namespace
                     const auto pol = projs_[i].native_engine->packedWeights().numerical_policy;
                     if (!shared_native_policy_set)
                     {
-                        shared_native_policy = pol;
+                        r.shared_native_policy = pol;
                         shared_native_policy_set = true;
                     }
-                    else if (pol != shared_native_policy)
+                    else if (pol != r.shared_native_policy)
                     {
-                        all_native_same_policy = false;
+                        r.all_native_same_policy = false;
                     }
-                    native_descs[native_count++] = FusedGemvDesc{
+                    r.native_descs[r.native_count++] = FusedGemvDesc{
                         .packed = &projs_[i].native_engine->packedWeights(),
-                        .output = proj_out_ptrs[i],
+                        .output = r.proj_out_ptrs[i],
                         .bias = nullptr,
                         .N = projs_[i].n,
                         .policy_n = projs_[i].policy_n};
                 }
             }
+            r.hc_ptrs = hc_.resolvePointers();
+            r.isa = cur_isa;
+            r.detail_timing = cur_perf &&
+                (PerfStatsCollector::isDomainEnabled("mk_sub") ||
+                 PerfStatsCollector::isDomainEnabled("stage_cpu_detail"));
+            r.kernel_stats = cur_perf && PerfStatsCollector::isDomainEnabled("kernel");
+            team_resolved_max_threads_ = cur_threads;
+            team_resolved_perf_enabled_ = cur_perf;
+            team_resolved_valid_ = true;
+            team_ok_.store(true, std::memory_order_relaxed);
+        }
 
-            const auto hc_ptrs = hc_.resolvePointers();
-            const ISALevel isa = activeISALevel();
-            const bool detail_timing = PerfStatsCollector::isDomainEnabled("stage_cpu_detail");
+        bool execute(IDeviceContext *ctx) override
+        {
+            if (!ctx || ctx->deviceId() != device())
+                return false;
+
+            const bool already_in_team = ::llaminar::v2::inLexicalWorkshare();
+            if (!already_in_team)
+                prepareForRetainedTeam(ctx);
+
+            const auto &r = team_resolved_;
+            const auto &gn = decl_.norm;
             using Clock = std::chrono::steady_clock;
             std::array<Clock::time_point, 7> ts{};
             auto mark = [&](size_t idx) noexcept {
-                if (detail_timing && omp_get_thread_num() == 0)
+                if (r.detail_timing && omp_get_thread_num() == 0)
                     ts[idx] = Clock::now();
             };
-            std::atomic<bool> ok{true};
+            auto &ok = team_ok_;
+            if (!already_in_team)
+                ok.store(true, std::memory_order_relaxed);
             auto run_team = [&]() {
                 mark(0);
-                // 1. HC prefix -> mixed[H].
-                if (!hc_.executeInTeam(hc_ptrs, partials, rounded_a, workspace_, isa))
+                // 1. HC prefix -> mixed[H] (+ fused mixed_q8_ quantization when shared SingleQ8).
+                CPUHCLocalPrefix::PostReadQuant post_quant{};
+                const bool want_fused_mixed_q8 =
+                    r.native_count > 0 && r.all_native_same_policy &&
+                    !projs_[0].isTwoTermQ8Native() &&
+                    r.mixed_ptr == r.hc_ptrs.read_output;
+                if (want_fused_mixed_q8)
+                {
+                    post_quant.single_q8_dst = mixed_q8_.data();
+                    post_quant.single_q8_policy = r.shared_native_policy;
+                }
+                if (!hc_.executeInTeam(r.hc_ptrs, r.partials, r.rounded_a, workspace_, r.isa,
+                                       nullptr, want_fused_mixed_q8 ? &post_quant : nullptr))
                 {
                     ok.store(false, std::memory_order_relaxed);
                 }
@@ -1478,32 +2086,33 @@ namespace
                     if (projs_[0].isTwoTermQ8Native())
                     {
                         cpu::native_quantised::cpuQ8ResidualCorrectedProjection(
-                            projs_[0].native_engine->packedWeights(), mixed_ptr, proj_out_ptrs[0],
+                            projs_[0].native_engine->packedWeights(), r.mixed_ptr, r.proj_out_ptrs[0],
                             DeviceRowRange::fullyActive(1),
                             std::span<Q8_1Block>(mixed_q8_.data(), mixed_q8_.size()),
                             std::span<Q8_1Block>(mixed_residual_q8_.data(), mixed_residual_q8_.size()));
                     }
 
-                    if (native_count > 0 && all_native_same_policy)
+                    if (r.native_count > 0 && r.all_native_same_policy)
                     {
-                        quantizeRowToQ8InTeam(mixed_ptr, mixed_q8_.data(), decl_.proj.k, shared_native_policy);
-                        runNativeQuantisedBundleInTeam(mixed_q8_.data(), native_descs.data(), native_count, partials);
+                        if (!post_quant.fused_completed)
+                            quantizeRowToQ8InTeam(r.mixed_ptr, mixed_q8_.data(), decl_.proj.k, r.shared_native_policy);
+                        runNativeQuantisedBundleInTeam(mixed_q8_.data(), r.native_descs.data(), r.native_count, r.partials);
                     }
-                    else if (native_count > 0)
+                    else if (r.native_count > 0)
                     {
                         for (int i = 0; i < 4; ++i)
                         {
                             if (!projs_[i].isSingleQ8Native())
                                 continue;
-                            quantizeRowToQ8InTeam(mixed_ptr, mixed_q8_.data(), projs_[i].k,
+                            quantizeRowToQ8InTeam(r.mixed_ptr, mixed_q8_.data(), projs_[i].k,
                                                   projs_[i].native_engine->packedWeights().numerical_policy);
                             FusedGemvDesc d{
                                 .packed = &projs_[i].native_engine->packedWeights(),
-                                .output = proj_out_ptrs[i],
+                                .output = r.proj_out_ptrs[i],
                                 .bias = nullptr,
                                 .N = projs_[i].n,
                                 .policy_n = projs_[i].policy_n};
-                            runNativeQuantisedBundleInTeam(mixed_q8_.data(), &d, 1, partials);
+                            runNativeQuantisedBundleInTeam(mixed_q8_.data(), &d, 1, r.partials);
                         }
                     }
                     mark(2);
@@ -1514,7 +2123,7 @@ namespace
                     if (a_is_float && b_is_float)
                     {
                         paired_ab_done = runPairedFloatGemvInTeam(
-                            mixed_ptr, projs_[2], proj_out_ptrs[2], projs_[3], proj_out_ptrs[3], rounded_a, isa);
+                            r.mixed_ptr, projs_[2], r.proj_out_ptrs[2], projs_[3], r.proj_out_ptrs[3], r.rounded_a, r.isa);
                     }
                     for (int i = 0; i < 4; ++i)
                     {
@@ -1523,9 +2132,9 @@ namespace
                         if (paired_ab_done && (i == 2 || i == 3))
                             continue;
                         if (!runFloatGemvInTeam(
-                                mixed_tensor, mixed_ptr, projs_[i],
-                                proj_out_tensors[i], proj_out_ptrs[i],
-                                rounded_a, &float_status_, workspace_, isa))
+                                r.mixed_tensor, r.mixed_ptr, projs_[i],
+                                r.proj_out_tensors[i], r.proj_out_ptrs[i],
+                                r.rounded_a, &float_status_, workspace_, r.isa))
                         {
                             ok.store(false, std::memory_order_relaxed);
                         }
@@ -1537,8 +2146,8 @@ namespace
                 if (ok.load(std::memory_order_relaxed))
                 {
                     if (!conv_kernel_->forward(
-                            proj_out_ptrs[0], conv_weight, conv_bias,
-                            conv_out, conv_state, 1, decl_.conv.channels, decl_.conv.kernel_size, true))
+                            r.proj_out_ptrs[0], r.conv_weight, r.conv_bias,
+                            r.conv_out, r.conv_state, 1, decl_.conv.channels, decl_.conv.kernel_size, true))
                     {
                         ok.store(false, std::memory_order_relaxed);
                     }
@@ -1549,10 +2158,10 @@ namespace
                 if (ok.load(std::memory_order_relaxed))
                 {
                     if (!rec_kernel_->executeMergedDecodeInTeam(
-                            conv_out, decl_.conv.channels,
-                            proj_out_ptrs[2], proj_out_ptrs[3],
-                            a_log, dt_bias,
-                            rec_out, rec_state,
+                            r.conv_out, decl_.conv.channels,
+                            r.proj_out_ptrs[2], r.proj_out_ptrs[3],
+                            r.a_log, r.dt_bias,
+                            r.rec_out, r.rec_state,
                             decl_.rec.n_k_heads, decl_.rec.n_heads, decl_.rec.d_k, decl_.rec.d_v,
                             decl_.rec.global_v_head_offset, decl_.rec.use_qk_l2norm))
                     {
@@ -1561,38 +2170,61 @@ namespace
                 }
                 mark(5);
 
-                // 5. GatedRMSNorm (in-place on rec_out with gate = Z) + 6. ssm_out projection.
+                // 5. GatedRMSNorm (in-place on rec_out with gate = Z) + fused out_proj_q8_
+                //    quantization in L1d + 6. ssm_out projection (-1 barrier/layer).
                 if (ok.load(std::memory_order_relaxed))
                 {
+                    const bool fuse_gn_q8 =
+                        out_proj_.isSingleQ8Native() &&
+                        (r.gn_norm_dim % 64u) == 0u &&
+                        out_proj_.k == static_cast<int>(r.gn_feature_dim);
+                    const auto out_policy = fuse_gn_q8
+                        ? out_proj_.native_engine->packedWeights().numerical_policy
+                        : CPUProjectionNumericalPolicy::BackendNative;
+                    const size_t gn_pairs = r.gn_norm_dim / 64u;
 #pragma omp for schedule(static)
-                    for (int g = 0; g < gn_groups; ++g)
+                    for (int g = 0; g < r.gn_groups; ++g)
                     {
-                        const size_t offset = static_cast<size_t>(g) * gn_norm_dim;
+                        const size_t offset = static_cast<size_t>(g) * r.gn_norm_dim;
                         applyCPUGatedRMSNormGroup(
-                            rec_out, proj_out_ptrs[1], gn_gamma, rec_out,
-                            offset, gn_norm_dim, gn_gamma_period,
+                            r.rec_out, r.proj_out_ptrs[1], r.gn_gamma, r.rec_out,
+                            offset, r.gn_norm_dim, r.gn_gamma_period,
                             gn.eps, gn.subtract_one, gn.gate_activation);
+                        if (fuse_gn_q8)
+                        {
+                            const size_t kb_base = offset / 32u;
+                            for (size_t p = 0; p < gn_pairs; ++p)
+                            {
+                                const size_t kb = kb_base + p * 2u;
+                                cpu::native_quantised::quantizeTwoActivationBlocks(
+                                    r.rec_out + offset + p * 64u,
+                                    out_proj_q8_[kb], out_proj_q8_[kb + 1u], out_policy);
+                            }
+                        }
                     }
-                    // Implicit barrier publishes gated rec_out before ssm_out quantization.
+                    // Implicit barrier publishes gated rec_out (and out_proj_q8_ when fused).
 
                     if (out_proj_.isSingleQ8Native())
                     {
-                        quantizeRowToQ8InTeam(rec_out, out_proj_q8_.data(), out_proj_.k,
-                                              out_proj_.native_engine->packedWeights().numerical_policy);
+                        if (!fuse_gn_q8)
+                        {
+                            quantizeRowToQ8InTeam(r.rec_out, out_proj_q8_.data(), out_proj_.k,
+                                                  out_proj_.native_engine->packedWeights().numerical_policy);
+                        }
                         FusedGemvDesc d{
                             .packed = &out_proj_.native_engine->packedWeights(),
-                            .output = out_proj_dst,
+                            .output = r.out_proj_dst,
                             .bias = nullptr,
                             .N = out_proj_.n,
                             .policy_n = out_proj_.policy_n};
-                        runNativeQuantisedBundleInTeam(out_proj_q8_.data(), &d, 1, partials);
+                        runNativeQuantisedBundleInTeam(out_proj_q8_.data(), &d, 1, r.partials);
                     }
                     else
                     {
                         if (!runFloatGemvInTeam(
-                                out_proj_in_tensor, rec_out, out_proj_,
-                                dynamic_cast<TensorBase *>(decl_.out_proj.C), out_proj_dst,
-                                rounded_a, &float_status_, workspace_, isa))
+                                r.out_proj_in_tensor, r.rec_out, out_proj_,
+                                r.out_proj_c_tensor, r.out_proj_dst,
+                                r.rounded_a, &float_status_, workspace_, r.isa))
                         {
                             ok.store(false, std::memory_order_relaxed);
                         }
@@ -1602,31 +2234,73 @@ namespace
             };
             OMP_LAYER_PARALLEL(run_team(););
 
-            if (detail_timing && ok.load(std::memory_order_relaxed))
+            if (!already_in_team || omp_get_thread_num() == 0)
             {
-                const auto ns = [&](size_t a, size_t b) {
-                    return static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(ts[b] - ts[a]).count());
-                };
-                PerfStatsCollector::recordTimingNs("mk_sub", "gdn_1_hc", ns(0, 1), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "gdn_2_qkvz", ns(1, 2), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "gdn_3_ab", ns(2, 3), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "gdn_4_conv", ns(3, 4), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "gdn_5_rec", ns(4, 5), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "gdn_6_norm_out", ns(5, 6), "decode", "cpu");
-            }
+                if (r.detail_timing && ok.load(std::memory_order_relaxed))
+                {
+                    const auto ns = [&](size_t a, size_t b) {
+                        return static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(ts[b] - ts[a]).count());
+                    };
+                    PerfStatsCollector::recordTimingNs("mk_sub", "gdn_1_hc", ns(0, 1), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "gdn_2_qkvz", ns(1, 2), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "gdn_3_ab", ns(2, 3), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "gdn_4_conv", ns(3, 4), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "gdn_5_rec", ns(4, 5), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "gdn_6_norm_out", ns(5, 6), "decode", "cpu");
+                }
 
-            if (ok.load(std::memory_order_relaxed) && PerfStatsCollector::isDomainEnabled("kernel"))
-            {
-                PerfStatsCollector::addCounter(
-                    "kernel", "cpu_retained_gdn_megakernel_calls", 1.0, "decode", "cpu",
-                    {{"n_heads", std::to_string(decl_.rec.n_heads)},
-                     {"isa", isaLevelName(isa)}});
+                if (ok.load(std::memory_order_relaxed) && r.kernel_stats)
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel", "cpu_retained_gdn_megakernel_calls", 1.0, "decode", "cpu",
+                        {{"n_heads", std::to_string(decl_.rec.n_heads)},
+                         {"isa", isaLevelName(r.isa)}});
+                }
             }
             return ok.load(std::memory_order_relaxed);
         }
 
     private:
+        /** @brief Immutable per-step pointers/flags resolved once on thread 0 before the retained team. */
+        struct TeamResolvedState
+        {
+            std::span<float> partials{};
+            float *rounded_a = nullptr;
+            const TensorBase *mixed_tensor = nullptr;
+            const float *mixed_ptr = nullptr;
+            std::array<TensorBase *, 4> proj_out_tensors{};
+            std::array<float *, 4> proj_out_ptrs{};
+            const float *conv_weight = nullptr;
+            const float *conv_bias = nullptr;
+            float *conv_out = nullptr;
+            float *conv_state = nullptr;
+            const float *a_log = nullptr;
+            const float *dt_bias = nullptr;
+            float *rec_out = nullptr;
+            float *rec_state = nullptr;
+            const float *gn_gamma = nullptr;
+            size_t gn_feature_dim = 0;
+            size_t gn_norm_dim = 0;
+            size_t gn_gamma_period = 0;
+            int gn_groups = 0;
+            TensorBase *out_proj_c_tensor = nullptr;
+            float *out_proj_dst = nullptr;
+            const TensorBase *out_proj_in_tensor = nullptr;
+            std::array<FusedGemvDesc, 4> native_descs{};
+            int native_count = 0;
+            CPUProjectionNumericalPolicy shared_native_policy = CPUProjectionNumericalPolicy::BackendNative;
+            bool all_native_same_policy = true;
+            CPUHCLocalPrefix::ResolvedPointers hc_ptrs{};
+            ISALevel isa = ISALevel::Scalar;
+            bool detail_timing = false;
+            bool kernel_stats = false;
+        };
+        TeamResolvedState team_resolved_{};
+        bool team_resolved_valid_ = false;
+        int team_resolved_max_threads_ = 0;
+        bool team_resolved_perf_enabled_ = false;
+        std::atomic<bool> team_ok_{true};
         CPUHCLocalPrefix hc_;
         CPUGDNDeclaration decl_;
         ContractedStageMetadata meta_;
@@ -1827,10 +2501,11 @@ namespace
         void bindWorkspace(DeviceWorkspaceManager *ws) override
         {
             workspace_ = ws;
+            team_resolved_valid_ = false;
             if (query_proj_row_work_ && ws)
                 query_proj_row_work_->prepare(ws, nullptr);
         }
-        void unbindWorkspace() override { workspace_ = nullptr; }
+        void unbindWorkspace() override { workspace_ = nullptr; team_resolved_valid_ = false; }
         bool hasWorkspace() const override { return workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
         bool hasDynamicParams() const override { return true; }
@@ -1861,6 +2536,7 @@ namespace
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
+            team_resolved_valid_ = false;
             decl_.rope.pos_offset = 0;
             decl_.rope.position_ids = nullptr;
             position_ids_cache_.clear();
@@ -1872,178 +2548,121 @@ namespace
             return info;
         }
 
-        bool execute(IDeviceContext *ctx) override
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override
         {
-            if (!ctx || ctx->deviceId() != device())
-                return false;
+            return CPURetainedTeamMode::CollectiveTeam;
+        }
 
-            std::span<float> partials{};
-            if (workspace_)
-                partials = CPUInvocationWorkspace::available<float>(workspace_, kCPUProjectionPartials);
-            if (partials.size() < required_partials_floats_)
+        void prepareForRetainedTeam(IDeviceContext *ctx) override
+        {
+            (void)ctx;
+            const ISALevel cur_isa = activeISALevel();
+            const int cur_threads = std::max(1, omp_get_max_threads());
+            const bool cur_detail =
+                PerfStatsCollector::isDomainEnabled("mk_sub") ||
+                PerfStatsCollector::isDomainEnabled("stage_cpu_detail");
+            const bool cur_kernel = PerfStatsCollector::isDomainEnabled("kernel");
+            const bool cur_perf = cur_detail || cur_kernel;
+            if (team_resolved_valid_ && team_resolved_.isa == cur_isa &&
+                team_resolved_max_threads_ == cur_threads)
             {
-                if (fallback_partials_.size() < std::max(required_partials_floats_, kDefaultPartialScratchFloats))
-                    fallback_partials_.resize(std::max(required_partials_floats_, kDefaultPartialScratchFloats));
-                partials = std::span<float>(fallback_partials_.data(), fallback_partials_.size());
+                if (cur_perf || team_resolved_perf_enabled_)
+                {
+                    team_resolved_.detail_timing = cur_detail;
+                    team_resolved_.kernel_stats = cur_kernel;
+                    team_resolved_perf_enabled_ = cur_perf;
+                }
+                team_resolved_.rope_pos = decl_.rope.position_ids ? decl_.rope.position_ids[0] : decl_.rope.pos_offset;
+                if (decl_.query_proj && query_proj_row_work_ && !query_proj_row_work_->prepared())
+                    query_proj_row_work_->prepare(workspace_, nullptr);
+                team_ok_.store(true, std::memory_order_relaxed);
+                return;
             }
-
-            float *rounded_a = nullptr;
+            auto &r = team_resolved_;
+            r.partials = {};
+            if (workspace_)
+                r.partials = CPUInvocationWorkspace::available<float>(workspace_, kCPUProjectionPartials);
+            if (r.partials.size() < required_partials_floats_)
+            {
+                const size_t need = std::max(required_partials_floats_, kDefaultPartialScratchFloats);
+                if (fallback_partials_.size() < need)
+                    fallback_partials_.resize(need);
+                r.partials = std::span<float>(fallback_partials_.data(), fallback_partials_.size());
+            }
+            r.rounded_a = nullptr;
             if (workspace_)
             {
                 auto ws_ra = CPUInvocationWorkspace::available<float>(workspace_, kCPUMegakernelRoundedA);
                 if (ws_ra.size() >= max_rounded_a_floats_)
-                    rounded_a = ws_ra.data();
+                    r.rounded_a = ws_ra.data();
             }
-            if (!rounded_a)
+            if (!r.rounded_a)
             {
                 if (fallback_rounded_a_.size() < max_rounded_a_floats_)
                     fallback_rounded_a_.resize(max_rounded_a_floats_);
-                rounded_a = fallback_rounded_a_.data();
+                r.rounded_a = fallback_rounded_a_.data();
             }
+            if (decl_.query_proj && query_proj_row_work_ && !query_proj_row_work_->prepared())
+                query_proj_row_work_->prepare(workspace_, nullptr);
 
-            const auto *mixed_tensor = dynamic_cast<const TensorBase *>(decl_.qkv.input);
-            const float *mixed_ptr = mixed_tensor->data();
-            auto *q_raw_tensor = dynamic_cast<TensorBase *>(decl_.qkv.output_q);
-            auto *k_tensor = dynamic_cast<TensorBase *>(decl_.qkv.output_k);
-            auto *v_tensor = dynamic_cast<TensorBase *>(decl_.qkv.output_v);
+            r.mixed_tensor = dynamic_cast<const TensorBase *>(decl_.qkv.input);
+            r.mixed_ptr = r.mixed_tensor->data();
+            r.q_raw_tensor = dynamic_cast<TensorBase *>(decl_.qkv.output_q);
+            r.k_tensor = dynamic_cast<TensorBase *>(decl_.qkv.output_k);
+            r.v_tensor = dynamic_cast<TensorBase *>(decl_.qkv.output_v);
             auto *q_split_tensor = dynamic_cast<TensorBase *>(decl_.split.output_q);
             auto *gate_split_tensor = dynamic_cast<TensorBase *>(decl_.split.output_gate);
-            auto *key_out_tensor = dynamic_cast<TensorBase *>(decl_.key_proj.C);
-            auto *query_out_tensor = decl_.query_proj ? dynamic_cast<TensorBase *>(decl_.query_proj->C) : nullptr;
+            r.key_out_tensor = dynamic_cast<TensorBase *>(decl_.key_proj.C);
+            r.query_out_tensor = decl_.query_proj ? dynamic_cast<TensorBase *>(decl_.query_proj->C) : nullptr;
+            r.q_raw_ptr = r.q_raw_tensor->mutable_data();
+            r.k_ptr = r.k_tensor->mutable_data();
+            r.v_ptr = r.v_tensor->mutable_data();
+            r.q_split_ptr = q_split_tensor->mutable_data();
+            r.gate_split_ptr = gate_split_tensor->mutable_data();
+            r.key_out_ptr = r.key_out_tensor->mutable_data();
+            r.query_out_ptr = r.query_out_tensor ? r.query_out_tensor->mutable_data() : nullptr;
 
-            float *q_raw_ptr = q_raw_tensor->mutable_data();
-            float *k_ptr = k_tensor->mutable_data();
-            float *v_ptr = v_tensor->mutable_data();
-            float *q_split_ptr = q_split_tensor->mutable_data();
-            float *gate_split_ptr = gate_split_tensor->mutable_data();
-            float *key_out_ptr = key_out_tensor->mutable_data();
-            float *query_out_ptr = query_out_tensor ? query_out_tensor->mutable_data() : nullptr;
-
-            const auto &prep = std::get<QwenSparseAttentionStage::PrepareReplay>(decl_.replay_stage.operation);
             const auto &idx = std::get<QwenSparseAttentionStage::Indexer>(decl_.indexer_stage.operation);
             const auto &sel = std::get<QwenSparseAttentionStage::SelectedAttention>(decl_.attn_stage.operation);
             const auto *commit_op = decl_.commit_stage
                 ? &std::get<QwenSparseAttentionStage::CommitPartial>(decl_.commit_stage->operation)
                 : nullptr;
 
-            auto *replay_ptr = reinterpret_cast<qwen4exp::QwenSparseReplay *>(
+            r.replay_ptr = reinterpret_cast<qwen4exp::QwenSparseReplay *>(
                 bindingIntPtr(decl_.replay_stage.replay));
-            const int rope_pos = decl_.rope.position_ids ? decl_.rope.position_ids[0] : decl_.rope.pos_offset;
-            const auto angles = primitives::carve_rope_angle_rows(
-                std::span<std::byte>(rope_angle_storage_.data(), rope_angle_storage_.size()),
-                1, rope_eff_rotary_ / 2);
-
-            // PrepareReplay on master thread BEFORE entering the OpenMP team so `replay`
-            // is immediately ready for ranking-only qsa_query_proj gating and QSA indexer!
-            {
-                int cpu_cursor = prep.cache.ring_head(prep.layer, prep.sequence);
-                int cpu_count = prep.cache.get_cached_tokens(prep.layer, prep.sequence);
-                qwen4exp::QwenSparsePreAppendSequenceView seq_view{};
-                seq_view.capacity = decl_.replay_stage.tokenCapacity;
-                seq_view.cursor = &cpu_cursor;
-                seq_view.cached_tokens = &cpu_count;
-                seq_view.encoding = qwen4exp::QwenSparseRingCursor::OldestRow;
-                const auto *pos_input = std::get_if<Qwen4ExpIntInput>(&prep.positionIds);
-                const int first_pos = pos_input
-                    ? 0
-                    : std::get<QwenSparseAttentionStage::PrepareReplay::ContiguousPositions>(prep.positionIds).first;
-                qsa_kernels_->prepareReplay(
-                    {seq_view,
-                     prep.liveRows ? resolveIntInputPtr(*prep.liveRows) : nullptr,
-                     pos_input ? resolveIntInputPtr(*pos_input) : nullptr,
-                     replay_ptr, nullptr, decl_.replay_stage.rowCapacity, first_pos},
-                    nullptr);
-            }
-
-            // Evaluate whether optional qsa_query_proj is live for this token's visible prefix.
-            bool run_query_proj = false;
-            if (decl_.query_proj)
-            {
-                if (query_proj_row_work_)
-                {
-                    if (!query_proj_row_work_->prepared())
-                        query_proj_row_work_->prepare(workspace_, nullptr);
-                    query_proj_row_work_->requirePrepared(workspace_, nullptr);
-                    query_proj_row_work_->requirePublishedInputs();
-                    const cpu::native_quantised::CPUProjectionRowGrid grid(
-                        1, &query_proj_row_work_->work());
-                    run_query_proj = grid.active(0);
-                }
-                else
-                {
-                    run_query_proj = true;
-                }
-            }
-
-            // Build fused NativeQuantised bundle sharing mixed_q8 across Q, K, V, qsa_key, [qsa_query].
-            std::array<FusedGemvDesc, 5> native_descs{};
-            std::array<bool, 5> is_in_native_bundle{false, false, false, false, false};
-            int native_count = 0;
-            CPUProjectionNumericalPolicy shared_policy = CPUProjectionNumericalPolicy::BackendNative;
-            bool shared_policy_set = false;
-            auto tryAddToBundle = [&](int slot, const CPUProjectionHandle &h, float *dst)
-            {
-                if (!h.isSingleQ8Native())
-                    return;
-                const auto pol = h.native_engine->packedWeights().numerical_policy;
-                if (!shared_policy_set)
-                {
-                    shared_policy = pol;
-                    shared_policy_set = true;
-                }
-                else if (pol != shared_policy)
-                {
-                    return;
-                }
-                is_in_native_bundle[slot] = true;
-                native_descs[native_count++] = FusedGemvDesc{
-                    .packed = &h.native_engine->packedWeights(),
-                    .output = dst,
-                    .bias = nullptr,
-                    .N = h.n,
-                    .policy_n = h.policy_n};
-            };
-            tryAddToBundle(0, qkv_projs_[0], q_raw_ptr);
-            tryAddToBundle(1, qkv_projs_[1], k_ptr);
-            tryAddToBundle(2, qkv_projs_[2], v_ptr);
-            tryAddToBundle(3, key_proj_, key_out_ptr);
-            if (run_query_proj && query_proj_)
-                tryAddToBundle(4, *query_proj_, query_out_ptr);
-
+            r.rope_pos = decl_.rope.position_ids ? decl_.rope.position_ids[0] : decl_.rope.pos_offset;
             const auto k_prec = decl_.kv_append.kv_cache->k_precision();
             const auto v_prec = decl_.kv_append.kv_cache->v_precision();
-            const bool kv_is_q16 = (k_prec == ActivationPrecision::Q16_1 && v_prec == ActivationPrecision::Q16_1);
-            const bool kv_is_aq8 = (k_prec == ActivationPrecision::AQ8);
-            void *q16_k_raw = (kv_is_q16 && q16_k_scratch_) ? q16_k_scratch_->raw_mutable_data() : nullptr;
-            void *q16_v_raw = (kv_is_q16 && q16_v_scratch_) ? q16_v_scratch_->raw_mutable_data() : nullptr;
-
-            const float *q_gamma_ptr = (decl_.q_norm && decl_.q_norm->gamma)
+            r.kv_is_q16 = (k_prec == ActivationPrecision::Q16_1 && v_prec == ActivationPrecision::Q16_1);
+            r.kv_is_aq8 = (k_prec == ActivationPrecision::AQ8);
+            r.q16_k_raw = (r.kv_is_q16 && q16_k_scratch_) ? q16_k_scratch_->raw_mutable_data() : nullptr;
+            r.q16_v_raw = (r.kv_is_q16 && q16_v_scratch_) ? q16_v_scratch_->raw_mutable_data() : nullptr;
+            r.q_gamma_ptr = (decl_.q_norm && decl_.q_norm->gamma)
                 ? dynamic_cast<const TensorBase *>(decl_.q_norm->gamma)->data()
                 : nullptr;
-            const float *k_gamma_ptr = (decl_.k_norm && decl_.k_norm->gamma)
+            r.k_gamma_ptr = (decl_.k_norm && decl_.k_norm->gamma)
                 ? dynamic_cast<const TensorBase *>(decl_.k_norm->gamma)->data()
                 : nullptr;
-            const ISALevel isa = activeISALevel();
+            r.isa = activeISALevel();
+            r.attn_out_ptr = bindingFloatPtr(sel.output);
+            r.sel_query_ptr = bindingConstFloatPtr(sel.query);
+            r.sel_selected_ptr = bindingConstIntPtr(sel.selected);
+            r.sel_selected_count_ptr = bindingConstIntPtr(sel.selectedCount);
+            r.sel_gate_ptr = sel.gate ? bindingConstFloatPtr(*sel.gate) : nullptr;
+            r.commit_prior_ptr = commit_op ? bindingConstFloatPtr(commit_op->priorPartial) : nullptr;
+            r.commit_raw_ptr = commit_op ? bindingConstFloatPtr(commit_op->rawKey) : nullptr;
+            r.commit_accepted_ptr = commit_op ? resolveIntInputPtr(commit_op->acceptedRows) : nullptr;
+            r.commit_out_ptr = commit_op ? bindingFloatPtr(commit_op->outputPartial) : nullptr;
+            r.gate_in_ptr = dynamic_cast<const TensorBase *>(decl_.gate.gate)->data();
+            r.gate_out_ptr = dynamic_cast<TensorBase *>(decl_.gate.output)->mutable_data();
+            r.gate_cols = decl_.gate.feature_dim;
+            r.wo_c_tensor = dynamic_cast<TensorBase *>(decl_.wo.C);
+            r.wo_dst = r.wo_c_tensor->mutable_data();
+            r.wo_in_tensor = dynamic_cast<const TensorBase *>(decl_.wo.A);
 
-            float *attn_out_ptr = bindingFloatPtr(sel.output);
-            const float *sel_query_ptr = bindingConstFloatPtr(sel.query);
-            const std::int32_t *sel_selected_ptr = bindingConstIntPtr(sel.selected);
-            const std::int32_t *sel_selected_count_ptr = bindingConstIntPtr(sel.selectedCount);
-            const float *sel_gate_ptr = sel.gate ? bindingConstFloatPtr(*sel.gate) : nullptr;
-            const float *commit_prior_ptr = commit_op ? bindingConstFloatPtr(commit_op->priorPartial) : nullptr;
-            const float *commit_raw_ptr = commit_op ? bindingConstFloatPtr(commit_op->rawKey) : nullptr;
-            const std::int32_t *commit_accepted_ptr = commit_op ? resolveIntInputPtr(commit_op->acceptedRows) : nullptr;
-            float *commit_out_ptr = commit_op ? bindingFloatPtr(commit_op->outputPartial) : nullptr;
-            const float *gate_in_ptr = dynamic_cast<const TensorBase *>(decl_.gate.gate)->data();
-            float *gate_out_ptr = dynamic_cast<TensorBase *>(decl_.gate.output)->mutable_data();
-            const int gate_cols = decl_.gate.feature_dim;
-            float *wo_dst = dynamic_cast<TensorBase *>(decl_.wo.C)->mutable_data();
-            const TensorBase *wo_in_tensor = dynamic_cast<const TensorBase *>(decl_.wo.A);
-
-            // Pre-build immutable QSA indexer and commit structs.
             const bool no_ranking = (idx.queryDemand == qwen4exp::QwenSparseQueryDemand::ProvenNoRanking);
-            const qwen4exp::QwenSparseIndexer indexer_args{
-                .replay = replay_ptr,
+            r.indexer_args = qwen4exp::QwenSparseIndexer{
+                .replay = r.replay_ptr,
                 .query = no_ranking ? nullptr : bindingConstFloatPtr(idx.query),
                 .raw_keys = bindingConstFloatPtr(idx.rawKey),
                 .partial_keys = bindingConstFloatPtr(idx.priorPartial),
@@ -2070,39 +2689,175 @@ namespace
                 .pool_selection = idx.poolSelection,
                 .query_demand = idx.queryDemand,
             };
+            r.hc_ptrs = hc_.resolvePointers();
+            r.isa = cur_isa;
+            r.detail_timing = cur_perf &&
+                (PerfStatsCollector::isDomainEnabled("mk_sub") ||
+                 PerfStatsCollector::isDomainEnabled("stage_cpu_detail"));
+            r.kernel_stats = cur_perf && PerfStatsCollector::isDomainEnabled("kernel");
+            team_resolved_max_threads_ = cur_threads;
+            team_resolved_perf_enabled_ = cur_perf;
+            team_resolved_valid_ = true;
+            team_ok_.store(true, std::memory_order_relaxed);
+        }
 
-            const auto hc_ptrs = hc_.resolvePointers();
-            qwen4exp::QwenSparseKV shared_kv_view{};
-            const bool detail_timing = PerfStatsCollector::isDomainEnabled("stage_cpu_detail");
+        bool execute(IDeviceContext *ctx) override
+        {
+            if (!ctx || ctx->deviceId() != device())
+                return false;
+
+            const bool already_in_team = ::llaminar::v2::inLexicalWorkshare();
+            if (!already_in_team)
+                prepareForRetainedTeam(ctx);
+
+            const auto &r = team_resolved_;
+            const auto &prep = std::get<QwenSparseAttentionStage::PrepareReplay>(decl_.replay_stage.operation);
+            const auto &sel = std::get<QwenSparseAttentionStage::SelectedAttention>(decl_.attn_stage.operation);
+            const auto *commit_op = decl_.commit_stage
+                ? &std::get<QwenSparseAttentionStage::CommitPartial>(decl_.commit_stage->operation)
+                : nullptr;
+            const auto angles = primitives::carve_rope_angle_rows(
+                std::span<std::byte>(rope_angle_storage_.data(), rope_angle_storage_.size()),
+                1, rope_eff_rotary_ / 2);
+
+            auto &shared_kv_view = team_kv_view_;
             using Clock = std::chrono::steady_clock;
-            std::array<Clock::time_point, 7> ts{};
-            auto mark = [&](size_t idx) noexcept {
-                if (detail_timing && omp_get_thread_num() == 0)
-                    ts[idx] = Clock::now();
+            std::array<Clock::time_point, 8> ts{};
+            auto mark = [&](size_t idx_t) noexcept {
+                if (r.detail_timing && omp_get_thread_num() == 0)
+                    ts[idx_t] = Clock::now();
             };
-            std::atomic<bool> ok{true};
+            auto &ok = team_ok_;
+            if (!already_in_team)
+                ok.store(true, std::memory_order_relaxed);
 
             auto run_team = [&]() {
                 mark(0);
-                // 1. HC prefix -> mixed[H].
-                if (!hc_.executeInTeam(hc_ptrs, partials, rounded_a, workspace_, isa))
+                // Overlap replay metadata + RoPE single-position angle precompute with HC prefix
+                // (hc_.executeInTeam has multiple internal barriers before QKV/RoPE consume these).
+#pragma omp single nowait
+                {
+                    int cpu_cursor = prep.cache.ring_head(prep.layer, prep.sequence);
+                    int cpu_count = prep.cache.get_cached_tokens(prep.layer, prep.sequence);
+                    qwen4exp::QwenSparsePreAppendSequenceView seq_view{};
+                    seq_view.capacity = decl_.replay_stage.tokenCapacity;
+                    seq_view.cursor = &cpu_cursor;
+                    seq_view.cached_tokens = &cpu_count;
+                    seq_view.encoding = qwen4exp::QwenSparseRingCursor::OldestRow;
+                    const auto *pos_input = std::get_if<Qwen4ExpIntInput>(&prep.positionIds);
+                    const int first_pos = pos_input
+                        ? 0
+                        : std::get<QwenSparseAttentionStage::PrepareReplay::ContiguousPositions>(prep.positionIds).first;
+                    qsa_kernels_->prepareReplay(
+                        {seq_view,
+                         prep.liveRows ? resolveIntInputPtr(*prep.liveRows) : nullptr,
+                         pos_input ? resolveIntInputPtr(*pos_input) : nullptr,
+                         r.replay_ptr, nullptr, decl_.replay_stage.rowCapacity, first_pos},
+                        nullptr);
+
+                    team_run_query_proj_ = false;
+                    if (decl_.query_proj)
+                    {
+                        if (query_proj_row_work_)
+                        {
+                            query_proj_row_work_->requirePrepared(workspace_, nullptr);
+                            query_proj_row_work_->requirePublishedInputs();
+                            const cpu::native_quantised::CPUProjectionRowGrid grid(
+                                1, &query_proj_row_work_->work());
+                            team_run_query_proj_ = grid.active(0);
+                        }
+                        else
+                        {
+                            team_run_query_proj_ = true;
+                        }
+                    }
+                    if (r.rope_pos >= 0 && rope_eff_rotary_ > 0 && (rope_eff_rotary_ % 2) == 0)
+                    {
+                        primitives::prepare_rope_single_position_angles(
+                            rope_eff_rotary_, r.rope_pos, decl_.rope.theta_base, angles);
+                    }
+                }
+
+                // Determine shared SingleQ8 policy from always-active QKV/key projections so HC can
+                // fuse mixed_q8_ publication in L1d without waiting on team_run_query_proj_.
+                CPUProjectionNumericalPolicy shared_policy = CPUProjectionNumericalPolicy::BackendNative;
+                bool shared_policy_set = false;
+                auto probePolicy = [&](const CPUProjectionHandle &h) {
+                    if (!shared_policy_set && h.isSingleQ8Native())
+                    {
+                        shared_policy = h.native_engine->packedWeights().numerical_policy;
+                        shared_policy_set = true;
+                    }
+                };
+                probePolicy(qkv_projs_[0]);
+                probePolicy(qkv_projs_[1]);
+                probePolicy(qkv_projs_[2]);
+                probePolicy(key_proj_);
+
+                // 1. HC prefix -> mixed[H] (+ fused mixed_q8_ quantization when shared SingleQ8).
+                CPUHCLocalPrefix::PostReadQuant post_quant{};
+                const bool want_fused_mixed_q8 =
+                    shared_policy_set && r.mixed_ptr == r.hc_ptrs.read_output;
+                if (want_fused_mixed_q8)
+                {
+                    post_quant.single_q8_dst = mixed_q8_.data();
+                    post_quant.single_q8_policy = shared_policy;
+                }
+                if (!hc_.executeInTeam(r.hc_ptrs, r.partials, r.rounded_a, workspace_, r.isa,
+                                       nullptr, want_fused_mixed_q8 ? &post_quant : nullptr))
                     ok.store(false, std::memory_order_relaxed);
                 mark(1);
+
+                // Build native projection bundle after hc_.executeInTeam's barriers guarantee
+                // team_run_query_proj_ is published across every worker.
+                const bool run_query_proj = team_run_query_proj_;
+                std::array<FusedGemvDesc, 5> native_descs{};
+                std::array<bool, 5> is_in_native_bundle{false, false, false, false, false};
+                int native_count = 0;
+                auto tryAddToBundle = [&](int slot, const CPUProjectionHandle &h, float *dst)
+                {
+                    if (!h.isSingleQ8Native())
+                        return;
+                    const auto pol = h.native_engine->packedWeights().numerical_policy;
+                    if (!shared_policy_set)
+                    {
+                        shared_policy = pol;
+                        shared_policy_set = true;
+                    }
+                    else if (pol != shared_policy)
+                    {
+                        return;
+                    }
+                    is_in_native_bundle[slot] = true;
+                    native_descs[native_count++] = FusedGemvDesc{
+                        .packed = &h.native_engine->packedWeights(),
+                        .output = dst,
+                        .bias = nullptr,
+                        .N = h.n,
+                        .policy_n = h.policy_n};
+                };
+                tryAddToBundle(0, qkv_projs_[0], r.q_raw_ptr);
+                tryAddToBundle(1, qkv_projs_[1], r.k_ptr);
+                tryAddToBundle(2, qkv_projs_[2], r.v_ptr);
+                tryAddToBundle(3, key_proj_, r.key_out_ptr);
+                if (run_query_proj && query_proj_)
+                    tryAddToBundle(4, *query_proj_, r.query_out_ptr);
 
                 // 2. Fused Q, K, V, qsa_key, [qsa_query] projections sharing ONE mixed_q8 quantization!
                 if (ok.load(std::memory_order_relaxed))
                 {
                     if (native_count > 0)
                     {
-                        quantizeRowToQ8InTeam(mixed_ptr, mixed_q8_.data(), decl_.qkv.k, shared_policy);
-                        runNativeQuantisedBundleInTeam(mixed_q8_.data(), native_descs.data(), native_count, partials);
+                        if (!post_quant.fused_completed)
+                            quantizeRowToQ8InTeam(r.mixed_ptr, mixed_q8_.data(), decl_.qkv.k, shared_policy);
+                        runNativeQuantisedBundleInTeam(mixed_q8_.data(), native_descs.data(), native_count, r.partials);
                     }
                     bool paired_kq_done = false;
                     if (!is_in_native_bundle[3] && !key_proj_.isSingleQ8Native() &&
                         run_query_proj && query_proj_ && !is_in_native_bundle[4] && !query_proj_->isSingleQ8Native())
                     {
                         paired_kq_done = runPairedFloatGemvInTeam(
-                            mixed_ptr, key_proj_, key_out_ptr, *query_proj_, query_out_ptr, rounded_a, isa);
+                            r.mixed_ptr, key_proj_, r.key_out_ptr, *query_proj_, r.query_out_ptr, r.rounded_a, r.isa);
                     }
                     auto runFallbackProj = [&](int slot, const CPUProjectionHandle &h, TensorBase *dst_tensor, float *dst_ptr)
                     {
@@ -2110,7 +2865,7 @@ namespace
                             return;
                         if (h.isSingleQ8Native())
                         {
-                            quantizeRowToQ8InTeam(mixed_ptr, mixed_q8_.data(), h.k,
+                            quantizeRowToQ8InTeam(r.mixed_ptr, mixed_q8_.data(), h.k,
                                                   h.native_engine->packedWeights().numerical_policy);
                             FusedGemvDesc d{
                                 .packed = &h.native_engine->packedWeights(),
@@ -2118,82 +2873,100 @@ namespace
                                 .bias = nullptr,
                                 .N = h.n,
                                 .policy_n = h.policy_n};
-                            runNativeQuantisedBundleInTeam(mixed_q8_.data(), &d, 1, partials);
+                            runNativeQuantisedBundleInTeam(mixed_q8_.data(), &d, 1, r.partials);
                         }
                         else if (!runFloatGemvInTeam(
-                                     mixed_tensor, mixed_ptr, h, dst_tensor, dst_ptr,
-                                     rounded_a, &float_status_, workspace_, isa))
+                                     r.mixed_tensor, r.mixed_ptr, h, dst_tensor, dst_ptr,
+                                     r.rounded_a, &float_status_, workspace_, r.isa))
                         {
                             ok.store(false, std::memory_order_relaxed);
                         }
                     };
-                    runFallbackProj(0, qkv_projs_[0], q_raw_tensor, q_raw_ptr);
-                    runFallbackProj(1, qkv_projs_[1], k_tensor, k_ptr);
-                    runFallbackProj(2, qkv_projs_[2], v_tensor, v_ptr);
+                    runFallbackProj(0, qkv_projs_[0], r.q_raw_tensor, r.q_raw_ptr);
+                    runFallbackProj(1, qkv_projs_[1], r.k_tensor, r.k_ptr);
+                    runFallbackProj(2, qkv_projs_[2], r.v_tensor, r.v_ptr);
                     if (!paired_kq_done)
                     {
-                        runFallbackProj(3, key_proj_, key_out_tensor, key_out_ptr);
+                        runFallbackProj(3, key_proj_, r.key_out_tensor, r.key_out_ptr);
                         if (run_query_proj && query_proj_)
-                            runFallbackProj(4, *query_proj_, query_out_tensor, query_out_ptr);
+                            runFallbackProj(4, *query_proj_, r.query_out_tensor, r.query_out_ptr);
                     }
                 }
                 mark(2);
 
-                // 3+4. Fused QGateSplit + Q_RMSNorm + K_RMSNorm in ONE parallel loop (zero races, 1 barrier!).
+                // 3+4+5. Fused QGateSplit + Q_RMSNorm + K_RMSNorm + RoPE in ONE parallel loop
+                //        (collapses 4 team barriers -> 1 barrier while keeping each head hot in L1d!).
                 if (ok.load(std::memory_order_relaxed))
                 {
                     const int nh = decl_.split.n_heads;
                     const int hd = decl_.split.head_dim;
-                    const int nkh = (decl_.k_norm && k_gamma_ptr) ? decl_.k_norm->n_heads : 0;
-                    const int total_norm_heads = nh + nkh;
+                    const int nkh_norm = (decl_.k_norm && r.k_gamma_ptr) ? decl_.k_norm->n_heads : 0;
+                    const int nkh_rope = (r.rope_pos >= 0 && !decl_.rope.skip_k) ? decl_.rope.n_kv_heads : 0;
+                    const int nkh_total = std::max(nkh_norm, nkh_rope);
+                    const int total_heads = nh + nkh_total;
                     const float q_eps = decl_.q_norm ? decl_.q_norm->eps : 1e-6f;
                     const float k_eps = decl_.k_norm ? decl_.k_norm->eps : 1e-6f;
+                    const bool do_fused_rope =
+                        r.rope_pos >= 0 &&
+                        rope_eff_rotary_ > 0 && (rope_eff_rotary_ % 2) == 0 &&
+                        decl_.rope.n_heads == nh &&
+                        decl_.rope.head_dim == hd &&
+                        (!decl_.k_norm || decl_.k_norm->head_dim == hd);
+                    const float *cos_ptr = do_fused_rope ? angles.cos_row(0) : nullptr;
+                    const float *sin_ptr = do_fused_rope ? angles.sin_row(0) : nullptr;
+                    const int half_rotary = rope_eff_rotary_ / 2;
 #pragma omp for schedule(static)
-                    for (int h = 0; h < total_norm_heads; ++h)
+                    for (int h = 0; h < total_heads; ++h)
                     {
                         if (h < nh)
                         {
-                            const float *src = q_raw_ptr + static_cast<size_t>(h) * static_cast<size_t>(2 * hd);
-                            float *q_dst = q_split_ptr + static_cast<size_t>(h) * static_cast<size_t>(hd);
-                            std::memcpy(gate_split_ptr + static_cast<size_t>(h) * static_cast<size_t>(hd),
+                            const float *src = r.q_raw_ptr + static_cast<size_t>(h) * static_cast<size_t>(2 * hd);
+                            float *q_dst = r.q_split_ptr + static_cast<size_t>(h) * static_cast<size_t>(hd);
+                            std::memcpy(r.gate_split_ptr + static_cast<size_t>(h) * static_cast<size_t>(hd),
                                         src + hd, static_cast<size_t>(hd) * sizeof(float));
-                            if (q_gamma_ptr)
+                            if (r.q_gamma_ptr)
                             {
                                 primitives::rmsnorm_fused_vectorized_row(
-                                    src, q_gamma_ptr, q_dst, static_cast<size_t>(hd), q_eps);
+                                    src, r.q_gamma_ptr, q_dst, static_cast<size_t>(hd), q_eps);
                             }
                             else
                             {
                                 std::memcpy(q_dst, src, static_cast<size_t>(hd) * sizeof(float));
                             }
+                            if (do_fused_rope)
+                                primitives::rotate_rope_head_in_place(q_dst, cos_ptr, sin_ptr, half_rotary);
                         }
                         else
                         {
                             const int kh = h - nh;
-                            float *k_dst = k_ptr + static_cast<size_t>(kh) * static_cast<size_t>(decl_.k_norm->head_dim);
-                            primitives::rmsnorm_fused_vectorized_row(
-                                k_dst, k_gamma_ptr, k_dst,
-                                static_cast<size_t>(decl_.k_norm->head_dim), k_eps);
+                            const int k_hd = decl_.k_norm ? decl_.k_norm->head_dim : hd;
+                            float *k_dst = r.k_ptr + static_cast<size_t>(kh) * static_cast<size_t>(k_hd);
+                            if (kh < nkh_norm)
+                            {
+                                primitives::rmsnorm_fused_vectorized_row(
+                                    k_dst, r.k_gamma_ptr, k_dst, static_cast<size_t>(k_hd), k_eps);
+                            }
+                            if (do_fused_rope && kh < nkh_rope)
+                                primitives::rotate_rope_head_in_place(k_dst, cos_ptr, sin_ptr, half_rotary);
                         }
                     }
 
-                    // 5. RoPE (nested-safe via OMP_WORKSHARE_REGION).
-                    if (rope_pos >= 0)
+                    if (r.rope_pos >= 0 && !do_fused_rope)
                     {
-                        float *k_rope = decl_.rope.skip_k ? nullptr : k_ptr;
+                        float *k_rope = decl_.rope.skip_k ? nullptr : r.k_ptr;
                         if (rope_eff_rotary_ < decl_.rope.head_dim)
                         {
                             primitives::apply_rope_partial(
-                                q_split_ptr, k_rope, 1, decl_.rope.head_dim, rope_eff_rotary_,
+                                r.q_split_ptr, k_rope, 1, decl_.rope.head_dim, rope_eff_rotary_,
                                 decl_.rope.n_heads, decl_.rope.n_kv_heads,
-                                rope_pos, decl_.rope.theta_base, angles);
+                                r.rope_pos, decl_.rope.theta_base, angles);
                         }
                         else
                         {
                             primitives::apply_rope_vectorized(
-                                q_split_ptr, k_rope, 1, decl_.rope.head_dim,
+                                r.q_split_ptr, k_rope, 1, decl_.rope.head_dim,
                                 decl_.rope.n_heads, decl_.rope.n_kv_heads,
-                                rope_pos, decl_.rope.theta_base, angles);
+                                r.rope_pos, decl_.rope.theta_base, angles);
                         }
                     }
                 }
@@ -2202,11 +2975,11 @@ namespace
                 // 6. KV Cache Append (supports Q16_1, AQ8, FP16, FP32, Q8_1, TQ4, TQ8 with zero extra forks).
                 if (ok.load(std::memory_order_relaxed))
                 {
-                    if (kv_is_q16)
+                    if (r.kv_is_q16)
                     {
                         auto append_q16 = [&]() {
-                            if (!quantizeFP32ToQ16ScratchSerial(*q16_k_scratch_, q16_k_raw, k_ptr) ||
-                                !quantizeFP32ToQ16ScratchSerial(*q16_v_scratch_, q16_v_raw, v_ptr) ||
+                            if (!quantizeFP32ToQ16ScratchSerial(*q16_k_scratch_, r.q16_k_raw, r.k_ptr) ||
+                                !quantizeFP32ToQ16ScratchSerial(*q16_v_scratch_, r.q16_v_raw, r.v_ptr) ||
                                 !decl_.kv_append.kv_cache->append(
                                     decl_.kv_append.layer_idx, decl_.kv_append.seq_idx,
                                     q16_k_scratch_.get(), q16_v_scratch_.get(), 1))
@@ -2216,7 +2989,7 @@ namespace
                         };
                         OMP_SINGLE(append_q16);
                     }
-                    else if (kv_is_aq8)
+                    else if (r.kv_is_aq8)
                     {
                         if (!decl_.kv_append.kv_cache->append(
                                 decl_.kv_append.layer_idx, decl_.kv_append.seq_idx,
@@ -2238,7 +3011,7 @@ namespace
                 // 7. QSA Indexer + 8. SelectedAttention + 9. optional CommitPartial.
                 if (ok.load(std::memory_order_relaxed))
                 {
-                    qsa_kernels_->indexer(indexer_args, nullptr);
+                    qsa_kernels_->indexer(r.indexer_args, nullptr);
 
                     OMP_SINGLE([&]() {
                         shared_kv_view = sel.native.cache.acquireSparseAttentionNativeView(
@@ -2253,15 +3026,16 @@ namespace
                             shared_kv_view.key_position_capacity = sel.keyPositionCapacity;
                         }
                     });
+                    mark(5);
 
                     const qwen4exp::QwenSparseAttention attn_args{
-                        .replay = replay_ptr,
-                        .query = sel_query_ptr,
+                        .replay = r.replay_ptr,
+                        .query = r.sel_query_ptr,
                         .kv = shared_kv_view,
-                        .selected = sel_selected_ptr,
-                        .selected_count = sel_selected_count_ptr,
-                        .gate = sel_gate_ptr,
-                        .output = attn_out_ptr,
+                        .selected = r.sel_selected_ptr,
+                        .selected_count = r.sel_selected_count_ptr,
+                        .gate = r.sel_gate_ptr,
+                        .output = r.attn_out_ptr,
                         .gpu_partials = nullptr,
                         .observations = nullptr,
                         .row_capacity = decl_.attn_stage.rowCapacity,
@@ -2277,83 +3051,165 @@ namespace
                     if (commit_op)
                     {
                         qsa_kernels_->commitPartial(
-                            {replay_ptr,
-                             commit_prior_ptr,
-                             commit_raw_ptr,
+                            {r.replay_ptr,
+                             r.commit_prior_ptr,
+                             r.commit_raw_ptr,
                              AcceptedRequestPrefixes::counted(
                                  DeviceRequestRowRanges::deviceCounted(
-                                     1, decl_.commit_stage->rowCapacity, &replay_ptr->live_rows),
-                                 commit_accepted_ptr),
-                             commit_out_ptr},
+                                     1, decl_.commit_stage->rowCapacity, &r.replay_ptr->live_rows),
+                                 r.commit_accepted_ptr),
+                             r.commit_out_ptr},
                             nullptr);
                     }
                 }
-                mark(5);
+                else
+                {
+                    mark(5);
+                }
+                mark(6);
 
-                // 10. AttentionOutputGate (parallel 256-element SIMD blocks) + 11. Wo projection.
+                // 10. AttentionOutputGate (parallel 64-element SIMD blocks + fused wo_q8_ in L1d)
+                //     + 11. Wo projection (-1 barrier/layer, full worker parallelism).
                 if (ok.load(std::memory_order_relaxed))
                 {
-                    constexpr int kGateBlock = 256;
-                    const int n_blocks = (gate_cols + kGateBlock - 1) / kGateBlock;
+                    const bool fuse_gate_q8 =
+                        wo_proj_.isSingleQ8Native() &&
+                        (r.gate_cols % 64) == 0 &&
+                        wo_proj_.k == r.gate_cols;
+                    const auto wo_policy = fuse_gate_q8
+                        ? wo_proj_.native_engine->packedWeights().numerical_policy
+                        : CPUProjectionNumericalPolicy::BackendNative;
+                    constexpr int kGateBlock = 64;
+                    const int n_blocks = (r.gate_cols + kGateBlock - 1) / kGateBlock;
 #pragma omp for schedule(static)
                     for (int blk = 0; blk < n_blocks; ++blk)
                     {
                         const int off = blk * kGateBlock;
-                        const size_t cnt = static_cast<size_t>(std::min(kGateBlock, gate_cols - off));
+                        const size_t cnt = static_cast<size_t>(std::min(kGateBlock, r.gate_cols - off));
                         applyCPUAttentionOutputGateRange(
-                            gate_in_ptr + off, attn_out_ptr + off, gate_out_ptr + off, cnt);
+                            r.gate_in_ptr + off, r.attn_out_ptr + off, r.gate_out_ptr + off, cnt);
+                        if (fuse_gate_q8)
+                        {
+                            cpu::native_quantised::quantizeTwoActivationBlocks(
+                                r.gate_out_ptr + off,
+                                wo_q8_[static_cast<size_t>(blk * 2)],
+                                wo_q8_[static_cast<size_t>(blk * 2 + 1)],
+                                wo_policy);
+                        }
                     }
-                    // Implicit barrier publishes gated attention output before Wo quantization.
+                    // Implicit barrier publishes gated attention output (and wo_q8_ when fused).
 
                     if (wo_proj_.isSingleQ8Native())
                     {
-                        quantizeRowToQ8InTeam(gate_out_ptr, wo_q8_.data(), wo_proj_.k,
-                                              wo_proj_.native_engine->packedWeights().numerical_policy);
+                        if (!fuse_gate_q8)
+                        {
+                            quantizeRowToQ8InTeam(r.gate_out_ptr, wo_q8_.data(), wo_proj_.k,
+                                                  wo_proj_.native_engine->packedWeights().numerical_policy);
+                        }
                         FusedGemvDesc d{
                             .packed = &wo_proj_.native_engine->packedWeights(),
-                            .output = wo_dst,
+                            .output = r.wo_dst,
                             .bias = nullptr,
                             .N = wo_proj_.n,
                             .policy_n = wo_proj_.policy_n};
-                        runNativeQuantisedBundleInTeam(wo_q8_.data(), &d, 1, partials);
+                        runNativeQuantisedBundleInTeam(wo_q8_.data(), &d, 1, r.partials);
                     }
                     else if (!runFloatGemvInTeam(
-                                 wo_in_tensor, gate_out_ptr, wo_proj_,
-                                 dynamic_cast<TensorBase *>(decl_.wo.C), wo_dst,
-                                 rounded_a, &float_status_, workspace_, isa))
+                                 r.wo_in_tensor, r.gate_out_ptr, wo_proj_,
+                                 r.wo_c_tensor, r.wo_dst,
+                                 r.rounded_a, &float_status_, workspace_, r.isa))
                     {
                         ok.store(false, std::memory_order_relaxed);
                     }
                 }
-                mark(6);
+                mark(7);
             };
             OMP_LAYER_PARALLEL(run_team(););
 
-            if (detail_timing && ok.load(std::memory_order_relaxed))
+            if (!already_in_team || omp_get_thread_num() == 0)
             {
-                const auto ns = [&](size_t a, size_t b) {
-                    return static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(ts[b] - ts[a]).count());
-                };
-                PerfStatsCollector::recordTimingNs("mk_sub", "qsa_1_hc", ns(0, 1), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "qsa_2_qkv_key", ns(1, 2), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "qsa_3_norm_rope", ns(2, 3), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "qsa_4_kv_append", ns(3, 4), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "qsa_5_idx_attn", ns(4, 5), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "qsa_6_gate_wo", ns(5, 6), "decode", "cpu");
-            }
+                if (r.detail_timing && ok.load(std::memory_order_relaxed))
+                {
+                    const auto ns = [&](size_t a, size_t b) {
+                        return static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(ts[b] - ts[a]).count());
+                    };
+                    PerfStatsCollector::recordTimingNs("mk_sub", "qsa_1_hc", ns(0, 1), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "qsa_2_qkv_key", ns(1, 2), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "qsa_3_norm_rope", ns(2, 3), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "qsa_4_kv_append", ns(3, 4), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "qsa_5a_idx", ns(4, 5), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "qsa_5b_attn", ns(5, 6), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "qsa_6_gate_wo", ns(6, 7), "decode", "cpu");
+                }
 
-            if (ok.load(std::memory_order_relaxed) && PerfStatsCollector::isDomainEnabled("kernel"))
-            {
-                PerfStatsCollector::addCounter(
-                    "kernel", "cpu_retained_qsa_megakernel_calls", 1.0, "decode", "cpu",
-                    {{"query_heads", std::to_string(sel.queryHeads)},
-                     {"isa", isaLevelName(isa)}});
+                if (ok.load(std::memory_order_relaxed) && r.kernel_stats)
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel", "cpu_retained_qsa_megakernel_calls", 1.0, "decode", "cpu",
+                        {{"query_heads", std::to_string(sel.queryHeads)},
+                         {"isa", isaLevelName(r.isa)}});
+                }
             }
             return ok.load(std::memory_order_relaxed);
         }
 
     private:
+        /** @brief Immutable per-step pointers/flags resolved once on thread 0 before the retained team. */
+        struct TeamResolvedState
+        {
+            std::span<float> partials{};
+            float *rounded_a = nullptr;
+            const TensorBase *mixed_tensor = nullptr;
+            const float *mixed_ptr = nullptr;
+            TensorBase *q_raw_tensor = nullptr;
+            TensorBase *k_tensor = nullptr;
+            TensorBase *v_tensor = nullptr;
+            TensorBase *key_out_tensor = nullptr;
+            TensorBase *query_out_tensor = nullptr;
+            float *q_raw_ptr = nullptr;
+            float *k_ptr = nullptr;
+            float *v_ptr = nullptr;
+            float *q_split_ptr = nullptr;
+            float *gate_split_ptr = nullptr;
+            float *key_out_ptr = nullptr;
+            float *query_out_ptr = nullptr;
+            qwen4exp::QwenSparseReplay *replay_ptr = nullptr;
+            int rope_pos = 0;
+            bool kv_is_q16 = false;
+            bool kv_is_aq8 = false;
+            void *q16_k_raw = nullptr;
+            void *q16_v_raw = nullptr;
+            const float *q_gamma_ptr = nullptr;
+            const float *k_gamma_ptr = nullptr;
+            ISALevel isa = ISALevel::Scalar;
+            float *attn_out_ptr = nullptr;
+            const float *sel_query_ptr = nullptr;
+            const std::int32_t *sel_selected_ptr = nullptr;
+            const std::int32_t *sel_selected_count_ptr = nullptr;
+            const float *sel_gate_ptr = nullptr;
+            const float *commit_prior_ptr = nullptr;
+            const float *commit_raw_ptr = nullptr;
+            const std::int32_t *commit_accepted_ptr = nullptr;
+            float *commit_out_ptr = nullptr;
+            const float *gate_in_ptr = nullptr;
+            float *gate_out_ptr = nullptr;
+            int gate_cols = 0;
+            TensorBase *wo_c_tensor = nullptr;
+            float *wo_dst = nullptr;
+            const TensorBase *wo_in_tensor = nullptr;
+            qwen4exp::QwenSparseIndexer indexer_args{};
+            CPUHCLocalPrefix::ResolvedPointers hc_ptrs{};
+            bool detail_timing = false;
+            bool kernel_stats = false;
+        };
+        TeamResolvedState team_resolved_{};
+        bool team_resolved_valid_ = false;
+        int team_resolved_max_threads_ = 0;
+        bool team_resolved_perf_enabled_ = false;
+        std::atomic<bool> team_ok_{true};
+        bool team_run_query_proj_ = false;
+        qwen4exp::QwenSparseKV team_kv_view_{};
         CPUHCLocalPrefix hc_;
         CPUQSADeclaration decl_;
         ContractedStageMetadata meta_;
@@ -2526,8 +3382,14 @@ namespace
                     cpu_k->bindRouterQ8HiddenStorage(storage);
             }
             workspace_ = ws;
+            team_resolved_valid_ = false;
         }
-        void unbindWorkspace() override { workspace_ = nullptr; }
+        void unbindWorkspace() override { workspace_ = nullptr; team_resolved_valid_ = false; }
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            team_resolved_valid_ = false;
+        }
         bool hasWorkspace() const override { return workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
         StageDumpInfo buildDumpInfoImpl() const override
@@ -2540,100 +3402,106 @@ namespace
             return info;
         }
 
-        bool execute(IDeviceContext *ctx) override
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override
         {
-            if (!ctx || ctx->deviceId() != device())
-                return false;
+            return CPURetainedTeamMode::CollectiveTeam;
+        }
 
-            // Resolve CPUMoEKernel owner before entering the OpenMP team (zero locks in team).
-            CPUMoEKernel *cpu_moe_kernel = resolveCPUMoEKernel();
-            if (!cpu_moe_kernel)
-                return false;
-            if (workspace_)
+        void prepareForRetainedTeam(IDeviceContext *ctx) override
+        {
+            (void)ctx;
+            const ISALevel cur_isa = activeISALevel();
+            const int cur_threads = std::max(1, omp_get_max_threads());
+            const bool cur_detail =
+                PerfStatsCollector::isDomainEnabled("mk_sub") ||
+                PerfStatsCollector::isDomainEnabled("stage_cpu_detail");
+            const bool cur_kernel = PerfStatsCollector::isDomainEnabled("kernel");
+            const bool cur_perf = cur_detail || cur_kernel;
+            if (team_resolved_valid_ && team_resolved_.isa == cur_isa &&
+                team_resolved_max_threads_ == cur_threads)
+            {
+                if (cur_perf || team_resolved_perf_enabled_)
+                {
+                    team_resolved_.detail_timing = cur_detail;
+                    team_resolved_.kernel_stats = cur_kernel;
+                    team_resolved_perf_enabled_ = cur_perf;
+                }
+                team_ok_.store(true, std::memory_order_relaxed);
+                return;
+            }
+            team_cpu_moe_kernel_ = resolveCPUMoEKernel();
+            if (team_cpu_moe_kernel_ && workspace_)
             {
                 if (const auto storage = workspace_->cpuRouterQ8Storage())
-                    cpu_moe_kernel->bindRouterQ8HiddenStorage(storage);
+                    team_cpu_moe_kernel_->bindRouterQ8HiddenStorage(storage);
             }
-
-            std::span<float> partials{};
+            auto &r = team_resolved_;
+            r.partials = {};
             if (workspace_)
-                partials = CPUInvocationWorkspace::available<float>(workspace_, kCPUProjectionPartials);
-            if (partials.size() < required_partials_floats_)
+                r.partials = CPUInvocationWorkspace::available<float>(workspace_, kCPUProjectionPartials);
+            if (r.partials.size() < required_partials_floats_)
             {
-                if (fallback_partials_.size() < std::max(required_partials_floats_, kDefaultPartialScratchFloats))
-                    fallback_partials_.resize(std::max(required_partials_floats_, kDefaultPartialScratchFloats));
-                partials = std::span<float>(fallback_partials_.data(), fallback_partials_.size());
+                const size_t need = std::max(required_partials_floats_, kDefaultPartialScratchFloats);
+                if (fallback_partials_.size() < need)
+                    fallback_partials_.resize(need);
+                r.partials = std::span<float>(fallback_partials_.data(), fallback_partials_.size());
             }
-
-            float *rounded_a = nullptr;
+            r.rounded_a = nullptr;
             if (workspace_)
             {
                 auto ws_ra = CPUInvocationWorkspace::available<float>(workspace_, kCPUMegakernelRoundedA);
                 if (ws_ra.size() >= max_rounded_a_floats_)
-                    rounded_a = ws_ra.data();
+                    r.rounded_a = ws_ra.data();
             }
-            if (!rounded_a)
+            if (!r.rounded_a)
             {
                 if (fallback_rounded_a_.size() < max_rounded_a_floats_)
                     fallback_rounded_a_.resize(max_rounded_a_floats_);
-                rounded_a = fallback_rounded_a_.data();
+                r.rounded_a = fallback_rounded_a_.data();
             }
 
             const auto &rt = decl_.router;
             const auto &sh = decl_.shared;
-            const int d_model = rt.d_model;
-            const int num_experts = rt.num_experts;
-            const int top_k = rt.top_k;
-            const int sh_inter = sh.intermediate;
-
-            const float *mixed_ptr = rt.input->data();
-            float *out_idx_ptr = rt.output_indices->mutable_data();
-            float *out_wt_ptr = rt.output_weights->mutable_data();
-            float *shared_out_ptr = sh.output->mutable_data();
-
-            const TensorType gate_type = rt.gate_weights->native_type();
-            const void *router_gate_data = nullptr;
-            if (gate_type == TensorType::FP16)
-                router_gate_data = dynamic_cast<const FP16Tensor *>(rt.gate_weights)->typed_data();
-            else if (gate_type == TensorType::BF16)
-                router_gate_data = dynamic_cast<const BF16Tensor *>(rt.gate_weights)->typed_data();
+            r.d_model = rt.d_model;
+            r.num_experts = rt.num_experts;
+            r.top_k = rt.top_k;
+            r.sh_inter = sh.intermediate;
+            r.mixed_ptr = rt.input->data();
+            r.out_idx_ptr = rt.output_indices->mutable_data();
+            r.out_wt_ptr = rt.output_weights->mutable_data();
+            r.shared_out_ptr = sh.output->mutable_data();
+            r.gate_type = rt.gate_weights->native_type();
+            if (r.gate_type == TensorType::FP16)
+                r.router_gate_data = dynamic_cast<const FP16Tensor *>(rt.gate_weights)->typed_data();
+            else if (r.gate_type == TensorType::BF16)
+                r.router_gate_data = dynamic_cast<const BF16Tensor *>(rt.gate_weights)->typed_data();
             else
-                router_gate_data = rt.gate_weights->data();
-
-            const bool shared_all_native =
+                r.router_gate_data = rt.gate_weights->data();
+            r.shared_all_native =
                 shared_gate_.isSingleQ8Native() && shared_up_.isSingleQ8Native() && shared_down_.isSingleQ8Native();
-
-            std::array<int, kDeviceMoEMaxTopK> selected_experts{};
-            std::array<float, kDeviceMoEMaxTopK> selected_weights{};
-            const Q8_1Block *published_router_q8 = nullptr;
-            float shared_gate_scalar = 0.0f;
-            const ISALevel isa = activeISALevel();
-
-            // Shared expert scratch pointers (prefer arena scratch if sized, else stage-owned).
-            float *sh_gate_ptr = (sh.gate_scratch && sh.gate_scratch->numel() >= static_cast<size_t>(sh_inter))
+            r.isa = activeISALevel();
+            r.sh_gate_ptr = (sh.gate_scratch && sh.gate_scratch->numel() >= static_cast<size_t>(r.sh_inter))
                 ? sh.gate_scratch->mutable_data()
                 : shared_gate_buf_.data();
-            float *sh_up_ptr = (sh.up_scratch && sh.up_scratch->numel() >= static_cast<size_t>(sh_inter))
+            r.sh_up_ptr = (sh.up_scratch && sh.up_scratch->numel() >= static_cast<size_t>(r.sh_inter))
                 ? sh.up_scratch->mutable_data()
                 : shared_up_buf_.data();
-
-            const auto hc_ptrs = hc_.resolvePointers();
-            const float *shared_gate_inp_ptr = (decl_.shared_gate && decl_.shared_gate->gate_inp)
+            r.hc_ptrs = hc_.resolvePointers();
+            r.shared_gate_inp_ptr = (decl_.shared_gate && decl_.shared_gate->gate_inp)
                 ? decl_.shared_gate->gate_inp->data()
                 : nullptr;
-            float *routed_out = decl_.routed ? decl_.routed->output->mutable_data() : nullptr;
-            float *combined_out = (decl_.shared_gate && decl_.shared_gate->combined_output)
+            r.routed_out = decl_.routed ? decl_.routed->output->mutable_data() : nullptr;
+            r.combined_out = (decl_.shared_gate && decl_.shared_gate->combined_output)
                 ? decl_.shared_gate->combined_output->mutable_data()
                 : nullptr;
 
-            // Borrow ONE shared L3-hot workspace slab for routed expert scratch across all 48 FFN layers.
-            float *routed_gate_ptr = nullptr;
-            float *routed_up_ptr = nullptr;
-            float *routed_down_ptr = nullptr;
-            Q8_1Block *routed_swiglu_q8_ptr = nullptr;
-            size_t routed_swiglu_q8_count = 0;
-            float *routed_splitk_ptr = nullptr;
-            size_t routed_splitk_cap = 0;
+            r.routed_gate_ptr = nullptr;
+            r.routed_up_ptr = nullptr;
+            r.routed_down_ptr = nullptr;
+            r.routed_swiglu_q8_ptr = nullptr;
+            r.routed_swiglu_q8_count = 0;
+            r.routed_splitk_ptr = nullptr;
+            r.routed_splitk_cap = 0;
             if (decl_.routed)
             {
                 std::byte *slab = nullptr;
@@ -2650,39 +3518,102 @@ namespace
                         fallback_routed_scratch_.resize(routed_scratch_layout_.total_bytes);
                     slab = fallback_routed_scratch_.data();
                 }
-                routed_gate_ptr = reinterpret_cast<float *>(slab + routed_scratch_layout_.gate_offset);
-                routed_up_ptr = reinterpret_cast<float *>(slab + routed_scratch_layout_.up_offset);
-                routed_down_ptr = reinterpret_cast<float *>(slab + routed_scratch_layout_.down_offset);
-                routed_swiglu_q8_ptr = reinterpret_cast<Q8_1Block *>(slab + routed_scratch_layout_.swiglu_q8_offset);
-                routed_swiglu_q8_count =
-                    static_cast<size_t>(top_k + 1) * ((static_cast<size_t>(decl_.routed->expert_intermediate) + 31u) / 32u);
-                routed_splitk_ptr = reinterpret_cast<float *>(slab + routed_scratch_layout_.splitk_offset);
-                routed_splitk_cap = CPUNativeQuantisedGemmKernel::kStandaloneMoESplitKScratchFloats;
+                r.routed_gate_ptr = reinterpret_cast<float *>(slab + routed_scratch_layout_.gate_offset);
+                r.routed_up_ptr = reinterpret_cast<float *>(slab + routed_scratch_layout_.up_offset);
+                r.routed_down_ptr = reinterpret_cast<float *>(slab + routed_scratch_layout_.down_offset);
+                r.routed_swiglu_q8_ptr = reinterpret_cast<Q8_1Block *>(slab + routed_scratch_layout_.swiglu_q8_offset);
+                r.routed_swiglu_q8_count =
+                    static_cast<size_t>(r.top_k + 1) *
+                    ((static_cast<size_t>(decl_.routed->expert_intermediate) + 31u) / 32u);
+                r.routed_splitk_ptr = reinterpret_cast<float *>(slab + routed_scratch_layout_.splitk_offset);
+                r.routed_splitk_cap = CPUNativeQuantisedGemmKernel::kStandaloneMoESplitKScratchFloats;
+
+                const int expected_workers = std::max(1, omp_get_max_threads());
+                if (cached_moe_workers_ != expected_workers || cached_moe_isa_ != r.isa)
+                    rebuildCachedMoERowEntries(expected_workers, r.isa);
             }
 
-            const bool fuse_shared_into_routed =
+            r.fuse_shared_into_routed =
                 decl_.routed.has_value() &&
-                shared_all_native &&
-                sh_inter == decl_.routed->expert_intermediate &&
-                (d_model % 64) == 0 &&
-                (sh_inter % 64) == 0 &&
-                static_cast<size_t>(top_k + 1) <= CPUNativeQuantisedGemmKernel::StandaloneMoEOneRowPlan::kMaxRoutes &&
+                r.shared_all_native &&
+                r.sh_inter == decl_.routed->expert_intermediate &&
+                (r.d_model % 64) == 0 &&
+                (r.sh_inter % 64) == 0 &&
+                static_cast<size_t>(r.top_k + 1) <= CPUNativeQuantisedGemmKernel::StandaloneMoEOneRowPlan::kMaxRoutes &&
                 CPUNativeQuantisedGemmKernel::supportsStandaloneMoEOneRowInTeam(
-                    d_model, sh_inter, static_cast<size_t>(top_k + 1));
-            const CPUProjectionNumericalPolicy shared_in_policy = shared_all_native
+                    r.d_model, r.sh_inter, static_cast<size_t>(r.top_k + 1));
+            r.shared_in_policy = r.shared_all_native
                 ? shared_gate_.native_engine->packedWeights().numerical_policy
                 : CPUProjectionNumericalPolicy::BackendNative;
-            const bool need_shared_in_q8_pre_router =
-                fuse_shared_into_routed &&
-                shared_in_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert;
-            const bool parallel_router_q8 = decl_.routed.has_value() && ((d_model % 64) == 0);
+            r.need_shared_in_q8_pre_router =
+                r.fuse_shared_into_routed &&
+                r.shared_in_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert;
+            r.parallel_router_q8 = decl_.routed.has_value() && ((r.d_model % 64) == 0);
+            r.isa = cur_isa;
+            r.detail_timing = cur_perf &&
+                (PerfStatsCollector::isDomainEnabled("mk_sub") ||
+                 PerfStatsCollector::isDomainEnabled("stage_cpu_detail"));
+            r.kernel_stats = cur_perf && PerfStatsCollector::isDomainEnabled("kernel");
+            team_resolved_max_threads_ = cur_threads;
+            team_resolved_perf_enabled_ = cur_perf;
+            team_resolved_valid_ = true;
+            team_ok_.store(true, std::memory_order_relaxed);
+        }
 
-            const int expected_workers = std::max(1, omp_get_max_threads());
-            if (decl_.routed && (cached_moe_workers_ != expected_workers || cached_moe_isa_ != isa))
-                rebuildCachedMoERowEntries(expected_workers, isa);
+        bool execute(IDeviceContext *ctx) override
+        {
+            if (!ctx || ctx->deviceId() != device())
+                return false;
 
-            CPUNativeQuantisedGemmKernel::StandaloneMoEOneRowPlan routed_plan{};
-            const bool detail_timing = PerfStatsCollector::isDomainEnabled("stage_cpu_detail");
+            const bool already_in_team = ::llaminar::v2::inLexicalWorkshare();
+            if (!already_in_team)
+                prepareForRetainedTeam(ctx);
+
+            CPUMoEKernel *cpu_moe_kernel = team_cpu_moe_kernel_;
+            if (!cpu_moe_kernel)
+                return false;
+
+            const auto &res = team_resolved_;
+            const std::span<float> partials = res.partials;
+            float *rounded_a = res.rounded_a;
+            const auto &rt = decl_.router;
+            const auto &sh = decl_.shared;
+            const int d_model = res.d_model;
+            const int num_experts = res.num_experts;
+            const int top_k = res.top_k;
+            const int sh_inter = res.sh_inter;
+            const float *mixed_ptr = res.mixed_ptr;
+            float *out_idx_ptr = res.out_idx_ptr;
+            float *out_wt_ptr = res.out_wt_ptr;
+            float *shared_out_ptr = res.shared_out_ptr;
+            const TensorType gate_type = res.gate_type;
+            const void *router_gate_data = res.router_gate_data;
+            const bool shared_all_native = res.shared_all_native;
+            auto &selected_experts = team_selected_experts_;
+            auto &selected_weights = team_selected_weights_;
+            auto &published_router_q8 = team_published_router_q8_;
+            auto &shared_gate_scalar = team_shared_gate_scalar_;
+            const ISALevel isa = res.isa;
+            float *sh_gate_ptr = res.sh_gate_ptr;
+            float *sh_up_ptr = res.sh_up_ptr;
+            const auto &hc_ptrs = res.hc_ptrs;
+            const float *shared_gate_inp_ptr = res.shared_gate_inp_ptr;
+            float *routed_out = res.routed_out;
+            float *combined_out = res.combined_out;
+            float *routed_gate_ptr = res.routed_gate_ptr;
+            float *routed_up_ptr = res.routed_up_ptr;
+            float *routed_down_ptr = res.routed_down_ptr;
+            Q8_1Block *routed_swiglu_q8_ptr = res.routed_swiglu_q8_ptr;
+            const size_t routed_swiglu_q8_count = res.routed_swiglu_q8_count;
+            float *routed_splitk_ptr = res.routed_splitk_ptr;
+            const size_t routed_splitk_cap = res.routed_splitk_cap;
+            const bool fuse_shared_into_routed = res.fuse_shared_into_routed;
+            const CPUProjectionNumericalPolicy shared_in_policy = res.shared_in_policy;
+            const bool need_shared_in_q8_pre_router = res.need_shared_in_q8_pre_router;
+            const bool parallel_router_q8 = res.parallel_router_q8;
+
+            auto &routed_plan = team_routed_plan_;
+            const bool detail_timing = res.detail_timing;
             using Clock = std::chrono::steady_clock;
             std::array<Clock::time_point, 7> ts{};
             std::array<Clock::time_point, 5> hc_ts{};
@@ -2690,21 +3621,37 @@ namespace
                 if (detail_timing && omp_get_thread_num() == 0)
                     ts[idx] = Clock::now();
             };
-            std::atomic<bool> ok{true};
+            auto &ok = team_ok_;
+            if (!already_in_team)
+                ok.store(true, std::memory_order_relaxed);
             auto run_team = [&]() {
                 mark(0);
-                // 1. HC prefix (fused hc_attn_write + hc_ffn_branch_norm + down/inject/up/read) -> mixed[H].
-                if (!hc_.executeInTeam(hc_ptrs, partials, rounded_a, workspace_, isa, detail_timing ? &hc_ts : nullptr))
+                // 1. HC prefix (fused hc_attn_write + hc_ffn_branch_norm + down/inject/up/read
+                //    + router_q8_local_/shared_in_q8_/rounded_a) -> mixed[H].
+                CPUHCLocalPrefix::PostReadQuant post_quant{};
+                const bool want_ffn_post = (mixed_ptr == hc_ptrs.read_output);
+                if (want_ffn_post)
+                {
+                    if (need_shared_in_q8_pre_router)
+                    {
+                        post_quant.single_q8_dst = shared_in_q8_.data();
+                        post_quant.single_q8_policy = shared_in_policy;
+                    }
+                    if (parallel_router_q8)
+                        post_quant.router_q8_dst = router_q8_local_.data();
+                }
+                if (!hc_.executeInTeam(hc_ptrs, partials, rounded_a, workspace_, isa,
+                                       detail_timing ? &hc_ts : nullptr,
+                                       want_ffn_post ? &post_quant : nullptr))
                     ok.store(false, std::memory_order_relaxed);
                 mark(1);
 
                 // 2. MoE Router GEMV + Softmax Top-K + canonical router Q8_1 publication.
                 if (ok.load(std::memory_order_relaxed))
                 {
-                    // Quantize shared_in_q8_ and router_q8_local_ in parallel with `nowait`:
-                    // router GEMV reads mixed_ptr directly, and the implicit barrier at the end
-                    // of router GEMV publishes both Q8 banks before finalize_routing / MoE.
-                    if (need_shared_in_q8_pre_router || parallel_router_q8)
+                    // Quantize shared_in_q8_ and router_q8_local_ in parallel with `nowait`
+                    // only when not already published in L1d during fused hc_up + ResidualRead.
+                    if (!post_quant.fused_completed && (need_shared_in_q8_pre_router || parallel_router_q8))
                     {
                         const int pairs = d_model / 64;
 #pragma omp for schedule(static) nowait
@@ -2740,6 +3687,16 @@ namespace
                                         router_q8_local_[static_cast<size_t>(p * 2 + 1)], 32);
                                 }
                             }
+                        }
+                    }
+
+                    // Overlap shared_gate_inp dot with router GEMV using nowait (published at router barrier).
+                    if (shared_gate_inp_ptr)
+                    {
+#pragma omp single nowait
+                        {
+                            const float dot = primitives::vec_dot(shared_gate_inp_ptr, mixed_ptr, d_model);
+                            shared_gate_scalar = 1.0f / (1.0f + std::exp(-dot));
                         }
                     }
 
@@ -2811,21 +3768,46 @@ namespace
                         if (!ok.load(std::memory_order_relaxed))
                             return;
                         primitives::softmax_row_fp32(router_logits_.data(), num_experts);
-                        std::iota(router_sort_idx_.begin(), router_sort_idx_.end(), 0);
                         const float *probs = router_logits_.data();
-                        std::partial_sort(
-                            router_sort_idx_.begin(),
-                            router_sort_idx_.begin() + top_k,
-                            router_sort_idx_.end(),
-                            [probs](int a, int b) { return probs[a] > probs[b]; });
+                        // Fast O(N) insertion top-k scan preserving exact descending probability +
+                        // ascending expert-id tie-breaking order of std::iota + std::partial_sort.
+                        int top_count = 0;
+                        float min_top_val = -std::numeric_limits<float>::infinity();
+                        int min_top_id = 0;
+                        for (int e = 0; e < num_experts; ++e)
+                        {
+                            const float v = probs[e];
+                            if (top_count == top_k && (v < min_top_val || (v == min_top_val && e > min_top_id)))
+                                continue;
+                            int pos = top_count < top_k ? top_count++ : (top_k - 1);
+                            while (pos > 0)
+                            {
+                                const int prev_e = selected_experts[static_cast<size_t>(pos - 1)];
+                                const float prev_v = probs[prev_e];
+                                if (v > prev_v || (v == prev_v && e < prev_e))
+                                {
+                                    selected_experts[static_cast<size_t>(pos)] = prev_e;
+                                    --pos;
+                                }
+                                else
+                                {
+                                    break;
+                                }
+                            }
+                            selected_experts[static_cast<size_t>(pos)] = e;
+                            if (top_count == top_k)
+                            {
+                                min_top_id = selected_experts[static_cast<size_t>(top_k - 1)];
+                                min_top_val = probs[min_top_id];
+                            }
+                        }
                         float topk_sum = 0.0f;
                         for (int k = 0; k < top_k; ++k)
-                            topk_sum += probs[router_sort_idx_[static_cast<size_t>(k)]];
+                            topk_sum += probs[selected_experts[static_cast<size_t>(k)]];
                         for (int k = 0; k < top_k; ++k)
                         {
-                            const int eid = router_sort_idx_[static_cast<size_t>(k)];
+                            const int eid = selected_experts[static_cast<size_t>(k)];
                             const float w = rt.norm_topk_prob ? (probs[eid] / topk_sum) : probs[eid];
-                            selected_experts[static_cast<size_t>(k)] = eid;
                             selected_weights[static_cast<size_t>(k)] = w;
                             out_idx_ptr[k] = static_cast<float>(eid);
                             out_wt_ptr[k] = w;
@@ -2842,11 +3824,6 @@ namespace
                                 return;
                             }
                             published_router_q8 = cpu_moe_kernel->publishedRouterQ8Hidden(mixed_ptr, 1, d_model);
-                        }
-                        if (shared_gate_inp_ptr)
-                        {
-                            const float dot = primitives::vec_dot(shared_gate_inp_ptr, mixed_ptr, d_model);
-                            shared_gate_scalar = 1.0f / (1.0f + std::exp(-dot));
                         }
                         if (decl_.routed && published_router_q8)
                         {
@@ -3133,50 +4110,101 @@ namespace
             };
             OMP_LAYER_PARALLEL(run_team(););
 
-            if (detail_timing && ok.load(std::memory_order_relaxed))
+            if (!already_in_team || omp_get_thread_num() == 0)
             {
-                const auto ns = [&](size_t a, size_t b) {
-                    return static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(ts[b] - ts[a]).count());
-                };
-                PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1_hc", ns(0, 1), "decode", "cpu");
-                const auto hns = [&](size_t a, size_t b) {
-                    return static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(hc_ts[b] - hc_ts[a]).count());
-                };
-                PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1a_hc_norm", hns(0, 1), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1b_hc_down", hns(1, 2), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1c_hc_inject", hns(2, 3), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1d_hc_up_read", hns(3, 4), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "ffn_2_router_gemv", ns(1, 2), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "ffn_3_finalize_routing", ns(2, 3), "decode", "cpu");
-                PerfStatsCollector::recordTimingNs("mk_sub", "ffn_4_shared_sep", ns(3, 4), "decode", "cpu");
-                if (decl_.routed)
+                if (detail_timing && ok.load(std::memory_order_relaxed))
                 {
-                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_5_moe_plan", ns(4, 5), "decode", "cpu");
-                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_6_accum_gate", ns(5, 6), "decode", "cpu");
+                    const auto ns = [&](size_t a, size_t b) {
+                        return static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(ts[b] - ts[a]).count());
+                    };
+                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1_hc", ns(0, 1), "decode", "cpu");
+                    const auto hns = [&](size_t a, size_t b) {
+                        return static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(hc_ts[b] - hc_ts[a]).count());
+                    };
+                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1a_hc_norm", hns(0, 1), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1b_hc_down", hns(1, 2), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1c_hc_inject", hns(2, 3), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_1d_hc_up_read", hns(3, 4), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_2_router_gemv", ns(1, 2), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_3_finalize_routing", ns(2, 3), "decode", "cpu");
+                    PerfStatsCollector::recordTimingNs("mk_sub", "ffn_4_shared_sep", ns(3, 4), "decode", "cpu");
+                    if (decl_.routed)
+                    {
+                        PerfStatsCollector::recordTimingNs("mk_sub", "ffn_5_moe_plan", ns(4, 5), "decode", "cpu");
+                        PerfStatsCollector::recordTimingNs("mk_sub", "ffn_6_accum_gate", ns(5, 6), "decode", "cpu");
+                    }
                 }
-            }
 
-            if (ok.load(std::memory_order_relaxed))
-            {
-                if (rt.decode_histogram && rt.layer_idx >= 0)
+                if (ok.load(std::memory_order_relaxed))
                 {
-                    rt.decode_histogram->record(
-                        rt.layer_idx, selected_experts.data(), selected_weights.data(), top_k);
-                }
-                if (PerfStatsCollector::isDomainEnabled("kernel"))
-                {
-                    PerfStatsCollector::addCounter(
-                        "kernel", "cpu_retained_ffn_megakernel_calls", 1.0, "decode", "cpu",
-                        {{"mode", decl_.routed ? "full_singleton_ffn" : "precollective_ffn"},
-                         {"isa", isaLevelName(isa)}});
+                    if (rt.decode_histogram && rt.layer_idx >= 0)
+                    {
+                        rt.decode_histogram->record(
+                            rt.layer_idx, selected_experts.data(), selected_weights.data(), top_k);
+                    }
+                    if (res.kernel_stats)
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel", "cpu_retained_ffn_megakernel_calls", 1.0, "decode", "cpu",
+                            {{"mode", decl_.routed ? "full_singleton_ffn" : "precollective_ffn"},
+                             {"isa", isaLevelName(isa)}});
+                    }
                 }
             }
             return ok.load(std::memory_order_relaxed);
         }
 
     private:
+        /** @brief Immutable per-step pointers/flags resolved once on thread 0 before the retained team. */
+        struct TeamResolvedState
+        {
+            std::span<float> partials{};
+            float *rounded_a = nullptr;
+            int d_model = 0;
+            int num_experts = 0;
+            int top_k = 0;
+            int sh_inter = 0;
+            const float *mixed_ptr = nullptr;
+            float *out_idx_ptr = nullptr;
+            float *out_wt_ptr = nullptr;
+            float *shared_out_ptr = nullptr;
+            TensorType gate_type = TensorType::FP32;
+            const void *router_gate_data = nullptr;
+            bool shared_all_native = false;
+            ISALevel isa = ISALevel::Scalar;
+            float *sh_gate_ptr = nullptr;
+            float *sh_up_ptr = nullptr;
+            CPUHCLocalPrefix::ResolvedPointers hc_ptrs{};
+            const float *shared_gate_inp_ptr = nullptr;
+            float *routed_out = nullptr;
+            float *combined_out = nullptr;
+            float *routed_gate_ptr = nullptr;
+            float *routed_up_ptr = nullptr;
+            float *routed_down_ptr = nullptr;
+            Q8_1Block *routed_swiglu_q8_ptr = nullptr;
+            size_t routed_swiglu_q8_count = 0;
+            float *routed_splitk_ptr = nullptr;
+            size_t routed_splitk_cap = 0;
+            bool fuse_shared_into_routed = false;
+            CPUProjectionNumericalPolicy shared_in_policy = CPUProjectionNumericalPolicy::BackendNative;
+            bool need_shared_in_q8_pre_router = false;
+            bool parallel_router_q8 = false;
+            bool detail_timing = false;
+            bool kernel_stats = false;
+        };
+        TeamResolvedState team_resolved_{};
+        bool team_resolved_valid_ = false;
+        int team_resolved_max_threads_ = 0;
+        bool team_resolved_perf_enabled_ = false;
+        std::atomic<bool> team_ok_{true};
+        CPUMoEKernel *team_cpu_moe_kernel_ = nullptr;
+        std::array<int, kDeviceMoEMaxTopK> team_selected_experts_{};
+        std::array<float, kDeviceMoEMaxTopK> team_selected_weights_{};
+        const Q8_1Block *team_published_router_q8_ = nullptr;
+        float team_shared_gate_scalar_ = 0.0f;
+        CPUNativeQuantisedGemmKernel::StandaloneMoEOneRowPlan team_routed_plan_{};
         CPUMoEKernel *resolveCPUMoEKernel()
         {
             if (decl_.router.routed_pipeline_kernel_owner)

@@ -817,6 +817,29 @@ namespace llaminar2::primitives
     } // namespace detail
     using namespace detail;
 
+    void prepare_rope_single_position_angles(
+        int rotary_dim,
+        int position,
+        float freq_base,
+        const RoPEAngleRows &angles)
+    {
+        if (rotary_dim <= 0 || (rotary_dim % 2) != 0)
+            return;
+        const auto &inv_freq = get_inv_freq_cached(rotary_dim, freq_base);
+        fill_rope_angle_row(inv_freq, position, angles.cos_row(0), angles.sin_row(0));
+    }
+
+    void rotate_rope_head_in_place(
+        float *head_ptr,
+        const float *cos_ptr,
+        const float *sin_ptr,
+        int half_rotary)
+    {
+        if (!head_ptr || !cos_ptr || !sin_ptr || half_rotary <= 0)
+            return;
+        rope_rotate_head_dispatch(head_ptr, cos_ptr, sin_ptr, half_rotary);
+    }
+
     void apply_rope_partial(
         float *q, float *k,
         int seq_len, int head_dim, int rotary_dim,

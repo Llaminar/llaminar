@@ -564,6 +564,64 @@ namespace llaminar2
         return saw_runner;
     }
 
+    bool StageRunnerRegistry::supportsMTPSidecarPreservesMainStateAll() const
+    {
+        bool saw_runner = false;
+        for (const auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner || !entry.runner->supportsMTPSidecarPreservesMainState())
+                return false;
+        }
+        return saw_runner;
+    }
+
+    bool StageRunnerRegistry::supportsLogicalMTPVerifierBaseCheckpointAll() const
+    {
+        bool saw_runner = false;
+        for (const auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner || !entry.runner->supportsLogicalMTPVerifierBaseCheckpoint())
+                return false;
+        }
+        return saw_runner;
+    }
+
+    bool StageRunnerRegistry::supportsMTPShiftedRowReuseFromSidecarAll() const
+    {
+        bool saw_runner = false;
+        for (const auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner || !entry.runner->supportsMTPShiftedRowReuseFromSidecar())
+                return false;
+        }
+        return saw_runner;
+    }
+
+    bool StageRunnerRegistry::requiresMTPDecodeEquivalentVerifierReplayAny() const
+    {
+        for (const auto &entry : entries_)
+        {
+            if (entry.runner && entry.runner->requiresMTPDecodeEquivalentVerifierReplay())
+                return true;
+        }
+        return false;
+    }
+
+    bool StageRunnerRegistry::supportsMTPSpecStatePublicationAll() const
+    {
+        bool saw_runner = false;
+        for (const auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner || !entry.runner->supportsMTPSpecStatePublication())
+                return false;
+        }
+        return saw_runner;
+    }
+
     bool StageRunnerRegistry::forwardMTPAll(int32_t draft_condition_token)
     {
         bool saw_runner = false;
@@ -3904,23 +3962,63 @@ namespace llaminar2
     }
     bool GlobalOrchestrator::supportsMTPSidecarPreservesMainState() const
     {
-        return rank_service_ready_ && rank_tail_capabilities_[3] != 0;
+        if (rank_service_ready_)
+            return rank_tail_capabilities_[3] != 0;
+        if (!requiresOriginalRankGPUTransport() &&
+            config_.topology.numStages() == 1 &&
+            !stage_runners_.empty())
+        {
+            return stage_runners_.supportsMTPSidecarPreservesMainStateAll();
+        }
+        return false;
     }
     bool GlobalOrchestrator::supportsLogicalMTPVerifierBaseCheckpoint() const
     {
-        return rank_service_ready_ && rank_tail_capabilities_[4] != 0;
+        if (rank_service_ready_)
+            return rank_tail_capabilities_[4] != 0;
+        if (!requiresOriginalRankGPUTransport() &&
+            config_.topology.numStages() == 1 &&
+            !stage_runners_.empty())
+        {
+            return stage_runners_.supportsLogicalMTPVerifierBaseCheckpointAll();
+        }
+        return false;
     }
     bool GlobalOrchestrator::supportsMTPShiftedRowReuseFromSidecar() const
     {
-        return rank_service_ready_ && rank_tail_capabilities_[5] != 0;
+        if (rank_service_ready_)
+            return rank_tail_capabilities_[5] != 0;
+        if (!requiresOriginalRankGPUTransport() &&
+            config_.topology.numStages() == 1 &&
+            !stage_runners_.empty())
+        {
+            return stage_runners_.supportsMTPShiftedRowReuseFromSidecarAll();
+        }
+        return false;
     }
     bool GlobalOrchestrator::requiresMTPDecodeEquivalentVerifierReplay() const
     {
-        return rank_service_ready_ && rank_tail_capabilities_[6] != 0;
+        if (rank_service_ready_)
+            return rank_tail_capabilities_[6] != 0;
+        if (!requiresOriginalRankGPUTransport() &&
+            config_.topology.numStages() == 1 &&
+            !stage_runners_.empty())
+        {
+            return stage_runners_.requiresMTPDecodeEquivalentVerifierReplayAny();
+        }
+        return false;
     }
     bool GlobalOrchestrator::supportsMTPSpecStatePublication() const
     {
-        return rank_service_ready_ && rank_tail_capabilities_[7] != 0;
+        if (rank_service_ready_)
+            return rank_tail_capabilities_[7] != 0;
+        if (!requiresOriginalRankGPUTransport() &&
+            config_.topology.numStages() == 1 &&
+            !stage_runners_.empty())
+        {
+            return stage_runners_.supportsMTPSpecStatePublicationAll();
+        }
+        return false;
     }
     bool GlobalOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const
     {

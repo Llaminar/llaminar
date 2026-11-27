@@ -536,58 +536,33 @@ namespace llaminar2::primitives
         if (!std::isfinite(row_max))
             row_max = 0.0f;
 
-        // Pass 2: Sum of exp
+        // Pass 2: Compute exp once per element, store in-place, and accumulate exact double sum.
         double sum = 0.0;
         for (c = 0; c < cols; ++c)
         {
             if (causal && c > row_idx)
+            {
+                row[c] = 0.0f;
                 continue;
-            float v = row[c] * scale;
-            sum += std::exp(v - row_max);
+            }
+            const float v = row[c] * scale;
+            const float e = std::exp(v - row_max);
+            row[c] = e;
+            sum += e;
         }
 
         if (sum <= 0.0)
             sum = 1.0;
 
-        float inv = static_cast<float>(1.0 / sum);
+        const float inv = static_cast<float>(1.0 / sum);
+        const __m256 vinv = _mm256_set1_ps(inv);
 
-        // Publish each finished probability after loading the entire aliased input vector.
+        // Pass 3: Normalize stored exp values in-place (bitwise identical to exp * inv).
         c = 0;
         for (; c <= cols - 8; c += 8)
-        {
-            __m256 v = _mm256_loadu_ps(row + c);
-            v = _mm256_mul_ps(v, scale_ps);
-
-            alignas(32) float tmp[8];
-            _mm256_store_ps(tmp, v);
-
-            for (int lane = 0; lane < 8; ++lane)
-            {
-                const int column = c + lane;
-                if (causal && column > row_idx)
-                {
-                    row[column] = 0.0f;
-                }
-                else
-                {
-                    row[column] = std::exp(tmp[lane] - row_max) * inv;
-                }
-            }
-        }
-
-        // Tail
+            _mm256_storeu_ps(row + c, _mm256_mul_ps(_mm256_loadu_ps(row + c), vinv));
         for (; c < cols; ++c)
-        {
-            if (causal && c > row_idx)
-            {
-                row[c] = 0.0f;
-            }
-            else
-            {
-                float v = row[c] * scale;
-                row[c] = std::exp(v - row_max) * inv;
-            }
-        }
+            row[c] *= inv;
 #else
         // Fallback to scalar if AVX2 not available
         softmax_row_fp32_scalar(row, cols, causal, scale, row_idx);
@@ -647,58 +622,33 @@ namespace llaminar2::primitives
         if (!std::isfinite(row_max))
             row_max = 0.0f;
 
-        // Pass 2: Sum of exp
+        // Pass 2: Compute exp once per element, store in-place, and accumulate exact double sum.
         double sum = 0.0;
         for (c = 0; c < cols; ++c)
         {
             if (causal && c > row_idx)
+            {
+                row[c] = 0.0f;
                 continue;
-            float v = row[c] * scale;
-            sum += std::exp(v - row_max);
+            }
+            const float v = row[c] * scale;
+            const float e = std::exp(v - row_max);
+            row[c] = e;
+            sum += e;
         }
 
         if (sum <= 0.0)
             sum = 1.0;
 
-        float inv = static_cast<float>(1.0 / sum);
+        const float inv = static_cast<float>(1.0 / sum);
+        const __m512 vinv = _mm512_set1_ps(inv);
 
-        // Publish each finished probability after loading the entire aliased input vector.
+        // Pass 3: Normalize stored exp values in-place (bitwise identical to exp * inv).
         c = 0;
         for (; c <= cols - 16; c += 16)
-        {
-            __m512 v = _mm512_loadu_ps(row + c);
-            v = _mm512_mul_ps(v, scale_ps);
-
-            alignas(64) float tmp[16];
-            _mm512_store_ps(tmp, v);
-
-            for (int lane = 0; lane < 16; ++lane)
-            {
-                const int column = c + lane;
-                if (causal && column > row_idx)
-                {
-                    row[column] = 0.0f;
-                }
-                else
-                {
-                    row[column] = std::exp(tmp[lane] - row_max) * inv;
-                }
-            }
-        }
-
-        // Tail
+            _mm512_storeu_ps(row + c, _mm512_mul_ps(_mm512_loadu_ps(row + c), vinv));
         for (; c < cols; ++c)
-        {
-            if (causal && c > row_idx)
-            {
-                row[c] = 0.0f;
-            }
-            else
-            {
-                float v = row[c] * scale;
-                row[c] = std::exp(v - row_max) * inv;
-            }
-        }
+            row[c] *= inv;
 #else
         // Fallback to AVX2 if AVX512 not available
         softmax_row_fp32_avx2(row, cols, causal, scale, row_idx);

@@ -96,6 +96,11 @@ public:
     }
     /** @brief Reuse the canonical native copy semantic tag. */
     ComputeStageType type()const override{return ComputeStageType::COPY;}
+    /** @brief CPU PLE next-bank copy is pure serial memcpy; run on master inside a retained decode team. */
+    CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override
+    {
+        return device().is_cpu() ? CPURetainedTeamMode::MasterSingle : CPURetainedTeamMode::None;
+    }
     std::size_t estimatedFlops()const override{return 0;}
     std::size_t estimatedMemoryBytes()const override{return 2*(8+std::size_t(9)*history_.channels*4);}
     bool supportsBackend(ComputeBackendType b)const override

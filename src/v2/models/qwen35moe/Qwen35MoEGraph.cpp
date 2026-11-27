@@ -2768,6 +2768,436 @@ namespace llaminar2
         return graph;
     }
 
+    ComputeGraph Qwen35MoEGraph::buildCPUIntermediateShardFFNGraphForLayer(
+        const LayerWeights &layer, ActivationBuffers &buffers, const LayerGraphSourceIdentity &identity,
+        int rows, DeviceId device, const Qwen4ExpPredictorResidualBinding *predictor,
+        MoEOverlayServicePhaseHint phase)
+    {
+        const auto plan = config_.moe.routed_expert_plan;
+        const auto residency = config_.moe.expert_overlay_participant_residency;
+        const auto manager = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+        auto *gtp = dynamic_cast<IGlobalTPContext *>(config_.tp_ctx);
+        const int layer_idx = identity.sourceLayer();
+        const auto prefix = identity.prefix();
+        const bool mtp = identity.workload() == GraphLayerWorkload::MTPDepth;
+        if (!device.is_cpu() || rows <= 0 || !plan || !residency || !manager || !gtp ||
+            gtp->degree() < 2 || !prepared_weight_store_ || !layer.moe_gate ||
+            phase == MoEOverlayServicePhaseHint::Auto)
+        {
+            throw std::invalid_argument(
+                "CPU F-shard model FFN requires original CPU source/store/family/global TP and positive rows/phase");
+        }
+        const auto &authority = config_.moe.expert_overlay_residency_authority;
+        if ((config_.moe.rebalance_config.mode != MoERebalanceRuntimeMode::Off &&
+             (config_.moe.rebalance_config.mode != MoERebalanceRuntimeMode::Dynamic ||
+              !authority || (!authority->stationaryTensorShardResidency() && !authority->noPeerResidency()))) ||
+            plan->domains.size() != 1u || plan->routed_tiers.size() != 1u ||
+            plan->continuation_domain != plan->routed_tiers.front().domain ||
+            plan->shared_expert_domain != plan->continuation_domain)
+        {
+            throw std::invalid_argument(
+                "CPU F-shard local model FFN requires one original stationary routed/shared/continuation CPU domain");
+        }
+        const auto &domain = plan->domains.front();
+        if (domain.routed_compute_policy != RoutedExpertComputePolicy::TensorSharded ||
+            domain.participants.size() != static_cast<size_t>(gtp->degree()) ||
+            !std::all_of(domain.participants.begin(), domain.participants.end(),
+                         [](const GlobalDeviceAddress &member) { return member.isCPU(); }))
+        {
+            throw std::invalid_argument(
+                "CPU F-shard model FFN requires homogeneous CPU TensorSharded participants matching global TP degree");
+        }
+
+        const auto &owners = residency->initialOwnerMap();
+        const int local_world_rank =
+            config_.moe.overlay_mpi_ctx ? config_.moe.overlay_mpi_ctx->rank() : -1;
+        const MoEExpertOwnerParticipant *participant = nullptr;
+        for (const auto &member : owners.participants())
+        {
+            if (member.device == device &&
+                member.domain_name == plan->continuation_domain &&
+                member.domain_participant_index == config_.tp_device_idx &&
+                (!member.world_rank_known || local_world_rank < 0 || member.world_rank == local_world_rank))
+            {
+                if (participant)
+                {
+                    throw std::invalid_argument(
+                        "CPU F-shard model FFN has ambiguous original participant");
+                }
+                participant = &member;
+            }
+        }
+        if (!participant)
+        {
+            throw std::invalid_argument(
+                "CPU F-shard model FFN has no original participant for layer " + std::to_string(layer_idx));
+        }
+
+        const auto declaration = adoptMoEOverlayJointGraphDeclaration(
+            *residency, manager->expertGemmRegistry(), prepared_weight_store_->modelId(),
+            participant->participant_id, layer_idx,
+            config_.moe.num_experts, config_.d_model, config_.moe.intermediate_size);
+        const auto initial = declaration->acquireInitialConstruction();
+        if (!initial)
+        {
+            throw std::logic_error(
+                "CPU F-shard model FFN original construction source already retired");
+        }
+        const auto selection = declaration->sourceSelection();
+        if (!selection)
+        {
+            throw std::logic_error(
+                "CPU F-shard model FFN lost its original source selection");
+        }
+        const auto &source = initial->layerForModelLayer(layer_idx);
+        const int local_intermediate =
+            selection->ownership().projection(WeightRole::MoEExpertUp).rows;
+        if (local_intermediate <= 0 ||
+            source.fragments.size() != static_cast<size_t>(config_.moe.num_experts))
+        {
+            throw std::logic_error(
+                "CPU F-shard model FFN has invalid local intermediate shard geometry for layer " +
+                std::to_string(layer_idx));
+        }
+
+        std::vector<ITensorGemm *> prepared_gate(static_cast<size_t>(config_.moe.num_experts), nullptr);
+        std::vector<ITensorGemm *> prepared_up(static_cast<size_t>(config_.moe.num_experts), nullptr);
+        std::vector<ITensorGemm *> prepared_down(static_cast<size_t>(config_.moe.num_experts), nullptr);
+        std::vector<std::shared_ptr<ITensorGemm>> owned_kernels;
+        owned_kernels.reserve(static_cast<size_t>(config_.moe.num_experts) * 3u);
+        for (int expert = 0; expert < config_.moe.num_experts; ++expert)
+        {
+            const auto &triplet = source.fragments[static_cast<size_t>(expert)];
+            if (!selection->contains(expert) || !triplet.valid() ||
+                triplet.gate()->get_n() != local_intermediate || triplet.gate()->get_k() != config_.d_model ||
+                triplet.up()->get_n() != local_intermediate || triplet.up()->get_k() != config_.d_model ||
+                triplet.down()->get_n() != config_.d_model || triplet.down()->get_k() != local_intermediate)
+            {
+                throw std::logic_error(
+                    "CPU F-shard model FFN requires complete local shard triplets for every expert in layer " +
+                    std::to_string(layer_idx) + " (expert=" + std::to_string(expert) + ")");
+            }
+            prepared_gate[static_cast<size_t>(expert)] = triplet.gate().get();
+            prepared_up[static_cast<size_t>(expert)] = triplet.up().get();
+            prepared_down[static_cast<size_t>(expert)] = triplet.down().get();
+            owned_kernels.push_back(triplet.gate());
+            owned_kernels.push_back(triplet.up());
+            owned_kernels.push_back(triplet.down());
+        }
+
+        const bool force_verifier =
+            !mtp && config_.grouped_mtp_verifier && config_.compute_all_position_logits;
+        const LayerWeightBindings layer_bindings =
+            predictor ? predictor->weights().fa_block : layerWeightBindingsForGraph(layer_idx);
+
+        ComputeGraph graph;
+        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> residual_read;
+        std::string norm_node;
+        if (config_.flash_next)
+        {
+            residual_read.emplace(addBranchBlockRead(
+                graph, prefix, buffers, layer_idx, rows, device, ResidualBlock::FeedForward, predictor));
+            norm_node = residual_read->terminal();
+        }
+        else
+        {
+            FusedResidualNormStage::Params norm_params;
+            norm_params.device_id = device;
+            norm_params.input = buffers.attn_proj;
+            norm_params.residual = buffers.current_hidden;
+            norm_params.gamma = layer.ffn_norm;
+            norm_params.norm_output = buffers.normalized;
+            norm_params.eps = config_.rms_norm_eps;
+            norm_params.seq_len = rows;
+            norm_params.hidden_dim = config_.d_model;
+            norm_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            norm_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            norm_params.norm_output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+            norm_node = prefix + "ffn_norm";
+            graph.addNode(norm_node, ComputeStageFactory::createFusedResidualNorm(norm_params), device);
+        }
+
+        // Routing and routed-expert execution share canonical CPU Q8_1 hidden publication
+        // directly through one graph-local kernel owner (no sparse overlay dispatch/return).
+        const auto routed_kernel_owner = std::make_shared<MoERoutedPipelineKernelOwner>();
+        TensorBase *indices = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_INDICES));
+        TensorBase *weights = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS));
+        TensorBase *moe_output = buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+        TensorBase *shared_output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
+
+        MoERoutingStage::Params route_params;
+        route_params.device_id = device;
+        route_params.input = buffers.normalized;
+        route_params.gate_weights = layer.moe_gate;
+        route_params.seq_len = rows;
+        route_params.d_model = config_.d_model;
+        route_params.layer_idx = layer_idx;
+        route_params.num_experts = config_.moe.num_experts;
+        route_params.top_k = config_.moe.top_k;
+        route_params.norm_topk_prob = config_.moe.norm_topk_prob;
+        route_params.output_indices = indices;
+        route_params.output_weights = weights;
+        route_params.routed_pipeline_kernel_owner = routed_kernel_owner;
+        route_params.routed_row_execution_policy = RoutedExpertRowExecutionPolicy::IntermediateShardLocal;
+        route_params.collect_device_runtime_histogram = false;
+        route_params.force_decode_equivalent_verifier_prefill = force_verifier;
+        route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+        route_params.output_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
+        route_params.output_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
+        const std::string router_node = prefix + "moe_routing";
+        graph.addNode(router_node, ComputeStageFactory::createMoERouting(route_params), device);
+        graph.addDependency(router_node, norm_node);
+
+        const bool has_shared_expert =
+            layer.shared_expert_gate && layer.shared_expert_up &&
+            layer.shared_expert_down && shared_output;
+        const bool shared_requires_allreduce =
+            has_shared_expert && needsTPAllreduce() &&
+            (predictor ? predictor->layout().sharedNeedsReduction() : denseTPAllreduceEnabledForCurrentGraph());
+
+        std::string shared_node;
+        if (has_shared_expert)
+        {
+            SharedExpertFFNStage::Params cpu_shared_params;
+            cpu_shared_params.device_id = device;
+            cpu_shared_params.input = buffers.normalized;
+            cpu_shared_params.gate_w = layer.shared_expert_gate;
+            cpu_shared_params.up_w = layer.shared_expert_up;
+            cpu_shared_params.down_w = layer.shared_expert_down;
+            cpu_shared_params.output = shared_output;
+            cpu_shared_params.gate_scratch = buffers.get(buffers.idFor(BufferId::MOE_GATE_SCRATCH));
+            cpu_shared_params.up_scratch = buffers.get(buffers.idFor(BufferId::MOE_UP_SCRATCH));
+            cpu_shared_params.seq_len = rows;
+            cpu_shared_params.d_model = config_.d_model;
+            cpu_shared_params.intermediate = static_cast<int>(layer.shared_expert_gate->rows());
+            cpu_shared_params.force_decode_equivalent_verifier_prefill = force_verifier;
+            cpu_shared_params.disable_grouped_decode_shortcut =
+                mtp && (predictor
+                            ? predictor->layout().policy() == MTPShiftedKVHeadLayout::FullModelPerParticipant
+                            : (config_.dense_tp_decode_replicated || config_.mtpUsesReplicatedDenseSidecarBinding()));
+            cpu_shared_params.prepared_store = prepared_weight_store_;
+            cpu_shared_params.prepared_ref_gate = preparedRefForGraphWeight(layer_bindings.shared_expert_gate, device);
+            cpu_shared_params.prepared_ref_up = preparedRefForGraphWeight(layer_bindings.shared_expert_up, device);
+            cpu_shared_params.prepared_ref_down = preparedRefForGraphWeight(layer_bindings.shared_expert_down, device);
+            cpu_shared_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+            cpu_shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+            cpu_shared_params.gate_scratch_buffer_id = buffers.idFor(BufferId::MOE_GATE_SCRATCH);
+            cpu_shared_params.up_scratch_buffer_id = buffers.idFor(BufferId::MOE_UP_SCRATCH);
+            shared_node = prefix + "shared_expert_ffn";
+            graph.addNode(shared_node, ComputeStageFactory::createSharedExpertFFN(cpu_shared_params), device);
+            graph.addDependency(shared_node, norm_node);
+        }
+
+        MoEExpertComputeStage::Params expert_params;
+        expert_params.device_id = device;
+        expert_params.input = buffers.normalized;
+        expert_params.seq_len = rows;
+        expert_params.d_model = config_.d_model;
+        expert_params.num_experts = config_.moe.num_experts;
+        expert_params.top_k = config_.moe.top_k;
+        expert_params.routed_pipeline_kernel_owner = routed_kernel_owner;
+        expert_params.cpu_router_q8_input_publication =
+            CPURouterQ8InputPublicationPolicy::RequireRouterStage;
+        expert_params.expert_intermediate = local_intermediate;
+        expert_params.expert_weight_resolution_policy =
+            MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+        expert_params.prepared_engine_binding_lifecycle =
+            MoEPreparedEngineBindingLifecycle::CompleteAtConstruction;
+        expert_params.persistent_weight_owner = weight_bindings_.physical_memory_owner;
+        expert_params.local_expert_start = 0;
+        expert_params.local_expert_count = -1;
+        expert_params.layer_idx = layer_idx;
+        expert_params.my_socket_id = std::max(0, config_.tp_device_idx);
+        expert_params.participant_count = gtp->degree();
+        expert_params.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+        expert_params.routed_row_execution_policy = RoutedExpertRowExecutionPolicy::IntermediateShardLocal;
+        expert_params.prepared_gate_gemm = std::move(prepared_gate);
+        expert_params.prepared_up_gemm = std::move(prepared_up);
+        expert_params.prepared_down_gemm = std::move(prepared_down);
+        expert_params.moe_owned_kernels = std::move(owned_kernels);
+        expert_params.expert_registry = &manager->expertGemmRegistry();
+        expert_params.routing_indices = indices;
+        expert_params.routing_weights = weights;
+        expert_params.routing_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
+        expert_params.routing_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
+        expert_params.force_decode_equivalent_verifier_prefill = force_verifier;
+        expert_params.output = moe_output;
+        expert_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+        expert_params.output_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+        expert_params.prepared_store = prepared_weight_store_;
+        expert_params.service_phase = phase;
+        const std::string routed_node = prefix + "moe_expert_ffn";
+        graph.addNode(routed_node, ComputeStageFactory::createMoEExpertCompute(expert_params), device);
+        graph.addDependency(routed_node, router_node);
+
+        const size_t allreduce_count =
+            static_cast<size_t>(rows) * static_cast<size_t>(config_.d_model);
+        const auto phase_override =
+            predictor ? std::optional{ForwardExecutionPhase::Decode} : std::nullopt;
+        std::string terminal;
+
+        if (has_shared_expert && shared_requires_allreduce &&
+            layer.shared_expert_gate_inp && buffers.attn_proj)
+        {
+            // Both routed and shared outputs are rank-local F/P partials while the
+            // sigmoid gate vector and normalized hidden input are replicated across
+            // every participant. Gate + combine locally first so one single [M, d_model]
+            // AllReduce publishes the complete FFN delta (and M=1 decode lowers the
+            // entire HC + router + shared + routed + gate region into RetainedCPUFFNStage).
+            SharedExpertGateStage::Params gate_params;
+            gate_params.device_id = device;
+            gate_params.input = buffers.normalized;
+            gate_params.gate_inp = layer.shared_expert_gate_inp;
+            gate_params.shared_output = shared_output;
+            gate_params.routed_residual = moe_output;
+            gate_params.combined_output = buffers.attn_proj;
+            gate_params.seq_len = rows;
+            gate_params.d_model = config_.d_model;
+            gate_params.execution_role = SharedExpertGateStage::ExecutionRole::ReplicatedOwner;
+            gate_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+            gate_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+            gate_params.residual_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+            gate_params.combined_output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            const std::string gate_node = prefix + "shared_expert_gate";
+            graph.addNode(gate_node, ComputeStageFactory::createSharedExpertGate(gate_params), device);
+            graph.addDependency(gate_node, shared_node);
+            graph.addDependency(gate_node, routed_node);
+
+            const std::string ar_node = prefix + "ffn_allreduce";
+            auto ar_stage = createTPAllreduceStage(
+                buffers.attn_proj, allreduce_count, device, layer_idx,
+                /*is_attention=*/false, ar_node, buffers.idFor(BufferId::ATTN_PROJ),
+                {}, std::nullopt, std::nullopt, phase_override);
+            if (!ar_stage)
+            {
+                throw std::logic_error(
+                    "CPU F-shard model FFN requires a non-null global TP AllReduce stage");
+            }
+            graph.addNode(ar_node, std::move(ar_stage), device);
+            graph.addDependency(ar_node, gate_node);
+            terminal = ar_node;
+        }
+        else
+        {
+            const std::string moe_ar_node = prefix + "moe_allreduce";
+            auto moe_ar_stage = createTPAllreduceStage(
+                moe_output, allreduce_count, device, layer_idx,
+                /*is_attention=*/false, moe_ar_node, buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
+                {}, std::nullopt, std::nullopt, phase_override);
+            if (!moe_ar_stage)
+            {
+                throw std::logic_error(
+                    "CPU F-shard model FFN requires a non-null global TP AllReduce stage");
+            }
+            graph.addNode(moe_ar_node, std::move(moe_ar_stage), device);
+            graph.addDependency(moe_ar_node, routed_node);
+            terminal = moe_ar_node;
+
+            if (has_shared_expert)
+            {
+                std::string shared_last = shared_node;
+                if (shared_requires_allreduce)
+                {
+                    const std::string shared_ar_node = prefix + "shared_expert_allreduce";
+                    auto shared_ar_stage = createTPAllreduceStage(
+                        shared_output, allreduce_count, device, layer_idx,
+                        /*is_attention=*/false, shared_ar_node,
+                        buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT),
+                        {}, std::nullopt, std::nullopt, phase_override);
+                    if (!shared_ar_stage)
+                    {
+                        throw std::logic_error(
+                            "CPU F-shard shared branch requires a non-null global TP AllReduce stage");
+                    }
+                    graph.addNode(shared_ar_node, std::move(shared_ar_stage), device);
+                    graph.addDependency(shared_ar_node, shared_last);
+                    graph.addDependency(shared_ar_node, terminal);
+                    shared_last = shared_ar_node;
+                }
+                if (layer.shared_expert_gate_inp && buffers.attn_proj)
+                {
+                    SharedExpertGateStage::Params gate_params;
+                    gate_params.device_id = device;
+                    gate_params.input = buffers.normalized;
+                    gate_params.gate_inp = layer.shared_expert_gate_inp;
+                    gate_params.shared_output = shared_output;
+                    gate_params.routed_residual = moe_output;
+                    gate_params.combined_output = buffers.attn_proj;
+                    gate_params.seq_len = rows;
+                    gate_params.d_model = config_.d_model;
+                    gate_params.execution_role = SharedExpertGateStage::ExecutionRole::ReplicatedOwner;
+                    gate_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+                    gate_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+                    gate_params.residual_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                    gate_params.combined_output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+                    const std::string gate_node = prefix + "shared_expert_gate";
+                    graph.addNode(gate_node, ComputeStageFactory::createSharedExpertGate(gate_params), device);
+                    graph.addDependency(gate_node, shared_last);
+                    graph.addDependency(gate_node, terminal);
+                    terminal = gate_node;
+                }
+                else
+                {
+                    ResidualAddStage::Params add_params;
+                    add_params.device_id = device;
+                    add_params.input = shared_output;
+                    add_params.residual = moe_output;
+                    add_params.output = buffers.attn_proj;
+                    add_params.num_elements = allreduce_count;
+                    add_params.input_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+                    add_params.residual_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                    add_params.output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+                    const std::string combine_node = prefix + "moe_combine";
+                    graph.addNode(combine_node, ComputeStageFactory::createResidualAdd(add_params), device);
+                    graph.addDependency(combine_node, shared_last);
+                    graph.addDependency(combine_node, terminal);
+                    terminal = combine_node;
+                }
+            }
+            else if (moe_output != buffers.attn_proj)
+            {
+                ResidualAddStage::Params copy_params;
+                copy_params.device_id = device;
+                copy_params.input = moe_output;
+                copy_params.residual = nullptr;
+                copy_params.output = buffers.attn_proj;
+                copy_params.num_elements = allreduce_count;
+                copy_params.input_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                copy_params.output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+                const std::string combine_node = prefix + "moe_combine";
+                graph.addNode(combine_node, ComputeStageFactory::createResidualAdd(copy_params), device);
+                graph.addDependency(combine_node, terminal);
+                terminal = combine_node;
+            }
+        }
+
+        if (residual_read)
+        {
+            terminal = addBranchBlockWrite(
+                graph, std::move(*residual_read), buffers, terminal,
+                predictor ? &predictor->ffnOutput() : nullptr);
+        }
+        else if (layer_idx >= config_.pp_layer_offset + config_.n_layers - 1)
+        {
+            ResidualAddStage::Params res_params;
+            res_params.device_id = device;
+            res_params.input = buffers.attn_proj;
+            res_params.residual = buffers.current_hidden;
+            res_params.output = buffers.current_hidden;
+            res_params.num_elements = allreduce_count;
+            res_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            res_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            res_params.output_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            const std::string res_node = prefix + "ffn_residual";
+            graph.addNode(res_node, ComputeStageFactory::createResidualAdd(res_params), device);
+            graph.addDependency(res_node, terminal);
+            terminal = res_node;
+        }
+
+        graph.setTerminalNode(terminal);
+        return graph;
+    }
+
 
     std::vector<Qwen35MoEGraph::MirroredLayerCheckpoint>
     Qwen35MoEGraph::mirroredLayerCheckpoints() const

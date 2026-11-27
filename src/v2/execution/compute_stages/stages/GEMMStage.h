@@ -214,8 +214,11 @@ namespace llaminar2
         };
 
         explicit GEMMStage(Params params);
+        ~GEMMStage() override;
 
         bool execute(IDeviceContext *ctx) override;
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override;
+        void prepareForRetainedTeam(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GEMM; }
         size_t estimatedFlops() const override;
@@ -388,6 +391,9 @@ namespace llaminar2
             ITensorGemm *gemm,
             int effective_n);
         void clearCachedGemmStream();
+
+        struct RetainedCPUSingleRowState;
+        std::unique_ptr<RetainedCPUSingleRowState> retained_cpu_state_;
 
     };
 

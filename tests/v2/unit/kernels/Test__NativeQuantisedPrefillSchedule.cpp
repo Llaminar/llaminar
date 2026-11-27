@@ -103,6 +103,28 @@ namespace
             {512, 2048, 2048, 1, 28}), std::invalid_argument);
     }
 
+    TEST(NativeQuantisedPrefillSchedule, CompactUnsignedAndFiveBitEncodingsUseFourRowGridOnWideISA)
+    {
+        for (const auto encoding : {CPUNativeQuantisedEncoding::UnsignedInt8,
+                                    CPUNativeQuantisedEncoding::UnsignedNibble,
+                                    CPUNativeQuantisedEncoding::CompactFiveBit})
+        {
+            for (int columns : {256, 320, 2560, 3072, 5120, 10240})
+            {
+                EXPECT_EQ(resolvePrefillSchedule(PrefillSchedulePolicy::Auto,
+                    {512, columns, columns, 1, 28, encoding, PrefillRowKernelSet::WideRows}),
+                    PrefillSchedulePolicy::FourRowGrid);
+                EXPECT_EQ(resolvePrefillSchedule(PrefillSchedulePolicy::Auto,
+                    {83, columns, columns, 1, 28, encoding, PrefillRowKernelSet::WideRows}),
+                    PrefillSchedulePolicy::FourRowGrid);
+            }
+            // Pairwise ISA (AVX2/Scalar) never selects AVX-512 FourRowGrid.
+            EXPECT_NE(resolvePrefillSchedule(PrefillSchedulePolicy::Auto,
+                {512, 3072, 3072, 1, 28, encoding, PrefillRowKernelSet::Pairwise}),
+                PrefillSchedulePolicy::FourRowGrid);
+        }
+    }
+
     TEST(NativeQuantisedPrefillSchedule, RejectsInvalidGeometryAndPolicy)
     {
         for (const auto shape : {

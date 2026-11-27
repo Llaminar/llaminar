@@ -12,11 +12,13 @@
 #include "../../../memory/StageBufferContract.h"
 #include "../../../execution/local_execution/collective/CollectiveContext.h"
 #include "../../../collective/ICollectiveBackend.h"
+#include "../../../collective/ITPContext.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/MPIContext.h"
+#include "../../../utils/OpenMPUtils.h"
 #include <mpi.h>
 #include <chrono>
 
@@ -32,8 +34,53 @@ namespace llaminar2
     {
     }
 
+    IComputeStage::CPURetainedTeamMode AllGatherStage::cpuRetainedTeamMode() const noexcept
+    {
+        if (!params_.device_id.is_gpu() && !params_.collective_ctx &&
+            params_.tp_ctx && params_.tp_ctx->degree() > 1 &&
+            params_.local_input && params_.full_output &&
+            params_.local_input->native_type() == TensorType::FP32 &&
+            params_.full_output->native_type() == TensorType::FP32)
+        {
+            const auto &local_shape = params_.local_input->shape();
+            const auto &full_shape = params_.full_output->shape();
+            if (local_shape.size() == 2 && full_shape.size() == 2)
+            {
+                const size_t seq_len = params_.actual_seq_len > 0 ? params_.actual_seq_len : local_shape[0];
+                const size_t vocab_local = local_shape[1];
+                const size_t vocab_full = full_shape[0] == local_shape[0] ? full_shape[1] : full_shape[0];
+                if (seq_len == 1 && vocab_full == vocab_local * static_cast<size_t>(params_.tp_ctx->degree()))
+                    return CPURetainedTeamMode::CollectiveTeam;
+            }
+        }
+        return CPURetainedTeamMode::None;
+    }
+
+    void AllGatherStage::prepareForRetainedTeam(IDeviceContext *ctx)
+    {
+        (void)ctx;
+        retained_in_ptr_ = nullptr;
+        retained_out_ptr_ = nullptr;
+        retained_send_count_ = 0;
+        if (cpuRetainedTeamMode() != CPURetainedTeamMode::CollectiveTeam)
+            return;
+        auto *input_fp32 = dynamic_cast<FP32Tensor *>(params_.local_input);
+        auto *output_fp32 = dynamic_cast<FP32Tensor *>(params_.full_output);
+        if (input_fp32 && output_fp32)
+        {
+            retained_in_ptr_ = input_fp32->data();
+            retained_out_ptr_ = output_fp32->mutable_data();
+            retained_send_count_ = params_.local_input->shape()[1];
+        }
+    }
+
     bool AllGatherStage::execute(IDeviceContext *ctx)
     {
+        if (retained_in_ptr_ && retained_out_ptr_ && ::llaminar::v2::inLexicalWorkshare())
+        {
+            return params_.tp_ctx->allgatherFloats(retained_in_ptr_, retained_out_ptr_, retained_send_count_);
+        }
+
         (void)ctx;
 
         if (!params_.local_input)
@@ -52,6 +99,32 @@ namespace llaminar2
         if (params_.collective_ctx)
         {
             return executeViaCollectiveContext();
+        }
+
+        // Fast native TP allgather for contiguous single-row CPU vocabulary gathers (e.g. ShmemSpin)
+        if (params_.tp_ctx && params_.tp_ctx->degree() > 1 &&
+            params_.local_input->native_type() == TensorType::FP32 &&
+            params_.full_output->native_type() == TensorType::FP32)
+        {
+            const auto &local_shape = params_.local_input->shape();
+            const auto &full_shape = params_.full_output->shape();
+            if (local_shape.size() == 2 && full_shape.size() == 2)
+            {
+                const size_t seq_len = params_.actual_seq_len > 0 ? params_.actual_seq_len : local_shape[0];
+                const size_t vocab_local = local_shape[1];
+                const size_t vocab_full = full_shape[0] == local_shape[0] ? full_shape[1] : full_shape[0];
+                if (seq_len == 1 && vocab_full == vocab_local * static_cast<size_t>(params_.tp_ctx->degree()))
+                {
+                    auto *input_fp32 = dynamic_cast<FP32Tensor *>(params_.local_input);
+                    auto *output_fp32 = dynamic_cast<FP32Tensor *>(params_.full_output);
+                    if (input_fp32 && output_fp32)
+                    {
+                        KERNEL_PROFILE_SCOPE(KernelType::ALLGATHER);
+                        return params_.tp_ctx->allgatherFloats(
+                            input_fp32->data(), output_fp32->mutable_data(), vocab_local);
+                    }
+                }
+            }
         }
 
         // Fall back to direct MPI

@@ -202,6 +202,41 @@ namespace llaminar2
          */
         bool requiresAllreduce() const override { return true; }
 
+        /** @brief Small CPU ShmemSpin allreduces run on master inside a retained decode team. */
+        CPURetainedTeamMode cpuRetainedTeamMode() const noexcept override
+        {
+            const size_t effective_count =
+                (params_.count > 0) ? params_.count : (params_.tensor ? params_.tensor->numel() : 0u);
+            if (!params_.device_id.is_gpu() && params_.tp_ctx && !params_.tp_ctx->isLocal() &&
+                effective_count > 0 && effective_count < 64u * 1024u &&
+                params_.sidebands.empty() && params_.sideband_workspace_bindings.empty() &&
+                !params_.request_rows && !params_.live_rows &&
+                params_.arithmetic_policy == TPAllreduceArithmeticPolicy::NativeCollective)
+            {
+                return CPURetainedTeamMode::MasterSingle;
+            }
+            return CPURetainedTeamMode::None;
+        }
+
+        /** @brief Cache raw host FP32 pointer once on master before entering a retained CPU team. */
+        void prepareForRetainedTeam(IDeviceContext *ctx) override
+        {
+            (void)ctx;
+            cached_cpu_allreduce_data_ = nullptr;
+            cached_cpu_allreduce_count_ = 0;
+            if (cpuRetainedTeamMode() == CPURetainedTeamMode::MasterSingle &&
+                params_.tensor && params_.tensor->native_type() == TensorType::FP32 &&
+                params_.tp_ctx && params_.tp_ctx->degree() > 1)
+            {
+                const size_t cnt = (params_.count > 0) ? params_.count : params_.tensor->numel();
+                if (cnt > 0 && cnt <= params_.tensor->numel())
+                {
+                    cached_cpu_allreduce_data_ = params_.tensor->mutable_data();
+                    cached_cpu_allreduce_count_ = cnt;
+                }
+            }
+        }
+
         /**
          * @brief TP allreduce sidebands reuse buffers declared by producer stages.
          */
@@ -350,6 +385,8 @@ namespace llaminar2
 
         Params params_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        float *cached_cpu_allreduce_data_ = nullptr;
+        size_t cached_cpu_allreduce_count_ = 0;
     };
 
     /**

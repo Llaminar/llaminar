@@ -3112,10 +3112,10 @@ namespace llaminar2::cpu::native_quantised
 
             // Convert exact integer dots through the selected publication tree.
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            const __m512 scale0 = loadScales512(packed, b_scales);
-            const __m512 scale1 = loadScales512(packed, b_scales + 16);
-            const __m512 scale2 = loadScales512(packed, b_scales + 32);
-            const __m512 scale3 = loadScales512(packed, b_scales + 48);
+            const __m512 scale0 = unsigned_int8 ? loadPlainFP16Scales512(b_scales) : loadScales512(packed, b_scales);
+            const __m512 scale1 = unsigned_int8 ? loadPlainFP16Scales512(b_scales + 16) : loadScales512(packed, b_scales + 16);
+            const __m512 scale2 = unsigned_int8 ? loadPlainFP16Scales512(b_scales + 32) : loadScales512(packed, b_scales + 32);
+            const __m512 scale3 = unsigned_int8 ? loadPlainFP16Scales512(b_scales + 48) : loadScales512(packed, b_scales + 48);
 
             // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
             // mins are FP16; load via F16C convert to FP32
@@ -3156,6 +3156,191 @@ namespace llaminar2::cpu::native_quantised
         publishProjectionOutputVector<Bounded, 16>(C, columns, 16, fp_acc1);
         publishProjectionOutputVector<Bounded, 16>(C, columns, 32, fp_acc2);
         publishProjectionOutputVector<Bounded, 16>(C, columns, 48, fp_acc3);
+    }
+
+    /**
+     * @brief Execute one exact 16-column ZMM sub-chunk (`z` in `[0, 3]`) of a single-row symmetric Q8_0 GEMV.
+     *
+     * Produces bitwise-identical FP32 outputs to @ref gemv_native_quantised_avx512_chunk_non_nibble
+     * while exposing 4x finer output-column parallelism to eliminate tail imbalance when
+     * `N_chunks % num_threads != 0` (e.g. `N=2560` -> 40 chunks -> 160 sub-chunks on 28 cores: 71.4% -> 95.2%).
+     */
+    inline void gemv_native_quantised_avx512_subchunk_q8(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8,
+        float *C,
+        int chunk,
+        int z,
+        int kb_start,
+        int kb_end) noexcept
+    {
+        const int col_offset = z * 16;
+        const int chunk_cols = std::min(64, packed.N - chunk * 64);
+        if (col_offset >= chunk_cols)
+            return;
+
+        const bool unsigned_int8 = packed.usesUnsignedInt8();
+        __m512 fp_acc = _mm512_setzero_ps();
+        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+
+        for (int kb = kb_start; kb < kb_end; ++kb)
+        {
+            if (kb + 2 < kb_end)
+            {
+                for (int g = 0; g < 8; ++g)
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 2, g, z), 0, 3);
+                __builtin_prefetch(packed.chunkScales(chunk, kb + 2) + col_offset, 0, 3);
+            }
+            const Q8_1Block &a_blk = A_q8[kb];
+            const float a_scale = nativeQuantisedFP16ScaleToFP32(a_blk.d);
+            // Split even/odd group VNNI chains into two independent INT32 accumulators to
+            // hide 5-cycle vpdpbusd latency; 32-bit integer addition is exact and associative.
+            __m512i int_acc0 = _mm512_setzero_si512();
+            __m512i int_acc1 = _mm512_setzero_si512();
+
+            if (unsigned_int8)
+            {
+                for (int group = 0; group < 8; group += 2)
+                {
+                    int32_t a_e, a_o;
+                    std::memcpy(&a_e, a_blk.qs + group * 4, 4);
+                    std::memcpy(&a_o, a_blk.qs + (group + 1) * 4, 4);
+                    int_acc0 = _mm512_dpbusd_epi32(
+                        int_acc0,
+                        _mm512_load_si512(packed.interleavedB(chunk, kb, group, z)),
+                        _mm512_set1_epi32(a_e));
+                    int_acc1 = _mm512_dpbusd_epi32(
+                        int_acc1,
+                        _mm512_load_si512(packed.interleavedB(chunk, kb, group + 1, z)),
+                        _mm512_set1_epi32(a_o));
+                }
+                const __m512i int_acc = _mm512_sub_epi32(
+                    _mm512_add_epi32(int_acc0, int_acc1),
+                    _mm512_set1_epi32(static_cast<int32_t>(a_blk.sum_qs) * 128));
+                const __m512 scale = loadPlainFP16Scales512(packed.chunkScales(chunk, kb) + col_offset);
+                fp_acc = accumulateSingleScaleBlockAVX512(fp_acc, int_acc, scale, a_scale, packed.numerical_policy);
+            }
+            else
+            {
+                for (int group = 0; group < 8; group += 2)
+                {
+                    const __m512i b0 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, z));
+                    const __m512i b1 = _mm512_load_si512(packed.interleavedB(chunk, kb, group + 1, z));
+                    int_acc0 = _mm512_dpbusd_epi32(int_acc0, _mm512_set1_epi32(pack_q8_1_unsigned_word(a_blk, group * 4)), b0);
+                    int_acc1 = _mm512_dpbusd_epi32(int_acc1, _mm512_set1_epi32(pack_q8_1_unsigned_word(a_blk, (group + 1) * 4)), b1);
+                }
+                const __m512i comp = _mm512_cvtepi16_epi32(
+                    _mm256_load_si256(reinterpret_cast<const __m256i *>(packed.chunkComp(chunk, kb) + col_offset)));
+                const __m512i int_acc = _mm512_sub_epi32(
+                    _mm512_add_epi32(int_acc0, int_acc1),
+                    _mm512_mullo_epi32(bias_128_i32, comp));
+                const __m512 scale = loadPlainFP16Scales512(packed.chunkScales(chunk, kb) + col_offset);
+                fp_acc = accumulateSingleScaleBlockAVX512(fp_acc, int_acc, scale, a_scale, packed.numerical_policy);
+            }
+        }
+
+        publishProjectionOutputVector<true, 16>(C, chunk_cols, col_offset, fp_acc);
+    }
+
+    /**
+     * @brief Execute one exact 32-column half-chunk (`half` in `{0, 1}`, ZMMs `2*half` and `2*half+1`)
+     *        of a single-row symmetric Q8_0 GEMV on AVX-512.
+     *
+     * Reads 128-byte pairs of adjacent cache lines per group (matching Intel L2 adjacent-line
+     * prefetchers with zero wasted DRAM lines), halves Q8_1 activation loads, keeps 4 live VNNI
+     * accumulator chains, and produces bitwise-identical outputs to full 64-column GEMV.
+     */
+    inline void gemv_native_quantised_avx512_halfchunk_q8(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8,
+        float *C,
+        int chunk,
+        int half,
+        int kb_start,
+        int kb_end) noexcept
+    {
+        const int z0 = half * 2;
+        const int z1 = z0 + 1;
+        const int col0 = z0 * 16;
+        const int col1 = z1 * 16;
+        const int chunk_cols = std::min(64, packed.N - chunk * 64);
+        if (col0 >= chunk_cols)
+            return;
+        if (col1 >= chunk_cols)
+        {
+            gemv_native_quantised_avx512_subchunk_q8(packed, A_q8, C, chunk, z0, kb_start, kb_end);
+            return;
+        }
+
+        const bool unsigned_int8 = packed.usesUnsignedInt8();
+        __m512 fp_acc0 = _mm512_setzero_ps();
+        __m512 fp_acc1 = _mm512_setzero_ps();
+        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+
+        for (int kb = kb_start; kb < kb_end; ++kb)
+        {
+            if (kb + 2 < kb_end)
+            {
+                for (int g = 0; g < 8; ++g)
+                {
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 2, g, z0), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 2, g, z1), 0, 3);
+                }
+                __builtin_prefetch(packed.chunkScales(chunk, kb + 2) + col0, 0, 3);
+            }
+            const Q8_1Block &a_blk = A_q8[kb];
+            const float a_scale = nativeQuantisedFP16ScaleToFP32(a_blk.d);
+            __m512i ia0_e = _mm512_setzero_si512();
+            __m512i ia0_o = _mm512_setzero_si512();
+            __m512i ia1_e = _mm512_setzero_si512();
+            __m512i ia1_o = _mm512_setzero_si512();
+            __m512i int_acc0, int_acc1;
+
+            if (unsigned_int8)
+            {
+                for (int group = 0; group < 8; group += 2)
+                {
+                    int32_t a_e, a_o;
+                    std::memcpy(&a_e, a_blk.qs + group * 4, 4);
+                    std::memcpy(&a_o, a_blk.qs + (group + 1) * 4, 4);
+                    const __m512i ae_v = _mm512_set1_epi32(a_e);
+                    const __m512i ao_v = _mm512_set1_epi32(a_o);
+                    ia0_e = _mm512_dpbusd_epi32(ia0_e, _mm512_load_si512(packed.interleavedB(chunk, kb, group, z0)), ae_v);
+                    ia1_e = _mm512_dpbusd_epi32(ia1_e, _mm512_load_si512(packed.interleavedB(chunk, kb, group, z1)), ae_v);
+                    ia0_o = _mm512_dpbusd_epi32(ia0_o, _mm512_load_si512(packed.interleavedB(chunk, kb, group + 1, z0)), ao_v);
+                    ia1_o = _mm512_dpbusd_epi32(ia1_o, _mm512_load_si512(packed.interleavedB(chunk, kb, group + 1, z1)), ao_v);
+                }
+                const __m512i bias = _mm512_set1_epi32(static_cast<int32_t>(a_blk.sum_qs) * 128);
+                int_acc0 = _mm512_sub_epi32(_mm512_add_epi32(ia0_e, ia0_o), bias);
+                int_acc1 = _mm512_sub_epi32(_mm512_add_epi32(ia1_e, ia1_o), bias);
+            }
+            else
+            {
+                for (int group = 0; group < 8; group += 2)
+                {
+                    const __m512i ae_v = _mm512_set1_epi32(pack_q8_1_unsigned_word(a_blk, group * 4));
+                    const __m512i ao_v = _mm512_set1_epi32(pack_q8_1_unsigned_word(a_blk, (group + 1) * 4));
+                    ia0_e = _mm512_dpbusd_epi32(ia0_e, ae_v, _mm512_load_si512(packed.interleavedB(chunk, kb, group, z0)));
+                    ia1_e = _mm512_dpbusd_epi32(ia1_e, ae_v, _mm512_load_si512(packed.interleavedB(chunk, kb, group, z1)));
+                    ia0_o = _mm512_dpbusd_epi32(ia0_o, ao_v, _mm512_load_si512(packed.interleavedB(chunk, kb, group + 1, z0)));
+                    ia1_o = _mm512_dpbusd_epi32(ia1_o, ao_v, _mm512_load_si512(packed.interleavedB(chunk, kb, group + 1, z1)));
+                }
+                const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+                const __m512i comp0 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + col0)));
+                const __m512i comp1 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + col1)));
+                int_acc0 = _mm512_sub_epi32(_mm512_add_epi32(ia0_e, ia0_o), _mm512_mullo_epi32(bias_128_i32, comp0));
+                int_acc1 = _mm512_sub_epi32(_mm512_add_epi32(ia1_e, ia1_o), _mm512_mullo_epi32(bias_128_i32, comp1));
+            }
+
+            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
+            const __m512 scale0 = loadPlainFP16Scales512(b_scales + col0);
+            const __m512 scale1 = loadPlainFP16Scales512(b_scales + col1);
+            fp_acc0 = accumulateSingleScaleBlockAVX512(fp_acc0, int_acc0, scale0, a_scale, packed.numerical_policy);
+            fp_acc1 = accumulateSingleScaleBlockAVX512(fp_acc1, int_acc1, scale1, a_scale, packed.numerical_policy);
+        }
+
+        publishProjectionOutputVector<true, 16>(C, chunk_cols, col0, fp_acc0);
+        publishProjectionOutputVector<true, 16>(C, chunk_cols, col1, fp_acc1);
     }
 
     /**
@@ -3639,6 +3824,74 @@ namespace llaminar2::cpu::native_quantised
         }
 
         // Standard N-parallel GEMV
+        // For symmetric Q8_0 matrices where 64-column chunk granularity creates tail imbalance
+        // on the active worker count (e.g. N=2560 -> 40 chunks on 28 cores = 71.4% balance),
+        // dispatch 16-column ZMM sub-chunks (160 tasks -> 95.2% balance) with bit-identical math.
+        const bool is_q8_0_direct =
+            packed.codebook_id == native_quantised_formats::Q8_0.codebook_id &&
+            !packed.is_superblock && !packed.is_asymmetric &&
+            (packed.usesUnsignedInt8() || packed.usesExpandedInt8());
+        if (schedule_override == DecodeSchedulePolicy::Auto && is_q8_0_direct &&
+            num_threads > 1 && N_chunks < 6 * num_threads && (N_chunks % num_threads) != 0)
+        {
+            const bool use_halfchunks = (N_chunks * 2 >= num_threads * 2 && N_chunks <= 160);
+            if (use_halfchunks)
+            {
+                const int total_halfchunks = N_chunks * 2;
+                auto do_gemv_halfchunks = [&]()
+                {
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_halfchunks; ++task)
+                    {
+                        const int chunk = task / 2;
+                        const int half = task % 2;
+                        if (chunk * 64 + half * 32 >= N)
+                            continue;
+                        if (use_avx512)
+                        {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                            gemv_native_quantised_avx512_halfchunk_q8(
+                                packed, A_q8, C + chunk * 64, chunk, half, 0, K_blocks);
+#endif
+                        }
+                        else
+                        {
+                            gemv_avx2_halfchunk_q8(
+                                packed, A_q8, C + chunk * 64, chunk, half, 0, K_blocks);
+                        }
+                    }
+                };
+                OMP_WORKSHARE_REGION(do_gemv_halfchunks);
+                return;
+            }
+            const int total_subchunks = N_chunks * 4;
+            auto do_gemv_subchunks = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int task = 0; task < total_subchunks; ++task)
+                {
+                    const int chunk = task / 4;
+                    const int z = task % 4;
+                    if (chunk * 64 + z * 16 >= N)
+                        continue;
+                    if (use_avx512)
+                    {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        gemv_native_quantised_avx512_subchunk_q8(
+                            packed, A_q8, C + chunk * 64, chunk, z, 0, K_blocks);
+#endif
+                    }
+                    else
+                    {
+                        gemv_avx2_subchunk_q8(
+                            packed, A_q8, C + chunk * 64, chunk, z, 0, K_blocks);
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(do_gemv_subchunks);
+            return;
+        }
+
         int total_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
 
         // Serial fast path: when there are fewer tasks than threads and we're
@@ -3813,7 +4066,8 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         const __m512i decode_lut,
         bool accumulate,
-        int columns)
+        int columns,
+        int next_chunk = -1)
     {
         __m512 fp0_0 = readProjectionOutputVector<Bounded, 16, __m512>(C_row0, columns, 0, accumulate);
         __m512 fp0_1 = readProjectionOutputVector<Bounded, 16, __m512>(C_row0, columns, 16, accumulate);
@@ -3831,8 +4085,10 @@ namespace llaminar2::cpu::native_quantised
 
         for (int kb = kb_start; kb < kb_end; ++kb)
         {
-            if (kb + 1 < kb_end)
-                packed.prefetchInterleavedUnitT0(chunk, kb + 1);
+            if (kb + 2 < kb_end)
+                packed.prefetchInterleavedUnitT0(chunk, kb + 2);
+            else if (next_chunk >= 0 && kb + 2 - kb_end < packed.blocks_per_row)
+                packed.prefetchInterleavedUnitT0(next_chunk, kb + 2 - kb_end);
             const Q8_1Block &a0 = A_q8_row0[kb];
             const Q8_1Block &a1 = A_q8_row1[kb];
             __m512i ia0_0 = _mm512_setzero_si512(), ia0_1 = _mm512_setzero_si512();
@@ -4093,7 +4349,8 @@ namespace llaminar2::cpu::native_quantised
         int kb_start,
         int kb_end,
         bool accumulate,
-        int columns)
+        int columns,
+        int next_chunk = -1)
     {
         if (packed.usesCompactMultiScale())
         {
@@ -4145,8 +4402,10 @@ namespace llaminar2::cpu::native_quantised
 
         for (int kb = kb_start; kb < kb_end; ++kb)
         {
-            if (kb + 1 < kb_end)
-                packed.prefetchInterleavedUnitT0(chunk, kb + 1);
+            if (kb + 2 < kb_end)
+                packed.prefetchInterleavedUnitT0(chunk, kb + 2);
+            else if (next_chunk >= 0 && kb + 2 - kb_end < packed.blocks_per_row)
+                packed.prefetchInterleavedUnitT0(next_chunk, kb + 2 - kb_end);
             const Q8_1Block &a0 = A_q8_row0[kb];
             const Q8_1Block &a1 = A_q8_row1[kb];
             float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
@@ -4294,10 +4553,10 @@ namespace llaminar2::cpu::native_quantised
             {
                 // Scale (shared b_scales loads)
                 const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-                __m512 bs0 = loadScales512(packed, b_scales);
-                __m512 bs1 = loadScales512(packed, b_scales + 16);
-                __m512 bs2 = loadScales512(packed, b_scales + 32);
-                __m512 bs3 = loadScales512(packed, b_scales + 48);
+                __m512 bs0 = unsigned_int8 ? loadPlainFP16Scales512(b_scales) : loadScales512(packed, b_scales);
+                __m512 bs1 = unsigned_int8 ? loadPlainFP16Scales512(b_scales + 16) : loadScales512(packed, b_scales + 16);
+                __m512 bs2 = unsigned_int8 ? loadPlainFP16Scales512(b_scales + 32) : loadScales512(packed, b_scales + 32);
+                __m512 bs3 = unsigned_int8 ? loadPlainFP16Scales512(b_scales + 48) : loadScales512(packed, b_scales + 48);
 
                 if (packed.is_asymmetric)
                 {
@@ -4382,7 +4641,8 @@ namespace llaminar2::cpu::native_quantised
         int kb_start,
         int kb_end,
         bool accumulate,
-        int columns = 64)
+        int columns = 64,
+        int next_chunk = -1)
     {
         if (packed.coefficientDomain() == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit)
         {
@@ -4395,17 +4655,108 @@ namespace llaminar2::cpu::native_quantised
                     CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit,
                     CPUProjectionNumericalPolicy::GPUAlignedExpert>(
                         packed, A_q8_row0, A_q8_row1, C_row0, C_row1,
-                        chunk, kb_start, kb_end, accumulate, columns);
+                        chunk, kb_start, kb_end, accumulate, columns, next_chunk);
             return gemmTwoRowsNonNibbleAVX512ChunkImpl<SumPairs, Bounded,
                 CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit,
                 CPUProjectionNumericalPolicy::BackendNative>(
                     packed, A_q8_row0, A_q8_row1, C_row0, C_row1,
-                    chunk, kb_start, kb_end, accumulate, columns);
+                    chunk, kb_start, kb_end, accumulate, columns, next_chunk);
         }
         return gemmTwoRowsNonNibbleAVX512ChunkImpl<SumPairs, Bounded,
             CPUNativeQuantisedCoefficientDomain::SignedInt8>(
                 packed, A_q8_row0, A_q8_row1, C_row0, C_row1,
-                chunk, kb_start, kb_end, accumulate, columns);
+                chunk, kb_start, kb_end, accumulate, columns, next_chunk);
+    }
+
+    /**
+     * @brief Execute one exact 16-column ZMM sub-chunk (`z` in `[0, 3]`) of a two-row Q8_0 tile.
+     *
+     * Produces bitwise-identical FP32 outputs to @ref gemm_2row_non_nibble_chunk while exposing
+     * 4x finer output-column parallelism for narrow wide-K projections (e.g. `hc_down` N=320, K=10240)
+     * without altering K-reduction order or adding partial buffers.
+     */
+    template <bool SumPairs = false>
+    inline void gemm_2row_q8_subchunk_avx512(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8_row0,
+        const Q8_1Block *A_q8_row1,
+        float *C_row0,
+        float *C_row1,
+        int chunk,
+        int z,
+        int kb_start,
+        int kb_end,
+        bool accumulate)
+    {
+        const int col_offset = z * 16;
+        const int remaining = packed.N - chunk * 64 - col_offset;
+        if (remaining <= 0)
+            return;
+
+        const bool unsigned_int8 = packed.usesUnsignedInt8();
+        __m512 fp0 = accumulate ? _mm512_loadu_ps(C_row0 + col_offset) : _mm512_setzero_ps();
+        __m512 fp1 = (accumulate && !SumPairs) ? _mm512_loadu_ps(C_row1 + col_offset) : _mm512_setzero_ps();
+
+        for (int kb = kb_start; kb < kb_end; ++kb)
+        {
+            if (kb + 2 < kb_end)
+            {
+                for (int g = 0; g < 8; ++g)
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 2, g, z), 0, 3);
+                __builtin_prefetch(packed.chunkScales(chunk, kb + 2) + col_offset, 0, 3);
+            }
+            const Q8_1Block &a0 = A_q8_row0[kb];
+            const Q8_1Block &a1 = A_q8_row1[kb];
+            const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
+            const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
+            __m512i ia0 = _mm512_setzero_si512();
+            __m512i ia1 = _mm512_setzero_si512();
+
+            if (unsigned_int8)
+            {
+                for (int group = 0; group < 8; ++group)
+                {
+                    int32_t w0, w1;
+                    std::memcpy(&w0, a0.qs + group * 4, 4);
+                    std::memcpy(&w1, a1.qs + group * 4, 4);
+                    const __m512i b = _mm512_load_si512(packed.interleavedB(chunk, kb, group, z));
+                    ia0 = _mm512_dpbusd_epi32(ia0, b, _mm512_set1_epi32(w0));
+                    ia1 = _mm512_dpbusd_epi32(ia1, b, _mm512_set1_epi32(w1));
+                }
+                ia0 = _mm512_sub_epi32(ia0, _mm512_set1_epi32(static_cast<int32_t>(a0.sum_qs) * 128));
+                ia1 = _mm512_sub_epi32(ia1, _mm512_set1_epi32(static_cast<int32_t>(a1.sum_qs) * 128));
+            }
+            else
+            {
+                for (int group = 0; group < 8; ++group)
+                {
+                    const __m512i a0_bc = _mm512_set1_epi32(pack_q8_1_unsigned_word(a0, group * 4));
+                    const __m512i a1_bc = _mm512_set1_epi32(pack_q8_1_unsigned_word(a1, group * 4));
+                    const __m512i b = _mm512_load_si512(packed.interleavedB(chunk, kb, group, z));
+                    ia0 = _mm512_dpbusd_epi32(ia0, a0_bc, b);
+                    ia1 = _mm512_dpbusd_epi32(ia1, a1_bc, b);
+                }
+                const __m512i cc = _mm512_cvtepi16_epi32(
+                    _mm256_load_si256(reinterpret_cast<const __m256i *>(packed.chunkComp(chunk, kb) + col_offset)));
+                const __m512i bc = _mm512_mullo_epi32(_mm512_set1_epi32(128), cc);
+                ia0 = _mm512_sub_epi32(ia0, bc);
+                ia1 = _mm512_sub_epi32(ia1, bc);
+            }
+
+            const __m512 bs = loadPlainFP16Scales512(packed.chunkScales(chunk, kb) + col_offset);
+            fp0 = accumulateSingleScaleBlockAVX512(fp0, ia0, bs, a0_scale, packed.numerical_policy);
+            fp1 = accumulateSingleScaleBlockAVX512(fp1, ia1, bs, a1_scale, packed.numerical_policy);
+        }
+
+        if constexpr (SumPairs)
+        {
+            storeNativeQuantisedLiveAVX512(C_row0, packed.N - chunk * 64, col_offset, _mm512_add_ps(fp0, fp1));
+        }
+        else
+        {
+            storeNativeQuantisedLiveAVX512(C_row0, packed.N - chunk * 64, col_offset, fp0);
+            storeNativeQuantisedLiveAVX512(C_row1, packed.N - chunk * 64, col_offset, fp1);
+        }
     }
 
     /**
@@ -4970,7 +5321,11 @@ namespace llaminar2::cpu::native_quantised
             for (int kb = kb_start; kb < kb_end; ++kb)
             {
                 if (kb + 1 < kb_end)
-                    packed.prefetchInterleavedUnitT0(chunk, kb + 1);
+                {
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 0, zbase), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 2, zbase), 0, 3);
+                    __builtin_prefetch(packed.chunkScales(chunk, kb + 1) + zbase * 16, 0, 3);
+                }
                 const Q8_1Block &a0 = A_q8_row0[kb];
                 const Q8_1Block &a1 = A_q8_row1[kb];
                 const Q8_1Block &a2 = A_q8_row2[kb];
@@ -5208,7 +5563,13 @@ namespace llaminar2::cpu::native_quantised
             for (int kb = kb_start; kb < kb_end; ++kb)
             {
                 if (kb + 1 < kb_end)
-                    packed.prefetchInterleavedUnitT0(chunk, kb + 1);
+                {
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 0, zbase), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 4, zbase), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 0, zbase + 1), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 4, zbase + 1), 0, 3);
+                    __builtin_prefetch(packed.chunkScales(chunk, kb + 1) + zbase * 16, 0, 3);
+                }
                 const Q8_1Block &a0 = A_q8_row0[kb];
                 const Q8_1Block &a1 = A_q8_row1[kb];
                 const Q8_1Block &a2 = A_q8_row2[kb];
@@ -5395,7 +5756,11 @@ namespace llaminar2::cpu::native_quantised
             for (int kb = kb_start; kb < kb_end; ++kb)
             {
                 if (kb + 1 < kb_end)
-                    packed.prefetchInterleavedUnitT0(chunk, kb + 1);
+                {
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 0, z), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 2, z), 0, 3);
+                    __builtin_prefetch(packed.chunkScales(chunk, kb + 1) + z * 16, 0, 3);
+                }
                 const Q8_1Block &a0 = A_q8_row0[kb];
                 const Q8_1Block &a1 = A_q8_row1[kb];
                 const Q8_1Block &a2 = A_q8_row2[kb];
@@ -5413,19 +5778,26 @@ namespace llaminar2::cpu::native_quantised
                         const __m512i raw = _mm512_load_si512(packed.interleavedB(chunk, kb, group, z));
                         const __m512i lo = _mm512_and_si512(raw, mask_0F);
                         const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(raw, 4), mask_0F);
-#define NIBBLE_4ROW_UACCUM(ROW, ABLK)                                            \
-                        {                                                        \
-                            int32_t wlo = 0, whi = 0;                            \
-                            std::memcpy(&wlo, ABLK.qs + group * 4, sizeof(wlo)); \
-                            std::memcpy(&whi, ABLK.qs + group * 4 + 16, sizeof(whi)); \
-                            ia##ROW = _mm512_dpbusd_epi32(ia##ROW, lo, _mm512_set1_epi32(wlo)); \
-                            ia##ROW = _mm512_dpbusd_epi32(ia##ROW, hi, _mm512_set1_epi32(whi)); \
-                        }
-                        NIBBLE_4ROW_UACCUM(0, a0)
-                        NIBBLE_4ROW_UACCUM(1, a1)
-                        NIBBLE_4ROW_UACCUM(2, a2)
-                        NIBBLE_4ROW_UACCUM(3, a3)
-#undef NIBBLE_4ROW_UACCUM
+                        // Separate low and high nibble passes across all four independent
+                        // accumulators to avoid back-to-back 5-cycle VNNI RAW stalls.
+                        int32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+                        std::memcpy(&w0, a0.qs + group * 4, sizeof(w0));
+                        std::memcpy(&w1, a1.qs + group * 4, sizeof(w1));
+                        std::memcpy(&w2, a2.qs + group * 4, sizeof(w2));
+                        std::memcpy(&w3, a3.qs + group * 4, sizeof(w3));
+                        ia0 = _mm512_dpbusd_epi32(ia0, lo, _mm512_set1_epi32(w0));
+                        ia1 = _mm512_dpbusd_epi32(ia1, lo, _mm512_set1_epi32(w1));
+                        ia2 = _mm512_dpbusd_epi32(ia2, lo, _mm512_set1_epi32(w2));
+                        ia3 = _mm512_dpbusd_epi32(ia3, lo, _mm512_set1_epi32(w3));
+
+                        std::memcpy(&w0, a0.qs + group * 4 + 16, sizeof(w0));
+                        std::memcpy(&w1, a1.qs + group * 4 + 16, sizeof(w1));
+                        std::memcpy(&w2, a2.qs + group * 4 + 16, sizeof(w2));
+                        std::memcpy(&w3, a3.qs + group * 4 + 16, sizeof(w3));
+                        ia0 = _mm512_dpbusd_epi32(ia0, hi, _mm512_set1_epi32(w0));
+                        ia1 = _mm512_dpbusd_epi32(ia1, hi, _mm512_set1_epi32(w1));
+                        ia2 = _mm512_dpbusd_epi32(ia2, hi, _mm512_set1_epi32(w2));
+                        ia3 = _mm512_dpbusd_epi32(ia3, hi, _mm512_set1_epi32(w3));
                     }
                     if (decode_kind == NibbleDecodeKind::Q4_0_LINEAR)
                     {
@@ -5533,6 +5905,40 @@ namespace llaminar2::cpu::native_quantised
      * @tparam Bounded Own only the live destination columns.
      * @param columns Logical width of this output tile.
      */
+    /**
+     * @brief Out-of-line AVX-512 L1d-resident `3row x 4z` UnsignedInt8 strip kernel.
+     *
+     * Implemented in CPUNativeQuantisedGemmKernel.cpp to keep ubiquitous headers light.
+     * Processes up to 48 rows of one 64-column chunk across `[kb_start, kb_end)` in
+     * 8-block L1d-resident K-strips with 4:1 `vpdpbusd:vpbroadcastd` reuse, preserving
+     * exact ascending-K FP32 accumulation order bitwise identical to serial M=1 decode.
+     */
+    void gemm_unsigned_int8_avx512_l1_strip_chunk(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8_strip,
+        int strip_rows,
+        int k_blocks_stride,
+        float *dst_base,
+        size_t dst_row_stride_floats,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        int cols) noexcept;
+
+    /**
+     * @brief Out-of-line AVX-512 6-Q8-row (3 real rows) `SumPairs` UnsignedInt8 chunk kernel.
+     *
+     * Evaluates three paired `(primary, residual)` rows per 64-column chunk with 2:1
+     * broadcast reuse and 1.5x higher weight reuse than 4-row `SumPairs`.
+     */
+    void gemm_6row_unsigned_int8_2z_sum_pairs(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *p0, const Q8_1Block *r0,
+        const Q8_1Block *p1, const Q8_1Block *r1,
+        const Q8_1Block *p2, const Q8_1Block *r2,
+        float *out0, float *out1, float *out2,
+        int chunk, int kb_start, int kb_end) noexcept;
+
     template<bool SumPairs = false, bool Bounded = false>
     inline void gemm_4row_non_nibble_2z_chunk(
         const CPUNativeQuantisedPackedWeights &packed,
@@ -5621,7 +6027,13 @@ namespace llaminar2::cpu::native_quantised
             for (int kb = kb_start; kb < kb_end; ++kb)
             {
                 if (kb + 1 < kb_end)
-                    packed.prefetchInterleavedUnitT0(chunk, kb + 1);
+                {
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 0, zbase), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 4, zbase), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 0, zbase + 1), 0, 3);
+                    __builtin_prefetch(packed.interleavedB(chunk, kb + 1, 4, zbase + 1), 0, 3);
+                    __builtin_prefetch(packed.chunkScales(chunk, kb + 1) + zbase * 16, 0, 3);
+                }
                 const Q8_1Block &a0 = A_q8_row0[kb];
                 const Q8_1Block &a1 = A_q8_row1[kb];
                 const Q8_1Block &a2 = A_q8_row2[kb];
@@ -6614,6 +7026,41 @@ namespace llaminar2::cpu::native_quantised
                  * independent partial per row, so increasing runtime M changes
                  * scheduling and weight reuse but never FP32 parenthesization.
                  */
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                if (use_avx512 && packed.usesUnsignedInt8() && !packed.is_asymmetric && !work && M >= 12)
+                {
+                    constexpr int kMaxStripRows = 48;
+                    const int blocks_avail = N_chunks * k_tiles;
+                    const int min_strips = (num_threads + blocks_avail - 1) / blocks_avail;
+                    int strip_target = (min_strips > 1)
+                        ? std::max(6, ((M + min_strips - 1) / min_strips + 2) / 3 * 3)
+                        : kMaxStripRows;
+                    strip_target = std::min(kMaxStripRows, strip_target);
+                    const int num_strips = (M + strip_target - 1) / strip_target;
+                    const int total_strip_tasks = blocks_avail * num_strips;
+                    const size_t partial_row_stride = static_cast<size_t>(N_chunks) * k_tiles * 64;
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_strip_tasks; ++task)
+                    {
+                        const int strip_idx = task % num_strips;
+                        const int chunk_and_kt = task / num_strips;
+                        const int kt = chunk_and_kt % k_tiles;
+                        const int chunk = chunk_and_kt / k_tiles;
+                        const int row0 = strip_idx * strip_target;
+                        const int sr = std::min(strip_target, M - row0);
+                        const int kb_start = kt * k_blocks_per_tile;
+                        const int kb_end = std::min(kb_start + k_blocks_per_tile, K_blocks);
+                        float *dst0 = partial_sums +
+                                      (((static_cast<size_t>(row0) * N_chunks + chunk) * k_tiles) + kt) * 64;
+                        gemm_unsigned_int8_avx512_l1_strip_chunk(
+                            packed,
+                            A_q8_all + static_cast<size_t>(row0) * K_blocks,
+                            sr, K_blocks, dst0, partial_row_stride, chunk, kb_start, kb_end, 64);
+                    }
+                }
+                else
+#endif
+                {
                 const int row_tile_width = schedule.physical_row_tile;
                 const int row_tile_count =
                     row_grid.tiles(row_tile_width);
@@ -6622,10 +7069,12 @@ namespace llaminar2::cpu::native_quantised
 #pragma omp for schedule(static)
                 for (int task = 0; task < total_shared_tile_tasks; ++task)
                 {
-                    const int kt = task % k_tiles;
-                    const int chunk_and_row_tile = task / k_tiles;
-                    const int chunk = chunk_and_row_tile % N_chunks;
-                    const int row_tile = chunk_and_row_tile / N_chunks;
+                    // Keep (chunk, kt) outer and row_tile inner so each weight panel stays L2-hot
+                    // across all M row tiles in prefill without changing K-partition reduction order.
+                    const int row_tile = task % row_tile_count;
+                    const int chunk_and_kt = task / row_tile_count;
+                    const int kt = chunk_and_kt % k_tiles;
+                    const int chunk = chunk_and_kt / k_tiles;
                     const auto span=row_grid.tileSpan(row_tile,row_tile_width);
                     if(span.size()==0)continue;
                     const int row0=span.first,tile_rows=span.size();
@@ -6738,6 +7187,7 @@ namespace llaminar2::cpu::native_quantised
                             packed, row0_q8, dst0, chunk, kb_start, kb_end);
                     }
                 }
+                }
 
 #pragma omp for schedule(static)
                 for (int task = 0; task < M * N_chunks; ++task)
@@ -6766,6 +7216,41 @@ namespace llaminar2::cpu::native_quantised
         if (schedule.route ==
             VerifierRowsExecutionRoute::GroupedFullKWideRows)
         {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+            if (use_avx512 && packed.usesUnsignedInt8() && !packed.is_asymmetric && !work && M >= 12)
+            {
+                constexpr int kMaxStripRows = 48;
+                const int min_strips = (num_threads + N_chunks - 1) / N_chunks;
+                int strip_target = (min_strips > 1)
+                    ? std::max(6, ((M + min_strips - 1) / min_strips + 2) / 3 * 3)
+                    : kMaxStripRows;
+                strip_target = std::min(kMaxStripRows, strip_target);
+                const int num_strips = (M + strip_target - 1) / strip_target;
+                const int total_strip_tasks = N_chunks * num_strips;
+                auto do_u8_l1_strips = [&]()
+                {
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_strip_tasks; ++task)
+                    {
+                        const int chunk = task / num_strips;
+                        const int strip_idx = task % num_strips;
+                        const int row0 = strip_idx * strip_target;
+                        const int sr = std::min(strip_target, M - row0);
+                        const int n_start = chunk * 64;
+                        const int n_cols = std::min(64, N - n_start);
+                        gemm_unsigned_int8_avx512_l1_strip_chunk(
+                            packed,
+                            A_q8_all + static_cast<size_t>(row0) * K_blocks,
+                            sr, K_blocks,
+                            C + static_cast<size_t>(row0) * ldc + n_start,
+                            static_cast<size_t>(ldc),
+                            chunk, 0, K_blocks, n_cols);
+                    }
+                };
+                OMP_WORKSHARE_REGION(do_u8_l1_strips);
+                return;
+            }
+#endif
             /*
              * Compose arbitrary runtime M from bounded four-row physical tiles.
              * AVX512 has native three/four-row kernels. Every tail still owns
@@ -9118,18 +9603,17 @@ namespace llaminar2::cpu::native_quantised
                         continue;
                     }
 
-                    const int k_tile = static_cast<int>(
-                        local_task % static_cast<size_t>(plan.k_tiles));
-                    const size_t chunk_and_row_tile =
-                        local_task / static_cast<size_t>(plan.k_tiles);
-                    const int chunk = static_cast<int>(
-                        chunk_and_row_tile %
-                        static_cast<size_t>(plan.n_chunks));
-                    const int row_tile = static_cast<int>(
-                        chunk_and_row_tile /
-                        static_cast<size_t>(plan.n_chunks));
                     const int row_tile_width =
                         plan.verifier_resolution.physical_row_tile;
+                    const size_t row_tile_count = static_cast<size_t>(
+                        (plan.rows - 1) / row_tile_width + 1);
+                    const int row_tile = static_cast<int>(
+                        local_task % row_tile_count);
+                    const size_t chunk_and_kt = local_task / row_tile_count;
+                    const int k_tile = static_cast<int>(
+                        chunk_and_kt % static_cast<size_t>(plan.k_tiles));
+                    const int chunk = static_cast<int>(
+                        chunk_and_kt / static_cast<size_t>(plan.k_tiles));
                     const int first_row = row_tile * row_tile_width;
                     execute_partial_tile(
                         projection,
@@ -9352,10 +9836,10 @@ namespace llaminar2::cpu::native_quantised
 #pragma omp for schedule(static)
                     for (int task = 0; task < total_shared_tile_tasks; ++task)
                     {
-                        const int kt = task % k_tiles;
-                        const int chunk_and_row_tile = task / k_tiles;
-                        const int chunk = chunk_and_row_tile % N_chunks;
-                        const int row_tile = chunk_and_row_tile / N_chunks;
+                        const int row_tile = task % row_tile_count;
+                        const int chunk_and_kt = task / row_tile_count;
+                        const int kt = chunk_and_kt % k_tiles;
+                        const int chunk = chunk_and_kt / k_tiles;
                         const int row0 = row_tile * row_tile_width;
                         const int tile_rows =
                             std::min(row_tile_width, projection_rows - row0);

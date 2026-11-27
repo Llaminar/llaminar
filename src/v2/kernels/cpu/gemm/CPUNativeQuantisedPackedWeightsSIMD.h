@@ -15,6 +15,14 @@
 #include <immintrin.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define LLAMINAR_ALWAYS_INLINE_SCALE __attribute__((always_inline))
+#define LLAMINAR_COLD_NOINLINE_SCALE __attribute__((noinline, cold))
+#else
+#define LLAMINAR_ALWAYS_INLINE_SCALE
+#define LLAMINAR_COLD_NOINLINE_SCALE
+#endif
+
 namespace llaminar2::cpu::native_quantised
 {
 #if defined(__AVX512F__)
@@ -22,24 +30,21 @@ namespace llaminar2::cpu::native_quantised
      * @brief Widen sixteen plain FP16 scales directly to FP32.
      * @param primary Aligned inline primary words within one 64-column unit.
      */
-    [[nodiscard]] inline __m512 loadPlainFP16Scales512(const uint16_t *primary)
+    [[nodiscard]] LLAMINAR_ALWAYS_INLINE_SCALE inline __m512 loadPlainFP16Scales512(const uint16_t *primary) noexcept
     {
         return _mm512_cvtph_ps(_mm256_load_si256(
             reinterpret_cast<const __m256i *>(primary)));
     }
 
     /**
-     * @brief Load sixteen effective scales without rounding source products to half.
-     * @param packed Retained CPU interleaved weight owner.
-     * @param primary Aligned inline primary words within one 64-column unit.
+     * @brief Out-of-line slow path for IQ3_S / IQ4_XS source-scale factors so hot
+     *        plain-FP16 kernels stay throw-free, inlined, and zero-spill.
      */
-    [[nodiscard]] inline __m512 loadScales512(
+    [[nodiscard]] LLAMINAR_COLD_NOINLINE_SCALE inline __m512 loadSourceScaled512Slow(
         const CPUNativeQuantisedPackedWeights &packed,
-        const uint16_t *primary)
+        const uint16_t *primary,
+        __m512 base)
     {
-        const __m512 base = loadPlainFP16Scales512(primary);
-        if (!packed.usesNibbleLUTSourceScale())
-            return base;
         const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
             reinterpret_cast<const __m256i *>(primary + 64)));
         if (packed.codebook_id == 11)
@@ -54,22 +59,32 @@ namespace llaminar2::cpu::native_quantised
         return _mm512_mul_ps(base, _mm512_cvtepi32_ps(
             _mm512_sub_epi32(_mm512_and_si512(raw, _mm512_set1_epi32(63)), _mm512_set1_epi32(32))));
     }
+
+    /**
+     * @brief Load sixteen effective scales without rounding source products to half.
+     * @param packed Retained CPU interleaved weight owner.
+     * @param primary Aligned inline primary words within one 64-column unit.
+     */
+    [[nodiscard]] LLAMINAR_ALWAYS_INLINE_SCALE inline __m512 loadScales512(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const uint16_t *primary)
+    {
+        const __m512 base = loadPlainFP16Scales512(primary);
+        if (__builtin_expect(!packed.usesNibbleLUTSourceScale(), 1))
+            return base;
+        return loadSourceScaled512Slow(packed, primary, base);
+    }
 #endif
 
 #if defined(__AVX2__)
     /**
-     * @brief Load eight effective scales using the same original source equation.
-     * @param packed Retained CPU interleaved weight owner.
-     * @param primary Aligned inline primary words within one 64-column unit.
+     * @brief Out-of-line slow path for AVX2 IQ3_S / IQ4_XS source-scale factors.
      */
-    [[nodiscard]] inline __m256 loadScales256(
+    [[nodiscard]] LLAMINAR_COLD_NOINLINE_SCALE inline __m256 loadSourceScaled256Slow(
         const CPUNativeQuantisedPackedWeights &packed,
-        const uint16_t *primary)
+        const uint16_t *primary,
+        __m256 base)
     {
-        const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
-            reinterpret_cast<const __m128i *>(primary)));
-        if (!packed.usesNibbleLUTSourceScale())
-            return base;
         const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
             reinterpret_cast<const __m128i *>(primary + 64)));
         if (packed.codebook_id == 11)
@@ -84,5 +99,24 @@ namespace llaminar2::cpu::native_quantised
         return _mm256_mul_ps(base, _mm256_cvtepi32_ps(
             _mm256_sub_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(63)), _mm256_set1_epi32(32))));
     }
+
+    /**
+     * @brief Load eight effective scales using the same original source equation.
+     * @param packed Retained CPU interleaved weight owner.
+     * @param primary Aligned inline primary words within one 64-column unit.
+     */
+    [[nodiscard]] LLAMINAR_ALWAYS_INLINE_SCALE inline __m256 loadScales256(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const uint16_t *primary)
+    {
+        const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
+            reinterpret_cast<const __m128i *>(primary)));
+        if (__builtin_expect(!packed.usesNibbleLUTSourceScale(), 1))
+            return base;
+        return loadSourceScaled256Slow(packed, primary, base);
+    }
 #endif
 } // namespace llaminar2::cpu::native_quantised
+
+#undef LLAMINAR_ALWAYS_INLINE_SCALE
+#undef LLAMINAR_COLD_NOINLINE_SCALE

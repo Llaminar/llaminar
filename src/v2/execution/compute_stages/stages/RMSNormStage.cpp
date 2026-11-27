@@ -15,7 +15,9 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../kernels/cpu/primitives/RMSNormPrimitives.h"
 
 namespace llaminar2
 {
@@ -29,8 +31,71 @@ namespace llaminar2
     {
     }
 
+    IComputeStage::CPURetainedTeamMode RMSNormStage::cpuRetainedTeamMode() const noexcept
+    {
+        if (!params_.device_id.is_gpu() &&
+            params_.input && params_.output && params_.gamma &&
+            params_.input->native_type() == TensorType::FP32 &&
+            params_.output->native_type() == TensorType::FP32 &&
+            params_.gamma->native_type() == TensorType::FP32)
+        {
+            const int seq = params_.seq_len > 0 ? params_.seq_len
+                                                : static_cast<int>(params_.input->rows());
+            if (seq == 1)
+                return CPURetainedTeamMode::MasterSingle;
+        }
+        return CPURetainedTeamMode::None;
+    }
+
+    void RMSNormStage::prepareForRetainedTeam(IDeviceContext *)
+    {
+        retained_in_ = nullptr;
+        retained_gamma_ = nullptr;
+        retained_out_ = nullptr;
+        retained_hidden_dim_ = 0;
+        if (cpuRetainedTeamMode() != CPURetainedTeamMode::MasterSingle)
+            return;
+        auto *input_base = requireTensorBasePtr(params_.input, "input");
+        auto *gamma_base = requireTensorBasePtr(params_.gamma, "gamma");
+        auto *output_base = requireTensorBasePtr(params_.output, "output");
+        if (!input_base || !gamma_base || !output_base)
+            return;
+        const TensorBase *effective_gamma = gamma_base;
+        if (params_.subtract_one)
+        {
+            if (!subtract_one_gamma_ || subtract_one_gamma_->numel() != gamma_base->numel())
+            {
+                subtract_one_gamma_ = std::make_shared<FP32Tensor>(
+                    gamma_base->shape(), DeviceId::cpu());
+                const float *src = gamma_base->data();
+                float *dst = subtract_one_gamma_->mutable_data();
+                for (size_t i = 0; i < gamma_base->numel(); ++i)
+                    dst[i] = 1.0f + src[i];
+            }
+            effective_gamma = subtract_one_gamma_.get();
+        }
+        retained_in_ = input_base->data();
+        retained_gamma_ = effective_gamma->data();
+        retained_out_ = output_base->mutable_data();
+        retained_hidden_dim_ = static_cast<size_t>(input_base->cols());
+    }
+
     bool RMSNormStage::execute(IDeviceContext *ctx)
     {
+        if (llaminar::v2::inLexicalWorkshare() &&
+            retained_in_ && retained_gamma_ && retained_out_ && retained_hidden_dim_ > 0)
+        {
+            traceInput("input", params_.input);
+            traceInput("gamma", params_.gamma);
+            primitives::rmsnorm_fused_vectorized_row(
+                retained_in_,
+                retained_gamma_,
+                retained_out_,
+                retained_hidden_dim_,
+                params_.eps);
+            traceOutput("output", params_.output);
+            return true;
+        }
         if (!ensureContext(ctx, "RMSNormStage"))
         {
             return false;

@@ -57,6 +57,7 @@ namespace llaminar2
         {
             constexpr const char *names[] = {
                 "LLAMINAR_LOG_LEVEL",
+                "LLAMINAR_PERF_STATS",
                 "LLAMINAR_PERF_STATS_JSON",
                 "LLAMINAR_PERF_STATS_CSV",
                 "LLAMINAR_PERF_STATS_FILTER",

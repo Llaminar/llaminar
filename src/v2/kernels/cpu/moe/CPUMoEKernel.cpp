@@ -1140,10 +1140,24 @@ namespace llaminar2
                     {"hidden_operand", "fp32"}, {"gate_weights", "bf16"},
                     {"accumulation", "fp32"}, {"reduction", "fixed_256_lane_tree"}});
         }
+        // For large non-verifier prefill batches (seq_len >= 32), oneDNN SGEMM achieves ~6x
+        // higher throughput on FP32 router weights than the small-M 4-row decode loop while
+        // keeping decode (M=1) and MTP verifier batches (M<=16) on the exact serial-equivalent path.
+        const bool fp32_prefill_onednn =
+            gate_type == TensorType::FP32 && seq_len >= 32 &&
+            !ITensorGemm::VerifierKernelModeScope::active();
+        if (fp32_prefill_onednn)
+        {
+            if (!gemm::run_onednn_fp32_matmul(
+                    hidden, static_cast<const float *>(gate_weights),
+                    result.router_logits.data(), seq_len, num_experts, d_model,
+                    true, 1.0f, 0.0f))
+                return false;
+        }
         const int row_tiles = seq_len / 4 + (seq_len % 4 != 0);
         auto route_rows = [&]()
         {
-            if (gate_type == TensorType::FP32)
+            if (gate_type == TensorType::FP32 && !fp32_prefill_onednn)
             {
 #pragma omp for collapse(2) schedule(static)
             for (int tile = 0; tile < row_tiles; ++tile)

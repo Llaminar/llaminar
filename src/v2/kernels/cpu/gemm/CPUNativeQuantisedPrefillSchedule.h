@@ -130,6 +130,24 @@ namespace llaminar2::cpu::native_quantised
         const std::int64_t chunks = (std::int64_t{geometry.columns} + 63) / 64;
         const std::int64_t blocks =
             (chunks + geometry.n_block_chunks - 1) / geometry.n_block_chunks;
+        const std::int64_t four_row_tasks =
+            ((std::int64_t{geometry.rows} + 3) / 4) * blocks;
+        // Compact unsigned/five-bit encodings achieve highest AVX-512 VNNI
+        // throughput and balanced wave occupancy with four-row weight-stationary
+        // tiles (`FourRowGrid`), including narrow N shapes that would otherwise
+        // fall into single-row `RowChunkGrid` or imbalanced `TwoRowNMajor`.
+        const bool compact_wide_encoding =
+            geometry.encoding == CPUNativeQuantisedEncoding::UnsignedInt8 ||
+            geometry.encoding == CPUNativeQuantisedEncoding::UnsignedNibble ||
+            geometry.encoding == CPUNativeQuantisedEncoding::CompactFiveBit;
+        if (compact_wide_encoding &&
+            geometry.row_kernels == PrefillRowKernelSet::WideRows &&
+            geometry.row_stride >= 64 &&
+            geometry.rows >= 4 &&
+            four_row_tasks >= geometry.workers)
+        {
+            return PrefillSchedulePolicy::FourRowGrid;
+        }
         if (geometry.row_stride < 64 ||
             (geometry.rows >= 2 && blocks <= geometry.workers / 4))
             return PrefillSchedulePolicy::RowChunkGrid;
@@ -144,8 +162,6 @@ namespace llaminar2::cpu::native_quantised
         const bool costly_decode =
             geometry.encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
             geometry.encoding == CPUNativeQuantisedEncoding::CompactMultiScale;
-        const std::int64_t four_row_tasks =
-            ((std::int64_t{geometry.rows} + 3) / 4) * blocks;
         return costly_decode && geometry.row_kernels == PrefillRowKernelSet::WideRows &&
                        geometry.rows >= 128 && four_row_tasks >= std::int64_t{geometry.workers} * 4
                    ? PrefillSchedulePolicy::FourRowGrid

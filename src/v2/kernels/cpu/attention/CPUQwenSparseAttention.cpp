@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace llaminar2::qwen4exp
@@ -267,6 +268,43 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
             : ProjectionRowSpan{0,replay.live_rows*4};
     const int first_block = replay.prefix_tokens / 4;
     const int complete_blocks = (replay.prefix_tokens + replay.live_rows) / 4;
+    // Fast single-owner decode path when at most one 4-token pool completes, no
+    // ranking pass is required (<= 512 blocks), and row capacity is 1: collapses
+    // 3 full team barriers into ONE OMP_SINGLE barrier with identical writes.
+    const bool single_owner_fast =
+        replay.live_rows <= 1 &&
+        p.row_capacity <= 1 &&
+        (complete_blocks - first_block) <= 1 &&
+        (queryHeads.end - queryHeads.first) <= 4 &&
+        (noRanking || complete_blocks <= QwenSparseBlocks);
+    if (single_owner_fast)
+    {
+        auto fast_indexer = [&]()
+        {
+            for (int block = first_block; block < complete_blocks; ++block)
+            {
+                const std::array<const float *, 4> raw{
+                    rawKey(p, block * 4), rawKey(p, block * 4 + 1),
+                    rawKey(p, block * 4 + 2), rawKey(p, block * 4 + 3)};
+                preparePool(raw, p.key_norm, replay.position_origin + block * 4, p,
+                            p.pooled_keys + std::size_t(block) * 128);
+            }
+            for (int row_head = queryHeads.first; row_head < queryHeads.end; ++row_head)
+            {
+                prepare(p.query + std::size_t(row_head) * 128, p.query_norm,
+                        replay.position_origin + replay.prefix_tokens + row_head / 4, p,
+                        p.prepared_query + std::size_t(row_head) * 128);
+            }
+            for (int row = 0; row < p.row_capacity; ++row)
+            {
+                if (!selectRow(p, row))
+                    invalidNumeric("indexer bounded selection");
+            }
+        };
+        OMP_SINGLE(fast_indexer);
+        return;
+    }
+
     auto preparation = [&]()
     {
 #pragma omp for schedule(static)
@@ -337,16 +375,52 @@ void cpuQwenSparseSelectPools(const QwenSparseIndexer &p)
  * @throws std::invalid_argument Before worksharing for invalid policy, ISA,
  * replay, selected mappings, byte geometry or publication exclusions.
  */
-void cpuQwenSparseAttention(const QwenSparseAttention &p)
+namespace
 {
-    const auto invocation=cpu_sparse::Invocation::bind(p);
+/** @brief Internal CPU QSA execution accepting an optional shared cooperative logits buffer. */
+void cpuQwenSparseAttentionWithInvocation(const cpu_sparse::Invocation &invocation, float *cooperative_logits, int max_fused_groups)
+{
     const int live_rows=invocation.liveRows();
     const int query_heads=invocation.queryHeads();
     const int head_start=invocation.queryHeadStart();
+    const int threads=std::max(1,omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads());
+
+    // Cooperative single-row decode path: decode each KV row ONCE across the entire KV-head group
+    // (up to 12 query heads) while fusing up to max_fused_groups KV groups into ONE 3-barrier pass
+    // (24/48 softmax tasks and 32/64 V-strip tasks so all cores stay busy in exact original order).
+    if(cooperative_logits && live_rows==1 && query_heads>0 && threads>1 &&
+       !invocation.isRotated() && invocation.selectedCount(0)>=32)
+    {
+        using GroupSpan = cpu_sparse::Invocation::CooperativeGroupSpan;
+        std::array<GroupSpan,16> groups{};
+        int group_count=0;
+        for(int h=0;h<query_heads;)
+        {
+            const int kv_end=std::min(query_heads,(((head_start+h)/12)+1)*12-head_start);
+            if(group_count<static_cast<int>(groups.size()))
+                groups[static_cast<std::size_t>(group_count)]={h,kv_end-h};
+            ++group_count;
+            h=kv_end;
+        }
+        if(group_count<=static_cast<int>(groups.size()))
+        {
+            const int batch_cap = std::max(1, std::min(4, max_fused_groups));
+            const auto coop_attention=[&]()
+            {
+                for(int g=0;g<group_count;g+=batch_cap)
+                {
+                    const int batch=std::min(batch_cap,group_count-g);
+                    invocation.executeSingleRowGroupsCooperativeInTeam(0,groups.data()+g,batch,cooperative_logits);
+                }
+            };
+            OMP_WORKSHARE_REGION(coop_attention);
+            return;
+        }
+    }
+
     // Choose the largest same-KV-head GQA tile (<=12 on AVX-512, <=6 on AVX2/NEON)
     // that still exposes enough independent tasks to fill all OpenMP workers.
     const int max_register_group=(invocation.isa()==ISALevel::AVX512)?12:6;
-    const int threads=std::max(1,omp_get_max_threads());
     int max_group_heads=1;
     if(live_rows>0&&query_heads>1)
     {
@@ -409,6 +483,26 @@ void cpuQwenSparseAttention(const QwenSparseAttention &p)
     };
     // The empty loop still participates in the retained team's completion edge.
     OMP_WORKSHARE_REGION(attention);
+}
+void cpuQwenSparseAttentionImpl(const QwenSparseAttention &p, float *cooperative_logits, int max_fused_groups)
+{
+    const auto invocation = cpu_sparse::Invocation::bind(p);
+    cpuQwenSparseAttentionWithInvocation(invocation, cooperative_logits, max_fused_groups);
+}
+} // namespace
+
+void cpuQwenSparseAttention(const QwenSparseAttention &p)
+{
+    if (!::llaminar::v2::inLexicalWorkshare())
+    {
+        constexpr std::size_t kPaddedSelected = (static_cast<std::size_t>(QwenSparseSelected) + 15u) & ~std::size_t{15u};
+        alignas(64) std::array<float, 2 * 12 * kPaddedSelected> stack_logits;
+        cpuQwenSparseAttentionImpl(p, stack_logits.data(), 1);
+    }
+    else
+    {
+        cpuQwenSparseAttentionImpl(p, nullptr, 1);
+    }
 }
 
 /** @brief Publish the exact original replay/raw-tail snapshot under one retained-team owner.
@@ -481,7 +575,20 @@ public:
     /** @copydoc IQwenSparseAttentionKernels::indexer */
     void indexer(const QwenSparseIndexer &p, void *) const override { cpuQwenSparseIndexer(p); }
     /** @copydoc IQwenSparseAttentionKernels::attention */
-    void attention(const QwenSparseAttention &p, void *) const override { cpuQwenSparseAttention(p); }
+    void attention(const QwenSparseAttention &p, void *) const override
+    {
+        if (::llaminar::v2::inLexicalWorkshare())
+        {
+            // Validate & seal invocation ONCE on a single thread instead of redundantly
+            // validating 600..2048 selected indices across all 28 retained-team workers.
+            OMP_SINGLE([&]() {
+                team_invocation_.emplace(cpu_sparse::Invocation::bind(p));
+            });
+            cpuQwenSparseAttentionWithInvocation(*team_invocation_, cooperative_logits_.data(), 4);
+            return;
+        }
+        cpuQwenSparseAttentionImpl(p, cooperative_logits_.data(), 4);
+    }
     /** @copydoc IQwenSparseAttentionKernels::prepareReplay */
     void prepareReplay(const QwenSparsePrepareReplay &p,void *) const override { cpuQwenSparsePrepareReplay(p); }
     /** @copydoc IQwenSparseAttentionKernels::snapshotPrior */
@@ -493,6 +600,10 @@ public:
     {
         cpuQwenStateTransfer(qwenSparseCandidateTransfer(p));
     }
+private:
+    static constexpr std::size_t kPaddedSelected = (static_cast<std::size_t>(QwenSparseSelected) + 15u) & ~std::size_t{15u};
+    alignas(64) mutable std::array<float, 2 * 4 * 12 * kPaddedSelected> cooperative_logits_{};
+    mutable std::optional<cpu_sparse::Invocation> team_invocation_{};
 };
 }
 /** @brief Construct the existing allocation-free-invocation CPU primitive bundle during setup.

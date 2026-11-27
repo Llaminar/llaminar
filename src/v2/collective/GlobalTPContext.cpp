@@ -768,6 +768,23 @@ namespace llaminar2
         return success;
     }
 
+    bool GlobalTPContext::allreduceFloats(float *data, size_t count)
+    {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::allreduceFloats - abort already requested for domain " << domain_id_);
+            return false;
+        }
+        if (!backend_ || (count > 0 && !data))
+        {
+            LOG_ERROR("GlobalTPContext::allreduceFloats - invalid backend or buffer for domain " << domain_id_);
+            return false;
+        }
+        if (count == 0)
+            return true;
+        return backend_->allreduce(data, count, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM);
+    }
+
     bool GlobalTPContext::broadcast(TensorBase *tensor, int source_index)
     {
         if (isAbortRequested())
@@ -870,6 +887,23 @@ namespace llaminar2
 
         // Delegate to UPI backend
         return backend_->allgather(send_data, recv_data, local_count, CollectiveDataType::FLOAT32);
+    }
+
+    bool GlobalTPContext::allgatherFloats(const float *send_data, float *recv_data, size_t send_count)
+    {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::allgatherFloats - abort already requested for domain " << domain_id_);
+            return false;
+        }
+        if (!backend_ || (send_count > 0 && (!send_data || !recv_data)))
+        {
+            LOG_ERROR("GlobalTPContext::allgatherFloats - invalid backend or buffer for domain " << domain_id_);
+            return false;
+        }
+        if (send_count == 0)
+            return true;
+        return backend_->allgather(send_data, recv_data, send_count, CollectiveDataType::FLOAT32);
     }
 
     void GlobalTPContext::requestAbort()

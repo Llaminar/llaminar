@@ -16,6 +16,7 @@
 #include "../../../../kernels/KernelFactory.h"
 #include "../../../../kernels/qwen4exp/Qwen4ExpValidation.h"
 #include "../../../../tensors/Tensors.h"
+#include "../../../../utils/OpenMPUtils.h"
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -351,11 +352,33 @@ qwen4exp::AcceptedPrefix Qwen4ExpPrimitiveStage::acceptedPrefix(const Qwen4ExpSt
             acceptance.fixedAcceptedRows};
 }
 
+IComputeStage::CPURetainedTeamMode Qwen4ExpPrimitiveStage::cpuRetainedTeamMode() const noexcept
+{
+    if (!device().is_cpu() || params_.rows.capacity != 1 || params_.rows.liveRows.has_value())
+        return CPURetainedTeamMode::None;
+    if (const auto *norm = std::get_if<BranchRMSNorm>(&params_.operation))
+    {
+        if (norm->single_q8)
+            return CPURetainedTeamMode::None;
+    }
+    return CPURetainedTeamMode::CollectiveTeam;
+}
+
+void Qwen4ExpPrimitiveStage::prepareForRetainedTeam(IDeviceContext *context)
+{
+    (void)context;
+    if (device().is_cpu() && hash_prepared_)
+    {
+        hash_prepared_->seal();
+        hash_prepared_->validate();
+    }
+}
+
 bool Qwen4ExpPrimitiveStage::execute(IDeviceContext *context)
 {
     if (!context || context->deviceId() != device())
         throw std::invalid_argument("Qwen4Exp stage requires the matching participant execution context");
-    if(hash_prepared_){if(device().is_cpu())hash_prepared_->seal();hash_prepared_->validate();}
+    if(hash_prepared_){if(device().is_cpu() && !::llaminar::v2::inLexicalWorkshare())hash_prepared_->seal();hash_prepared_->validate();}
     void *stream = nullptr;
     if (device().is_gpu())
     {
