@@ -888,6 +888,23 @@ namespace llaminar2
         }
 
         /**
+         * @brief Test-only: set the host decode cursor for a pooled forward.
+         *
+         * A runner-level truncate/import changes the pooled publication's
+         * row count; the host cursor authority must be re-seated to the
+         * truncated position before the next forward or the pooled gate
+         * refuses (which is exactly the fail-closed contract). This setter
+         * exists only for the runner-level unit fixture to model that
+         * re-seat; production restoration goes through the request/prefix
+         * admission path.
+         */
+        void setPooledDecodeStartPosition(int position) noexcept
+        {
+            if (!state_.positions.empty())
+                state_.positions[0] = position;
+        }
+
+        /**
          * @brief Construct an isolated orchestrator for model-free unit tests.
          *
          * This legacy surface intentionally has no model context or physical-

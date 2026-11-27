@@ -86,8 +86,8 @@ public:
          * @return Pointer to one retained bank page metadata entry.
          *
          * Single CPU runner-thread metadata authority: the caller may replace
-         * the entry's publication (relinquishPrivatePin) when it owns the
-         * frame. Never exposes live KV payload ownership.
+         * the entry's publication when it owns the frame. Never exposes live
+         * KV payload ownership.
          */
         CPUFP32KVPage *pageAt(std::size_t index) const;
         /** @return Number of retained pages of this bank. */

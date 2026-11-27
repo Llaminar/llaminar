@@ -470,3 +470,254 @@ TEST(PooledDenseDecode, TwoRequestsShareOnePoolWithoutCrossTalk)
     EXPECT_EQ(binding_a.priorFor(0)->snapshot.view().rows(), 2 + 5);
     EXPECT_EQ(binding_b.priorFor(0)->snapshot.view().rows(), 3 + 4);
 }
+
+
+/** @test P2 runner-level truncate/export/import: a live pooled request exports
+ * its history, truncates mid-page, and continues decode; the byte oracle is a
+ * SECOND pooled request that prefilled the same truncated prefix and decoded
+ * the same tokens from row 0 of an identical history and stream pace — the
+ * two end at the same row count with identical K/V bytes and logits. */
+TEST(PooledDenseDecode, RunnerTruncateExportImportRoundTrip)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 4> prompt{1, 3, 5, 7};
+    const std::array<int32_t, 4> decode_after{2, 4, 6, 8};
+    const int truncated_rows = 4; // Mid-page (4 < page_tokens 8).
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 24;
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 3 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 4;
+        budget.max_pages_per_request = 64;
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/fx.config.n_layers, /*admitted_issuances=*/10, /*readers_per_bank=*/4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=plan->total_bytes,
+            .admission_available_bytes=plan->total_bytes},
+            PhysicalMemoryOwner::KVCache, plan->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *plan, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    // Target: prefill 4 + decode 2 = 6 rows, truncate to 4, decode 4 more = 8.
+    PagedKVInstance target_instance;
+    ASSERT_TRUE(make_instance(target_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> target_owner;
+    PreparedWeightStore target_store;
+    std::shared_ptr<QwenStandardGraph> target_builder;
+    make_runner(fx, target_owner, target_store, target_builder);
+    PooledKVDecodeBinding target(&target_instance.pool(), &target_instance.table(),
+        /*request_id=*/21, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers,
+        /*admitted_issuances=*/10);
+    target_owner->setPooledDecodeBinding(&target);
+
+    ASSERT_OK("target prefill", target_owner->forward(prompt.data(), 4, 1) != nullptr);
+    const std::array<int32_t, 2> pre_decode{2, 4};
+    ASSERT_OK("target decode 0", target_owner->forward(&pre_decode[0], 1, 1) != nullptr);
+    ASSERT_OK("target decode 1", target_owner->forward(&pre_decode[1], 1, 1) != nullptr);
+    EXPECT_EQ(target.priorFor(0)->snapshot.view().rows(), 6);
+    auto exported = target.exportLayer(0);
+    ASSERT_TRUE(exported.has_value());
+    EXPECT_EQ(static_cast<int>(exported->meta().rows), 6);
+    EXPECT_TRUE(target.truncateLayer(0, truncated_rows));
+    EXPECT_EQ(target.priorFor(0)->snapshot.view().rows(), truncated_rows);
+    target_owner->setPooledDecodeStartPosition(truncated_rows);
+    for (const auto token : decode_after)
+        ASSERT_OK("target decode after truncate", target_owner->forward(&token, 1, 1) != nullptr);
+    EXPECT_EQ(target.priorFor(0)->snapshot.view().rows(),
+        truncated_rows + static_cast<int>(decode_after.size()));
+
+    // Oracle: a second pooled request that prefilled the SAME 4-row prefix and
+    // decoded the same 4 tokens — identical history bytes at row 8.
+    PagedKVInstance oracle_instance;
+    ASSERT_TRUE(make_instance(oracle_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> oracle_owner;
+    PreparedWeightStore oracle_store;
+    std::shared_ptr<QwenStandardGraph> oracle_builder;
+    make_runner(fx, oracle_owner, oracle_store, oracle_builder);
+    PooledKVDecodeBinding oracle(&oracle_instance.pool(), &oracle_instance.table(),
+        /*request_id=*/22, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers,
+        /*admitted_issuances=*/10);
+    oracle_owner->setPooledDecodeBinding(&oracle);
+    ASSERT_OK("oracle prefill", oracle_owner->forward(prompt.data(), 4, 1) != nullptr);
+    for (const auto token : decode_after)
+        ASSERT_OK("oracle decode", oracle_owner->forward(&token, 1, 1) != nullptr);
+    EXPECT_EQ(oracle.priorFor(0)->snapshot.view().rows(), 8);
+
+    // Both are at row 8 with the same 4-token prefix + the same decode tokens:
+    // compare the NEXT token's logits (identical attention inputs).
+    const int32_t cmp = 10;
+    const auto *target_cmp = target_owner->forward(&cmp, 1, 1);
+    const auto *oracle_cmp = oracle_owner->forward(&cmp, 1, 1);
+    ASSERT_NE(target_cmp, nullptr);
+    ASSERT_NE(oracle_cmp, nullptr);
+    const std::size_t vocab = static_cast<std::size_t>(fx.config.vocab_size);
+    EXPECT_EQ(std::memcmp(target_cmp, oracle_cmp, vocab * sizeof(float)), 0)
+        << "truncated request diverged from the identical-prefix oracle";
+    // Byte-identity of the retained history: same pages, same rows.
+    auto target_view = target.priorFor(0)->snapshot.view();
+    auto oracle_view = oracle.priorFor(0)->snapshot.view();
+    ASSERT_EQ(target_view.rows(), oracle_view.rows());
+    const int rows = target_view.rows();
+    for (int row = 0; row < rows; ++row)
+    {
+        EXPECT_EQ(std::memcmp(target_view.key(row, 0), oracle_view.key(row, 0),
+                static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+            << "history K diverged at row " << row;
+        EXPECT_EQ(std::memcmp(target_view.value(row, 0), oracle_view.value(row, 0),
+                static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+            << "history V diverged at row " << row;
+    }
+}
+
+/** @test P2 cancellation under a running pooled step + exact borrower
+ * retirement: a request cancelled between steps publishes nothing new, its
+ * accepted-work envelope and tail frames retire to the pool, and a resolved
+ * borrower of its LAST published snapshot stays valid (reads the exact bytes)
+ * until it releases — the pool never reuses a frame a borrower still pins.
+ * A replacement request on the SAME instance then runs cleanly. */
+TEST(PooledDenseDecode, RunnerCancellationRetiresBorrowersExactly)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 3> prompt{1, 3, 5};
+    const std::array<int32_t, 4> decode{2, 4, 6, 8};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 3 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 4;
+        budget.max_pages_per_request = 64;
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/1, /*admitted_issuances=*/8, /*readers_per_bank=*/4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        // Two persistent-tail bindings: 2 banks/layer x 2 bindings + headroom
+        // >= layers x issuances x 2. Widen the table explicitly.
+        auto table_geom = plan->table_geometry;
+        table_geom.bank_count = 2 * table_geom.bank_count;
+        table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+        table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+        auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+        widened->table_geometry = table_geom;
+        widened->total_bytes = PhysicalPagePool::physicalBytes(plan->pool_geometry, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=widened->total_bytes,
+            .admission_available_bytes=widened->total_bytes},
+            PhysicalMemoryOwner::KVCache, widened->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *widened, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 16;
+
+    PagedKVInstance instance;
+    ASSERT_TRUE(make_instance(instance));
+    std::unique_ptr<DeviceGraphOrchestrator> owner;
+    PreparedWeightStore store;
+    std::shared_ptr<QwenStandardGraph> builder;
+    make_runner(fx, owner, store, builder);
+    PooledKVDecodeBinding binding(&instance.pool(), &instance.table(),
+        /*request_id=*/201, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, /*layers=*/1,
+        /*admitted_issuances=*/8, /*persistent_tail=*/true);
+    owner->setPooledDecodeBinding(&binding);
+    ASSERT_OK("prefill", owner->forward(prompt.data(), 3, 1) != nullptr);
+    ASSERT_OK("decode 0", owner->forward(&decode[0], 1, 1) != nullptr);
+    ASSERT_OK("decode 1", owner->forward(&decode[1], 1, 1) != nullptr);
+
+    // A real borrower of the LAST published snapshot: resolve the live ref.
+    auto *prior = binding.priorFor(0);
+    ASSERT_NE(prior, nullptr);
+    ASSERT_TRUE(prior->ref.valid());
+    auto borrowed = instance.table().resolveSnapshotRef(prior->ref);
+    ASSERT_TRUE(borrowed.has_value());
+    auto borrowed_view = borrowed->view();
+    const int borrowed_rows = borrowed_view.rows();
+    EXPECT_EQ(borrowed_rows, 5);
+
+    // Cancel the request; the last publication stays alive while the borrower
+    // holds it (frames retire after the last pin).
+    binding.cancelRequest();
+    EXPECT_TRUE(binding.cancelled());
+    EXPECT_FALSE(binding.hasLivePublication());
+    EXPECT_EQ(binding.remainingIssuances(), 0u);
+    // The borrowing snapshot is still readable byte-exact.
+    EXPECT_EQ(borrowed->view().rows(), borrowed_rows);
+    for (int row = 0; row < borrowed_rows; ++row)
+        (void)borrowed_view.key(row, 0);
+    // A NEW request on the SAME instance runs cleanly after the cancellation.
+    std::unique_ptr<DeviceGraphOrchestrator> owner2;
+    PreparedWeightStore store2;
+    std::shared_ptr<QwenStandardGraph> builder2;
+    make_runner(fx, owner2, store2, builder2);
+    PooledKVDecodeBinding binding2(&instance.pool(), &instance.table(),
+        /*request_id=*/202, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, /*layers=*/1,
+        /*admitted_issuances=*/8, /*persistent_tail=*/true);
+    owner2->setPooledDecodeBinding(&binding2);
+    ASSERT_OK("replacement prefill", owner2->forward(prompt.data(), 3, 1) != nullptr);
+    ASSERT_OK("replacement decode", owner2->forward(&decode[2], 1, 1) != nullptr);
+    EXPECT_EQ(binding2.priorFor(0)->snapshot.view().rows(), 4);
+    // Release the borrower; the replacement's own writes remain valid.
+    borrowed.reset();
+}

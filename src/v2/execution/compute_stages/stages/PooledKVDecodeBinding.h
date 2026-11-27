@@ -295,6 +295,39 @@ public:
     }
 
     /**
+     * @brief Cancel the pooled request and retire ALL its state exactly.
+     *
+     * Cancellation under a running step: the step guard cancels on unwind
+     * (N1); an explicit cancellation between steps drops every not-yet-
+     * published next cell, releases the step grant and the request's
+     * accepted-work envelope, and drops every pre-assigned tail frame
+     * (persistent tail) WITHOUT releasing frames another reader still
+     * borrows — the pool retires each frame after its last pin. After this
+     * call the binding is inert: prepareStep/export/truncate refuse.
+     */
+    void cancelRequest() noexcept
+    {
+        step_grant_.reset();
+        step_rows_ = 0;
+        step_prepared_ = false;
+        for (auto &pair : cells_)
+        {
+            pair.cells[1] = {};
+            pair.cells[0] = {};
+        }
+        for (auto &fresh : fresh_tail_frames_)
+            fresh.reset();
+        tail_frames_.clear();
+        fresh_tail_frames_.clear();
+        tail_grant_.reset();
+        private_publication_grant_.reset();
+        reservation_.reset();
+        cancelled_ = true;
+    }
+    /** @return Whether the request was explicitly cancelled. */
+    bool cancelled() const noexcept { return cancelled_; }
+
+    /**
      * @brief Complete page demand of one layer for appending @p rows.
      * @return Pages needed (COW extension + fresh pages), never zero for rows>0.
      */
@@ -486,7 +519,7 @@ public:
      */
     StepGuard prepareStep(int rows)
     {
-        if (!pool_ || !reservation_) return StepGuard{};
+        if (cancelled_ || !pool_ || !reservation_) return StepGuard{};
         const std::size_t layers = cells_.size();
         // N2: the accepted-work version envelope must cover THIS step.
         if (reservation_->remaining() < layers)
@@ -608,6 +641,96 @@ public:
         return prior.snapshot.view().rows();
     }
 
+    /**
+     * @brief Export one layer's complete live pooled history as an archive.
+     * @param layer Attended layer.
+     * @return The exact archive of that layer's publication (provenance is
+     * the layer's native geometry), or empty when the layer has no live
+     * publication.
+     */
+    std::optional<PagedKVArchive> exportLayer(int layer) const
+    {
+        const auto *prior = priorFor(layer);
+        if (!prior) return std::nullopt;
+        return PagedKVArchive::fromView(prior->snapshot.view());
+    }
+
+    /**
+     * @brief Truncate ONE layer's history to @p rows and replace its prior.
+     *
+     * The truncated view is an exact prefix of the retained pages (same
+     * referents, fewer visible rows); a NEW bank is published with the
+     * clipped extent and becomes the prior cell. The old publication is
+     * retired after the substitution (a reader that still holds it keeps its
+     * own referents).
+     * @param layer Attended layer.
+     * @param rows Exact new visible row count (0 < rows <= current rows).
+     * @return True on success; false (no mutation) when the layer has no
+     * live publication, @p rows is out of range, or a new bank cannot be
+     * admitted (never partially truncates).
+     */
+    bool truncateLayer(int layer, int rows)
+    {
+        if (!pool_ || !table_ || rows <= 0) return false;
+        auto *prior = priorFor(layer);
+        if (!prior) return false;
+        const int current = prior->snapshot.view().rows();
+        if (rows > current) return false;
+        if (rows == current) return true; // No-op.
+        // The production truncation path (kernel
+        // TruncateExportReattachStaysByteExact): exact prefix view -> archive
+        // -> re-materialized private pages through attachArchivedPrefix, so a
+        // mid-page clip never exposes a partially-visible page to the kernel.
+        auto clipped = prior->snapshot.view().prefix(static_cast<std::size_t>(rows));
+        auto archive = PagedKVArchive::fromView(clipped);
+        if (archive.empty()) return false;
+        const auto pages_needed =
+            (static_cast<std::size_t>(rows) + static_cast<std::size_t>(page_tokens_) - 1) /
+                static_cast<std::size_t>(page_tokens_);
+        auto grant = pool_->tryAdmit(pages_needed ? pages_needed : 1);
+        if (!grant) { LOG_ERROR("[PooledKVDecodeBinding] truncate grant refused"); return false; }
+        // The truncation publishes ONE new bank inside this request's OWN
+        // accepted-work version envelope (a maintenance issuance), never the
+        // normal-admission budget (which other requests own).
+        auto truncated = reservation_
+            ? table_->tryBeginReserved(*reservation_)
+            : table_->tryBeginUpdate();
+        if (!truncated)
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] truncate bank refused");
+            return false;
+        }
+        try
+        {
+            truncated->attachArchivedPrefix(archive, *grant, page_tokens_,
+                /*trust_domain=*/0, /*ancestry_id=*/0);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] truncateArchive attach refused: " << e.what());
+            return false;
+        }
+        auto snapshot = truncated->commit();
+        if (!table_->bindPublication(snapshot, request_id_, slot_))
+        { LOG_ERROR("[PooledKVDecodeBinding] truncate bind refused"); return false; }
+        auto ref = table_->refFor(snapshot, request_id_, slot_);
+        if (!ref.valid())
+        { LOG_ERROR("[PooledKVDecodeBinding] truncate ref refused"); return false; }
+        if (layer < 0 || static_cast<std::size_t>(layer) >= cells_.size())
+            return false;
+        // The new bank's pages are PRIVATE (materialized) publications: their
+        // frames stay owned by THIS grant. The previous private-publication
+        // grant (if any) may now be released — its bank was already replaced
+        // by the new snapshot (readers of the superseded bank keep reading;
+        // share() of a superseded retiring frame correctly refuses). The
+        // grant must outlive this function or the frames become retiring.
+        private_publication_grant_ = std::move(grant);
+        auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
+        cell.ref = ref;
+        cell.snapshot = std::move(snapshot);
+        return true;
+    }
+
 private:
     static constexpr std::size_t kRequiredBanksPerLayer = 2;
     struct PooledPublicationCellPair
@@ -637,7 +760,11 @@ private:
     std::size_t admitted_issuances_ = 0;
     std::vector<PooledPublicationCellPair> cells_;
     std::optional<CPUFP32PagedKVTable::IssuanceReservation> reservation_;
+    bool cancelled_ = false;
     std::optional<PhysicalPagePool::Grant> step_grant_;
+    /** Grant owning the frames of the LAST truncation/import bank (private
+     * materialized pages must stay owned for the bank's lifetime). */
+    std::optional<PhysicalPagePool::Grant> private_publication_grant_;
     int step_rows_ = 0;
     bool step_prepared_ = false;
     /** Persistent exclusive-tail grant (one frame per layer), admitted at binding. */
