@@ -60,6 +60,29 @@ from test_server_execution_contract import automatic_evidence
 from test_gpu_driver_diagnostics import clean_evidence as clean_driver_evidence
 
 
+INTEGRATION_OPERATION = ROOT / "scripts/ci/arm_native_integration_operation.sh"
+INTEGRATION_OPERATION_RUN = (
+    "python3 scripts/ci/arm_native_build_evidence.py capture -- "
+    "sh scripts/ci/arm_native_integration_operation.sh")
+
+
+def canonical_integration_operation(dockerfile: str) -> str:
+    """Return the Integration build script after proving the builder executes it.
+
+    The canonical Integration configure/build/strip operation lives in one
+    shell script shared by the ARM evidence export and the gated builder.  The
+    script text only certifies the image when the builder stage actually runs
+    it exactly once and the Dockerfile keeps no second Integration build.
+    """
+    operation_stage = dockerfile.split("FROM toolchain AS builder-integration-operation", 1)[1].split(
+        "FROM builder-integration-operation AS builder", 1)[0]
+    if operation_stage.count(INTEGRATION_OPERATION_RUN) != 1:
+        raise AssertionError("The builder must run the canonical Integration operation exactly once")
+    if "-B build_v2_integration" in dockerfile:
+        raise AssertionError("The Dockerfile must not keep a second Integration build")
+    return INTEGRATION_OPERATION.read_text(encoding="utf-8")
+
+
 def rocm_release_pins():
     """Read the installer-owned flat pins without maintaining another version table."""
     return dict(line.split("=", 1) for line in
@@ -4504,17 +4527,35 @@ class ImageIdentityTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         builder = dockerfile.split("FROM toolchain AS builder", 1)[1].split(
             "FROM ubuntu:24.04 AS runtime", 1)[0]
+        operation = canonical_integration_operation(dockerfile)
         test_runner = dockerfile.split("FROM runtime AS test-runner", 1)[1]
         self.assertIn("ON:full-matrix|OFF:model-free", builder)
         self.assertIn(
             'full-matrix) integration_targets="v2_unit_gate v2_production_test_preflight_gate '
             'v2_model_parity_matrices"',
-            builder,
+            operation,
         )
         self.assertIn(
             'model-free) integration_targets="v2_unit_gate v2_production_test_preflight_gate"',
-            builder,
+            operation,
         )
+        # Execute the operation's actual target selection: only full-matrix may
+        # compile matrices, and an unknown inventory must stop the build.
+        start = operation.index('case "${LLAMINAR_TEST_RUNNER_INVENTORY}" in')
+        selection = operation[start:operation.index("esac", start) + len("esac")]
+        for inventory in ("full-matrix", "model-free", "unit-only", "arm64-pr", "unknown"):
+            with self.subTest(inventory=inventory):
+                result = subprocess.run(
+                    ["/bin/sh", "-ec", selection + '\nprintf \'%s\' "$integration_targets"'],
+                    env=dict(os.environ, LLAMINAR_TEST_RUNNER_INVENTORY=inventory),
+                    capture_output=True, text=True)
+                if inventory == "unknown":
+                    self.assertNotEqual(result.returncode, 0)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout)
+                self.assertEqual("v2_model_parity_matrices" in result.stdout.split(),
+                                 inventory == "full-matrix")
         self.assertIn(
             'org.llaminar.test_runner_inventory="${LLAMINAR_TEST_RUNNER_INVENTORY}"', test_runner,
         )
@@ -4528,13 +4569,16 @@ class ImageIdentityTests(unittest.TestCase):
         changing their cache keys or imposing a timeout policy.
         """
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        for phase in ("rccl", "onednn", "integration", "release"):
+        # Integration is owned by the canonical operation script the builder runs.
+        sources = dict.fromkeys(("rccl", "onednn", "release"), dockerfile)
+        sources["integration"] = canonical_integration_operation(dockerfile)
+        for phase, source in sources.items():
             with self.subTest(phase=phase):
-                self.assertIn(f'{phase}_started_epoch="$(date +%s)"', dockerfile)
+                self.assertIn(f'{phase}_started_epoch="$(date +%s)"', source)
                 self.assertIn(
                     f'==> [{phase}] done; elapsed_seconds=$(( $(date +%s) - '
                     f'{phase}_started_epoch ))',
-                    dockerfile,
+                    source,
                 )
 
     def test_snapshot_does_not_materialize_docker_ignored_parity_evidence(self):
@@ -5081,7 +5125,11 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('-DONLY_FUNCS="${rccl_build_funcs}"', dockerfile)
         self.assertIn("-DENABLE_MSCCL_KERNEL=OFF", dockerfile)
         self.assertIn('tar.gz/${LLAMINAR_RCCL_GIT_COMMIT}"', dockerfile)
-        self.assertEqual(dockerfile.count('-DCMAKE_HIP_ARCHITECTURES="${rocm_gpu_targets}"'), 2)
+        # Release is built in the Dockerfile; Integration by its canonical operation.
+        operation = canonical_integration_operation(dockerfile)
+        for build, source in (("Release", dockerfile), ("Integration", operation)):
+            with self.subTest(build=build):
+                self.assertEqual(source.count('-DCMAKE_HIP_ARCHITECTURES="${rocm_gpu_targets}"'), 1)
 
     def test_rccl_dependency_is_selected_once_for_builder_and_runtime(self):
         # Runtime search lists previously ignored the configured source-built
@@ -5095,7 +5143,11 @@ class InfrastructureTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("install -m 0755 /src/external/rccl/build/librccl.so.1.0 "
                       "/usr/local/lib/librccl.so.1.0", dockerfile)
-        self.assertEqual(dockerfile.count("-DRCCL_LIBRARY=/usr/local/lib/librccl.so.1"), 2)
+        # Release is built in the Dockerfile; Integration by its canonical operation.
+        operation = canonical_integration_operation(dockerfile)
+        for build, source in (("Release", dockerfile), ("Integration", operation)):
+            with self.subTest(build=build):
+                self.assertEqual(source.count("-DRCCL_LIBRARY=/usr/local/lib/librccl.so.1"), 1)
 
     def test_rccl_capture_patch_is_staged_for_its_late_build_consumer(self):
         """Keep the RCCL capture patch alive until its dedicated source build.

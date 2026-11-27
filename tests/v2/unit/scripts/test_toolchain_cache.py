@@ -203,11 +203,21 @@ class ToolchainCacheTests(unittest.TestCase):
             cache_step = next(step for step in steps if step.get("id") == "toolchain")
             self.assertEqual(cache_step["uses"], "./.github/actions/cache-develop-toolchain")
             self.assertEqual(cache_step["with"]["cpu-isa"], "NEON")
-        build = next(step["with"] for step in pr_steps if step.get("with", {}).get("target") == "test-runner")
-        self.assertEqual(build["build-contexts"], "${{ steps.toolchain.outputs.neon-context }}")
-        self.assertIn("type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}", build["cache-from"])
-        self.assertTrue(build["cache-to"].startswith("type=gha,scope=llaminar-build-neon-pr,"))
-        self.assertIn("scope=llaminar-build-neon-pr", build["cache-from"])
+        # The PR builds through shell `docker buildx build` commands.  Every one
+        # must consume the admitted NEON toolchain context, and none may write
+        # the trusted registry cache.
+        pr_builds = [step for step in pr_steps if "docker buildx build" in step.get("run", "")]
+        self.assertTrue(pr_builds)
+        for step in pr_builds:
+            with self.subTest(step=step.get("name")):
+                self.assertEqual(step["env"]["TOOLCHAIN_CONTEXT"], "${{ steps.toolchain.outputs.neon-context }}")
+                self.assertRegex(step["run"], r'--build-context "\$(TOOLCHAIN_CONTEXT|\{TOOLCHAIN_CONTEXT:\?\})"')
+                self.assertNotIn("--cache-to type=registry", step["run"])
+        build = next(step for step in pr_builds if "--target test-runner" in step["run"])["run"]
+        self.assertIn("--cache-from type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}", build)
+        self.assertIn("--cache-from type=gha,scope=llaminar-build-neon-pr,", build)
+        self.assertIn("--cache-to type=gha,scope=llaminar-build-neon-pr,", build)
+        self.assertEqual(build.count("--cache-to "), 1)
         publish_build = next(step for step in publication_steps if "--cache-to" in step.get("run", ""))
         login = next(step for step in publication_steps if step.get("uses") == "docker/login-action@v4")
         self.assertLess(publication_steps.index(login), publication_steps.index(publish_build))

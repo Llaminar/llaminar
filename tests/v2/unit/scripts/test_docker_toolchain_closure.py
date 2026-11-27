@@ -8,7 +8,8 @@ filesystem. At the RCCL consumer boundary the actual Python entrypoint must
 start. The original early retirement reproduces the missing-file failure.
 Architecture defaults execute the real shell prefix against the canonical pins.
 Both application builds resolve the generated RCCL header through their actual
-Docker arguments and the production CMake admission check.
+arguments (Release in the Dockerfile, Integration in the canonical operation
+script run by the builder) and the production CMake admission check.
 """
 from pathlib import Path
 import os
@@ -21,6 +22,11 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[4]
 DOCKER = ROOT / "Dockerfile"
+INTEGRATION_OPERATION = ROOT / "scripts/ci/arm_native_integration_operation.sh"
+INTEGRATION_OPERATION_RUN = (
+    "RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked "
+    "python3 scripts/ci/arm_native_build_evidence.py capture -- "
+    "sh scripts/ci/arm_native_integration_operation.sh")
 
 
 def instructions(text: str):
@@ -131,8 +137,18 @@ class DockerToolchainClosureTests(unittest.TestCase):
         start = cmake.index("        find_file(_rccl_abi_header")
         end = cmake.index("        target_sources(rocm_backend", start)
         admission = cmake[start:end]
-        builds = [row for row in instructions(DOCKER.read_text())
-                  if row.startswith("RUN ") and "RCCL_CMAKE_ARGS=" in row]
+        docker = list(instructions(DOCKER.read_text()))
+        # Release is configured directly in the Dockerfile.  Integration is the
+        # canonical operation script, which binds only through the builder RUN.
+        self.assertEqual(sum(" ".join(row.split()) == INTEGRATION_OPERATION_RUN for row in docker), 1,
+                         "The builder must run the canonical Integration operation exactly once")
+        operation = [row for row in instructions(INTEGRATION_OPERATION.read_text())
+                     if "RCCL_CMAKE_ARGS=" in row]
+        release = [row for row in docker if row.startswith("RUN ") and "RCCL_CMAKE_ARGS=" in row]
+        self.assertEqual(["build_v2_integration" in row for row in operation], [True])
+        self.assertEqual(["build_v2_release" in row and "build_v2_integration" not in row
+                          for row in release], [True])
+        builds = operation + release
         self.assertEqual(len(builds), 2, "Integration and Release must both be covered")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
