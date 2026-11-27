@@ -4160,6 +4160,15 @@ class ProofBindingTest(unittest.TestCase):
         CHECKER.validate_plan([clang], "AppleClang-21", paths)
         CHECKER.validate_plan(gnu, "GNU-14", paths)
         CHECKER.validate_plan([gnu[0] + ["-fPIC", "-fopenmp"], gnu[1]], "GNU-14", paths)
+        for option, value in (("-MMD", "/w/out/proof.d"), ("-MQ", "probe"),
+                              ("-isystem", "/sdk/include"), ("-iquote", "/w/generated")):
+            compiler = list(gnu[0])
+            if option in ("-MMD", "-MQ"):
+                compiler[compiler.index("-MD" if option == "-MMD" else "-MT")] = option
+            else:
+                compiler += [option, value]
+            with self.subTest(production_only=option), self.assertRaisesRegex(ValueError, "job argument not admitted"):
+                CHECKER.validate_plan([compiler, gnu[1]], "GNU-14", paths)
         for unsupported in ("-funknown-witness", "-fPIC=1", "-fopenmp=libomp", "-fno-openmp"):
             with self.subTest(unsupported=unsupported), self.assertRaises(ValueError):
                 CHECKER.validate_plan([gnu[0] + [unsupported], gnu[1]], "GNU-14", paths)

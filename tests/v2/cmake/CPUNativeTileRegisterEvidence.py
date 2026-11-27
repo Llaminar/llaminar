@@ -6232,6 +6232,9 @@ class JobPaths(NamedTuple):
 
 def admit_job(job: list[str], table: dict[str, str], paths: JobPaths, positional: str) -> dict[str, list[str]]:
     """Admit every argument of one expanded job by its type; return the designated paths it names."""
+    if table is GNU_CC1PLUS and paths.production is None:
+        table = {option: kind for option, kind in table.items()
+                 if option not in ("-MMD", "-MQ", "-isystem", "-iquote")}
     named: dict[str, list[str]] = {}
     position = 1
     while position < len(job):
@@ -6299,13 +6302,15 @@ def validate_plan(jobs: list[list[str]], identity: str, paths: JobPaths) -> None
     if len(jobs) != 2 or Path(jobs[0][0]).name != "cc1plus" or not os.path.isabs(jobs[0][0]) or jobs[1][0] != "as":
         raise ValueError(f"the GNU driver must run exactly one cc1plus job and one as job: {[job[:1] for job in jobs]}")
     compiler = admit_job(jobs[0], GNU_CC1PLUS, paths, paths.source)
-    # GCC retains earlier dialect switches in -### even when the witness's
-    # final -std=c++20 overrides the production target's C++23 dialect.
+    # GCC retains earlier dialect switches in -###; only the final one is effective.
     standards = [arg for arg in jobs[0] if arg.startswith("-std=")]
     expected_standard = ([arg for arg in paths.production["direct"] if arg.startswith("-std=")]
                          if paths.production else ["-std=c++20"])
     if not standards or not expected_standard or standards[-1] != expected_standard[-1]:
-        raise ValueError("GNU witness requires final effective -std=c++20")
+        mode = "production" if paths.production else "probe"
+        expected = expected_standard[-1] if expected_standard else "<missing bound standard>"
+        actual = standards[-1] if standards else "<missing>"
+        raise ValueError(f"GNU {mode} witness requires final effective {expected}; got {actual}")
     # GNU passes -MD the object-derived name; -MF selects the file actually written.
     if compiler.get("target") != [paths.production["output"] if paths.production else "probe"] or \
             compiler.get("deps") != [paths.deps] or len(compiler.get("md", [])) != 1 or \
