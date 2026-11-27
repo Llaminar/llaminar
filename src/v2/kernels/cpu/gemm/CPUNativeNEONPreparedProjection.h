@@ -1191,8 +1191,11 @@ namespace llaminar2::cpu::native_quantised
             for (int column0 = 0; column0 < columns_; column0 += 4 * S)
             {
                 constexpr bool ordered = Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert;
+                // The three- and four-row SMMLA tiles keep the partition-0 select: the
+                // seed's live register spills there (orderedPartitionSeedNEON()).
+                constexpr bool seeded = ordered && !(multi_scale::usesRowPairs<Ops> && Rows >= 3);
                 float32x4_t reduced[Rows][S]{};
-                if constexpr (ordered)
+                if constexpr (seeded)
                 {
 #pragma GCC unroll 4
                     for (std::size_t row = 0; row < Rows; ++row)
@@ -1297,7 +1300,7 @@ namespace llaminar2::cpu::native_quantised
                     for (std::size_t row = 0; row < Rows; ++row)
 #pragma GCC unroll 4
                         for (int strip = 0; strip < S; ++strip)
-                            reduced[row][strip] = !ordered ? partial[row][strip]
+                            reduced[row][strip] = !ordered || (!seeded && partition == 0) ? partial[row][strip]
                                                            : addOrderedNEON(reduced[row][strip], partial[row][strip]);
                 }
 #pragma GCC unroll 4
