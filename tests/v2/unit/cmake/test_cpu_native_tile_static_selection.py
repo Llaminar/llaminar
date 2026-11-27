@@ -154,7 +154,7 @@ class StaticSelectionNativeTest(unittest.TestCase):
             Path(base).mkdir(parents=True, exist_ok=True)
         root = Path(tempfile.mkdtemp(prefix="static-comdat-", dir=base))
         print(f"Retained native COMDAT selection: {root}", flush=True)
-        template = "template<int N> __attribute__((noinline)) int chosen(){return N;}\n"
+        template = "template<int N> __attribute__((noinline,noipa)) int chosen(){return N;}\n"
         for name, wrapper in (("f", "use"), ("g", "other")):
             (root / (name + ".cpp")).write_text(template + f"int {wrapper}(){{return chosen<7>();}}\n")
         (root / "main.cpp").write_text("extern int use(); int main(){return use();}\n")
