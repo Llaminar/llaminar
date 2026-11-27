@@ -1700,8 +1700,12 @@ namespace llaminar2::cpu::native_quantised
                 using I = typename Ops::I;
                 using F = typename Ops::F;
                 constexpr bool ordered = Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert;
+                // Q5_K SMMLA retires each row's scalar half conversion at its
+                // contribution. Widening four scales together keeps the portable
+                // conversion's masks live across the decode and spills two vectors.
                 constexpr bool widen_activation_rows =
-                    Coded != 0 && Rows == 4 && ordered && Ops::instruction != Dot::ASIMD;
+                    Coded != 0 && Rows == 4 && ordered && Ops::instruction != Dot::ASIMD &&
+                    !(Coded == 7 && multi_scale::usesRowPairs<Ops>);
                 constexpr bool nibble = Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale;
                 for (int column = 0; column < columns_; column += 4)
                 {
