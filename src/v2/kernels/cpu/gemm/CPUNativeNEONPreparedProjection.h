@@ -1456,7 +1456,7 @@ namespace llaminar2::cpu::native_quantised
             "2:1:0:2:0:0", "2:1:1:3:11:0", "2:2:0:3:11:0", "2:2:0:4:2:0", "2:2:1:3:11:0", "2:2:1:4:2:0",
             "2:2:1:7:0:0", "2:2:1:7:1:1", "3:0:0:2:0:0", "3:0:0:3:11:0", "3:0:1:3:7:1", "3:0:1:3:11:0",
             "3:1:0:2:0:0", "3:1:0:3:11:0", "3:1:1:3:7:1", "3:1:1:3:11:0", "3:2:0:2:0:0", "3:2:0:3:11:0",
-            "3:2:0:4:2:0", "3:2:1:2:0:0", "3:2:1:3:11:0", "3:2:1:4:2:0", "3:2:1:6:1:1", "4:0:0:2:0:0",
+            "3:0:1:4:2:0", "3:1:1:4:2:0", "3:2:0:4:2:0", "3:2:1:2:0:0", "3:2:1:3:11:0", "3:2:1:4:2:0", "3:2:1:6:1:1", "4:0:0:2:0:0",
             "4:0:0:3:11:0", "4:0:0:6:1:1", "4:0:1:3:7:1", "4:0:1:3:11:0", "4:1:0:3:11:0", "4:1:0:4:2:0",
             "4:1:0:7:0:0", "4:1:0:7:1:1", "4:1:1:3:7:1", "4:1:1:3:11:0", "4:1:1:6:1:1", "4:1:1:7:1:1",
             "4:2:0:3:11:0", "4:2:0:4:2:0", "4:2:1:3:11:0", "4:2:1:4:2:0", "4:2:1:6:1:1",
@@ -1763,11 +1763,7 @@ namespace llaminar2::cpu::native_quantised
                             {
                                 // IQ4_XS ties the barrier to the block, so GCC cannot hoist it
                                 // (and every offset derived from it) out of the K walk.
-                                if constexpr (Physical == Encoding::NibbleLUTSourceScale && Rows == 3 && ordered)
-                                    // The unit already advances with K: retain the loop dependency
-                                    // without extending the logical block's lifetime into addressing.
-                                    asm("" : "+r"(strip) : "r"(unit));
-                                else if constexpr (Physical == Encoding::NibbleLUTSourceScale)
+                                if constexpr (Physical == Encoding::NibbleLUTSourceScale)
                                     asm("" : "+r"(strip) : "r"(block));
                                 else
                                     asm("" : "+r"(strip));
