@@ -1669,9 +1669,9 @@ namespace
 
     /**
      * Fixed-count K tiles leave empty trailing tiles on a short K: their start
-     * lies at or beyond the matrix while the clamped end does not. Such a span
-     * must publish zero (or retain the accumulator) without a weight read;
-     * a nonempty span outside the matrix remains fatal.
+     * is clamped to the matrix end by orderedKTileBegin(). That empty interval
+     * must publish zero (or retain the accumulator) without reading activation
+     * or weights. Reversed and out-of-matrix intervals must still be rejected.
      */
     TEST_F(CPUNativeQuantisedGemvTest, CompactEmptyTrailingKTilePublishesWithoutReading)
     {
@@ -1685,27 +1685,48 @@ namespace
                 continue;
             SCOPED_TRACE(format.label);
             const int blocks = packed.blocks_per_row;
-            std::vector<Q8_1Block> activation(static_cast<size_t>(blocks));
-            std::array<float, 64> output{};
-            const auto run = [&](int begin, int end, bool accumulate) {
-                multi_scale::dispatch<kCompactLanes>(packed,
-                    std::array<const Q8_1Block *, 1>{activation.data()},
-                    std::array<float *, 1>{output.data()}, 0, begin, end, accumulate);
+            const auto prove_empty = [&]<int Lanes, size_t Rows>() {
+                SCOPED_TRACE(Lanes);
+                SCOPED_TRACE(Rows);
+                std::array<float, 64 * Rows> output{};
+                std::array<const Q8_1Block *, Rows> activation{};
+                std::array<float *, Rows> outputs{};
+                for (size_t row = 0; row < Rows; ++row)
+                    outputs[row] = output.data() + row * 64;
+                const auto run = [&](int begin, int end, bool accumulate) {
+                    multi_scale::dispatch<Lanes>(packed, activation, outputs,
+                        0, begin, end, accumulate);
+                };
+                // K=768 has 24 blocks: fixed-width tiles 12..15 are empty.
+                // Use the production producer's clamp, never a reversed range.
+                // Null activation rows make any accidental input read fatal.
+                for (const int tile : {12, 13, 15})
+                {
+                    const int begin = orderedKTileBegin(tile, 2, blocks);
+                    ASSERT_EQ(begin, blocks);
+                    output.fill(-7.0f);
+                    ASSERT_NO_THROW(run(begin, blocks, false));
+                    for (const float value : output)
+                        ASSERT_EQ(std::bit_cast<uint32_t>(value), 0u);
+                    output.fill(-0.0f);
+                    ASSERT_NO_THROW(run(begin, blocks, true));
+                    for (const float value : output)
+                        ASSERT_EQ(std::bit_cast<uint32_t>(value), 0x80000000u);
+                }
+                EXPECT_THROW(run(blocks + 2, blocks, false), std::invalid_argument);
+                EXPECT_THROW(run(1, 0, false), std::invalid_argument);
+                EXPECT_THROW(run(blocks + 1, blocks + 1, false), std::invalid_argument);
+                EXPECT_THROW(run(blocks - 1, blocks + 1, false), std::invalid_argument);
+                EXPECT_THROW(run(-1, 1, false), std::invalid_argument);
             };
-            // A 24-block K split into 16 tiles of 2 yields tiles [26, 24) etc.
-            for (const int begin : {blocks, blocks + 2, blocks + 6})
-            {
-                output.fill(-7.0f);
-                ASSERT_NO_THROW(run(begin, blocks, false));
-                for (const float value : output)
-                    ASSERT_EQ(std::bit_cast<uint32_t>(value), 0u);
-                output.fill(-7.0f);
-                ASSERT_NO_THROW(run(begin, blocks, true));
-                for (const float value : output)
-                    ASSERT_EQ(value, -7.0f);
-            }
-            EXPECT_THROW(run(blocks - 1, blocks + 1, false), std::invalid_argument);
-            EXPECT_THROW(run(-1, 1, false), std::invalid_argument);
+            // AVX2 single-row Q5_K uses the single-scale leaf; multiple rows
+            // use the generic multi-scale traversal. Both admit the same empty.
+            prove_empty.template operator()<kCompactLanes, 1>();
+            prove_empty.template operator()<kCompactLanes, 2>();
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+            prove_empty.template operator()<16, 1>();
+            prove_empty.template operator()<16, 2>();
+#endif
         }
     }
 
