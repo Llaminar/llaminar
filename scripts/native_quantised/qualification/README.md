@@ -1,16 +1,14 @@
-# NativeQuantised qualification tooling — UNVERIFIED import
+# NativeQuantised qualification tooling provenance
 
-Canonical source import: `factory@192.168.178.79:/home/factory/pr73-production/tools-v9/`.
-All 21 files are byte-preserved. `tools-SHA256SUMS-v9` SHA256 is
+The dormant 21-file tools-v9 import has been removed; it was never activated in
+CMake or CI. Historical commit `ce7806d5e79bf5a756ed719a426c77761d92e2c5`
+preserves the byte-identical original import and its original manifest SHA256
 `72f815965e96bdc483936126b2176f55369422f110827223ff61a9a47997d46a`.
-The manifest authenticates the historical source, not current qualification.
+That digest identifies historical source only, not the current repository tools.
+Remote diagnostic evidence and originals are unchanged.
 
-This import is NOT activated in CMake, CI or any qualification workflow.
-Historical shell launchers retain their original absolute paths and must not be
-run as installed repository commands. Review any invocation separately.
-No production/economy acceptance follows from importing these tools.
-
-Verify source integrity from this directory with `shasum -a 256 -c tools-SHA256SUMS-v9`.
-The import commit preserves the original implementation for negative controls;
-subsequent proposed changes must be reviewed before qualification use. Do not
-edit or replace the remote originals. Owner owns push and activation.
+The single source-owned analysis authority remains
+`tests/v2/cmake/CPUNativeTileRegisterEvidence.py`; its regression registrations
+live in `tests/v2/cmake/V2CPUArchitectureTests.cmake`. Dated proposal history is
+under `docs/v2/projects/2026-11/2026-11-27-tlsle-static/`.
+No qualification or economy acceptance follows from the import or its removal.
