@@ -1,41 +1,71 @@
-# ARM ordered row decomposition — implementation checkpoint
+# ARM physical row-program routing — implementation checkpoint
 
-UNVERIFIED: committed before builds/tests by owner instruction. No acceptance or
-stack qualification is claimed. Performance optimization is deferred; retained
-economy16 and previous native runs must not be overwritten.
+UNQUALIFIED: source checkpoints precede tests by owner instruction. Byte and
+stack acceptance require the final frozen source, not a prior passing build.
+No speed claim is made; payload rereads and slower-than-develop execution are
+accepted for this repair. Partition-carry/shared-decode optimization remains a
+separate follow-up, not discarded or implemented here. Retain economy16 and
+all prior native evidence.
 
-`kNEONRowDecompositions` is the exact ordered-only source-key inventory (13
-keys): ASIMD 3-row IQ3/source-IQ4 and 4-row IQ3/IQ1/Q4_K;
-SDOT 3-row IQ3/IQ1/source-IQ4/Q4_K and 4-row IQ3/IQ1/Q4_K;
-I8MM 4-row IQ3. The first physical program consumes rows [0,2), the
-second [2,Rows). All K geometry, column chunk and exact spans are retained.
-ASIMD/SDOT retain their families; the I8MM IQ3 source uses SDOT pairs because
-the existing I8MM two-row IQ3 key fails its current stack gate.
+## Single routing authority
 
-Expected retired physical keys by envelope: NEON 5, DOTPROD 12, I8MM 13.
-Existing smaller leaf keys are reused; no larger source program is instantiated
-by the production dispatch branches. The test-only wide oracle deliberately
-instantiates originals in the numerical test executable, not the probe.
+`kNEONRowDecompositions` contains 19 exact source keys. Its explicit policy,
+source family, encoding, map, minimum, pair family and tail family select the
+existing physical programs at compile time. No runtime retry or fallback is
+possible. Rows 1/2 select one same-row alternate; rows 3/4 consume exact spans
+[0,2) and [2,Rows), preserving each row's K partitions, scale program and FP
+fold order. Slices call exact `run`/`runCoded` leaves without redispatch.
 
-Pending independent review BEFORE changing effective key/inventory handling:
+Ordered source keys (rows/family; family A=ASIMD, D=SDOT, I=I8MM):
 
-- The register witness currently expects a Cartesian row/family/encoding set.
-  It must instead expect the union of actually dispatched leaves under this
-  exact typed routing policy, reject retired wide symbols, and audit dispatch
-  closure to the precise smaller-row targets. Do not weaken stack accounting,
-  committed budgets, baselines, or role classification.
-- GCC attribute key lists and current role/count inventory must remove retired
-  keys only after that review. Smaller keys retain their existing identities
-  and budgets. None of those proof artifacts is modified in this checkpoint.
-- Qualify each replacement leaf against CURRENT source/envelope measurements,
-  not merely absence from a failure list. Original failures remaining at M=1
-  and I8MM M=2 are explicitly outside this implementation's claim.
-- Run focused original-wide versus decomposed numerical test, full native
-  all-format and NaN-priority contracts, and all three actual-dispatch stack
-  gates. No tests have yet run. The focused regression is explicitly registered
-  in ProductionTestPreflight; it covers both policies, ragged N, partition
-  boundaries, exact row offsets/guards and repeated dirty-buffer execution.
+| Source | Format | First leaf | Tail leaf | Optimization follow-up |
+|---|---|---|---|---|
+| 3/A | IQ3_S | 2/A | 1/A | recover shared decode across three rows |
+| 3/A | IQ4_XS | 2/A | 1/A | recover shared source-scale decode |
+| 4/A | IQ3_S, Q5_K, Q4_K | 2/A | 2/A | recover four-row payload reuse |
+| 3/D | IQ3_S | 2/D | 1/A | recover shared decode without spilling SDOT1 |
+| 3/D | Q5_K, IQ4_XS, Q4_K | 2/D | 1/D | recover three-row payload reuse |
+| 4/D | IQ3_S, Q5_K, Q4_K | 2/D | 2/D | recover four-row payload reuse |
+| 4/I | IQ3_S | 2/D | 2/D | economical exact SMMLA partition carry |
+| 2/I | IQ3_S | 2/D | none | economical exact SMMLA partition carry |
+| 1/D | IQ3_S, Q5_0, Q5_1 | 1/A | none | recover admitted exact SDOT scale program |
 
-Partition-carry/shared-decode redesign is a separate future optimization, not
-part of this implementation. This policy accepts payload rereads; it never
-executes serial-row replay or allocates unused row capacity.
+BackendNative additionally routes only 1/D Q5_0 and Q5_1 to 1/A. This
+cross-ISA arithmetic change is **not qualified** until compared against the
+retired SDOT program including NaN/Inf/zero inputs. All other unlisted keys
+retain their original physical program. Source keys are rejected as targets
+(no routing chains). Expected retired source counts: NEON 5, DOTPROD 17,
+I8MM 19. The final replacement bytes and stack traffic must be measured anew.
+
+## Proof inventory and numerical contracts
+
+The checker parses the C++ table and enum values; a native CTest compares it
+against the compiled constexpr table dump. The probe expects exactly the
+actual-dispatch leaf union, rejects missing/extra/retired programs, and restricts
+each dispatcher to its own exact replacements. Production chain evidence also
+rejects retired source symbols. The test-only wide oracle is confined to the
+numerical executable, never the production probe or runtime.
+
+Only retired exact-key entries are removed from GCC attributes, register-budget
+inventory and ordered-add/chain counts. Every live ceiling and count remains
+unchanged. The new role-map entry is an unchanged-line remap of the previous
+source-bound entry; historical maps and the develop StackTable remain immutable.
+Do not waive admission or traffic accounting if an exact replacement regresses.
+
+Focused preflight compares original and installed programs on both policies,
+all affected source formats, rows 1..4 as applicable, N tails/chunks and K
+partition boundaries, dirty repeated execution and guard bytes. Four input
+phases cover finite data, exceptional activation scales, exceptional weight
+scales and both: distinct signed NaN payloads (including signaling), infinities
+and signed zeros occur at different K positions. Full production all-format,
+K-tile/carry and actual-TU stack/admission gates remain mandatory.
+
+## Evidence status
+
+- Initial redispatch checkpoint 97acc3bbb: GNU14 I8MM Integration focused
+  wide-vs-installed regression passed (51 ms); superseded, not final proof.
+- All-19 checkpoint 26d511a68: build failed before numerical execution because
+  a nondependent two-row private enum alias forced premature class instantiation.
+  The subsequent checkpoint makes that alias dependent; no arithmetic changed.
+- Remote evidence roots: `~/pr73-arm-stack-q5/runs/rowpairs97` and `rowpairs26`.
+  Later frozen runs must use new paths, never overwrite these records.
