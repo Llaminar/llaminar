@@ -30,8 +30,19 @@ foreach(V2_TEST_SOCKETS IN ITEMS 1 2 4 8)
     endif()
     include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/V2RootedTransportSocketReplayTests.cmake")
     include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/V2CPUShardCohortStageTest.cmake")
-    set(preflight ${V2_ROOTED_TRANSPORT_SOCKET_REPLAY_TESTS} ${V2_PRODUCTION_TEST_PREFLIGHT_TESTS})
-    if(NOT "${registered}" STREQUAL "${expected}" OR NOT "${preflight}" STREQUAL "${expected}")
-        message(FATAL_ERROR "Unexpected rooted preflight registration for ${V2_TEST_SOCKETS} sockets: ${registered}")
+    # Each registration appends itself to the explicit preflight inventory at its
+    # own site; the rooted replay list names exactly the two socket replays.
+    set(expected_rooted "")
+    if(V2_TEST_SOCKETS GREATER_EQUAL 2)
+        set(expected_rooted
+            V2_Integration_CPURootedGatherParallelCopyReplay
+            V2_Integration_ShmemSpinAbsorbingAbortReplay)
+    endif()
+    if(NOT "${registered}" STREQUAL "${expected}"
+       OR NOT "${V2_PRODUCTION_TEST_PREFLIGHT_TESTS}" STREQUAL "${expected}"
+       OR NOT "${V2_ROOTED_TRANSPORT_SOCKET_REPLAY_TESTS}" STREQUAL "${expected_rooted}")
+        message(FATAL_ERROR "Unexpected rooted preflight registration for ${V2_TEST_SOCKETS} sockets: "
+            "registered=${registered} preflight=${V2_PRODUCTION_TEST_PREFLIGHT_TESTS} "
+            "rooted=${V2_ROOTED_TRANSPORT_SOCKET_REPLAY_TESTS}")
     endif()
 endforeach()
