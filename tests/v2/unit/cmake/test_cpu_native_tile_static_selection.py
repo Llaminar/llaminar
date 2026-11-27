@@ -92,7 +92,8 @@ class StaticSelectionNativeTest(unittest.TestCase):
             for name in ("f", "g"):
                 subprocess.run([ar, "rcs", str(root / (name + ".a")), str(root / (name + ".o"))], check=True)
             args = [compiler, "-fuse-ld=bfd", str(root / "main.o"), "-Wl,--whole-archive",
-                    str(root / "f.a"), str(root / "g.a"), "-Wl,--no-whole-archive", "-o", str(root / "app")]
+                    str(root / "f.a"), str(root / "g.a"), "-Wl,--no-whole-archive",
+                    f"-Wl,--dependency-file={root / 'production.d'}", "-o", str(root / "app")]
             subprocess.run(args, check=True)
             result = C.capture_static_link(args, root, root / "app", root / "capture")
             self.assertIn(str(root / "f.a"), result["files"])

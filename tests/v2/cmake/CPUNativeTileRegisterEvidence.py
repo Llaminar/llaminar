@@ -2041,6 +2041,69 @@ def _static_options(argv: list[str]) -> None:
             raise ValueError(f"unsupported static link option: {t}")
 
 
+def _static_trace_paths(text: str, cwd: Path) -> set[Path]:
+    """Canonicalize only native file and GNU archive-member trace records."""
+    result = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.fullmatch(r"\(([^()]+)\)([^()\s]+)|([^()]+)\(([^()\s]+)\)", line)
+        path = (match[1] or match[3]) if match else line
+        if any(c in path for c in "()\t\n") or not path.strip():
+            raise ValueError(f"unsupported static trace record: {line}")
+        try:
+            p = (cwd / path).resolve(strict=True)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"unresolved static trace record: {line}") from error
+        if not p.is_file():
+            raise ValueError(f"static trace is not a file: {line}")
+        if match:
+            members = _static_members(p.read_bytes())
+            name = match[2] or match[4]
+            if len([m for m in members if m[3] == name]) != 1:
+                raise ValueError("ambiguous/unresolved traced archive member")
+        result.add(p)
+    return result
+
+
+def _static_map_records(text: str) -> tuple[list[tuple], list[tuple]]:
+    """Parse GNU kept/discarded input intervals, joining exactly one wrapped line.
+
+    Output-section records have no leading space and cannot become input owners.
+    Every input-section-looking line must match the supported grammar; malformed
+    wrapped records are not silently discarded. Discarded records are independent
+    observations, never candidates for the kept owner.
+    """
+    boundary = "Linker script and memory map"
+    if text.count(boundary) != 1 or text.count("Discarded input sections") != 1:
+        raise ValueError("ambiguous GNU map kept/discarded boundary")
+    discarded, kept = text.split(boundary)
+    discarded = discarded.split("Discarded input sections", 1)[1]
+    if "Memory Configuration" not in discarded:
+        raise ValueError("GNU map missing discarded end boundary")
+    discarded = discarded.split("Memory Configuration", 1)[0]
+
+    def records(part):
+        result, lines, i = [], part.splitlines(), 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            if not re.match(r"^ \.[^\s]+", line):
+                continue
+            if re.fullmatch(r" \.[^\s]+", line):
+                if i == len(lines) or not re.match(r"^\s+0x", lines[i]):
+                    raise ValueError("malformed wrapped GNU map section")
+                line += " " + lines[i].strip()
+                i += 1
+            match = re.fullmatch(r" (\.[^\s]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+([^\n]+)", line)
+            if not match:
+                raise ValueError(f"unsupported GNU map input record: {line}")
+            result.append((match[1], int(match[2], 16), int(match[3], 16), match[4].strip()))
+        return result
+    return records(discarded), records(kept)
+
+
 def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Path) -> dict:
     """Capture a bounded GNU14/ld.bfd production edge; diagnostics never mint authority.
 
@@ -2062,11 +2125,40 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     oi = args.index("-o") + 1
     if (cwd / args[oi]).resolve() != output:
         raise ValueError("static output does not match edge")
-    if any("--dependency-file" in a or "-Map" in a or "--trace" in a for a in args):
+    if any("-Map" in a or "--trace" in a or "--cref" in a for a in args):
         raise ValueError("production edge already has unsupported diagnostic side outputs")
     driver = Path(args[0]).resolve(strict=True)
     args[0] = str(driver)
     files[str(driver)] = _static_hash(driver.read_bytes())
+    dep_tokens = [a for a in args if "--dependency-file" in a]
+    if len(dep_tokens) != 1 or not dep_tokens[0].startswith("-Wl,--dependency-file="):
+        raise ValueError("static edge requires exactly one -Wl,--dependency-file=PATH token")
+    di = args.index(dep_tokens[0])
+    production_dep = (cwd / dep_tokens[0].split("=", 1)[1]).resolve(strict=True)
+    dep_bytes = production_dep.read_bytes()
+    files[str(production_dep)] = _static_hash(dep_bytes)
+    (artifacts / "original.d").write_bytes(dep_bytes)
+
+    def dependency_paths(data):
+        text = data.decode().replace("\\\n", "")
+        first = text.split("\n\n", 1)[0]
+        if ":" not in first or "\\" in first:
+            raise ValueError("unsupported static dependency grammar")
+        return {(cwd / p).resolve(strict=True) for p in first.split(":", 1)[1].split()}
+
+    original_dependencies = dependency_paths(dep_bytes)
+
+    def relink(label, extras):
+        command = args.copy()
+        command[oi] = str(artifacts / f"{label}.elf")
+        command[di] = f"-Wl,--dependency-file={artifacts / (label + '.d')}"
+        command += extras
+        # Mechanical delta gate: only the two output values and the exact named
+        # diagnostic suffix may differ. Never strip/reorder original options.
+        changed = [i for i in range(len(args)) if args[i] != command[i]]
+        if changed != sorted([oi, di]) or command[len(args):] != extras:
+            raise ValueError("unexpected static relink argv delta")
+        return command
     production = output.read_bytes()
     (artifacts / "production.elf").write_bytes(production)
 
@@ -2090,9 +2182,9 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         raise ValueError("static driver must expose one collect2 job")
     cp = Path(collect[0]).resolve(strict=True)
     files[str(cp)] = _static_hash(cp.read_bytes())
-    debug_args = args.copy()
-    debug_args[oi] = str(artifacts / "debug.elf")
-    debug = run("collect2-debug", debug_args + ["-debug"])
+    debug = run("collect2-debug", relink("debug", ["-debug"]))
+    if dependency_paths((artifacts / "debug.d").read_bytes()) != original_dependencies:
+        raise ValueError("static debug dependency set differs from production")
     match = re.findall(r"^ld_file_name\s*=\s*(\S+)\s*$", debug, re.M)
     if len(match) != 1:
         raise ValueError("collect2 did not identify its actual linker")
@@ -2117,29 +2209,21 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         if token in ("-plugin", "--plugin"):
             p = Path(job_tokens[i+1]).resolve(strict=True)
             files[str(p)] = _static_hash(p.read_bytes())
-    dep = artifacts / "native.d"
-    instrument = args + ["-Wl,--trace", f"-Wl,--dependency-file={dep}"]
     transactions = []
     for label in ("instrumented", "control", "map"):
-        command = instrument.copy()
-        command[oi] = str(artifacts / f"{label}.elf")
+        extras = [] if label == "control" else ["-Wl,--trace"]
         if label == "map":
-            command += [f"-Wl,-Map={artifacts / 'native.map'}"]
+            extras += [f"-Wl,-Map={artifacts / 'native.map'}"]
+        command = relink(label, extras)
         trace = run(label, command)
         if (artifacts / f"{label}.elf").read_bytes() != production:
             raise ValueError(f"static {label} differs from production")
-        dependency = dep.read_bytes()
-        (artifacts / f"{label}.d").write_bytes(dependency)
-        # Restrict grammar rather than guessing make quoting or trace diagnostics.
-        text = dependency.decode().replace("\\\n", "")
-        first = text.split("\n\n", 1)[0]
-        if ":" not in first or "\\" in first:
-            raise ValueError("unsupported static dependency grammar")
-        paths = first.split(":", 1)[1].split()
-        traced = [line.strip() for line in trace.splitlines() if line.strip()]
-        def canonical(items):
-            return {(cwd / p).resolve(strict=True) for p in items}
-        dependencies, traces = canonical(paths), canonical(traced)
+        dependency = (artifacts / f"{label}.d").read_bytes()
+        dependencies = dependency_paths(dependency)
+        if dependencies != original_dependencies:
+            raise ValueError("static relink dependency set differs from production")
+        traces = (set(map(Path, transactions[0])) if label == "control" and not trace.strip()
+                  else _static_trace_paths(trace, cwd))
         if dependencies != traces or not dependencies:
             raise ValueError("static trace/dependency input set mismatch")
         inventory = {}
@@ -2220,14 +2304,11 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
         raise ValueError("ambiguous static input symbol")
     original = originals[0]
     mapping = (artifacts / "native.map").read_text()
-    boundary = "Linker script and memory map"
-    if mapping.count(boundary) != 1 or mapping.count("Discarded input sections") != 1:
-        raise ValueError("ambiguous GNU map kept/discarded boundary")
-    discarded, kept = mapping.split(boundary)
-    # GNU map input-section lines may wrap once between section name and address.
-    intervals = re.findall(r"^ (\.[^\s]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+([^\n]+)$", kept, re.M)
-    owners = [(n, int(a, 16), int(s, 16), p.strip()) for n,a,s,p in intervals
-              if int(a, 16) < address+size and address < int(a, 16)+int(s, 16)]
+    discarded, kept = _static_map_records(mapping)
+    rejected = [r for r in discarded if r[0] == original.section and r[2]]
+    if not rejected:
+        raise ValueError("static proof requires recorded discarded competing target copies")
+    owners = [(n, a, s, p) for n, a, s, p in kept if a < address+size and address < a+s]
     if len(owners) != 1:
         raise ValueError("static map has ambiguous/missing kept owner")
     name, placed, extent, owner = owners[0]
@@ -2243,6 +2324,7 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
         selected = matches[0][4]
         (artifacts / "selected-member.json").write_text(json.dumps(dict(
             archive=str(p), ordinal=matches[0][0], header_offset=matches[0][1], raw_name=matches[0][2].hex())))
+    (artifacts / "discarded-target-copies.json").write_text(json.dumps(rejected, indent=2))
     if selected != object_bytes or name != original.section or extent != image.sections[name].size:
         raise ValueError("static kept member/section differs from audited object")
     if placed + original.value != address or original.size != size:

@@ -40,3 +40,10 @@ boundary. Reviewer acceptance and actual AArch64 native adversarial controls are
 mandatory before Q5 use. Required negative inventory from STATIC-ACQUISITION.md
 remains the qualification contract; these initial tests do not claim to complete
 that inventory. Owner pushes each unverified slice before verification.
+
+Exactly one existing -Wl,--dependency-file=PATH is required. The production
+executable and dependency file are snapshotted and rehashed unchanged. Relinks
+replace only the output and dependency PATH values; instrument/map additionally
+add their exact diagnostic options. Original and every redirected dependency
+inventory must agree. No production side output is overwritten, restored or
+deleted. Authority is single-process and bound to the captured environment.
