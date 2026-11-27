@@ -1630,4 +1630,27 @@ namespace llaminar2::test
             }
         }
     }
+
+    /**
+     * @test Every binary16 scale word publishes its exact FP32 expansion.
+     *
+     * nativeQuantisedFP16ScaleToFP32() documents byte-identity over all
+     * 65,536 encodings: finite values go through the hardware convert, while
+     * exponent-31 words (infinity/NaN) must take the scalar bit expansion
+     * because hardware is permitted to quiet signaling NaNs. An x86 build
+     * once fell out of the function on exponent-31 words (undefined return),
+     * so the sweep covers every word, including every NaN payload.
+     */
+    TEST(CPUCodedCompactUnits, NativeQuantisedFP16ScaleCoversEveryWord)
+    {
+        for (std::uint32_t word = 0; word <= 0xFFFFu; ++word)
+        {
+            const std::uint16_t bits = static_cast<std::uint16_t>(word);
+            const float scaled = nativeQuantisedFP16ScaleToFP32(bits);
+            const float exact = fp16_to_fp32(bits);
+            ASSERT_EQ(std::bit_cast<std::uint32_t>(scaled),
+                      std::bit_cast<std::uint32_t>(exact))
+                << "word=0x" << std::hex << word;
+        }
+    }
 } // namespace llaminar2::test

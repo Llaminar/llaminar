@@ -44,6 +44,10 @@ namespace llaminar2::cpu::native_quantised
 #if defined(__F16C__)
         if ((value & 0x7c00u) != 0x7c00u)
             return _cvtsh_ss(value);
+        // Exponent 31 only (infinity/NaN): hardware converts are permitted to
+        // quiet signaling NaNs, so this cold path uses the scalar bit
+        // expansion to keep the helper byte-identical over all 65,536 words.
+        return llaminar2::fp16_to_fp32(value);
 #elif defined(__aarch64__) && defined(__ARM_NEON)
         if ((value & 0x7c00u) != 0x7c00u)
         {
