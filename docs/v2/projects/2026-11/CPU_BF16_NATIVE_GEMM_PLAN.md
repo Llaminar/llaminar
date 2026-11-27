@@ -143,23 +143,31 @@ mirror, the production library path) vs the native AVX512-BF16 route,
 
 | M | N | K | oneDNN | native AVX512-BF16 | native / oneDNN |
 |---|---|---|---|---|---|
-| 16 | 4096 | 4096 | 0.299 ms (1.80 TF/s) | 2.161 ms (0.25 TF/s) | 7.2× |
-| 32 | 4096 | 4096 | 0.532 ms (2.02 TF/s) | 4.106 ms (0.26 TF/s) | 7.7× |
-| 96 | 4096 | 4096 | 0.837 ms (3.85 TF/s) | 12.362 ms (0.26 TF/s) | 14.8× |
-| 32 | 8192 | 8192 | 1.404 ms (3.06 TF/s) | 17.914 ms (0.24 TF/s) | 12.8× |
+| 16 | 4096 | 4096 | 0.264–7.7 ms (0.07–2.0 TF/s)* | 0.990 ms (0.54 TF/s) | 0.13×–3.7×* |
+| 32 | 4096 | 4096 | 0.342–0.532 ms (2.0–3.1 TF/s) | 1.944 ms (0.55 TF/s) | 3.9–5.7× |
+| 96 | 4096 | 4096 | 0.745–1.367 ms (2.4–4.3 TF/s) | 5.748 ms (0.56 TF/s) | 4.2–6.3× |
+| 32 | 8192 | 8192 | 1.404–1.412 ms (3.0–3.1 TF/s) | 6.491 ms (0.66 TF/s) | 4.6× |
 
-Interpretation: the first-slice native route is **7-15× slower than the
-library** on this AVX512-BF16 host. The dominant cost is weight reuse: the
-current kernel processes one row at a time and re-streams the whole N×K
-weight matrix per row (no M-blocking), with 8-column register blocking, a
-per-column 16-lane reduction at the end and no multi-M tiling. oneDNN
-blocks M so B is read once per block. This is the measurement the plan
-predicted: the route exists for its fixed deterministic contract; economy
-is the next work package (M-blocking with B reuse, wider column tiles,
-batched lane reductions) before any automatic default flip. AMX could not
-be measured on this VM (tile data instructions are #UD); on real Sapphire
-Rapids hardware AMX's 16×16 tiles give B reuse as a side effect and are
-the expected win over oneDNN, pending the same isolated measurement.
+*The M=16 oneDNN rows include a 7.7 ms outlier from shared-node
+interference; see the interpretation below.
+
+Interpretation: the first-slice native route was **7-15× slower than the
+library** on this AVX512-BF16 host. After the first tuning pass (4×4 M/N
+register blocking, then 32×128 cache-panel blocking) the native route is
+**~550-660 GF/s (2.2-2.6× the first slice) with the gap narrowed to
+~4-4.6×** (M=16: 0.99 ms vs oneDNN's 0.26-7.7 ms — oneDNN shows strong
+run-to-run variance from the shared node, 2-4 TF/s typical). The route was
+made economical by blocking (weight reuse), not by changing arithmetic: the
+same fixed lane partitions, K-ascending chunk order and final tree are
+preserved (the determinism suite stays byte-green).
+
+Remaining gap attribution (quantified for the next work package):
+- NO packed weight layout: every B chunk is an unaligned load; oneDNN's
+  BLAS path uses pre-packed panel weights from its own format dialogue.
+- No prefetch/double-buffering, and the per-output 16-lane final reduction
+  is ~4 shuffle+add ops per output word.
+- Cross-route difference typical ~0.1% (different fixed trees), which is
+  not a contract violation (per-route determinism is).
 
 Max absolute difference between native and oneDNN outputs was ~4.0 on
 values of magnitude ~4096 (≈0.1%): both routes are FP32-accumulating

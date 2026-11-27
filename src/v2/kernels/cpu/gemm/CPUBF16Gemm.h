@@ -356,7 +356,7 @@ namespace llaminar2
             }
 
             /**
-             * @brief Execute the AVX512-BF16 GEMM route.
+             * @brief Execute the AVX512-BF16 GEMM route (M/N register blocked).
              * @param A Row-major BF16 activations [M,K].
              * @param B Row-major BF16 transposed weights [N,K].
              * @param C FP32 output [M,N].
@@ -374,7 +374,17 @@ namespace llaminar2
              * a[2i]·b[2i] + a[2i+1]·b[2i+1] — each lane owns a disjoint K
              * partition (pairs with index i mod 16). After the K loop the 16
              * lanes reduce through fixedReduceLanes16(), then the shared
-             * epilogue rounds the output. Rows are independent; OpenMP
+             * epilogue rounds the output.
+             *
+             * Economy: the kernel registers kMBlock rows × kColumnBlock
+             * columns and keeps every accumulator ZMM resident, so each
+             * weight chunk is loaded once per row block and reused across
+             * kMBlock rows (the dominant traffic in the measured first slice
+             * was B re-read per row) while each activation chunk is reused
+             * across the column block. Blocking changes only data reuse:
+             * every output word still visits K in the same ascending chunk
+             * order with the same per-lane partitions, so the route contract
+             * and its bytes are unchanged. Row blocks are independent; OpenMP
              * schedules them statically so every worker builds identical words.
              */
             inline bool run_avx512bf16_matmul(const uint16_t *A, const uint16_t *B,
@@ -390,39 +400,66 @@ namespace llaminar2
                 if (bf16RouteProbeEnabled().load(std::memory_order_relaxed))
                     bf16NativeRouteCounter(Engine::AVX512BF16).fetch_add(1, std::memory_order_relaxed);
 
-                constexpr int kColumnBlock = 8; // 8 accumulator ZMMs stay register-resident
-                const int col_tiles = (N + kColumnBlock - 1) / kColumnBlock;
+                // 4×4 microkernel: 16 accumulators + 4 A + 4 B chunks keep the
+                // working set register-resident. Panels: a 32-row × 128-column
+                // block holds its activation panel (32×K×2 B) and weight panel
+                // (K×128×2 B) in L2, so the weight matrix is streamed from DRAM
+                // roughly once per N panel instead of once per row group.
+                constexpr int kRowBlock = 4;
+                constexpr int kColumnBlock = 4;
+                const int row_group_count = (M + kRowBlock - 1) / kRowBlock;
+                const int col_tile_count = (N + kColumnBlock - 1) / kColumnBlock;
                 auto work = [&]()
                 {
-#pragma omp for schedule(static)
-                    for (int row = 0; row < M; ++row)
+#pragma omp for schedule(static) collapse(2)
+                    for (int mbg = 0; mbg < row_group_count; mbg += 8)
                     {
-                        const uint16_t *a = A + static_cast<std::size_t>(row) * K;
-                        float *c = C + static_cast<std::size_t>(row) * N;
-                        for (int ct = 0; ct < col_tiles; ++ct)
+                        for (int nbg = 0; nbg < col_tile_count; nbg += 32)
                         {
-                            const int first_col = ct * kColumnBlock;
-                            const int cols = std::min(kColumnBlock, N - first_col);
-                            __m512 acc[kColumnBlock];
-#pragma unroll
-                            for (int col = 0; col < kColumnBlock; ++col)
-                                acc[col] = _mm512_setzero_ps();
-                            for (int kt = 0; kt < K; kt += 32)
+                            const int rg_end = std::min(mbg + 8, row_group_count);
+                            const int ct_end = std::min(nbg + 32, col_tile_count);
+                            for (int rg = mbg; rg < rg_end; ++rg)
                             {
-                                const __m512bh a_chunk = loadBf16Chunk(a + kt);
-                                for (int col = 0; col < cols; ++col)
+                                const int row0 = rg * kRowBlock;
+                                const int rows = std::min(kRowBlock, M - row0);
+                                for (int ct = nbg; ct < ct_end; ++ct)
                                 {
-                                    const uint16_t *b_row =
-                                        B + static_cast<std::size_t>(first_col + col) * K + kt;
-                                    acc[col] = _mm512_dpbf16_ps(
-                                        acc[col], a_chunk, loadBf16Chunk(b_row));
+                                    const int first_col = ct * kColumnBlock;
+                                    const int cols = std::min(kColumnBlock, N - first_col);
+                                    __m512 acc[kRowBlock][kColumnBlock];
+#pragma unroll
+                                    for (int row = 0; row < kRowBlock; ++row)
+#pragma unroll
+                                        for (int col = 0; col < kColumnBlock; ++col)
+                                            acc[row][col] = _mm512_setzero_ps();
+                                    for (int kt = 0; kt < K; kt += 32)
+                                    {
+                                        __m512bh a_chunk[kRowBlock];
+#pragma unroll
+                                        for (int row = 0; row < rows; ++row)
+                                            a_chunk[row] = loadBf16Chunk(
+                                                A + static_cast<std::size_t>(row0 + row) * K + kt);
+                                        for (int col = 0; col < cols; ++col)
+                                        {
+                                            const __m512bh b_chunk = loadBf16Chunk(
+                                                B + static_cast<std::size_t>(first_col + col) * K + kt);
+#pragma unroll
+                                            for (int row = 0; row < rows; ++row)
+                                                acc[row][col] = _mm512_dpbf16_ps(
+                                                    acc[row][col], a_chunk[row], b_chunk);
+                                        }
+                                    }
+                                    for (int row = 0; row < rows; ++row)
+                                    {
+                                        float *c = C + static_cast<std::size_t>(row0 + row) * N;
+                                        for (int col = 0; col < cols; ++col)
+                                        {
+                                            const float dot = fixedReduceLanes16(acc[row][col]);
+                                            float *out = c + first_col + col;
+                                            *out = completeEpilogueValue(dot, alpha, beta, out);
+                                        }
+                                    }
                                 }
-                            }
-                            for (int col = 0; col < cols; ++col)
-                            {
-                                const float dot = fixedReduceLanes16(acc[col]);
-                                float *out = c + first_col + col;
-                                *out = completeEpilogueValue(dot, alpha, beta, out);
                             }
                         }
                     }
@@ -466,8 +503,17 @@ namespace llaminar2
             static_assert(sizeof(AMXPalette1Config) == 64,
                 "AMX TILECFG is exactly 64 bytes: 16-byte header + 16 uint16 cols + 16 uint8 rows");
 
-            /** @brief Tile indices used by the AMX-BF16 GEMM program. */
-            enum AMXTile : int { AMX_TILE_A = 0, AMX_TILE_B = 1, AMX_TILE_D = 2 };
+            /** @brief Tile indices of the 1A+3B+4D AMX-BF16 GEMM program. */
+            enum AMXTile : int
+            {
+                AMX_TILE_A = 0,
+                AMX_TILE_B0 = 1, AMX_TILE_B1 = 2, AMX_TILE_B2 = 3,
+                AMX_TILE_D0 = 4, // four D tiles: 64 output rows per block
+            };
+
+            /** @brief Register-blocking geometry: 64 rows × 48 columns per tile block. */
+            inline constexpr int kAMXBf16MBlock = 64;
+            inline constexpr int kAMXBf16NBlock = 48;
 
             /**
              * @brief One AMX tile-state scope: loadconfig on entry, release on exit.
@@ -493,9 +539,16 @@ namespace llaminar2
                 AMXTileScope() noexcept
                 {
                     AMXPalette1Config config{};
-                    config.cols[AMX_TILE_A] = 32; config.rows[AMX_TILE_A] = 16; // 16 rows × 16 BF16
-                    config.cols[AMX_TILE_B] = 32; config.rows[AMX_TILE_B] = 16;
-                    config.cols[AMX_TILE_D] = 64; config.rows[AMX_TILE_D] = 16; // 16 rows × 16 FP32
+                    for (int t = 0; t < 4; ++t)
+                    {
+                        config.cols[AMX_TILE_A + t] = 32;
+                        config.rows[AMX_TILE_A + t] = 16; // 16 rows × 16 BF16
+                    }
+                    for (int t = 0; t < 4; ++t)
+                    {
+                        config.cols[AMX_TILE_D0 + t] = 64;
+                        config.rows[AMX_TILE_D0 + t] = 16; // 16 rows × 16 FP32
+                    }
                     _tile_loadconfig(&config);
                 }
                 ~AMXTileScope() noexcept
@@ -564,13 +617,17 @@ namespace llaminar2
              * @param beta Existing-output scale.
              * @throws std::invalid_argument For non-tile geometry or null pointers.
              * @throws std::runtime_error When the engine is not compiled/admitted.
-             * @details Contract: each 16×16 output tile zeroes its FP32
+             * @details Contract: each 16×16 output sub-block zeroes its FP32
              * accumulator, then walks K in ascending 16-element tiles with
              * `tdpbf16ps` (the hardware's deterministic 16-wide FP32 dot
              * product per output element and its fixed internal accumulation
-             * order). The finished tile is stored to a local scratch and each
-             * word publishes through the shared epilogue. Output tiles are
-             * independent, so OpenMP schedules the 16-row row-blocks statically.
+             * order). Register blocking (one A tile + three B tiles + four D
+             * tiles) makes each weight tile load serve four activation
+             * sub-tiles and each activation tile load serve three weight
+             * tiles; blocking changes only tile load traffic, never the
+             * per-element K-ascending accumulation sequence, so the route
+             * contract and bytes are unchanged. Output blocks are
+             * independent, so OpenMP schedules the 64-row m-blocks statically.
              */
             inline bool run_amxbf16_matmul(const uint16_t *A, const uint16_t *B,
                                            float *C, int M, int N, int K,
@@ -593,40 +650,63 @@ namespace llaminar2
                 const std::size_t b_stride =
                     static_cast<std::size_t>(transpose_B ? K : N) * 2;
                 const int row_blocks = M / 16;
+                const int m_blocks = (row_blocks + 3) / 4;
                 auto work = [&]()
                 {
 #pragma omp for schedule(static)
-                    for (int rb = 0; rb < row_blocks; ++rb)
+                    for (int mb = 0; mb < m_blocks; ++mb)
                     {
                         AMXTileScope scope;
-                        const int row0 = rb * 16;
-                        for (int nt = 0; nt < N; nt += 16)
+                        const int msub_live = std::min(4, row_blocks - mb * 4);
+                        // Register blocking: one A tile + three B tiles + four
+                        // D tiles = seven live tiles, so each 16×16 output
+                        // sub-block shares its weight/activation tile loads
+                        // with the whole 64×48 block (tile loadd traffic is
+                        // divided by the block factors versus one 16×16
+                        // sub-block per pass). K stays ascending in 16-element
+                        // tiles and every D element accumulates through exactly
+                        // the same sequence of tdpbf16ps instructions, so the
+                        // route's arithmetic contract is unchanged.
+                        for (int nb = 0; nb < N; nb += kAMXBf16NBlock)
                         {
-                            amxZeroTile(AMX_TILE_D);
+                            const int bsub_live = std::min(3, (N - nb) / 16);
+                            for (int d = 0; d < msub_live; ++d)
+                                amxZeroTile(AMX_TILE_D0 + d);
                             for (int kt = 0; kt < K; kt += 16)
                             {
-                                // A tile: 16 rows of the activation block.
-                                copyAMXTile(a_tile, A + static_cast<std::size_t>(row0) * K + kt,
-                                            a_stride);
-                                amxLoadBf16Tile(AMX_TILE_A, a_tile);
-                                // B tile: 16 K rows of the weight block; the two
-                                // layouts share one strided row copy.
-                                copyAMXTile(b_tile,
-                                            transpose_B
-                                                ? B + static_cast<std::size_t>(nt) * K + kt
-                                                : B + static_cast<std::size_t>(kt) * N + nt,
-                                            b_stride);
-                                amxLoadBf16Tile(AMX_TILE_B, b_tile);
-                                amxDpbf16(AMX_TILE_D, AMX_TILE_A, AMX_TILE_B);
-                            }
-                            amxStoreF32Tile(AMX_TILE_D, c_tile);
-                            for (int row = 0; row < 16; ++row)
-                            {
-                                float *out = C + static_cast<std::size_t>(row0 + row) * N + nt;
-                                for (int col = 0; col < 16; ++col)
+                                // Weight tiles first: they stay resident across
+                                // all four activation sub-tiles of this K step.
+                                for (int c = 0; c < bsub_live; ++c)
                                 {
-                                    const float dot = c_tile[row * 16 + col];
-                                    out[col] = completeEpilogueValue(dot, alpha, beta, out + col);
+                                    copyAMXTile(b_tile,
+                                                transpose_B
+                                                    ? B + static_cast<std::size_t>(nb + c * 16) * K + kt
+                                                    : B + static_cast<std::size_t>(kt) * N + nb + c * 16,
+                                                b_stride);
+                                    amxLoadBf16Tile(AMX_TILE_B0 + c, b_tile);
+                                }
+                                for (int d = 0; d < msub_live; ++d)
+                                {
+                                    copyAMXTile(a_tile,
+                                                A + static_cast<std::size_t>(mb * 4 + d) * 16 * K + kt,
+                                                a_stride);
+                                    amxLoadBf16Tile(AMX_TILE_A, a_tile);
+                                    for (int c = 0; c < bsub_live; ++c)
+                                        amxDpbf16(AMX_TILE_D0 + d, AMX_TILE_A, AMX_TILE_B0 + c);
+                                }
+                            }
+                            for (int d = 0; d < msub_live; ++d)
+                            {
+                                amxStoreF32Tile(AMX_TILE_D0 + d, c_tile);
+                                for (int row = 0; row < 16; ++row)
+                                {
+                                    float *out = C + static_cast<std::size_t>(mb * 4 + d) * 16 * N
+                                        + static_cast<std::size_t>(row) * N + nb;
+                                    for (int col = 0; col < bsub_live * 16; ++col)
+                                    {
+                                        const float dot = c_tile[row * 16 + col];
+                                        out[col] = completeEpilogueValue(dot, alpha, beta, out + col);
+                                    }
                                 }
                             }
                         }
