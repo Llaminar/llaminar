@@ -4,6 +4,11 @@
   "git_blob": "acf7202c83d39fc92a937ec6ee6f9c17dff971fe",
   "path": "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h"
  },
+ "44a46bf7b36830996a9b93ec0961bb08d3d862babd9194c6353a34eba62485ed": {
+  "commit": "cdc1660a2568f9f82ee3565fc3ad3b8d9eb08be2",
+  "git_blob": "dbc4c517ee1c69b1383408353c390ab4b891fa15",
+  "path": "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h"
+ },
  "de93dc51f371a407931bca1d95e18ad1ce076b8c8f0cdaf5dd3de3aec64a6929": {
   "commit": "63b0534010e1253e4194438e28164440fb6e8e24",
   "git_blob": "447e3bc7977b8970b2423df026363e8fc26ee704",
