@@ -1377,7 +1377,9 @@ def tlsdesc_groups(code: dict, image: ObjectImage, extents: dict) -> dict[tuple[
 def tlsle_groups(code: dict, image: ObjectImage, extents: dict) -> dict[tuple[str, int], str]:
     """Model only the consecutive ELF AArch64 local-exec HI12/LO12_NC ADD pair.
 
-    Both relocations name the same symbol with zero addend, inside one function.
+    Both relocations name the same symbol and identical addend A, 0 <= A < 2^24,
+    inside one function. Preserve A in both symbolic operands: HI12 and LO12_NC
+    partition the same 24-bit local-exec offset expression.
     HI12 is `add xD, xB, #0, lsl #12`; LO12_NC is `add xD, xD, #0`.
     D/B are x0-x30 (never SP/ZR); no other TLSLE forms are admitted. Preserve
     symbolic operands, not numeric zero: normal provenance analysis must still
@@ -1393,8 +1395,8 @@ def tlsle_groups(code: dict, image: ObjectImage, extents: dict) -> dict[tuple[st
             if record[0] != TLSLE_PAIR[0]:
                 continue
             tail = table.get(head + 4)
-            if image.macho or tail != (TLSLE_PAIR[1], record[1], 0) or record[2]:
-                raise ValueError("TLS local-exec pair is incomplete, mixed-symbol or has an addend")
+            if image.macho or tail != (TLSLE_PAIR[1], record[1], record[2]) or not 0 <= record[2] < (1 << 24):
+                raise ValueError("TLS local-exec pair is incomplete, mixed-symbol or has unequal/out-of-range addends")
             if not any(sec == section and start <= head and head + 8 <= end
                        for sec, start, end in extents.values()):
                 raise ValueError("TLS local-exec pair crosses a function boundary")
@@ -1403,8 +1405,9 @@ def tlsle_groups(code: dict, image: ObjectImage, extents: dict) -> dict[tuple[st
             if not first or not second or first[1] != second[1] or first[1] != second[2]:
                 raise ValueError("TLS local-exec pair has unsupported ADD form or register chain")
             dest, base = first[1], first[2]
-            result[(section, head)] = f"add\tx{dest}, x{base}, :tprel_hi12:{record[1]}"
-            result[(section, head + 4)] = f"add\tx{dest}, x{dest}, :tprel_lo12_nc:{record[1]}"
+            target = relocation_target(record[1], record[2])
+            result[(section, head)] = f"add\tx{dest}, x{base}, :tprel_hi12:{target}"
+            result[(section, head + 4)] = f"add\tx{dest}, x{dest}, :tprel_lo12_nc:{target}"
             claimed.update((head, head + 4))
         if any(record[0] in TLSLE_PAIR and address not in claimed for address, record in table.items()):
             raise ValueError("TLS local-exec relocation outside an exact HI12/LO12_NC pair")

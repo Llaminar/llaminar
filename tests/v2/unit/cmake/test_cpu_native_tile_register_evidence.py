@@ -1260,10 +1260,11 @@ def tls_sequence(register: str = "x2", symbols: tuple = (TLS,) * 4, order: tuple
     return "\n".join(lines[index] for index in order) + "\n"
 
 
-def tlsle_sequence(base: str = "x1", dest: str = "x2") -> str:
+def tlsle_sequence(base: str = "x1", dest: str = "x2", addends: tuple[int, int] = (0, 0)) -> str:
     """Recorded local-exec relocation shape; literal operands are relocation placeholders."""
-    return (f"\tadd\t{dest}, {base}, #0x0, lsl #12 !{CHECKER.TLSLE_PAIR[0]}:{TLS}\n"
-            f"\tadd\t{dest}, {dest}, #0x0 !{CHECKER.TLSLE_PAIR[1]}:{TLS}\n")
+    high, low = (CHECKER.relocation_target(TLS, addend) for addend in addends)
+    return (f"\tadd\t{dest}, {base}, #0x0, lsl #12 !{CHECKER.TLSLE_PAIR[0]}:{high}\n"
+            f"\tadd\t{dest}, {dest}, #0x0 !{CHECKER.TLSLE_PAIR[1]}:{low}\n")
 
 
 class TLSLocalExecPairTest(unittest.TestCase):
@@ -1312,6 +1313,34 @@ class TLSLocalExecPairTest(unittest.TestCase):
             data[offset + record * 24 + 8:offset + record * 24 + 12] = kind.to_bytes(4, "little")
             with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "not admitted in code"):
                 CHECKER.read_object(bytes(data))
+
+    def test_identical_24_bit_addends_preserve_both_symbolic_operands(self) -> None:
+        for addend in (0, 1, 16, 4095, 4096, (1 << 24) - 1):
+            for base, dest in (("x0", "x0"), ("x20", "x4"), ("x30", "x30")):
+                with self.subTest(addend=addend, base=base, dest=dest):
+                    functions = [("f", tlsle_sequence(base, dest, (addend, addend)) + "\tret\n")]
+                    image = CHECKER.read_object(witness_object(functions))
+                    bodies = CHECKER.normalize_disassembly(disassembly(functions), image)
+                    target = CHECKER.relocation_target(TLS, addend)
+                    self.assertIn(f":tprel_hi12:{target}", str(bodies))
+                    self.assertIn(f":tprel_lo12_nc:{target}", str(bodies))
+                    counts, _, errors = traffic(functions[0][1])
+                    self.assertEqual(errors, [])
+                    self.assertTrue(all(not value for value in counts.values()), counts)
+        _, _, errors = traffic("\tadd\tx1, sp, #0\n" + tlsle_sequence(addends=(16, 16)) + "\tret\n")
+        self.assertTrue(any("relocated arithmetic on a stack address" in error for error in errors), errors)
+
+    def test_unequal_one_sided_negative_and_out_of_range_addends_fail(self) -> None:
+        for addends in ((16, 17), (16, 0), (0, 16), (-1, -1), (1 << 24, 1 << 24)):
+            with self.subTest(addends=addends), self.assertRaisesRegex(ValueError, "TLS local-exec"):
+                traffic(tlsle_sequence(addends=addends) + "\tret\n")
+        pair = tlsle_sequence(addends=(16, 16))
+        cases = (pair.replace(CHECKER.TLSLE_PAIR[1] + ":" + TLS, CHECKER.TLSLE_PAIR[1] + ":other"),
+                 pair.replace("x1", "xzr"), pair.replace("x2", "x31"),
+                 pair.replace("#0x0", "#0x1"), pair.replace("\n", "\n\tnop\n", 1))
+        for pair in cases:
+            with self.subTest(pair=pair), self.assertRaisesRegex(ValueError, "TLS local-exec"):
+                traffic(pair + "\tret\n")
 
     def test_addend_and_function_boundary_fail(self) -> None:
         functions = [("f", tlsle_sequence() + "\tret\n")]
