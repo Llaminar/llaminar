@@ -8,8 +8,12 @@ or duplicate instructions without changing arithmetic. This lexical gate admits:
 
 * `optimize(...)` (any spelling: __attribute__, [[gnu::...]], __optimize__) whose
   arguments are string literals made only of ADMITTED tokens;
-* an attribute carrying a register-pressure token (REQUIRES_EXACT) only together
-  with fp-contract=off and no-associative-math.
+* an attribute carrying a register-pressure or vectoriser token (REQUIRES_EXACT) only
+  together with fp-contract=off and no-associative-math. The single exception is
+  SLP_PAIR_EXEMPTIONS: the four vectoriser-only `no-tree-slp-vectorize` pins of the
+  x86 packed-prefill TU, named by exact file and function. Every exemption must
+  match exactly one attribute; a renamed or moved exempt function fails closed
+  (its attribute loses the waiver and the stale exemption is reported).
 
 It rejects target/target_clones attributes, `#pragma GCC optimize|target|push_options`
 (including _Pragma), `#pragma clang optimize`, every FP-semantic option
@@ -27,11 +31,16 @@ import sys
 
 SUFFIXES = {".h", ".hpp", ".hh", ".cpp", ".cc", ".cxx", ".inl", ".inc", ".ipp", ".cu", ".cuh", ".hip"}
 ADMITTED = {"fp-contract=off", "no-associative-math", "no-thread-jumps", "no-schedule-insns",
-            # Pre-existing x86 packed-prefill pin (CPUNativeX86PackedPrefill.cpp): selects the loop
-            # vectorizer over SLP; no FP-semantic effect.
             "no-tree-slp-vectorize"}
-REQUIRES_EXACT = {"no-thread-jumps", "no-schedule-insns"}
+REQUIRES_EXACT = {"no-thread-jumps", "no-schedule-insns", "no-tree-slp-vectorize"}
 EXACT = {"fp-contract=off", "no-associative-math"}
+SLP_TOKEN = "no-tree-slp-vectorize"
+# Pre-existing x86 packed-prefill pins: they select the loop vectoriser over SLP for the
+# ordered panel family and carry no exact pair. Their contraction is proven separately by
+# the x86 contraction witness. Keyed by (repository-relative file, declared function name).
+X86_PACKED_PREFILL = "src/v2/kernels/cpu/gemm/CPUNativeX86PackedPrefill.cpp"
+SLP_PAIR_EXEMPTIONS = frozenset((X86_PACKED_PREFILL, name)
+                                for name in ("orderedPanel", "stripeOrdered", "run", "pooledChunk"))
 FP_SEMANTIC = re.compile(
     r"^(?:O(?:fast|[0-3sgz]?)$|(?:no-)?fast-math$|fp-contract=(?:fast|on)$|associative-math$|reciprocal-math$|"
     r"(?:no-)?finite-math-only$|unsafe-math-optimizations$|no-signed-zeros$|no-trapping-math$|"
@@ -133,7 +142,9 @@ def option_tokens(arguments: str) -> list[str] | None:
     return tokens
 
 
-def check_attribute_list(body: str, line: int, path: str) -> list[Violation]:
+def check_attribute_list(body: str, line: int, path: str, function: str | None = None,
+                         exempt_used: list[tuple[str, str]] | None = None) -> list[Violation]:
+    """Violations of one attribute list declared before @p function (None when not a function)."""
     violations = []
     for item in split_top(body):
         match = ATTRIBUTE_NAME.match(item)
@@ -161,17 +172,30 @@ def check_attribute_list(body: str, line: int, path: str) -> list[Violation]:
                 violations.append(Violation(path, line, f"FP-semantic optimize option {token!r}"))
             elif token not in ADMITTED:
                 violations.append(Violation(path, line, f"optimize option {token!r} is not admitted"))
-        if REQUIRES_EXACT & set(tokens) and not EXACT <= set(tokens):
-            violations.append(Violation(path, line, "optimize options " + ", ".join(sorted(REQUIRES_EXACT & set(tokens)))
+        unpaired = REQUIRES_EXACT & set(tokens) if not EXACT <= set(tokens) else set()
+        if SLP_TOKEN in unpaired and function is not None and (path, function) in SLP_PAIR_EXEMPTIONS:
+            unpaired.discard(SLP_TOKEN)
+            if exempt_used is not None:
+                exempt_used.append((path, function))
+        if unpaired:
+            violations.append(Violation(path, line, "optimize options " + ", ".join(sorted(unpaired))
                                         + " require fp-contract=off and no-associative-math in the same attribute"))
     return violations
 
 
 ATTRIBUTE_OPEN = re.compile(r"__attribute__\s*\(\s*\(|\[\[")
+DECLARATOR = re.compile(r"[^;{}()#=\[\]]*?\b([A-Za-z_]\w*)\s*\(")
+
+
+def declared_function(code: str, end: int) -> str | None:
+    """Name of the function whose declarator directly follows an attribute ending at @p end."""
+    match = DECLARATOR.match(code, end)
+    return match.group(1) if match else None
 BARE = re.compile(r"\b(?:__)?(?:optimize|target_clones|target_version)(?:__)?\s*\(|\b__target__\s*\(")
 
 
-def scan_text(path: str, text: str, code: str | None = None) -> list[Violation]:
+def scan_text(path: str, text: str, code: str | None = None,
+              exempt_used: list[tuple[str, str]] | None = None) -> list[Violation]:
     code = blank_comments(text) if code is None else code
     line_of = lambda offset: code.count("\n", 0, offset) + 1  # noqa: E731
     violations: list[Violation] = []
@@ -198,7 +222,8 @@ def scan_text(path: str, text: str, code: str | None = None) -> list[Violation]:
                 continue
             inner = code[code.index("(", open_index + 1) + 1:end - 2]
         covered.append((match.start(), end))
-        violations += check_attribute_list(inner, line_of(match.start()), path)
+        violations += check_attribute_list(inner, line_of(match.start()), path, declared_function(code, end),
+                                           exempt_used)
     for match in BARE.finditer(code) if "optimize" in code or "target_" in code or "__target__" in code else ():
         if not any(lo <= match.start() < hi for lo, hi in covered):
             violations.append(Violation(path, line_of(match.start()),
@@ -215,8 +240,13 @@ CANDIDATE = re.compile(r"optimize|target|pragma|_Pragma")
 
 
 def scan(repo_root: Path) -> tuple[list[Violation], int, int]:
-    """(violations, files scanned, optimize attributes seen) over src/v2."""
+    """(violations, files scanned, optimize attributes seen) over src/v2.
+
+    Every SLP_PAIR_EXEMPTIONS entry must waive exactly one attribute; otherwise the
+    exemption is stale (function renamed, moved or duplicated) and is reported.
+    """
     violations, files, attributes = [], 0, 0
+    exempt_used: list[tuple[str, str]] = []
     for path in sorted((repo_root / "src/v2").rglob("*")):
         if path.suffix not in SUFFIXES or not path.is_file():
             continue
@@ -227,7 +257,12 @@ def scan(repo_root: Path) -> tuple[list[Violation], int, int]:
         relative = path.relative_to(repo_root).as_posix()
         code = blank_comments(text)
         attributes += len(re.findall(r"\boptimize\s*\(", code))
-        violations += scan_text(relative, text, code)
+        violations += scan_text(relative, text, code, exempt_used)
+    for path, function in sorted(SLP_PAIR_EXEMPTIONS):
+        count = exempt_used.count((path, function))
+        if count != 1:
+            violations.append(Violation(path, 0, f"{SLP_TOKEN} pair exemption for {function}() matched {count} "
+                                                 "attributes, expected exactly 1"))
     return violations, files, attributes
 
 
