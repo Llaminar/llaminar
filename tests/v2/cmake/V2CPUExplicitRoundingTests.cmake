@@ -23,6 +23,9 @@ function(v2_add_cpu_rounding_target target)
     target_include_directories(${target} PRIVATE
         "${V2_NUMERIC_ROOT}/src/v2" "${V2_NUMERIC_ROOT}/tests/v2")
     target_compile_features(${target} PRIVATE cxx_std_20)
+    # A conversion branch that falls off its end is undefined behaviour the
+    # optimizer exploits (the F16C half-scale path published 65504 as +inf).
+    target_compile_options(${target} PRIVATE -Werror=return-type)
     target_link_libraries(${target} PRIVATE GTest::gtest_main)
 endfunction()
 
@@ -82,6 +85,13 @@ v2_add_core_free_test(V2_Integration_CPUExplicitRoundingContract
     COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
     LABELS V2 Integration ProductionTestPreflight CPU Numerics MoE AllFormats ByteExact Regression)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUExplicitRoundingContract)
+# Focused regression: the native half conversion's finite/non-finite seam
+# (max-finite 65504 saturates to 65504, never +inf; NaN payloads are kept).
+v2_add_core_free_test(V2_Integration_CPUNativeHalfScaleFiniteSeam
+    COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
+        --gtest_filter=CPUExplicitRoundingContract.NativeHalfScaleFiniteSeamSaturatesAndKeepsPayloads:CPUExplicitRoundingContract.NativeHalfScaleEveryEncodingIsByteExact
+    LABELS V2 Integration ProductionTestPreflight CPU Numerics ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeHalfScaleFiniteSeam)
 
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_executable(v2_test_cpu_native_neon_numerical_contract

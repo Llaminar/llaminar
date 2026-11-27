@@ -44,6 +44,11 @@ namespace llaminar2::cpu::native_quantised
 #if defined(__F16C__)
         if ((value & 0x7c00u) != 0x7c00u)
             return _cvtsh_ss(value);
+        // Exponent 31 only. Every preprocessor branch must return: falling off
+        // the end is undefined behaviour, and GCC 14 then miscompiles the
+        // whole conversion (max-finite 65504 published as +inf, quieted sNaN
+        // payloads, a non-terminating exhaustive loop).
+        return llaminar2::fp16_to_fp32(value);
 #elif defined(__aarch64__) && defined(__ARM_NEON)
         if ((value & 0x7c00u) != 0x7c00u)
         {
