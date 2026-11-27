@@ -4,6 +4,8 @@
 LANGUAGES NONE fixtures build marker targets with the real production module.
 They need no compiler, model, SDK or accelerator. The preserved former eager
 body exposes both omitted build dependencies and unnormalized late CPU budgets.
+The deferred finalizer also requires ProductionTestPreflight label membership
+to equal the explicit V2_PRODUCTION_TEST_PREFLIGHT_TESTS inventory.
 """
 from pathlib import Path
 import json
@@ -25,23 +27,24 @@ def run(arguments):
     return result.stdout
 
 
+# Explicit inventory matching every ProductionTestPreflight-labeled fixture.
+COMPLETE_INVENTORY = (
+    'list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS EarlyPreflight LatePreflight LateScript)\n')
+
+
 class TestGateFinalization(unittest.TestCase):
     """Exercise early/late/duplicate includes and the literal former failure."""
 
-    def configure_and_build(self, module, *, duplicate=False, performance=False):
-        """Return actual marker inventory and CTest properties after complete configure."""
-        with tempfile.TemporaryDirectory(prefix='llaminar-test-gate-') as directory:
-            source = Path(directory) / 'source'
-            build = Path(directory) / 'build'
-            source.mkdir()
-            ninja = shutil.which('ninja')
-            self.assertIsNotNone(ninja, 'The canonical Ninja executable must be available')
-            include = 'include([=[' + str(module) + ']=])\n'
-            source.joinpath('CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.24)
+    def write_fixture(self, source, module, *, duplicate=False, performance=False,
+                      inventory=COMPLETE_INVENTORY):
+        """Write the fixture project; ``inventory`` is CMake text run after every registration."""
+        include = 'include([=[' + str(module) + ']=])\n'
+        source.joinpath('CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.24)
 project(TestGateFinalization NONE)
 enable_testing()
 set(V2_TEST_THREADS_PER_CORE 2)
 set(V2_PERF_TESTS_ONLY ''' + ('ON' if performance else 'OFF') + ''')
+set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS "")
 function(register_fixture name labels budget)
     add_custom_target(${name}_target
         COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/${name}.built")
@@ -63,7 +66,17 @@ register_fixture(LatePreflight "V2;Integration;ProductionTestPreflight" 7)
 # Script-only entries require scheduling but correctly contribute no build target.
 add_test(NAME LateScript COMMAND ${CMAKE_COMMAND} -E true)
 set_tests_properties(LateScript PROPERTIES LABELS "V2;Unit;ProductionTestPreflight")
-''')
+''' + inventory)
+
+    def configure_and_build(self, module, *, duplicate=False, performance=False):
+        """Return actual marker inventory and CTest properties after complete configure."""
+        with tempfile.TemporaryDirectory(prefix='llaminar-test-gate-') as directory:
+            source = Path(directory) / 'source'
+            build = Path(directory) / 'build'
+            source.mkdir()
+            ninja = shutil.which('ninja')
+            self.assertIsNotNone(ninja, 'The canonical Ninja executable must be available')
+            self.write_fixture(source, module, duplicate=duplicate, performance=performance)
             run(['cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja',
                  '-DCMAKE_MAKE_PROGRAM:FILEPATH=' + ninja])
             if not performance:
@@ -102,6 +115,49 @@ set_tests_properties(LateScript PROPERTIES LABELS "V2;Unit;ProductionTestPreflig
         built, properties = self.configure_and_build(MODULE, performance=True)
         self.assertEqual(built, set())
         self.assertEqual(properties['LateUnit']['PROCESSORS'], 6)
+
+
+    def configure_inventory(self, inventory):
+        """Configure the production module with ``inventory``; return (exit code, output)."""
+        with tempfile.TemporaryDirectory(prefix='llaminar-preflight-inventory-') as directory:
+            source = Path(directory) / 'source'
+            source.mkdir()
+            ninja = shutil.which('ninja')
+            self.assertIsNotNone(ninja, 'The canonical Ninja executable must be available')
+            self.write_fixture(source, MODULE, inventory=inventory)
+            result = subprocess.run(['cmake', '-S', str(source), '-B', str(Path(directory) / 'build'),
+                                     '-G', 'Ninja', '-DCMAKE_MAKE_PROGRAM:FILEPATH=' + ninja],
+                                    capture_output=True, text=True, timeout=20)
+            return result.returncode, result.stdout + result.stderr
+
+    def test_preflight_label_membership_must_equal_explicit_inventory(self):
+        """Every label/list difference is fatal and names the test, in both directions."""
+        returncode, output = self.configure_inventory(COMPLETE_INVENTORY)
+        self.assertEqual(returncode, 0, output)
+        cases = (
+            ('label only', 'list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS EarlyPreflight LateScript)\n',
+             r'Labeled but not listed \(1\):\s+LatePreflight\s'),
+            ('listed unregistered', COMPLETE_INVENTORY +
+             'list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS GhostPreflight)\n',
+             r'Listed but not a labeled registered test \(1\):\s+GhostPreflight\s'),
+            ('listed without label', COMPLETE_INVENTORY +
+             'list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS LateUnit)\n',
+             r'Listed but not a labeled registered test \(1\):\s+LateUnit\s'),
+        )
+        for name, inventory, diagnostic in cases:
+            with self.subTest(name):
+                returncode, output = self.configure_inventory(inventory)
+                self.assertNotEqual(returncode, 0, output)
+                self.assertIn('ProductionTestPreflight label membership differs', output)
+                self.assertRegex(output, diagnostic)
+
+    def test_backend_omitted_members_leave_the_inventory_explicitly(self):
+        """A listed member omitted for an uncompiled backend is not an unregistered name."""
+        returncode, output = self.configure_inventory(
+            COMPLETE_INVENTORY +
+            'set_property(GLOBAL APPEND PROPERTY V2_BACKEND_OMITTED_TESTS OmittedROCmPreflight)\n'
+            'list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS OmittedROCmPreflight)\n')
+        self.assertEqual(returncode, 0, output)
 
 
 if __name__ == '__main__':

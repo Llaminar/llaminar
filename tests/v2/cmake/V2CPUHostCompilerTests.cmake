@@ -33,6 +33,7 @@ v2_add_core_free_test(V2_Integration_CPUHostCompileContract
         "--compiler-CUDA=${CMAKE_CUDA_COMPILER}"
         "--compiler-HIP=${CMAKE_HIP_COMPILER}"
     LABELS V2 Integration DeviceFree ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHostCompileContract)
 
 # Simulated compiler identities exercise real CMake generation, not native codegen.
 # Unit owns fast feedback; the separately named Integration entry explicitly
@@ -47,6 +48,7 @@ v2_add_core_free_test(V2_Integration_CPUHostGeneratedCommands
         -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
         -p test_cpu_host_generated_commands.py
     LABELS V2 Integration DeviceFree ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHostGeneratedCommands)
 
 # A configure-owned header fixture standard, independent of incidental CXXFLAGS.
 add_library(v2_cpu_host_coherence_contract INTERFACE)
@@ -66,3 +68,4 @@ v2_add_core_free_test(V2_Integration_CPUHostCoherence
         -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
         -p test_cpu_host_coherence.py
     LABELS V2 Integration DeviceFree ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHostCoherence)

@@ -19,6 +19,7 @@ foreach(V2_SHARED_FILE_SUITE Unit Integration)
         LABELS "V2;${V2_SHARED_FILE_SUITE};DeviceFree;BuildSystem;Regression" TIMEOUT 30)
 endforeach()
 set_property(TEST V2_Integration_NativeSharedFileProofPackaging APPEND PROPERTY LABELS ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeSharedFileProofPackaging)
 
 # Replay the actual installer argv through both proof parsers, including the
 # original dash-prefixed argument failure, without invoking an SDK or compiler.
@@ -28,6 +29,7 @@ add_test(NAME V2_Integration_NCCLInstallerArchitectureArgumentReplay
         NativeSharedFileProofTests.test_nccl_installer_preserves_dash_prefixed_architecture_arguments)
 set_tests_properties(V2_Integration_NCCLInstallerArchitectureArgumentReplay PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;Replay;Regression" TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NCCLInstallerArchitectureArgumentReplay)
 
 if(HAVE_CUDA AND HAVE_NCCL AND NOT V2_PERF_TESTS_ONLY)
     get_filename_component(V2_SHARED_FILE_NCCL_LIBDIR "${NCCL_LIBRARY}" DIRECTORY)
@@ -66,6 +68,7 @@ if(HAVE_CUDA AND HAVE_NCCL AND NOT V2_PERF_TESTS_ONLY)
             LABELS "V2;${V2_SHARED_FILE_SUITE};NCCL;DeviceFree;Replay;Regression" TIMEOUT 30)
     endforeach()
     set_property(TEST V2_Integration_NCCLSharedFileLifecycle APPEND PROPERTY LABELS ProductionTestPreflight)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NCCLSharedFileLifecycle)
 endif()
 
 if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
@@ -103,4 +106,5 @@ if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
             LABELS "V2;${V2_SHARED_FILE_SUITE};RCCL;DeviceFree;Replay;Regression" TIMEOUT 30)
     endforeach()
     set_property(TEST V2_Integration_RCCLSharedFileLifecycle APPEND PROPERTY LABELS ProductionTestPreflight)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RCCLSharedFileLifecycle)
 endif()

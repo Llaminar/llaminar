@@ -55,6 +55,7 @@ add_v2_test(V2_Integration_SharedDispatchLiveUnionContract
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_shared_dispatch_selection>
             --gtest_filter=MoEOverlaySharedDispatchSelection.* --gtest_repeat=20
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;LivePayload;Contract;Regression" NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SharedDispatchLiveUnionContract)
 
 # Actual factory scalar projection, including authored CPU TP1 and joint TP2..8.
 add_executable(v2_unit_moe_graph_compute_policy unit/execution/moe/Test__MoEGraphComputePolicy.cpp)

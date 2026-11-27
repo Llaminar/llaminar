@@ -47,16 +47,22 @@ foreach(_ctest_metadata_suite IN ITEMS Unit Integration)
         COMMAND $<TARGET_FILE:v2_test_cpu_compiler_configuration>
         LABELS ${_ctest_metadata_labels})
 endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CTestTimeoutOwnerMetadata)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCoreFreeSanitizerFailurePolicy)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPortabilityIntegrationFlags)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompilerConfiguration)
 v2_add_core_free_test(V2_Integration_CTestBuildToolImageContracts
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/test_production_pipeline.py"
         ImageIdentityTests
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CTestBuildToolImageContracts)
 v2_add_core_free_test(V2_Integration_DeviceFreeImageFixtureOwnership
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/test_production_pipeline.py"
         CrossHostRunnerTests.test_report_artifacts_survive_staging_cleanup_on_success_and_failure
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeviceFreeImageFixtureOwnership)
 foreach(_stage_header_suite IN ITEMS Unit Integration)
     if(_stage_header_suite STREQUAL "Unit")
         set(_stage_header_labels V2 Unit CPU DeviceFree Architecture)
@@ -73,6 +79,8 @@ foreach(_stage_header_suite IN ITEMS Unit Integration)
             --cxx "${CMAKE_CXX_COMPILER}"
         LABELS ${_stage_header_labels})
 endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCacheAppendHeaderBoundary)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TurboQuantGPUHeaderBoundary)
 v2_add_core_free_test(V2_Unit_CPUHostTopology
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
@@ -83,6 +91,7 @@ v2_add_core_free_test(V2_Integration_CPUHybridTopologyAdmission
         CPUHostTopologyTests.test_hybrid_single_package_has_twenty_distinct_sibling_groups
         CPUHostTopologyTests.test_actual_cmake_gate_ignores_multiline_presentation_geometry
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Topology Build Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHybridTopologyAdmission)
 v2_add_core_free_test(V2_Integration_CPUHostTopologyRejectUnknownGeometry
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
@@ -90,11 +99,13 @@ v2_add_core_free_test(V2_Integration_CPUHostTopologyRejectUnknownGeometry
         CPUHostTopologyTests.test_capture_requires_complete_stable_original_affinity
         CPUHostTopologyTests.test_cmake_rejects_asymmetric_projection_and_noninteger_counts
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Topology Build Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHostTopologyRejectUnknownGeometry)
 v2_add_core_free_test(V2_Integration_CPUHostTopologyReceiptRetirement
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
         CPUHostTopologyTests.test_actual_owner_retires_receipt_before_failed_readmission
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Topology Build Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHostTopologyReceiptRetirement)
 v2_add_core_free_test(V2_Unit_OneDNNBuildLifecycle
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_onednn_build_lifecycle.py"
@@ -106,6 +117,7 @@ v2_add_core_free_test(V2_Integration_OneDNNConfiguredBuildResume
         --cmake "${CMAKE_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
         OneDNNBuildLifecycleTest.test_failed_build_resumes_and_complete_install_reuses
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OneDNNConfiguredBuildResume)
 v2_add_core_free_test(V2_Integration_OneDNNFailedPublication
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_onednn_build_lifecycle.py"
@@ -114,6 +126,7 @@ v2_add_core_free_test(V2_Integration_OneDNNFailedPublication
         OneDNNBuildLifecycleTest.test_identity_change_invalidates_install_and_configured_artifacts
         OneDNNBuildLifecycleTest.test_missing_artifact_retires_success_before_failed_producer
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OneDNNFailedPublication)
 v2_add_core_free_test(V2_Integration_OneDNNOriginAuthentication
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_onednn_build_lifecycle.py"
@@ -122,6 +135,7 @@ v2_add_core_free_test(V2_Integration_OneDNNOriginAuthentication
         OneDNNBuildLifecycleTest.test_origin_mismatch_preserves_existing_source_and_configuration
         OneDNNBuildLifecycleTest.test_failed_git_probe_is_not_a_destructive_origin_mismatch
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OneDNNOriginAuthentication)
 v2_add_core_free_test(V2_Integration_OneDNNRequiredInstallClosure
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_onednn_build_lifecycle.py"
@@ -136,12 +150,14 @@ v2_add_core_free_test(V2_Integration_OneDNNRequiredInstallClosure
         OneDNNBuildLifecycleTest.test_nested_directory_link_rejects_before_unpublished_retry_writes
         OneDNNBuildLifecycleTest.test_owned_versioned_library_file_links_remain_legal
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OneDNNRequiredInstallClosure)
 v2_add_core_free_test(V2_Integration_OneDNNCompilerArgumentIdentity
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_onednn_build_lifecycle.py"
         --cmake "${CMAKE_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
         OneDNNBuildLifecycleTest.test_compiler_arg1_is_forwarded_and_changes_identity
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build ISA Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OneDNNCompilerArgumentIdentity)
 add_executable(v2_test_q16_1_rmsnorm
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/ops/Test__Q16_1RMSNorm.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")
@@ -155,6 +171,7 @@ v2_add_core_free_test(V2_Unit_Q16_1RMSNorm
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16LegacyCoverage
     COMMAND $<TARGET_FILE:v2_test_q16_1_rmsnorm>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16_1 Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormQ16LegacyCoverage)
 # Pure-integer Q8_1 gamma is cached by owner control block, never by raw address.
 add_executable(v2_test_cpu_rmsnorm_gamma_q11_identity
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/ops/Test__RMSNormGammaQ11Identity.cpp"
@@ -170,6 +187,7 @@ v2_add_core_free_test(V2_Integration_CPURMSNormGammaQ11OwnerIdentity
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_gamma_q11_identity>
         --gtest_filter=RMSNormGammaQ11Identity.NewOwnerAtReusedAddressNeverStaleHits:RMSNormGammaQ11Identity.ExpiredOwnerRequantizes:RMSNormGammaQ11Identity.UnownedGammaIsNeverCached
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q8_1 Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormGammaQ11OwnerIdentity)
 # Compile the actual legacy precision caller TU, not a hand-copied surrogate.
 # Its remaining precision/ISA cases retain their canonical full-core Unit gate;
 # this core-free selection certifies only the admitted original-INT32 publisher.
@@ -188,6 +206,7 @@ v2_add_core_free_test(V2_Integration_CPURMSNormInt32PrecisionCaller
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_precision>
         --gtest_filter=Test__RMSNormPrecision.ISAParity_Int32OriginalPublication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32PrecisionCaller)
 add_executable(v2_test_cpu_rmsnorm_workshare
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPURMSNormWorkshare.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUQuantizedRMSNorm.cpp"
@@ -207,91 +226,117 @@ v2_add_core_free_test(V2_Integration_CPURMSNormFP32Application
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPURMSNormWorkshare.FP32ApplicationRetainsOriginalRoundedEdges
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm ByteExact Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormFP32Application)
 v2_add_core_free_test(V2_Integration_CPURMSNormScalarFP32Summary
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPURMSNormWorkshare.ScalarFP32SummaryRetainsIncreasingColumnFMA
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormScalarFP32Summary)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32Precision
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNorm.FullWidthSummaryNeverRoundsOriginalIntegersThroughFP32:CPUInt32RMSNorm.ExplicitScalarUsesOriginalIncreasingColumnFP64Program
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Native ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32Precision)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32Admission
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNorm.OriginalBankIntersectionsAndUndeclaredPolicyRejectBeforeStores
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32Admission)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32Completion
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNorm.EmptyRetainedSummaryCompletesBeforeRetirement:CPUInt32RMSNorm.SmallRetainedSummaryHasOnePublicationOwner
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Workshare Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32Completion)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32AllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNorm.AllPositiveWorkersThroughTenRetainOriginalSummaries
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32AllPositiveWorkers)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32LegacyCoverage
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=Test__RMSNormINT32.*
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32LegacyCoverage)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationProgram
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNormPublication.OriginalNativeRNEFragmentsAndAwayTails:CPUInt32RMSNormPublication.OriginalScaleHasNoForeignFloorAndZeroInverseDoesNotReadGamma:CPUInt32RMSNormPublication.ExplicitScalarFusedUsesSerialSummaryAndOriginalAwayPublication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32PublicationProgram)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNormPublication.CompleteOriginalBanksAndPolicyRejectBeforePublication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32PublicationAdmission)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNormPublication.EmptyStagedAndFusedCallsCompleteRetainedTeam:CPUInt32RMSNormPublication.NonemptyStagedAndFusedCompleteBeforeImmediateReuse
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Workshare Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32PublicationCompletion)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationNumeric
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNormPublication.NonfiniteAndUnrepresentableRowsAreFatalNotZeroed
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Numerical Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32PublicationNumeric)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationAllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNormPublication.AllPositiveWorkersThroughTenRetainNativeStagedFusedBytesAndGuards
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormInt32PublicationAllPositiveWorkers)
 v2_add_core_free_test(V2_Integration_CPURMSNormRetainedSummary
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*WideRetainedRowUsesCompleteOriginalSummary
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormRetainedSummary)
 v2_add_core_free_test(V2_Integration_CPURMSNormRetainedAlias
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*SmallRetainedAliasCompletesExactlyOnce
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormRetainedAlias)
 v2_add_core_free_test(V2_Integration_CPURMSNormEmptyCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*EmptyRetainedInvocationCompletesBeforeReturn
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormEmptyCompletion)
 v2_add_core_free_test(V2_Integration_CPURMSNormOriginalFloatingRows
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*FloatingMatricesPreserveOriginalRowsAndSerialBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm ByteExact)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormOriginalFloatingRows)
 v2_add_core_free_test(V2_Integration_CPURMSNormAllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*AllPositiveWorkersThroughTenRetainSerialBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm ByteExact)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormAllPositiveWorkers)
 v2_add_core_free_test(V2_Integration_CPURMSNormOriginalBankAliases
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*OriginalBankAndPolicyAliasesRejectBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormOriginalBankAliases)
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16Geometry
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16CompleteGeometryRejectsBeforeStores
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormQ16Geometry)
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16Expansion
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16ExpansionProtectsCompleteOriginalBanks
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormQ16Expansion)
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16EmptyCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16EmptyRetainedInvocationCompletes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormQ16EmptyCompletion)
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16AllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16AllPositiveWorkersThroughTenRetainSerialBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 ByteExact)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormQ16AllPositiveWorkers)
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16NumericalProgram
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16RoundedSquaresAndOriginalMetadataMatchIndependentProgram
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormQ16NumericalProgram)
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16ReductionTreeIdentity
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16ReductionTreeIdentityRemainsISASpecific
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 ISA ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormQ16ReductionTreeIdentity)
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16Policy
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16PolicyAndNonfiniteSummaryFailHard
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormQ16Policy)
 v2_add_core_free_test(V2_Integration_CPURMSNormPortableHalfTail
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*PortableHalfNormalRoundingIsLaneIndependent
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm FP16 ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormPortableHalfTail)
 add_executable(v2_test_cpu_workshare_timing
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUWorkshareTiming.cpp")
 target_compile_features(v2_test_cpu_workshare_timing PRIVATE cxx_std_20)
@@ -304,12 +349,15 @@ v2_add_core_free_test(V2_Unit_CPUWorkshareTiming
 v2_add_core_free_test(V2_Integration_CPUWorkshareTiming
     COMMAND $<TARGET_FILE:v2_test_cpu_workshare_timing>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Profiling Ownership)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUWorkshareTiming)
 v2_add_core_free_test(V2_Integration_CPUWorkshareTimingRetainedRelease
     COMMAND $<TARGET_FILE:v2_test_cpu_workshare_timing> --gtest_filter=*RetainedPublicationCompletesBeforeStackReuse
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Profiling Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUWorkshareTimingRetainedRelease)
 v2_add_core_free_test(V2_Integration_CPUWorkshareTimingLifecycle
     COMMAND $<TARGET_FILE:v2_test_cpu_workshare_timing> --gtest_filter=*PublicationStateRejectsRepeatedOperations
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Profiling Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUWorkshareTimingLifecycle)
 add_executable(v2_test_cpu_openmp_workshare
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__OpenMPWorkshare.cpp")
 target_compile_features(v2_test_cpu_openmp_workshare PRIVATE cxx_std_23)
@@ -323,23 +371,28 @@ v2_add_core_free_test(V2_Integration_OpenMPWorkshareLexicalRetained
     COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
         --gtest_filter=OpenMPWorkshare.RetainedSerializedTeamReusesExactTeam:OpenMPWorkshare.RetainedInactiveTeamReusesExactTeam:OpenMPWorkshare.RegionIfRetainedVariantsStayDirect:OpenMPWorkshare.BeginWorkshareEmptySemantics
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPWorkshareLexicalRetained)
 v2_add_core_free_test(V2_Integration_OpenMPWorkshareRetainedDepth
     COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
         --gtest_filter=OpenMPWorkshare.StandalonePolicyIsUnchanged:OpenMPWorkshare.RetainedActiveTeamReusesExactTeam:OpenMPWorkshare.NestedSerializedTeamDepthIsStable:OpenMPWorkshare.CollapseFormsReuseRetainedTeam:OpenMPWorkshare.RepeatedRetainedCallsKeepConstantDepth:OpenMPWorkshare.ImmediateAfterReturnBeforeOuterJoin:OpenMPWorkshare.RetainedSingleExecutesExactlyOnce:OpenMPWorkshare.SingleNoWaitHasNoForcedBarrier:OpenMPWorkshare.RegionSyncAddsExplicitBarrierAfterNowaitWork:OpenMPWorkshare.LayerParallelReusesRetainedTeam:OpenMPWorkshare.CanonicalPlacementAuthority
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPWorkshareRetainedDepth)
 v2_add_core_free_test(V2_Integration_OpenMPTeamForkCounterContract
     COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
         --gtest_filter=OpenMPWorkshare.TeamForkCounterCountsExactlyTheRealForks:OpenMPWorkshare.TeamForkCounterPublicationCostAndDefault:OpenMPWorkshare.TeamForkScopeAttributesExactlyUnderOverlapAndNesting:OpenMPWorkshare.TeamForkWorkerContextForksNeverReachOwnerCells:OpenMPWorkshare.TeamForkScopeStackRestoredAfterReverseTeardown
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree OpenMP Workshare Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPTeamForkCounterContract)
 v2_add_core_free_test(V2_Integration_OpenMPForkNoteSourcePolicy
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/check_cpu_openmp_fork_note_policy.py"
         --repo-root "${V2_CPU_ARCHITECTURE_ROOT}"
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare SourcePolicy Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPForkNoteSourcePolicy)
 v2_add_core_free_test(V2_Integration_OpenMPForkNoteSourcePolicyNegativeControls
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/test_cpu_openmp_fork_note_policy.py"
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare SourcePolicy Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPForkNoteSourcePolicyNegativeControls)
 add_executable(v2_test_cpu_rmsnorm_numeric_fatal
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPURMSNormNumericFatal.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")
@@ -353,18 +406,22 @@ v2_add_core_free_test(V2_Unit_CPURMSNormNumericFatal
 v2_add_core_free_test(V2_Integration_CPURMSNormNumericFatal
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Numerical Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormNumericFatal)
 v2_add_core_free_test(V2_Integration_CPURMSNormHalfPolicyIdentity
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
         --gtest_filter=CPURMSNormNumericFatal.HalfT5RejectedColdAndFatalInRetainedTeam:CPURMSNormNumericFatal.HalfNullGammaIdentityMatchesExplicitOnes:CPURMSNormNumericFatal.RowNullGammaIdentityMatchesExplicitOnes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm FP16 Policy Identity Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormHalfPolicyIdentity)
 v2_add_core_free_test(V2_Integration_CPURMSNormExplicitFatalSink
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
         --gtest_filter=CPURMSNormNumericFatal.FP32MatrixNonfiniteSummaryIsExplicitFatal:CPURMSNormNumericFatal.FP32MatrixNonfiniteRetainedTeamIsExplicitFatal:CPURMSNormNumericFatal.FP32MatrixNonfiniteNestedRetainedIsExplicitFatal:CPURMSNormNumericFatal.FP32DirectRowZeroDenominatorIsExplicitFatal:CPURMSNormNumericFatal.HalfMatrixNonfiniteSummaryIsExplicitFatal:CPURMSNormNumericFatal.HalfMatrixNonfiniteRetainedTeamIsExplicitFatal:CPURMSNormNumericFatal.HalfZeroDenominatorIsFatalAndPositiveEpsilonLegal:CPURMSNormNumericFatal.T5FiniteOverflowSummaryIsFatal:CPURMSNormNumericFatal.TinyOnlyRowRoundedFP32InverseOverflowIsFatal:CPURMSNormNumericFatal.DirectSIMDLeavesGateRangesAndTails:CPURMSNormNumericFatal.MultiOwnerMatrixEmitsIntactTypedFatal:CPURMSNormNumericFatal.Q16NonfiniteScaleIsExplicitFatal
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Numerical Fatal Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormExplicitFatalSink)
 v2_add_core_free_test(V2_Integration_CPURMSNormLegalNumericPositives
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
         --gtest_filter=CPURMSNormNumericFatal.GuardedZeroAndLargeFinitePositivesRemainLegal:CPURMSNormNumericFatal.T5ZeroRowPublishesLegalGuardedZeros:CPURMSNormNumericFatal.GuardedZeroRowOutputRemainsZeroWithNonfiniteGamma:CPURMSNormNumericFatal.ZeroRowWithPositiveEpsilonAndValidGammaStaysLegal:CPURMSNormNumericFatal.ColdEpsilonPolicyRemainsStandaloneRecoverable
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Numerical Positive Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURMSNormLegalNumericPositives)
 add_executable(v2_unit_cpu_aligned_storage_header
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUAlignedStorageHeader.cpp")
 target_compile_features(v2_unit_cpu_aligned_storage_header PRIVATE cxx_std_23)
@@ -376,6 +433,7 @@ v2_add_core_free_test(V2_Unit_CPUAlignedStorageHeader
 v2_add_core_free_test(V2_Integration_CPUAlignedStorageHeader
     COMMAND $<TARGET_FILE:v2_unit_cpu_aligned_storage_header>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Interface Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUAlignedStorageHeader)
 
 # Header ownership is tested with the real external MPI SDK, without MPI_Init,
 # device discovery or an alternate topology definition. Full runtime ABI gates
@@ -394,10 +452,12 @@ v2_add_core_free_test(V2_Unit_MPIContextOwnershipHeader
 v2_add_core_free_test(V2_Integration_MPIContextOwnershipHeader
     COMMAND $<TARGET_FILE:v2_unit_mpi_context_header>
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Interface Ownership MPI Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIContextOwnershipHeader)
 v2_add_core_free_test(V2_Integration_CPUCodegenTargetManifestMultiLanguage
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_target_manifest.py"
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodegenTargetManifestMultiLanguage)
 v2_add_core_free_test(V2_Unit_CPUCodegenEvidenceLifecycle
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
@@ -420,6 +480,7 @@ foreach(v2_tile_register_shard IN ITEMS analysis binding-0 binding-1 binding-2 b
             "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py"
             --shard "${v2_tile_register_shard}"
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeTileRegisterEvidence${v2_tile_register_name})
 endforeach()
 # The stack-traffic table, key map, role map, gate and driver-receipt controls (compiler-free, a few seconds).
 foreach(scope IN ITEMS Unit Integration)
@@ -432,21 +493,25 @@ foreach(scope IN ITEMS Unit Integration)
             "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_stack_table.py"
         LABELS ${labels})
 endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeTileStackTable)
 v2_add_core_free_test(V2_Integration_CPUCodegenFailedRebuildInvalidation
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
         CPUCodegenEnvelopeEvidenceTest.test_failed_rebuild_retires_previous_success
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodegenFailedRebuildInvalidation)
 v2_add_core_free_test(V2_Integration_CPUCodegenNestedResponseExtent
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
         CPUCodegenEnvelopeEvidenceTest.test_nested_response_changes_cycles_and_missing_inputs_are_rejected
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodegenNestedResponseExtent)
 v2_add_core_free_test(V2_Integration_CPUCodegenNativeAssemblyEvidence
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
         CPUCodegenEnvelopeEvidenceTest.test_empty_and_ir_only_witnesses_are_rejected
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodegenNativeAssemblyEvidence)
 
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -461,14 +526,17 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONRMSNormReduction
         COMMAND $<TARGET_FILE:v2_test_neon_rmsnorm_reduction>
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NEON RMSNorm ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRMSNormReduction)
     v2_add_core_free_test(V2_Integration_NEONRMSNormOriginalBorrow
         COMMAND $<TARGET_FILE:v2_test_neon_rmsnorm_reduction>
             --gtest_filter=*OriginalBorrowGeometryRejectsBeforeArithmetic
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NEON RMSNorm Ownership Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRMSNormOriginalBorrow)
     v2_add_core_free_test(V2_Integration_NEONRMSNormInt32Width
         COMMAND $<TARGET_FILE:v2_test_neon_rmsnorm_reduction>
             --gtest_filter=*IntegerOriginalRowsRetainFullWidthAndSerialBytes
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NEON RMSNorm ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRMSNormInt32Width)
     add_executable(v2_test_neon_gdn_normalization
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONGDNNormalization.cpp")
     target_compile_features(v2_test_neon_gdn_normalization PRIVATE cxx_std_20)
@@ -480,6 +548,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONGDNNormalization
         COMMAND $<TARGET_FILE:v2_test_neon_gdn_normalization>
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NEON GDN ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONGDNNormalization)
     add_executable(v2_test_neon_attention_math
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONAttentionMath.cpp"
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/VectorPrimitives.cpp")
@@ -493,26 +562,32 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONAttentionMath
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math>
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONAttentionMath)
     v2_add_core_free_test(V2_Integration_NEONAttentionFloatingRows
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*FloatingOriginalCacheRowsRetainSerialBytes
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONAttentionFloatingRows)
     # The row programs that trust admitted geometry are private to the owning
     # kernel (compile-time witness) and the integer width guard is fatal.
     v2_add_core_free_test(V2_Integration_NEONAttentionAdmittedRowsBoundary
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*PrivateIntegerRowsRejectUnprovenWidths
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONAttentionAdmittedRowsBoundary)
     # Int32 accumulation is exact only under the typed Q16 reduction bound:
     # equality with int64 sums, closed-form worst cases and fatal rejection.
     v2_add_core_free_test(V2_Integration_NEONAttentionQ16Int32Bound
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math>
             --gtest_filter=*IntegerOriginalRowsAccumulateExactlyUnderTheTypedBound:*Q16BoundWorstCaseWitnessesStayExact:*Q16BoundRejectsUnprovenReductions:*Q16BoundRejectsInvalidTailCodesBeforeTailArithmetic
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONAttentionQ16Int32Bound)
     v2_add_core_free_test(V2_Integration_NEONAttentionQueryQuantization
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*OriginalQueryQuantizationProgram
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONAttentionQueryQuantization)
     v2_add_core_free_test(V2_Integration_NEONAttentionStorageAdmission
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*OriginalStorageAndDomainAdmission:*NonfiniteWeightIsFatalBeforeAnySharedNumeratorWrite
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONAttentionStorageAdmission)
 endif()
 add_executable(v2_unit_cpu_isa_profile
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/utils/Test__CPUISAProfile.cpp")
@@ -651,6 +726,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree ISA Build Regression
         # The analysis runs one worker per admitted physical core: the test occupies the whole team's slots.
         WHOLE_TEAM)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONTileRegisters)
     set_property(GLOBAL APPEND PROPERTY
         V2_TEST_BUILD_TARGETS_V2_Integration_CPUNativeNEONTileRegisters
         v2_cpu_native_tile_register_proof)
@@ -703,6 +779,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         set_property(GLOBAL APPEND PROPERTY
             V2_TEST_BUILD_TARGETS_V2_${scope}_CPUCodegenEnvelope v2_cpu_codegen_envelope_proof)
     endforeach()
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodegenEnvelope)
 endif()
 
 v2_add_core_free_test(V2_Unit_CPUISAProfile
@@ -711,10 +788,12 @@ v2_add_core_free_test(V2_Unit_CPUISAProfile
 v2_add_core_free_test(V2_Integration_CPUISAProfile
     COMMAND $<TARGET_FILE:v2_unit_cpu_isa_profile>
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree ISA Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUISAProfile)
 
 v2_add_core_free_test(V2_Integration_CPUCacheObservationNoInventedCapacity
     COMMAND $<TARGET_FILE:v2_unit_cpu_isa_profile> --gtest_filter=CPUCacheObservation.*
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCacheObservationNoInventedCapacity)
 
 include("${CMAKE_CURRENT_LIST_DIR}/V2CPUAttentionKeyQ8Tests.cmake")
 
@@ -730,27 +809,35 @@ v2_add_core_free_test(V2_Unit_CPUSoftmax WHOLE_TEAM
 v2_add_core_free_test(V2_Integration_CPUSoftmax WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=-*AllPositiveWorkers*
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax ByteExact)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmax)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxPolynomialLinearTerm
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*ExponentialPolynomialLinearTermAndAccuracy
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax NumericalContract Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxPolynomialLinearTerm)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxQ8FP16Metadata
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*Q8FP16MetadataAndSignedEndpoint
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Quantization Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxQ8FP16Metadata)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxQ8MinimumScale
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*Q8FP16MinimumScaleRetainsLongUniformRows
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Quantization Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxQ8MinimumScale)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxProbabilityAccuracy
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*ProbabilityAccuracyAgainstDoubleExponentials
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax NumericalContract)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxProbabilityAccuracy)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxOriginalColumnPredicate
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*OriginalColumnPredicateRetainsINTMAXBoundary
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxOriginalColumnPredicate)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxFP16FragmentAlignment
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*UnalignedFP16OriginalAndProbabilityFragments
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxFP16FragmentAlignment)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxGeometry
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*OriginalGeometryRejectsBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxGeometry)
 # One storage per cell keeps each whole-team sweep inside the 30 s budget on
 # hosts with many logical CPUs; together they cover the original program.
 foreach(_softmax_storage IN ITEMS FP32 BF16 FP16 Q8_1)
@@ -758,20 +845,25 @@ foreach(_softmax_storage IN ITEMS FP32 BF16 FP16 Q8_1)
         COMMAND $<TARGET_FILE:v2_test_cpu_softmax>
             --gtest_filter=CPUSoftmax.AllPositiveWorkersRetainOriginalSerialRows${_softmax_storage}
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxRetainedOriginalRows${_softmax_storage})
 endforeach()
 v2_add_core_free_test(V2_Integration_CPUSoftmaxEmptyCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*EmptyRetainedWorkshareCompletesBeforeRelease
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSoftmaxEmptyCompletion)
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONSoftmaxOrderedRows
         COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=NEONSoftmax.OrderedOriginalRowsAllStorage
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Softmax ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONSoftmaxOrderedRows)
     v2_add_core_free_test(V2_Integration_NEONSoftmaxExpAccuracy
         COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=NEONSoftmax.ExponentialAccuracyAndSubnormalProgram
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Softmax NumericalContract)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONSoftmaxExpAccuracy)
     v2_add_core_free_test(V2_Integration_NEONSoftmaxNumericAdmission
         COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=NEONSoftmax.ActiveNumericFailuresRejectBeforeMutation
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Softmax Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONSoftmaxNumericAdmission)
 endif()
 
 add_executable(v2_test_cpu_tq_rotation
@@ -787,18 +879,23 @@ v2_add_core_free_test(V2_Unit_CPUTQRotation WHOLE_TEAM
 v2_add_core_free_test(V2_Integration_CPUTQRotation WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation ByteExact)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTQRotation)
 v2_add_core_free_test(V2_Integration_CPUTQRotationFringes
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation> --gtest_filter=*OriginalGeometryFringesRetainArithmeticAndCanaries
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTQRotationFringes)
 v2_add_core_free_test(V2_Integration_CPUTQRotationStorageAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation> --gtest_filter=*OriginalStorageAndGeometryRejectBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTQRotationStorageAdmission)
 v2_add_core_free_test(V2_Integration_CPUTQRotationFiniteVerifier
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation> --gtest_filter=*NonfiniteVerifierObservationsFailClosed
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTQRotationFiniteVerifier)
 v2_add_core_free_test(V2_Integration_CPUTQRotationOriginalHeads WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation> --gtest_filter=*AllPositiveWorkersRetainOriginalSerialHeadBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation ByteExact)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTQRotationOriginalHeads)
 
 add_executable(v2_test_qwen_sparse_native_bank
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__QwenSparseNativeBank.cpp"
@@ -814,18 +911,22 @@ v2_add_core_free_test(V2_Unit_QwenSparseNativeBank
 v2_add_core_free_test(V2_Integration_QwenSparseNativeBank
     COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseNativeBank)
 v2_add_core_free_test(V2_Integration_QwenSparseNativeBankAddressAdmission
     COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
         --gtest_filter=*WrappingAndUnalignedOriginalAddressDomainsReject:*ActualCommonValidatorRejectsWrappingOriginalBank
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseNativeBankAddressAdmission)
 v2_add_core_free_test(V2_Integration_QwenSparseNativeBankPolicyAdmission
     COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
         --gtest_filter=*UnknownOrIncompleteNativePoliciesReject:*ActualCommonValidatorRejectsUnrepresentableGQAAndRotaryPolicies:*ExactPhysicalElementAlignmentIsNotSIMDOrUniversalAlignment
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseNativeBankPolicyAdmission)
 v2_add_core_free_test(V2_Integration_QwenSparseNativeBankOriginalExclusions
     COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
         --gtest_filter=*EveryCodecRoleAndLayoutRetainsOriginalSlices:*CompleteOriginalCapacityAndMetadataExclusions:*PostAdmissionCoordinateCorruptionIsFatal
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseNativeBankOriginalExclusions)
 add_executable(v2_test_cpu_qwen_sparse_native_codec
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseNativeCodec.cpp")
 target_compile_features(v2_test_cpu_qwen_sparse_native_codec PRIVATE cxx_std_23)
@@ -838,14 +939,17 @@ v2_add_core_free_test(V2_Unit_CPUQwenSparseNativeCodec
 v2_add_core_free_test(V2_Integration_CPUQwenSparseNativeCodec
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_native_codec>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseNativeCodec)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseNativeCodecRadialOrder
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_native_codec>
         --gtest_filter=*OriginalRadialScaleOrderCannotBeReassociated
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseNativeCodecRadialOrder)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseNativeCodecNumeric
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_native_codec>
         --gtest_filter=*InvalidOriginalNumericDataIsFatalBeforeFragmentPublication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Numeric Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseNativeCodecNumeric)
 add_executable(v2_test_cpu_qwen_sparse_attention
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/Test__QwenSparseAttention.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseLifetime.cpp"
@@ -870,10 +974,12 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseOriginalCacheProgram
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=QwenSparseAttention.NativeSelectedAttentionIsGroupedSerialByteEquivalent:QwenSparseAttention.InactiveRowsPreserveOutputAndTrafficAcrossDirtyReplays:QwenSparseAttention.EveryNativeCodecAndQ16BlockUsesCanonicalRingAndBasis
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention QwenSparse ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseOriginalCacheProgram)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.CompleteOriginalExclusionsRejectBeforePublication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseAdmission)
 v2_add_core_free_test(V2_Unit_CPUQwenSparseRepresentationCast
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseIndexerProgram.NativeRepresentationCastsRetainIndependentIEEEWordBoundaries
@@ -882,56 +988,69 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseNoRankingNullScoreAddress
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=QwenSparseAttention.ProvenNoRankingPreservesRequiredStateWithoutQueryBanks
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseNoRankingNullScoreAddress)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerAnalyticElementaries
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseIndexerProgram.IndexerAnalyticElementariesCannotMerge
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact NumericalContract Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseIndexerAnalyticElementaries)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerScoreProgram
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseIndexerProgram.NativeRankingScoresRetainOriginalHeadProgram
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact NumericalContract Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseIndexerScoreProgram)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerNoContraction
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseIndexerProgram.FP32MeanAndRopeCastEdgesCannotContractAfterInlining
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention QwenSparse ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseIndexerNoContraction)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseRepresentationCast
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseIndexerProgram.NativeRepresentationCastsRetainIndependentIEEEWordBoundaries
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseRepresentationCast)
 foreach(_indexer_rep IN ITEMS FP32 FP16 BF16)
     v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerRepresentation${_indexer_rep}
         COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
             --gtest_filter=CPUQwenSparseIndexerProgram.OriginalRepresentationAndPartialRopeMatchIndependentBytes${_indexer_rep}
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseIndexerRepresentation${_indexer_rep})
 endforeach()
 v2_add_core_free_test(V2_Integration_CPUQwenSparseExactOriginalBasis
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseExactBasis.OriginalNonsymmetricBasisAndQueryAliasMatchOrderedFMABytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseExactOriginalBasis)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseReplayAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.OriginalReplayIntervalRejectsBeforeAnyWordLoad
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseReplayAdmission)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseQueryAlias
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.FullSameHeadQueryAliasMatchesOriginalNativeProgram
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseQueryAlias)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.EmptyAndNonemptyCallsCompleteBeforeOuterJoin
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ordering Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseCompletion)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseTerminalCounters
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=QwenSparseTerminalCounters.*:CPUQwenSparseLifetime.CanonicalCounterOverflowIsFatalAtPublicPublication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse StateMachine Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseTerminalCounters)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerNumeric
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.ConsumedIndexerNumericCorruptionIsFatalNotClamped
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Numeric Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseIndexerNumeric)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseAllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.AllPositiveWorkersRetainOriginalSerialRowsAndGuards
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact ThreadBudget)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseAllPositiveWorkers)
 # Each real representation/tail owns its timeout and every caller-admitted team
 # size. One named resource prevents these whole-team sweeps competing with each
 # other; it does not reduce workers or cap ordinary build/CTest parallelism.
@@ -942,6 +1061,7 @@ foreach(_indexer_rep IN ITEMS FP32 FP16 BF16)
                 "--gtest_filter=OriginalInputs/CPUQwenSparseIndexerTotality.NativeRowsAndWorkers/${_indexer_rep}_Tail${_indexer_tail}"
             LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact ThreadBudget Regression
             RESOURCE_LOCK CPUQwenSparseIndexer_AllTeams)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseIndexer${_indexer_rep}Tail${_indexer_tail}AllPositiveWorkers)
     endforeach()
 endforeach()
 add_executable(v2_test_cpu_qwen_sparse_fp32
@@ -957,10 +1077,12 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseFP32OriginalProgram
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_fp32>
         --gtest_filter=CPUQwenSparseFP32.OriginalRowsRetainDeclaredNativeFMAAndButterfly:CPUQwenSparseFP32.QsaButterflyIsNotGenericAttentionFold
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention QwenSparse ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseFP32OriginalProgram)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseFP32Admission
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_fp32>
         --gtest_filter=CPUQwenSparseFP32.ScalarAndForeignProgramsAreNotAdvertised
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQwenSparseFP32Admission)
 add_executable(v2_test_cpu_tq_attention
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUTQAttention.cpp")
 target_compile_features(v2_test_cpu_tq_attention PRIVATE cxx_std_20)
@@ -973,23 +1095,29 @@ v2_add_core_free_test(V2_Unit_CPUTQAttention WHOLE_TEAM
 v2_add_core_free_test(V2_Integration_CPUTQAttention WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant ByteExact)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTQAttention)
 v2_add_core_free_test(V2_Integration_CPUTQAttentionStorageAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention> --gtest_filter=*StorageAndGeometryAdmissionPrecedeWrites
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTQAttentionStorageAdmission)
 v2_add_core_free_test(V2_Integration_CPUTQAttentionMetadataRoles
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention>
         --gtest_filter=*OriginalMetadataRolesThresholdsAndNumeratorBytes:*InvalidSelectedMetadataAndWeightRejectBeforeWrites
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTQAttentionMetadataRoles)
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONTQAttentionOrderedScore
         COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention> --gtest_filter=*NativeScoreMatchesIndependentOrderedFMABytes
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention TurboQuant ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONTQAttentionOrderedScore)
     v2_add_core_free_test(V2_Integration_NEONTQAttentionCentroidDecode
         COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention> --gtest_filter=*NativeCentroidDecodeByteDomains
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention TurboQuant ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONTQAttentionCentroidDecode)
     v2_add_core_free_test(V2_Integration_NEONTQAttentionOriginalCodebooks
         COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention> --gtest_filter=*NativeOriginalCodebookWordAuthorities
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention TurboQuant ByteExact Ownership Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONTQAttentionOriginalCodebooks)
 endif()
 
 add_executable(v2_test_cpu_swiglu
@@ -1006,51 +1134,63 @@ v2_add_core_free_test(V2_Unit_CPUSwiGLU
 v2_add_core_free_test(V2_Integration_CPUSwiGLU
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree SwiGLU Numerics ByteExact)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSwiGLU)
 v2_add_core_free_test(V2_Integration_CPUSwiGLUBlockGeometry
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
         --gtest_filter=CPUSwiGLU.CompleteBlockGeometryRejectsBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree SwiGLU Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSwiGLUBlockGeometry)
 v2_add_core_free_test(V2_Integration_CPUFusedSwiGLUPublicationStorage
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
         --gtest_filter=CPUSwiGLU.FusedPublicationRejectsPolicyAndSourceAliasesBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised SwiGLU Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFusedSwiGLUPublicationStorage)
 v2_add_core_free_test(V2_Integration_CPUSwiGLUStorageAliases
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
         --gtest_filter=CPUSwiGLU.PartialStorageAliasesRejectBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree SwiGLU Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSwiGLUStorageAliases)
 v2_add_core_free_test(V2_Integration_CPUSwiGLUEmptyWorkshare
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
         --gtest_filter=CPUSwiGLU.EmptyRetainedWorksharesCompleteBeforeReturn
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree SwiGLU ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSwiGLUEmptyWorkshare)
 v2_add_core_free_test(V2_Integration_CPUSwiGLURetainedQ8
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
         --gtest_filter=CPUSwiGLU.Q8RetainedTeamsPublishOnceAndCompleteEmpty
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree SwiGLU ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSwiGLURetainedQ8)
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONSwiGLUTypedRetained
         COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
             --gtest_filter=NativeSwiGLU.TypedRetainedTeamsAndEmptyCompletion
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree SwiGLU ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONSwiGLUTypedRetained)
     v2_add_core_free_test(V2_Integration_NEONHalfNarrowing
         COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
             --gtest_filter=NativeSwiGLU.PortableHalfNarrowingAllExponentAndMantissaDomains
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Half Numerics ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONHalfNarrowing)
     v2_add_core_free_test(V2_Integration_NEONSwiGLUAccuracy
         COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
             --gtest_filter=NativeSwiGLU.OrdinaryAccuracyAgainstDoubleExponential
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree SwiGLU Numerics Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONSwiGLUAccuracy)
     v2_add_core_free_test(V2_Integration_NEONSwiGLUDeviceContract
         COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
             --gtest_filter=NativeSwiGLU.DeviceContractWordsAndExceptionalDomains
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree SwiGLU ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONSwiGLUDeviceContract)
     v2_add_core_free_test(V2_Integration_NEONSwiGLUSeparateNewtonRounding
         COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
             --gtest_filter=NativeSwiGLU.DeviceNewtonRoundingSurvivesInlining
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree SwiGLU ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONSwiGLUSeparateNewtonRounding)
     v2_add_core_free_test(V2_Integration_NEONSwiGLUOriginalRowTails
         COMMAND $<TARGET_FILE:v2_test_cpu_swiglu>
             --gtest_filter=NativeSwiGLU.OriginalRowsTailsAliasesAndNativeEntryPoints
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree SwiGLU ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONSwiGLUOriginalRowTails)
 endif()
 
 add_executable(v2_test_cpu_rope_workshare
@@ -1066,6 +1206,7 @@ v2_add_core_free_test(V2_Unit_CPURoPEWorkshare
 v2_add_core_free_test(V2_Integration_CPURoPECachedRetained
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPECachedRetained)
 
 # CPU RoPE angles live only in the admitted cpu_rope_angles workspace.
 foreach(_rope_storage_suite IN ITEMS Unit Integration)
@@ -1084,51 +1225,64 @@ foreach(_rope_storage_suite IN ITEMS Unit Integration)
             "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/test_cpu_rope_angle_storage_policy.py"
         LABELS ${_rope_storage_labels})
 endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEAngleStorageSourcePolicy)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEAngleStorageSourcePolicyNegativeControls)
 v2_add_core_free_test(V2_Integration_CPURoPESharedAngleFill
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.SharedAngleFillCompletesBeforeRotationInRetainedTeams
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE ByteExact Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPESharedAngleFill)
 v2_add_core_free_test(V2_Integration_CPURoPENegativePositionDirtyWorkspace
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.OrdinaryNegativePositionsIgnoreDirtyAngleWorkspace
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE FP32 BF16 FP16 ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPENegativePositionDirtyWorkspace)
 v2_add_core_free_test(V2_Integration_CPURoPEQ8OneRowTeamHeadOwnership
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.Q8OneRowRetainedTeamRotatesEachHeadOnce
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Q8_1 ByteExact Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEQ8OneRowTeamHeadOwnership)
 v2_add_core_free_test(V2_Integration_CPURoPEQ8OneRowNegativePosition
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.Q8OneRowNegativePositionIsIndependentOfPriorCall
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Q8_1 ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEQ8OneRowNegativePosition)
 v2_add_core_free_test(V2_Integration_CPURoPEAngleBindingRejection
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.AngleRowsRejectMissingOrUndersizedPlanes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Ownership Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEAngleBindingRejection)
 v2_add_core_free_test(V2_Integration_CPURoPEInverseFrequencyLookup
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.InverseFrequencyLookupIsStableAcrossThreadsAndEvictions:CPURoPEWorkshare.InverseFrequencyLookupAlternatesConfigurationsInRetainedTeams
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEInverseFrequencyLookup)
 v2_add_core_free_test(V2_Integration_CPURoPEInlineBoundedCoefficients
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.InlineWideHeadsAndPartialPrefixesRetainProductionBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEInlineBoundedCoefficients)
 v2_add_core_free_test(V2_Integration_CPURoPEInlineEmptyCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.InlineEmptyCompletionPrecedesObserverRelease
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEInlineEmptyCompletion)
 v2_add_core_free_test(V2_Integration_CPURoPEInlineGeometry
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.InlineGeometryRejectsBeforeAccess
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEInlineGeometry)
 
 v2_add_core_free_test(V2_Integration_CPURoPEHybridOriginalRows
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.HybridWideHeadsRetainSerialOriginalRows
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEHybridOriginalRows)
 v2_add_core_free_test(V2_Integration_CPURoPEHybridStorageAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.HybridStorageAdmissionAndEmptyCompletion
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURoPEHybridStorageAdmission)
 
 add_executable(v2_test_cpu_flash_attention_launch_policy
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUFlashAttentionLaunchPolicy.cpp"
@@ -1144,28 +1298,34 @@ v2_add_core_free_test(V2_Unit_CPUFlashAttentionLaunchPolicy
 v2_add_core_free_test(V2_Integration_CPUFlashAttentionLaunchPolicy
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Dispatch Geometry)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionLaunchPolicy)
 # Every CPU attention entry admits banks, head mapping and output disjointness
 # once per invocation; the row programs (NEON included) carry no per-call checks.
 v2_add_core_free_test(V2_Integration_CPUAttentionInvocationAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
         --gtest_filter=CPUAttentionInvocationAdmission.*
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUAttentionInvocationAdmission)
 v2_add_core_free_test(V2_Integration_CPUFA2NativeISAAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
         --gtest_filter=*NativeISAIdentityRejectsForeignEnvelopes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ISA Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFA2NativeISAAdmission)
 v2_add_core_free_test(V2_Integration_CPUFA2ARMCanonicalSpanPolicy
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
         --gtest_filter=*ARMCanonicalSpanDoesNotBorrowX86CacheEvidence
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFA2ARMCanonicalSpanPolicy)
 v2_add_core_free_test(V2_Integration_CPUFA2CheckedGeometry
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
         --gtest_filter=*WorkingSetOverflowRejectsWithoutNarrowing:*ParallelGeometryBoundsPrecedeMultiplication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFA2CheckedGeometry)
 v2_add_core_free_test(V2_Integration_CPUQ16AttentionIntegerRange
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
         --gtest_filter=CPUQ16AttentionMath.*
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Quantization Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQ16AttentionIntegerRange)
 
 add_executable(v2_unit_cpu_native_block_decode
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeBlockDecode.cpp")
@@ -1178,6 +1338,7 @@ v2_add_core_free_test(V2_Unit_CPUNativeBlockDecode
 v2_add_core_free_test(V2_Integration_CPUNativeBlockDecode
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_block_decode>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Quantization Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeBlockDecode)
 
 add_executable(v2_unit_cpu_native_weight_view
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeQuantisedWeightView.cpp")
@@ -1191,6 +1352,7 @@ v2_add_core_free_test(V2_Unit_CPUNativeQuantisedWeightView
 v2_add_core_free_test(V2_Integration_CPUNativeQuantisedWeightView
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_weight_view>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Quantization Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedWeightView)
 
 # Prepared metadata is admitted once per publication generation; execution
 # never tests reserved bits inside a worker team. Coverage equals the former
@@ -1209,6 +1371,7 @@ v2_add_core_free_test(V2_Integration_CPUNativeQuantisedMetadataSealCoverage
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
         --gtest_filter=CPUNativeQuantisedMetadataSeal.CoversExactlyTheFormerInLoopRulesOnEveryLane:CPUNativeQuantisedMetadataSeal.ViewRequiresTheSealOfItsExactBytesAndInterpretation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedMetadataSealCoverage)
 # Partial final chunks: producers normalize padding words in the owned
 # generation; raw poisoned padding is rejected, normalized arrivals admitted.
 # Admitted in-team metadata access keeps a fatal (never throwing) coordinate bound.
@@ -1216,14 +1379,17 @@ v2_add_core_free_test(V2_Integration_CPUNativeQuantisedAdmittedAccessBound
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
         --gtest_filter=CPUNativeQuantisedMetadataSeal.AdmittedMetadataAccessIsFatalOutsideThePublication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedAdmittedAccessBound)
 v2_add_core_free_test(V2_Integration_CPUNativeQuantisedPaddingNormalization
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
         --gtest_filter=CPUNativeQuantisedMetadataSeal.PaddingNormalization*
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedPaddingNormalization)
 v2_add_core_free_test(V2_Integration_CPUNativeQuantisedMetadataSealLifecycle
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
         --gtest_filter=CPUNativeQuantisedMetadataSeal.EveryMutationWithdrawsAdmission:CPUNativeQuantisedMetadataSeal.RejectedResealLeavesThePublicationUnadmitted:CPUNativeQuantisedMetadataSeal.UnsealedAndStalePublicationsAreFatal:CPUNativeQuantisedMetadataSeal.SlotRewriteAtTheSameAddressNeedsAReseal
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Lifecycle Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedMetadataSealLifecycle)
 
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_executable(v2_test_neon_integer_rope
@@ -1239,27 +1405,33 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONIntegerRoPE
         COMMAND $<TARGET_FILE:v2_test_neon_integer_rope>
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONIntegerRoPE)
     v2_add_core_free_test(V2_Integration_NEONRoPEIntegerMetadataDeferral
         COMMAND $<TARGET_FILE:v2_test_neon_integer_rope>
             --gtest_filter=*FixedDynamicQ16WidenedProductsAndDeferredScales
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPEIntegerMetadataDeferral)
     v2_add_core_free_test(V2_Integration_NEONRoPEIntegerBiasAndWidening
         COMMAND $<TARGET_FILE:v2_test_neon_integer_rope>
             --gtest_filter=*LegacySignedBiasAndScaleIdentity
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPEIntegerBiasAndWidening)
     v2_add_core_free_test(V2_Integration_NEONRoPEIntegerStorageAdmission
         COMMAND $<TARGET_FILE:v2_test_neon_integer_rope>
             --gtest_filter=*GeometryAliasesAndInvalidScaleRejection
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPEIntegerStorageAdmission)
 
     v2_add_core_free_test(V2_Integration_NEONRoPEQ8SignedRatioExtrema
         COMMAND $<TARGET_FILE:v2_test_neon_integer_rope>
             --gtest_filter=*Q8CommonScalePairRetainsWidenedSignedByteExtrema
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPEQ8SignedRatioExtrema)
     v2_add_core_free_test(V2_Integration_NEONRoPEHybridPairRounding
         COMMAND $<TARGET_FILE:v2_test_neon_integer_rope>
             --gtest_filter=*HybridPairsMatchIndependentMemoryRoundedBytes
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPEHybridPairRounding)
 
     add_executable(v2_test_neon_rope
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONRoPE.cpp"
@@ -1274,19 +1446,23 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONRoPE
         COMMAND $<TARGET_FILE:v2_test_neon_rope>
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Numerics ByteExact)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPE)
     v2_add_core_free_test(V2_Integration_NEONRoPEPairRounding
         COMMAND $<TARGET_FILE:v2_test_neon_rope>
             --gtest_filter=*FloatingStoragePairsMatchMemoryRoundedBytes
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Numerics ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPEPairRounding)
 
     v2_add_core_free_test(V2_Integration_NEONRoPEQuantizedBlockCycles
         COMMAND $<TARGET_FILE:v2_test_neon_rope>
             --gtest_filter=*QuantizedSingleOddEvenBlockCyclesRetainIndependentBytes
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPEQuantizedBlockCycles)
     v2_add_core_free_test(V2_Integration_NEONRoPEHalfScaleOverflow
         COMMAND $<TARGET_FILE:v2_test_neon_rope>
             --gtest_filter=*Q8OutputScaleOverflowIsFatalBeforeBlockPublication
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONRoPEHalfScaleOverflow)
 
     # Core-free NEON kernel tests link the tile headers' cold plan/walk reporter authority.
     add_executable(v2_test_native_neon_execution
@@ -1303,23 +1479,28 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_CPUNativeNEONExecution WHOLE_TEAM
         COMMAND $<TARGET_FILE:v2_test_native_neon_execution>
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised Numerics ByteExact AllFormats)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONExecution)
     v2_add_core_free_test(V2_Integration_CPUProjectionPublicationStorageAliases
         COMMAND $<TARGET_FILE:v2_test_native_neon_execution>
             --gtest_filter=*RejectsInputPublicationAndBetaWorkAliasesBeforeWrites
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUProjectionPublicationStorageAliases)
     v2_add_core_free_test(V2_Integration_CPUQ8ResidualRetainedPrimaryReuse
         COMMAND $<TARGET_FILE:v2_test_native_neon_execution>
             --gtest_filter=*RetainedTwoTermCompletesBeforePrimaryReuse
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQ8ResidualRetainedPrimaryReuse)
     v2_add_core_free_test(V2_Integration_CPUPreparedOwnerSingleScaleMin
         COMMAND $<TARGET_FILE:v2_test_native_neon_execution>
             --gtest_filter=*ResidentSingleScaleOwnerMinIsExactZero
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedOwnerSingleScaleMin)
 
     v2_add_core_free_test(V2_Integration_CPUNativeNEONSwiGLUDownPublication
         COMMAND $<TARGET_FILE:v2_test_native_neon_execution>
             --gtest_filter=*AllSourcesFusedSwiGLUQ8DownRetainSerialRows
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised SwiGLU ByteExact AllFormats)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONSwiGLUDownPublication)
 
     add_executable(v2_test_native_neon_projection_batch
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONProjectionBatch.cpp")
@@ -1335,14 +1516,17 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_CPUNativeNEONProjectionBatch WHOLE_TEAM
         COMMAND $<TARGET_FILE:v2_test_native_neon_projection_batch>
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised Numerics ByteExact AllFormats)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONProjectionBatch)
     v2_add_core_free_test(V2_Integration_CPUNativeNEONEmptyWorkshare
         COMMAND $<TARGET_FILE:v2_test_native_neon_projection_batch>
             --gtest_filter=*EmptyRetainedTeamCompletesBeforeNextPublication
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONEmptyWorkshare)
     v2_add_core_free_test(V2_Integration_CPUNativeNEONOriginalRowPublication
         COMMAND $<TARGET_FILE:v2_test_native_neon_projection_batch>
             --gtest_filter=*OriginalRequestSlicesRepeatsAndDirtyInactiveRows:*RejectsWholeBankAliasesAndInvalidGeometry
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONOriginalRowPublication)
 
     add_executable(v2_unit_neon_typed_tensor_ops
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONTypedTensorOps.cpp")
@@ -1356,6 +1540,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONTypedTensorOps
         COMMAND $<TARGET_FILE:v2_unit_neon_typed_tensor_ops>
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Quantization Numerics ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NEONTypedTensorOps)
 endif()
 
 add_executable(v2_test_recursive_stage_snapshot
@@ -1370,6 +1555,7 @@ v2_add_core_free_test(V2_Unit_RecursiveStageSnapshot
 v2_add_core_free_test(V2_Integration_RecursiveStageSnapshotCompletion
     COMMAND $<TARGET_FILE:v2_test_recursive_stage_snapshot>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Metadata Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecursiveStageSnapshotCompletion)
 
 add_executable(v2_test_cpu_projection_native_workspace
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUProjectionNativeWorkspace.cpp"
@@ -1385,6 +1571,7 @@ v2_add_core_free_test(V2_Unit_CPUProjectionNativeWorkspace
 v2_add_core_free_test(V2_Integration_CPUProjectionNativeWorkspaceABI
     COMMAND $<TARGET_FILE:v2_test_cpu_projection_native_workspace>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Memory NativeQuantised Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUProjectionNativeWorkspaceABI)
 
 add_executable(v2_test_cpu_typed_tensor_arithmetic
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUTypedTensorArithmetic.cpp")
@@ -1398,10 +1585,12 @@ v2_add_core_free_test(V2_Unit_CPUTypedTensorArithmetic
 v2_add_core_free_test(V2_Integration_CPUTypedTensorDecodedAddRounding
     COMMAND $<TARGET_FILE:v2_test_cpu_typed_tensor_arithmetic>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Quantization ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTypedTensorDecodedAddRounding)
 v2_add_core_free_test(V2_Integration_CPUTypedTensorProductRoundingAliases
     COMMAND $<TARGET_FILE:v2_test_cpu_typed_tensor_arithmetic>
         --gtest_filter=CPUTypedTensorArithmetic.DecodedPairRoundingSurvivesOperandOrderAndAliases
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Quantization ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUTypedTensorProductRoundingAliases)
 
 add_executable(v2_unit_typed_tensor_block_geometry
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__TypedTensorBlockGeometry.cpp")
@@ -1414,6 +1603,7 @@ v2_add_core_free_test(V2_Unit_TypedTensorBlockGeometry
 v2_add_core_free_test(V2_Integration_TypedTensorBlockGeometry
     COMMAND $<TARGET_FILE:v2_unit_typed_tensor_block_geometry>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Quantization Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TypedTensorBlockGeometry)
 
 add_executable(v2_unit_portable_vector_primitives
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/primitives/Test__PortableVectorPrimitives.cpp"
@@ -1426,6 +1616,7 @@ v2_add_core_free_test(V2_Unit_PortableVectorPrimitives
 v2_add_core_free_test(V2_Integration_PortableVectorGroupedByteEquivalence
     COMMAND $<TARGET_FILE:v2_unit_portable_vector_primitives> --grouped
     LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Primitives Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PortableVectorGroupedByteEquivalence)
 
 foreach(scope IN ITEMS Unit Integration)
     set(labels V2 ${scope} CPU DeviceFree Build Regression)
@@ -1441,3 +1632,5 @@ foreach(scope IN ITEMS Unit Integration)
             -P "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/TestOpenMPNativeIdentity.cmake"
         LABELS ${labels})
 endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUInstructionSetContract)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPNativeIdentityContract)

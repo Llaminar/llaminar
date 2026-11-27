@@ -81,6 +81,7 @@ endforeach()
 v2_add_core_free_test(V2_Integration_CPUExplicitRoundingContract
     COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
     LABELS V2 Integration ProductionTestPreflight CPU Numerics MoE AllFormats ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUExplicitRoundingContract)
 
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_executable(v2_test_cpu_native_neon_numerical_contract
@@ -95,6 +96,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_CPUNativeNEONNumericalContract
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_numerical_contract>
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Numerics ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONNumericalContract)
 
     add_executable(v2_test_cpu_native_neon_prepared_projection
         "${V2_NUMERIC_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONPreparedProjection.cpp")
@@ -109,12 +111,14 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_CPUNativeNEONPreparedProjection
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Numerics ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONPreparedProjection)
     # Padding contract at N%4 = 1/2/3 tails: poisoned loaded padding is rejected
     # before any write; benign padding keeps serial bytes for every family/policy.
     v2_add_core_free_test(V2_Integration_CPUNativeNEONTailPaddingContract
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=*TailPaddingContract
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Metadata ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONTailPaddingContract)
     # Native quantized NEON entries admit the calling thread's FPCR profile
     # (RNE, FZ/FZ16/AHP clear) and fail fatally under any other: the staged
     # coded factors and the FP32 contribution program round under it.
@@ -122,10 +126,12 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=CPUNativeNEONFloatingPointProfile.*
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Numerics Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONFloatingPointProfile)
     v2_add_core_free_test(V2_Integration_CPUNativeSourceCoefficientMetadata_NEON
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=CPUNativeNEONPreparedProjection.RejectsInvalidSourceMetadataBeforeAnyWrite
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Metadata Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeSourceCoefficientMetadata_NEON)
     # Decode panels (idea 04): every panel width writes the strip walk's bytes,
     # including partial strips and strips wholly in sealed padding columns, and
     # the lane-indexed activation leaf equals the broadcast-word leaf.
@@ -133,6 +139,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=*PanelWidthsMatchTheStripProgram:CPUNativeNEONMultiScaleOps.*
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised ByteExact AllFormats Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONPanelTailsMatchSerial)
     add_executable(v2_test_cpu_native_neon_packed_prefill
         "${V2_NUMERIC_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONPackedPrefill.cpp")
     target_include_directories(v2_test_cpu_native_neon_packed_prefill PRIVATE
@@ -146,6 +153,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_CPUNativeNEONPackedPrefill
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_packed_prefill>
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONPackedPrefill)
     # Row-pair SMMLA exists only in the I8MM envelope. These focused gates
     # prove its operands are the serial SDOT walk's product terms and that its
     # N-tail/odd-row bytes, including canaries past N, equal SDOT's.
@@ -154,10 +162,12 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
             COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
                 --gtest_filter=*I8MMOperandGroupingMatchesSerialSDOTWalk:*I8MMRowPairPrimitivePlacesEveryProduct
             LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised I8MM ByteExact Regression)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONI8MMOperandGrouping)
         v2_add_core_free_test(V2_Integration_CPUNativeNEONI8MMTailsMatchSDOT
             COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
                 --gtest_filter=*I8MMRowPairsMatchSDOTAcrossNTailsAndOddRows
             LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised I8MM ByteExact AllFormats Regression)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONI8MMTailsMatchSDOT)
     endif()
     # Native MXFP4 primary scales are E8M0 bytes, never FP16: the NEON
     # tile must select the exact placement widening from the prepared identity.
@@ -165,4 +175,5 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=CPUNativeNEONPreparedProjection.EveryAdmittedE8M0ByteWidensExactly:CPUNativeNEONPreparedProjection.MXFP4ScaleFieldsFollowThePreparedIdentity
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised MXFP4 Metadata Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MXFP4NEONScaleWords)
 endif()

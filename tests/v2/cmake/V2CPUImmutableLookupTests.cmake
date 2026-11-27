@@ -22,15 +22,19 @@ v2_add_core_free_test(V2_Integration_CPUImmutableLookupNativePayloads
     COMMAND $<TARGET_FILE:v2_test_cpu_immutable_lookup_rows>
         --gtest_filter=CPUImmutableLookupRows.FloatingAllOriginalPayloads:CPUImmutableLookupRows.FloatingIndependentNonfiniteFringes:CPUImmutableLookupRows.IQ4OriginalCodebookScalesAndPartialRows
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ImmutableLookup Native ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUImmutableLookupNativePayloads)
 v2_add_core_free_test(V2_Integration_CPUImmutableLookupOriginalRows WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_immutable_lookup_rows>
         --gtest_filter=CPUImmutableLookupRows.EverySourceAndPositiveTeamRetainSerialOriginalRows:CPUImmutableLookupRows.RetainedNativePublicationCompletesBeforeOutputReuse
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ImmutableLookup AllFormats ByteExact Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUImmutableLookupOriginalRows)
 v2_add_core_free_test(V2_Integration_CPUImmutableLookupAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_immutable_lookup_rows>
         --gtest_filter=CPUImmutableLookupRows.GeometryAndOriginalOutputIntersectionsRejectBeforeStores:CPUImmutableLookupRows.GuardAuthenticationRejectsAdjacentOverwrites
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ImmutableLookup Ownership Geometry Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUImmutableLookupAdmission)
 v2_add_core_free_test(V2_Integration_CPUImmutableLookupEmptyCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_immutable_lookup_rows>
         --gtest_filter=CPUImmutableLookupRows.EmptyRetainedCallsCompleteBeforeImmediateReuse
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ImmutableLookup Workshare Ownership Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUImmutableLookupEmptyCompletion)
