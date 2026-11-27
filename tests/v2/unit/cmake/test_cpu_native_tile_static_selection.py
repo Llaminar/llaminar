@@ -74,6 +74,14 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
         self.assertEqual([m[4] for m in members], [b"aa", b"bb"])
 
 
+    def test_emulation_comes_from_actual_linker_inventory(self):
+        observed = "GNU ld (test)\n  Supported emulations:\n   aarch64linux\n   aarch64elf\n"
+        for tokens in (["-maarch64linux"], ["-m", "aarch64linux"]):
+            self.assertEqual(C._static_emulation(tokens, observed), "aarch64linux")
+        for tokens in ([], ["-m"], ["-mforeign"], ["-maarch64linux", "-maarch64elf"]):
+            with self.assertRaises(ValueError):
+                C._static_emulation(tokens, observed)
+
     def test_wrapped_map_kept_and_discarded_are_distinct(self):
         name = ".text." + "long_mangled_name" * 12
         text = ("Discarded input sections\n " + name + "\n  0x0 0x8 loser.a(loser.o)\n"

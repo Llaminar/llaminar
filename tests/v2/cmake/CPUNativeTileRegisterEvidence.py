@@ -2107,6 +2107,29 @@ def _static_map_records(text: str) -> tuple[list[tuple], list[tuple]]:
     return records(discarded), records(kept)
 
 
+def _static_emulation(tokens: list[str], supported: str) -> str:
+    """Select exactly one collect2 emulation from the actual linker's -V list."""
+    if supported.count("Supported emulations:") != 1:
+        raise ValueError("static linker did not report its emulations")
+    values = supported.split("Supported emulations:", 1)[1].split()
+    if not values or any(not re.fullmatch(r"[A-Za-z0-9_]+", v) for v in values):
+        raise ValueError("unsupported static linker emulation inventory")
+    selected, i = [], 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "-m":
+            i += 1
+            if i == len(tokens):
+                raise ValueError("static emulation has no value")
+            selected.append(tokens[i])
+        elif t.startswith("-m"):
+            selected.append(t[2:])
+        i += 1
+    if len(selected) != 1 or selected[0] not in values:
+        raise ValueError("static link requires one actual supported emulation")
+    return selected[0]
+
+
 def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Path) -> dict:
     """Capture a bounded GNU14/ld.bfd production edge; diagnostics never mint authority.
 
@@ -2185,26 +2208,34 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         raise ValueError("static driver must expose one collect2 job")
     cp = Path(collect[0]).resolve(strict=True)
     files[str(cp)] = _static_hash(cp.read_bytes())
-    debug = run("collect2-debug", relink("debug", ["-debug"]))
+    debug = run("collect2-debug", relink("debug", ["-Wl,-debug"]))
     if dependency_paths((artifacts / "debug.d").read_bytes()) != original_dependencies:
         raise ValueError("static debug dependency set differs from production")
     match = re.findall(r"^ld_file_name\s*=\s*(\S+)\s*$", debug, re.M)
     if len(match) != 1:
         raise ValueError("collect2 did not identify its actual linker")
     linker = Path(match[0]).resolve(strict=True)
-    if linker.name != "ld.bfd":
-        raise ValueError("static selection requires actual ld.bfd")
+    triplet = run("driver-triplet", [str(driver), "-dumpmachine"]).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)+", triplet):
+        raise ValueError("unsupported static driver triplet")
+    if linker.name not in ("ld.bfd", triplet + "-ld.bfd"):
+        raise ValueError("static selection requires actual driver-triplet ld.bfd")
+    native_linker = linker.read_bytes()
+    _static_elf(native_linker)
+    if _field(native_linker, 16, 2) not in (2, 3) or _field(native_linker, 18, 2) != _field(driver.read_bytes(), 18, 2):
+        raise ValueError("static linker is not a native ELF executable")
+    native_jobs = [shlex.split(line) for line in debug.splitlines() if line.startswith(match[0] + " ")]
+    if len(native_jobs) != 1 or "-debug" in native_jobs[0]:
+        raise ValueError("collect2 must consume debug before invoking its linker")
     files[str(linker)] = _static_hash(linker.read_bytes())
-    if "GNU ld" not in run("linker-version", [str(linker), "--version"]):
+    if not run("linker-version", [str(linker), "--version"]).startswith("GNU ld ("):
         raise ValueError("static linker is not GNU bfd")
     if (artifacts / "debug.elf").read_bytes() != production:
         raise ValueError("collect2 debug preparation changed production bytes")
     job_tokens = [token for line in jobs.splitlines() if line.strip() and
                   Path(shlex.split(line)[0]).name == "collect2" for token in shlex.split(line)]
-    emulations = [job_tokens[i+1] for i, t in enumerate(job_tokens[:-1]) if t == "-m"]
-    if len(emulations) != 1:
-        raise ValueError("static link requires one explicit collect2 emulation")
-    script_command = [str(linker), "-m", emulations[0], "--verbose"]
+    emulation = _static_emulation(job_tokens, run("linker-emulations", [str(linker), "-V"]))
+    script_command = [str(linker), "-m", emulation, "--verbose"]
     default_script = run("default-script", script_command)
     (artifacts / "default-script.txt").write_text(default_script)
     # GNU14 exposes the plugin on the actual job even when there is no LTO work.
