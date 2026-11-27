@@ -48,3 +48,48 @@ These are developer checks only, not the complete Unit/preflight gate, native
 production T-a, static verifier coverage or Q5 qualification. The approved static
 acquisition scope and observed provenance gaps are in STATIC-ACQUISITION.md;
 no static authority has been implemented or minted.
+
+## Bounded native parser attempt — T-a BLOCKED, not PASS
+
+After developer validation, parent requested the small native parser control.
+Copied the actual object to `/tmp/pr73-tlsle-native-inspection/WeightManager.cpp.o`
+and retained remote GNU `objdump -dr` output as `WeightManager.objdump` there.
+Recomputed object SHA256 equals the recorded 2e4caad3... digest above. Used the
+original checker extracted with
+`git show f44e67e9a:tests/v2/cmake/CPUNativeTileRegisterEvidence.py` and the live
+checker separately. Native command:
+
+```
+python3 -B /tmp/pr73-tlsle-native-inspection/check_pair.py
+```
+
+The original checker rejects the **actual complete object** at relocation549:
+`relocation type 549 is not admitted in code (.text)` (T-b reproduced).
+The live checker advances beyond549, then **fails closed at relocation541**:
+
+```
+relocation type 541 is not admitted in code (.text._ZZNSt9once_flag18_Prepare_executionC4IZSt9call_onceIMNSt13__future_base13_State_baseV2EFvPSt8functionIFSt10unique_ptrINS3_12_Result_baseENS7_8_DeleterEEvEEPbEJPS4_SC_SD_EEvRS_OT_DpOT0_EUlvE_EERSI_ENUlvE_4_FUNEv)
+```
+
+`readelf -Wr` identifies this as R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 at0,
+paired with type542 R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC at4, targeting
+`_ZSt15__once_callable` with zero addends. These are **not** the approved
+local-exec grammar. No new admission, slicing, relocation removal, fake
+function image or parser bypass was used. Normalization and pair extraction
+were never reached; T-a remains BLOCKED despite the conforming549/551 native
+instruction inspection. Native parser command exits1; do not report it green.
+
+The first scratch invocation failed because the extracted original checker
+lacked sibling CPUCodegenEnvelope.py; copied complete current sibling Python
+support to scratch and reran. Subsequent runs reproduced the native failure
+above. The final combined stdout/stderr is retained as `result.txt` in the
+scratch directory. No scratch artifacts are staged or committed.
+
+Additional retained remote file SHA256:
+
+- WeightManager-relocations.txt: 04e9961f80e4f595a43dd01d4cb2ccc9f57acbcc66d2d2b4841e0c4dfbdbd0db
+- analysis-feasibility.json: b74bfc0d1698853db0581b4847df04b23d15f9fb46d24b2c205dc780f0da541c
+
+Static acquisition implementation and any TLSIE extension need their own
+reviewed slices. The present work closes neither native whole-object admission
+nor Q5 qualification.
