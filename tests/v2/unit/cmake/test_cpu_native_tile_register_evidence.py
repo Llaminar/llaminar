@@ -1404,6 +1404,19 @@ class TLSInitialExecPairTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "function boundary"):
             CHECKER.tlsie_groups(code, image, {"f": (".text.f", 0, 4), "g": (".text.f", 4, 12)})
 
+    def test_assembly_text_without_object_pair_fails_closed(self) -> None:
+        body = ['\t.section .text.f,"ax"',
+                f"\tadrp\tx1, :gottprel:{TLS}",
+                f"\tldr\tx2, [x1, :gottprel_lo12:{TLS}]", "\tret"]
+        _, errors = CHECKER.analyse_traffic("f", {"f": body}, CHECKER.GENERIC, set())
+        self.assertTrue(any("object-validated pair" in error for error in errors), errors)
+        # Flattening authenticated text back to plain assembly must lose admission.
+        functions = [("f", tlsie_sequence() + "\tret\n")]
+        bodies = CHECKER.normalize_disassembly(disassembly(functions), CHECKER.read_object(witness_object(functions)))
+        plain = {name: [str(line) for line in lines] for name, lines in bodies.items()}
+        _, errors = CHECKER.analyse_traffic("f", plain, CHECKER.GENERIC, set())
+        self.assertTrue(any("object-validated pair" in error for error in errors), errors)
+
     def test_other_tls_relocations_remain_rejected(self) -> None:
         functions = [("f", tlsie_sequence() + "\tret\n")]
         original = witness_object(functions)

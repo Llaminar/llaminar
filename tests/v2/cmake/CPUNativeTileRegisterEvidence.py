@@ -1191,6 +1191,14 @@ def relocation_target(symbol: str, addend: int) -> str:
     return symbol if not addend else f"{symbol}{'+' if addend > 0 else '-'}0x{abs(addend):x}"
 
 
+class TLSIEPage(str):
+    """Object-normalizer-only instruction text for a validated initial-exec GOT page."""
+
+
+class TLSIEOffsetLoad(str):
+    """Object-normalizer-only instruction text for a validated initial-exec offset load."""
+
+
 class Bodies(dict):
     """Normalised function bodies {raw name: lines}, with the exception edges of each function: eh = {raw name:
     {instruction index of a call inside an LSDA call-site range: landing-pad label}}."""
@@ -1301,7 +1309,10 @@ def _normalize_disassembly(disassembly: str, image: ObjectImage) -> dict[str, li
                 body.append(f".L{address:x}:")
             if (section, address) in data_marks:
                 body.append("\t.data-mapping-symbol")
-            body.append(f"\t{text}")
+            line = f"\t{text}"
+            if isinstance(text, (TLSIEPage, TLSIEOffsetLoad)):
+                line = type(text)(line)
+            body.append(line)
         bodies[name] = body
     return bodies
 
@@ -1425,8 +1436,8 @@ def tlsie_groups(code: dict, image: ObjectImage, extents: dict) -> dict[tuple[st
             first, second = page.fullmatch(texts[0]), load.fullmatch(texts[1])
             if not first or not second or first[1] != second[2]:
                 raise ValueError("TLS initial-exec pair has unsupported ADRP/LDR form or register chain")
-            result[(section, head)] = f"adrp\tx{first[1]}, :gottprel:{record[1]}"
-            result[(section, head + 4)] = f"ldr\tx{second[1]}, [x{first[1]}, :gottprel_lo12:{record[1]}]"
+            result[(section, head)] = TLSIEPage(f"adrp\tx{first[1]}, :gottprel:{record[1]}")
+            result[(section, head + 4)] = TLSIEOffsetLoad(f"ldr\tx{second[1]}, [x{first[1]}, :gottprel_lo12:{record[1]}]")
             claimed.update((head, head + 4))
         if any(record[0] in TLSIE_PAIR and address not in claimed for address, record in table.items()):
             raise ValueError("TLS initial-exec relocation outside an exact PAGE21/LO12_NC pair")
@@ -1636,6 +1647,7 @@ class Instruction:
     """One parsed machine instruction."""
 
     def __init__(self, text: str, dialect: Dialect) -> None:
+        self.tlsie_offset_load = False
         self.text = text.strip()
         parts = self.text.split(None, 1)
         mnemonic = parts[0].lower()
@@ -1722,7 +1734,11 @@ def build_cfg(body: list[str], dialect: Dialect) -> tuple[list[Block], list[str]
             if statement.startswith("."):
                 errors.append(f"data or directive inside code: {statement}")
                 continue
+            if ":gottprel" in statement and not isinstance(line, (TLSIEPage, TLSIEOffsetLoad)):
+                errors.append("TLS initial-exec text lacks an object-validated pair")
+                continue
             instruction = Instruction(statement, dialect)
+            instruction.tlsie_offset_load = isinstance(line, TLSIEOffsetLoad)
             blocks[-1].instructions.append(instruction)
             if instruction.base in BRANCHES or INDIRECT.match(instruction.base) or RETURN.match(instruction.base):
                 blocks.append(Block())  # Every branch ends its block.
@@ -2739,8 +2755,7 @@ class Analysis:
             return False
         if kind in ("jump", "branch"):
             return self.reads(instruction, state, instruction.operands[:-1])
-        if instruction.base == "ldr" and instruction.memory is not None and \
-                ":gottprel_lo12:" in instruction.operands[instruction.memory]:
+        if instruction.tlsie_offset_load:
             # This pair's GOT load is not stack traffic or an invariant-load credit.
             memory = MEMORY.fullmatch(instruction.operands[instruction.memory])
             source = gp(memory.group(1)) if memory else None
