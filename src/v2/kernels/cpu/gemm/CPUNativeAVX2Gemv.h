@@ -27,6 +27,7 @@
 #include "CPUNativeQuantisedWeightPacker.h"
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
+#include "CPUNativeOrderedKTile.h"
 #include "CPUNativeQuantisedQ6Kernels.h"
 #include "CPUNativeQuantisedQ5X86Kernels.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
@@ -1059,7 +1060,7 @@ namespace llaminar2::cpu::native_quantised
         alignas(32) float partial[64];
         for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
         {
-            const int kb_start = k_tile * k_blocks_per_tile;
+            const int kb_start = orderedKTileBegin(k_tile, k_blocks_per_tile, K_blocks);
             const int kb_end = std::min(
                 kb_start + k_blocks_per_tile, K_blocks);
             gemv_avx2_chunk_non_nibble(
@@ -1186,7 +1187,7 @@ namespace llaminar2::cpu::native_quantised
         alignas(32) float partial1[64];
         for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
         {
-            const int kb_start = k_tile * k_blocks_per_tile;
+            const int kb_start = orderedKTileBegin(k_tile, k_blocks_per_tile, K_blocks);
             const int kb_end = std::min(
                 kb_start + k_blocks_per_tile, K_blocks);
             gemm_2row_non_nibble_chunk_avx2(

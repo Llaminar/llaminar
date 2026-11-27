@@ -101,6 +101,7 @@
 #include "CPUNativeQuantisedExecutionContract.h"
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
+#include "CPUNativeOrderedKTile.h"
 #include "CPUNativeQuantisedWeightPacker.h"
 #include "CPUNativeQuantisedScalarReference.h"
 #include "CPUNativeQuantisedTileConfig.h"
@@ -3217,7 +3218,7 @@ namespace llaminar2::cpu::native_quantised
                     const int chunk_start = block_idx * n_block_chunks;
                     const int chunk_count =
                         std::min(n_block_chunks, N_chunks - chunk_start);
-                    const int kb_start = kt * k_blocks_per_tile;
+                    const int kb_start = orderedKTileBegin(kt, k_blocks_per_tile, K_blocks);
                     const int kb_end =
                         std::min(kb_start + k_blocks_per_tile, K_blocks);
                     for (int offset = 0; offset < chunk_count; ++offset)
@@ -4072,7 +4073,7 @@ namespace llaminar2::cpu::native_quantised
         alignas(64) float partial1[64];
         for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
         {
-            const int kb_start = k_tile * k_blocks_per_tile;
+            const int kb_start = orderedKTileBegin(k_tile, k_blocks_per_tile, K_blocks);
             const int kb_end = std::min(
                 kb_start + k_blocks_per_tile, K_blocks);
             if (packed.usesNibbleLUT())
@@ -4141,7 +4142,7 @@ namespace llaminar2::cpu::native_quantised
         alignas(64) float partial[64];
         for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
         {
-            const int kb_start = k_tile * k_blocks_per_tile;
+            const int kb_start = orderedKTileBegin(k_tile, k_blocks_per_tile, K_blocks);
             const int kb_end = std::min(
                 kb_start + k_blocks_per_tile, K_blocks);
             gemv_native_quantised_avx512_chunk_non_nibble(
@@ -5151,7 +5152,7 @@ namespace llaminar2::cpu::native_quantised
 
                 for (int kt = 0; kt < num_k_tiles; ++kt)
                 {
-                    int kb_start = kt * k_tile_blocks;
+                    int kb_start = orderedKTileBegin(kt, k_tile_blocks, K_blocks);
                     int kb_end = std::min(kb_start + k_tile_blocks, K_blocks);
                     bool accum = (kt > 0);
 
@@ -5572,7 +5573,7 @@ namespace llaminar2::cpu::native_quantised
                     const auto span=row_grid.tileSpan(row_tile,row_tile_width);
                     if(span.size()==0)continue;
                     const int row0=span.first,tile_rows=span.size();
-                    const int kb_start = kt * k_blocks_per_tile;
+                    const int kb_start = orderedKTileBegin(kt, k_blocks_per_tile, K_blocks);
                     const int kb_end =
                         std::min(kb_start + k_blocks_per_tile, K_blocks);
                     auto partial_for_row = [&](int row)
@@ -7861,7 +7862,7 @@ namespace llaminar2::cpu::native_quantised
                 const auto &plan = plans[static_cast<size_t>(projection)];
                 const Q8_1Block *projection_input =
                     descriptor.input ? descriptor.input : A_q8_all;
-                const int kb_start = k_tile * plan.k_blocks_per_tile;
+                const int kb_start = orderedKTileBegin(k_tile, plan.k_blocks_per_tile, K_blocks);
                 const int kb_end = std::min(
                     kb_start + plan.k_blocks_per_tile,
                     K_blocks);
@@ -8804,7 +8805,7 @@ namespace llaminar2::cpu::native_quantised
                         const int chunk_start = block_idx * n_block_chunks;
                         const int chunk_count = std::min(
                             n_block_chunks, N_chunks - chunk_start);
-                        const int kb_start = kt * k_blocks_per_tile;
+                        const int kb_start = orderedKTileBegin(kt, k_blocks_per_tile, K_blocks);
                         const int kb_end = std::min(
                             kb_start + k_blocks_per_tile, K_blocks);
                         for (int offset = 0; offset < chunk_count; ++offset)
@@ -8924,7 +8925,7 @@ namespace llaminar2::cpu::native_quantised
                         const int row0 = row_tile * row_tile_width;
                         const int tile_rows =
                             std::min(row_tile_width, projection_rows - row0);
-                        const int kb_start = kt * k_blocks_per_tile;
+                        const int kb_start = orderedKTileBegin(kt, k_blocks_per_tile, K_blocks);
                         const int kb_end =
                             std::min(kb_start + k_blocks_per_tile, K_blocks);
                         auto partial_for_row = [&](int row)

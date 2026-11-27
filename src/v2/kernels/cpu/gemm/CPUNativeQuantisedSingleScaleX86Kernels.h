@@ -599,14 +599,18 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
      * @brief Validate a requested K interval and, for ordered trees, its exact partition geometry.
      * @throws std::invalid_argument For a chunk, K interval or partition tree outside the admitted matrix.
      *
-     * The same admission as rows(): empty trailing partitions of a short K are
-     * legal and contribute positive zero.
+     * The K interval is the kernel's walk range, 0 <= begin <= end <=
+     * blocks_per_row, exactly as its entry's requireSuperblockWalk() admits it.
+     * An empty trailing K tile of a short row is legal and contributes positive
+     * zero; its producers hand it over as [blocks, blocks) (orderedKTileBegin()),
+     * never reversed. A reversed interval is rejected here, recoverably, before
+     * the fatal entry admission is reached.
      */
     template <Reduction Tree, typename Packed>
     inline void requireSingleScaleTile(const Packed &packed, int chunk, int begin, int end, int partitions,
                                        int blocks_per_partition)
     {
-        if (chunk < 0 || chunk >= packed.N_padded / 64 || (end > begin && (begin < 0 || end > packed.blocks_per_row)))
+        if (chunk < 0 || chunk >= packed.N_padded / 64 || begin < 0 || begin > end || end > packed.blocks_per_row)
             throw std::invalid_argument("Multi-scale CPU tile is outside its admitted geometry");
         if constexpr (Tree == Reduction::OrderedPartitions)
             // The shared authority's exact int arithmetic bound (begin + partitions
@@ -665,7 +669,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
      * @brief x86 Q5_K (7) or IQ3_S (11) tile; fixes the policy before the traversal.
      * @tparam Tree Contiguous K or the admitted ordered partition tree.
      * @param partitions,blocks_per_partition Exact ordered tree; one and zero for Contiguous.
-     * @throws std::invalid_argument For a chunk, nonempty K interval or tree outside the matrix.
+     * @throws std::invalid_argument For a chunk, a reversed or out-of-row K interval, or a tree outside the matrix.
      */
     template <int Codebook, int Lanes, std::size_t Rows, Reduction Tree, typename Packed>
     inline void singleScaleRows(const Packed &packed, const std::array<const Q8_1Block *, Rows> &activation,

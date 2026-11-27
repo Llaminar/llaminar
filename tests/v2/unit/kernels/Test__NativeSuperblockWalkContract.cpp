@@ -15,11 +15,21 @@
  * fatal control. The NEON tile's plan rejection cannot be reached through an
  * admitted view (blocks_per_row = ceil(K / 32) <= 2^26 with at most sixteen
  * partitions), so its producer is exercised directly.
+ *
+ * Ordered K tiles handed to a kernel entry come from orderedKTileBegin(): the
+ * sixteen-tile GPU-aligned rows of 35, 37, 17 and 24 blocks, whose unclamped
+ * trailing starts reached the x86 single-scale entries as reversed walks, now
+ * hand over [blocks, blocks); the reversed ranges themselves stay fatal.
  */
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
 #include <climits>
+#include <cstring>
+#include <stdexcept>
 #include <cstdint>
 #include <vector>
+#include "kernels/cpu/gemm/CPUNativeOrderedKTile.h"
 #include "kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h"
 #if defined(__AVX2__)
@@ -169,5 +179,120 @@ TEST(NativeSuperblockWalkContract, X86SingleScaleKernelEntryRejectsOriginalStuck
                       llaminar2::CPUProjectionNumericalPolicy::BackendNative>(packed, activation, output, 0, 8, 9,
                                                                                false, 1, 0)),
                  "Invalid CPU superblock walk range: first=8 last=9 blocks=8");
+}
+#endif
+
+namespace {
+/** @brief One GPU-aligned 16-tile ordered row the x86 CI run (6528b623b) reported as a reversed walk. */
+struct ReversedTileCase {
+    int blocks;
+    int tile;        ///< First tile whose unclamped start passed the row.
+    int unclamped;   ///< tile * width, the reported first.
+};
+// GPU-aligned trees always form sixteen tiles: 35 blocks (K=1120) and 37, 17 and 24 blocks leave empty trailing
+// tiles whose unclamped start produced "first=36 last=35", "first=39 last=37", "first=18 last=17" and
+// "first=26 last=24" at the x86 single-scale kernel entries.
+constexpr int kGPUAlignedTiles = 16;
+constexpr std::array<ReversedTileCase, 4> kReportedReversedTiles{{{35, 12, 36}, {37, 13, 39}, {17, 9, 18}, {24, 13, 26}}};
+
+/** @brief Check that the ordered K tiles of one row are admitted walks covering [0, blocks) in order. */
+void expectCanonicalTiles(int blocks, int tiles) {
+    SCOPED_TRACE(::testing::Message() << "blocks=" << blocks << " tiles=" << tiles);
+    const int width = blocks == 0 ? 0 : (blocks + tiles - 1) / tiles;
+    int covered = 0;
+    for (int tile = 0; tile < tiles; ++tile) {
+        // The production producers' exact expressions.
+        const int begin = orderedKTileBegin(tile, width, blocks);
+        const int end = std::min(begin + width, blocks);
+        ASSERT_TRUE(admitsSuperblockWalk(begin, end, std::size_t(blocks))) << "tile " << tile << ": [" << begin
+                                                                           << ", " << end << ")";
+        requireSuperblockWalk(begin, end, std::size_t(blocks));
+        if (begin == end) {
+            // An empty tile is exactly the empty walk at the end of the row.
+            EXPECT_EQ(begin, blocks) << "tile " << tile;
+            continue;
+        }
+        // Nonempty tiles keep their blocks: increasing, contiguous and unchanged by the clamp.
+        ASSERT_EQ(begin, covered) << "tile " << tile;
+        ASSERT_EQ(begin, tile * width) << "tile " << tile;
+        covered = end;
+    }
+    EXPECT_EQ(covered, blocks) << "the tiles cover [0, blocks)";
+}
+} // namespace
+
+TEST(NativeSuperblockWalkContract, OrderedKTileProducerNeverHandsOverAReversedRange) {
+    for (const ReversedTileCase &reported : kReportedReversedTiles) {
+        const int width = (reported.blocks + kGPUAlignedTiles - 1) / kGPUAlignedTiles;
+        // The reported range is what the unclamped producer formed, and it is (still) inadmissible.
+        ASSERT_EQ(reported.tile * width, reported.unclamped);
+        ASSERT_GT(reported.unclamped, reported.blocks);
+        EXPECT_FALSE(admitsSuperblockWalk(reported.unclamped, reported.blocks, std::size_t(reported.blocks)));
+        EXPECT_EQ(orderedKTileBegin(reported.tile, width, reported.blocks), reported.blocks);
+        expectCanonicalTiles(reported.blocks, kGPUAlignedTiles);
+    }
+    // Every short row, every tile count up to and beyond the row, including empty rows.
+    for (int blocks = 0; blocks <= 160; ++blocks)
+        for (int tiles = 1; tiles <= 37; ++tiles)
+            expectCanonicalTiles(blocks, tiles);
+}
+
+TEST(NativeSuperblockWalkContract, ReportedReversedTileRangesStayFatal) {
+    // The producer, not the admission, changed: the reversed ranges themselves remain fatal.
+    EXPECT_DEATH(requireSuperblockWalk(36, 35, 35), "Invalid CPU superblock walk range: first=36 last=35 blocks=35");
+    EXPECT_DEATH(requireSuperblockWalk(39, 37, 37), "Invalid CPU superblock walk range: first=39 last=37 blocks=37");
+    EXPECT_DEATH(requireSuperblockWalk(18, 17, 17), "Invalid CPU superblock walk range: first=18 last=17 blocks=17");
+    EXPECT_DEATH(requireSuperblockWalk(26, 24, 24), "Invalid CPU superblock walk range: first=26 last=24 blocks=24");
+}
+
+#if defined(__AVX2__)
+namespace {
+/** @brief Minimal admitted publication of one 64-column chunk: an empty walk addresses no weight byte. */
+struct EmptyTilePublication {
+    int blocks_per_row = 0;
+    int N_padded = 64;
+    [[nodiscard]] const std::uint8_t *interleavedBase() const noexcept { return nullptr; }
+};
+} // namespace
+
+TEST(NativeSuperblockWalkContract, X86SingleScaleEntryAdmitsTheCanonicalEmptyTrailingTile) {
+    // The x86 Q5_K leaf receives the producer's empty trailing tile [blocks, blocks) of each reported row. It
+    // publishes positive zero, or retains the output when accumulating, exactly as an ordered partial of +0.
+    for (const ReversedTileCase &reported : kReportedReversedTiles) {
+        SCOPED_TRACE(::testing::Message() << "blocks=" << reported.blocks);
+        const EmptyTilePublication packed{.blocks_per_row = reported.blocks};
+        const int width = (reported.blocks + kGPUAlignedTiles - 1) / kGPUAlignedTiles;
+        const int begin = orderedKTileBegin(reported.tile, width, reported.blocks);
+        const int end = std::min(begin + width, reported.blocks);
+        ASSERT_EQ(begin, reported.blocks);
+        ASSERT_EQ(end, reported.blocks);
+        const std::array<const llaminar2::Q8_1Block *, 1> activation{nullptr};
+        for (const bool accumulate : {false, true}) {
+            float row[64];
+            std::fill(std::begin(row), std::end(row), -3.5f);
+            const std::array<float *, 1> output{row};
+            multi_scale::x86::singleScalePolicy<7, 8, 1, multi_scale::Reduction::Contiguous,
+                                                llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed, activation, output, 0, begin, end, accumulate, 1, 0);
+            for (const float value : row) {
+                std::uint32_t bits;
+                std::memcpy(&bits, &value, sizeof(bits));
+                EXPECT_EQ(bits, accumulate ? 0xc0600000u : 0u) << "accumulate=" << accumulate;
+            }
+        }
+        // The recoverable tile pre-check admits the empty tile and rejects the reversed one before the kernel.
+        EXPECT_NO_THROW((multi_scale::x86::requireSingleScaleTile<multi_scale::Reduction::Contiguous>(
+            packed, 0, begin, end, 1, 0)));
+        EXPECT_THROW((multi_scale::x86::requireSingleScaleTile<multi_scale::Reduction::Contiguous>(
+                         packed, 0, reported.unclamped, reported.blocks, 1, 0)),
+                     std::invalid_argument);
+        // The kernel entry itself still terminates on the reversed range.
+        float row[64]{};
+        const std::array<float *, 1> output{row};
+        EXPECT_DEATH((multi_scale::x86::singleScalePolicy<7, 8, 1, multi_scale::Reduction::Contiguous,
+                          llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                         packed, activation, output, 0, reported.unclamped, reported.blocks, false, 1, 0)),
+                     "Invalid CPU superblock walk range");
+    }
 }
 #endif
