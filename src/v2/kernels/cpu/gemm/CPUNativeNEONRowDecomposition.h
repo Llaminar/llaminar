@@ -22,6 +22,7 @@ namespace llaminar2::cpu::native_quantised
         int map;
         bool minimum;
         multi_scale::NEONByteDot pair_family;
+        multi_scale::NEONByteDot tail_family;
     };
 
     using NEONRowDot = multi_scale::NEONByteDot;
@@ -29,19 +30,19 @@ namespace llaminar2::cpu::native_quantised
 
     /** @brief Ordered-only source keys; absent keys retain their original physical tile. */
     inline constexpr NEONRowDecompositionKey kNEONRowDecompositions[] = {
-        {3, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD},
-        {3, NEONRowDot::ASIMD, NEONRowEncoding::NibbleLUTSourceScale, 2, false, NEONRowDot::ASIMD},
-        {4, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD},
-        {4, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::ASIMD},
-        {4, NEONRowDot::ASIMD, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::ASIMD},
-        {3, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd},
-        {3, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd},
-        {3, NEONRowDot::DotProd, NEONRowEncoding::NibbleLUTSourceScale, 2, false, NEONRowDot::DotProd},
-        {3, NEONRowDot::DotProd, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd},
-        {4, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd},
-        {4, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd},
-        {4, NEONRowDot::DotProd, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd},
-        {4, NEONRowDot::I8MM, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd},
+        {3, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {3, NEONRowDot::ASIMD, NEONRowEncoding::NibbleLUTSourceScale, 2, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {4, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {4, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {4, NEONRowDot::ASIMD, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {3, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::ASIMD},
+        {3, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {3, NEONRowDot::DotProd, NEONRowEncoding::NibbleLUTSourceScale, 2, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {3, NEONRowDot::DotProd, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::DotProd, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::I8MM, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
     };
 
     /** @brief Compile-time selection; backend-native arithmetic is never decomposed. */
@@ -58,14 +59,14 @@ namespace llaminar2::cpu::native_quantised
     }
     /** @brief Resolve the pair instruction family from the same exact routing authority. */
     template <int Rows, NEONRowDot Family, CPUProjectionNumericalPolicy Policy,
-              NEONRowEncoding Encoding, int Map, bool Minimum>
+              NEONRowEncoding Encoding, int Map, bool Minimum, bool Tail = false>
     consteval NEONRowDot decomposedNEONPairFamily()
     {
         static_assert(decomposeNEONRows<Rows, Family, Policy, Encoding, Map, Minimum>());
         for (const auto &key : kNEONRowDecompositions)
             if (key.rows == Rows && key.family == Family && key.encoding == Encoding &&
                 key.map == Map && key.minimum == Minimum)
-                return key.pair_family;
+                return Tail ? key.tail_family : key.pair_family;
         throw "missing exact NEON row decomposition";
     }
 
