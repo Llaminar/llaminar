@@ -204,11 +204,14 @@ class StaticSelectionNativeTest(unittest.TestCase):
         image = C.read_object(obj)
         unit = C.make_unit("winner", image, C.normalize_disassembly(listing, image))
         target, alias = "_ZN6ChosenILi7EEC2Ev", "_ZN6ChosenILi7EEC1Ev"
-        paths = C.JobPaths(str(root / "f.cpp"), str(root / "f.o"), str(root / "f.d"), str(root), None)
+        scratch = C.executed_command([compiler], str(root / "f.cpp"), root / "b1.o", root / "b1.d")
+        subprocess.run(scratch, cwd=root, check=True)
+        self.assertEqual((root / "b1.o").read_bytes(), obj)
+        paths = C.JobPaths(str(root / "f.cpp"), str(root / "b1.o"), str(root / "b1.d"), str(root), None)
         identity = C.compiler_identity(subprocess.check_output([compiler, "--version"], text=True))
-        plan = C.driver_plan(commands["f"], str(root), identity, paths)
-        replay = C.StaticB1Replay(commands["f"], str(root), paths.source, plan,
-                                  root / "f.o", root / "f.d", root / "replayed.s")
+        plan = C.driver_plan(scratch, str(root), identity, paths)
+        replay = C.StaticB1Replay(scratch, str(root), paths.source, plan,
+                                  root / "b1.o", root / "b1.d", root / "replayed.s")
         with self.assertRaisesRegex(ValueError, "without B1"):
             C.verify_static_executable_selection(args, root, root / "app", root / "no-plan", unit, obj, obj, target)
         authority = C.verify_static_executable_selection(args, root, root / "app", root / "valid", unit, obj, obj,
@@ -254,6 +257,18 @@ class StaticSelectionNativeTest(unittest.TestCase):
                                     ("alias-section", "section", 1), ("alias-global", "info", 0x12),
                                     ("alias-ifunc", "info", 0x2a), ("alias-hidden", "visibility", 2)):
             inject_final(label, field, value)
+        original_replay = C._static_replay_b1
+        def mutated_after_replay(*arguments):
+            files = original_replay(*arguments)
+            retained = arguments[2] / "production.s"
+            retained.write_text(retained.read_text() + "\n// changed after replay\n")
+            return files
+        with mock.patch.object(C, "_static_replay_b1", mutated_after_replay), self.assertRaisesRegex(ValueError, "artifact changed"):
+            C.verify_static_executable_selection(args, root, root / "app", root / "changed-after-replay",
+                                                unit, obj, obj, target, b1=replay)
+        with self.assertRaisesRegex(ValueError, "overlap production"):
+            C.verify_static_executable_selection(args, root, root / "app", root / "production-path",
+                                                unit, obj, obj, target, b1=replay._replace(obj=root / "f.o"))
         original_symbol = next(s for s in image.symbols if s.name == alias)
         for changed in (original_symbol._replace(size=original_symbol.size+4),
                         original_symbol._replace(section=".text.other"),

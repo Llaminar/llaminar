@@ -2666,6 +2666,9 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
     if overlaps or input_overlap:
         if b1 is None:
             raise ValueError("static final function has overlapping aliases without B1 authority")
+        if any(str(path.resolve()) in recipe["files"] for path in
+               (b1.obj, b1.dependencies, b1.assembly)):
+            raise ValueError("static B1 replay paths overlap production link inputs/outputs")
         b1_files = _static_replay_b1(b1, object_bytes, artifacts)
         canonical, aliases = _static_alias_extent(image, target, (artifacts / "production.s").read_text())
         for name in aliases:

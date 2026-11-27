@@ -36,3 +36,34 @@ AArch64/GNU14 integration lane, not an unqualified host preflight substitute.
 Neither passing fixture controls nor reviewed code qualifies Q5. Actual production
 alias B1/native admission and the separate line-witness/numerical/economy gates
 remain necessary. No budget, table, kernel or Q5 verdict changes here.
+
+## Checked controls and actual production boundary
+
+Pinned native host: `factory@192.168.178.80`, image
+`pr73-arm-stack-repair:gnu14`, immutable image ID
+`005a823c10bf26cf666b13bfa86be8437553c7682ac70ebef986fc3bd5aee7b5`.
+After parent publication, local boundaries passed 13/13. The combined boundary
+and full native classes passed 18/18 in 8.868 seconds. Retained evidence root:
+`/home/factory/pr73-alias-23156/native/`, including
+`static-alias-m8cka7_r`, `static-comdat-x7a7hzvm`,
+`static-closure-4l_t2gy7`, `static-native-s5h7uoul`, `static-ninja-vhkbk07v`.
+A final scratch-output isolation guard and after-replay mutation control were
+added after this run; their subsequent validation is reported separately.
+
+The read-only actual production command diagnostic is retained there as
+`actual-production-boundary.json` (driver query only, **no authority**).
+Its precise first rejection is:
+`job value -MT CMakeFiles/llaminar2_core.dir/loaders/WeightManager.cpp.o not admitted`.
+The executable, Ninja database and selected WeightManager object retain the
+three exact SHA256 anchors in STATIC-ALIASES-PROPOSAL.md. No production output
+was written and no actual Q5 alias was admitted. This is not a `.set` failure.
+
+The independently owned production-plan lane must supply a reviewed typed
+production compile authority before actual alias continuation: exact configured
+launcher/driver edge, source/compile-database/Ninja identity, complete source
+closure, actual dialect/target, selected compiler/assembler identities, retained
+assembler input and whole selected-object identity. Adapt this B1 seam to that
+shared authority after review; do not duplicate its grammar, substitute C++20,
+rewrite the dependency target to `probe`, or treat old b1.json as authority.
+The actual target remains the exact ISA1 lambda from the proposal, final
+`0x4d6f70`, size `0x110`; the second reached lambda needs its own proof.
