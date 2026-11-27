@@ -15,7 +15,8 @@
  * interval is one team barrier, the workshare and its closing barrier.
  *
  * Candidates: a cell runs only when every row tile executes the requested
- * width. Compact multi-scale encodings (own column walk) and I8MM cells whose
+ * width. Compact multi-scale encodings retain their own column walk and accept
+ * only Strips = 1 for production-path timing. I8MM cells whose
  * row pairs run the SMMLA strip walk (M >= 2 with Strips > 1) are rejected
  * rather than mislabelled.
  *
@@ -161,7 +162,7 @@ struct Workload
 /**
  * @brief Admit every selection before any allocation or timing.
  * @throws std::invalid_argument For malformed, empty, duplicate or out-of-range input,
- * unknown or compact formats, uncompiled families and candidates a tile would not run.
+ * unknown formats, uncompiled families and candidates a tile would not run.
  */
 Workload admit(const std::function<std::string(const char *, const char *)> &get)
 {
@@ -185,9 +186,9 @@ Workload admit(const std::function<std::string(const char *, const char *)> &get
         throw std::invalid_argument("LLAMINAR_PANEL_ISA names a family this binary does not contain: " + w.isa);
     w.formats = fields(get("LLAMINAR_PANEL_FORMATS", "Q4_K,Q6_K,IQ4_XS,Q8_0"), "LLAMINAR_PANEL_FORMATS");
     for (const auto &label : w.formats)
-        if (preparedEncodingForSource(format(label)) == CPUNativeQuantisedEncoding::CompactMultiScale)
+        if (preparedEncodingForSource(format(label)) == CPUNativeQuantisedEncoding::CompactMultiScale && w.strips != 1)
             throw std::invalid_argument("Compact multi-scale format " + label +
-                " keeps its own column walk; it has no panel candidate");
+                " keeps its own column walk; only Strips=1 executes its production program");
     // Numbers are canonical decimals, so the fields' textual uniqueness is
     // uniqueness of the parsed rows and N x K cells.
     for (const auto &text : fields(get("LLAMINAR_PANEL_SHAPES", "2048x4096,17408x5120,512x2048"), "LLAMINAR_PANEL_SHAPES"))
@@ -404,7 +405,21 @@ int selfTest()
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
         if (!compact_found && preparedEncodingForSource(*source.metadata) == CPUNativeQuantisedEncoding::CompactMultiScale)
         {
-            rejects({{"LLAMINAR_PANEL_FORMATS", std::string(source.quant_type)}}, "compact format");
+            const std::string label(source.quant_type);
+            for (const std::string strips : {"2", "4"})
+                rejects({{"LLAMINAR_PANEL_FORMATS", label}, {"LLAMINAR_PANEL_STRIPS", strips}},
+                    "compact format with a forced panel");
+            try
+            {
+                const auto w = admit([&](const char *name, const char *fallback) {
+                    if (std::string_view(name) == "LLAMINAR_PANEL_FORMATS") return label;
+                    if (std::string_view(name) == "LLAMINAR_PANEL_STRIPS") return std::string("1");
+                    return std::string(fallback);
+                });
+                expect(w.strips == 1 && w.formats == std::vector<std::string>{label},
+                    "compact production program admitted without a panel override");
+            }
+            catch (const std::exception &) { expect(false, "compact Strips=1 admitted"); }
             compact_found = true;
         }
     expect(compact_found, "a registered compact format exists for the control");
