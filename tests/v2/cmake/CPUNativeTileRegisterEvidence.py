@@ -2007,7 +2007,11 @@ def _static_replay_b1(replay: StaticB1Replay, selected: bytes, artifacts: Path) 
 
 
 def _static_alias_extent(image: ObjectImage, target: str, assembly: str) -> tuple[str, frozenset[str]]:
-    """Prove exactly one directed compiler alias, not coincident bytes or linker folding."""
+    """Corroborate one directed assignment for an object-proven alias extent.
+
+    Whole-object equality cannot distinguish .set from adjacent labels. The
+    input symbol section/value/size proof, not spelling, excludes linker ICF.
+    """
     originals = [s for s in image.symbols if s.name == target]
     if len(originals) != 1:
         raise ValueError("ambiguous static input symbol")
@@ -2031,6 +2035,8 @@ def _static_alias_extent(image: ObjectImage, target: str, assembly: str) -> tupl
         directive = re.fullmatch(r'\.section\s+([^,\s]+)(?:,.*)?', line)
         if directive:
             section = directive[1].strip('"')
+        elif line.startswith((".pushsection", ".popsection", ".previous", ".subsection")):
+            raise ValueError("unsupported static alias section switching")
         elif line in (".text", ".data", ".bss"):
             section = line
         match = re.fullmatch(r'\.set\s+([^,\s]+)\s*,\s*([^,\s]+)|([^=\s]+)\s*=\s*([^=\s]+)', line)

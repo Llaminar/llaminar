@@ -39,6 +39,7 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
         for text in ("", assembly.replace("alias,body", "alias,wrong"),
                      assembly + ".set alias,body\n", assembly + ".set third,body\n",
                      assembly.replace(".text.body", ".text.other"),
+                     assembly.replace(".set", ".pushsection .text.other\n.set"),
                      assembly.replace(".set alias,body", ".set alias,body+0")):
             with self.subTest(assembly=text), self.assertRaises(ValueError):
                 C._static_alias_extent(image, "body", text)
@@ -191,7 +192,7 @@ class StaticSelectionNativeTest(unittest.TestCase):
         (root / "main.cpp").write_text("extern int use(); int main(){return use();}\n")
         commands = {}
         for name in ("f", "g", "main"):
-            command = C.executed_command([compiler, "-ffunction-sections"], str(root / (name + ".cpp")),
+            command = C.executed_command([compiler], str(root / (name + ".cpp")),
                                          root / (name + ".o"), root / (name + ".d"))
             subprocess.run(command, cwd=root, check=True)
             commands[name] = command
@@ -221,6 +222,47 @@ class StaticSelectionNativeTest(unittest.TestCase):
         self.assertIs(model.summary(unit, model.resolve(unit, alias)[2], context),
                       model.summary(unit, model.resolve(unit, target)[2], context))
         self.assertEqual(len(model.cache), 1)
+        original_capture = C.capture_static_link
+        original_app = (root / "app").read_bytes()
+        def inject_final(label, field, value):
+            """Change actual native final ELF fields, after the real capture."""
+            def captured(*args_, **kwargs):
+                recipe = original_capture(*args_, **kwargs)
+                data = bytearray((root / "app").read_bytes())
+                headers, _ = C._static_elf(data)
+                for h in headers:
+                    if h["type"] != 2:
+                        continue
+                    strings = headers[h["link"]]
+                    for b in range(h["offset"] + 24, h["offset"] + h["size"], 24):
+                        name = C._string(data, strings["offset"] + int.from_bytes(data[b:b+4], "little"),
+                                         strings["offset"] + strings["size"])
+                        if name == alias:
+                            offset, width = {"info": (4, 1), "visibility": (5, 1), "section": (6, 2),
+                                             "address": (8, 8), "size": (16, 8)}[field]
+                            old = int.from_bytes(data[b+offset:b+offset+width], "little")
+                            data[b+offset:b+offset+width] = (value if field in ("info", "visibility") else old+value).to_bytes(width, "little")
+                (root / "app").write_bytes(data)
+                return recipe
+            try:
+                with mock.patch.object(C, "capture_static_link", captured), self.assertRaises(ValueError):
+                    C.verify_static_executable_selection(args, root, root / "app", root / label,
+                                                        unit, obj, obj, target, b1=replay)
+            finally:
+                (root / "app").write_bytes(original_app)
+        for label, field, value in (("alias-size", "size", 4), ("alias-address", "address", 4),
+                                    ("alias-section", "section", 1), ("alias-global", "info", 0x12),
+                                    ("alias-ifunc", "info", 0x2a), ("alias-hidden", "visibility", 2)):
+            inject_final(label, field, value)
+        original_symbol = next(s for s in image.symbols if s.name == alias)
+        for changed in (original_symbol._replace(size=original_symbol.size+4),
+                        original_symbol._replace(section=".text.other"),
+                        original_symbol._replace(kind="other"), original_symbol._replace(binding="global")):
+            changed_image = image._replace(symbols=[changed if s.name == alias else s for s in image.symbols])
+            with self.assertRaises(ValueError):
+                C._static_alias_extent(changed_image, target, (root / "replayed.s").read_text())
+        with self.assertRaisesRegex(ValueError, "multiple static authorities"):
+            C.CallModel({"winner": unit}, {target: authority, alias: {"copy": "winner"}})
         retained = root / "valid" / "production.s"
         retained.write_text(retained.read_text() + "\n.set wrong,body\n")
         self.assertEqual(model.resolve(unit, alias)[0], "fail")
