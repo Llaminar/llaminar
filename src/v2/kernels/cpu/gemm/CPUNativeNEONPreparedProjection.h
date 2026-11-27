@@ -690,6 +690,10 @@ namespace llaminar2::cpu::native_quantised
             typename Ops::I (&dots)[Rows]) const noexcept
         {
             using I = typename Ops::I;
+            // Recompute IQ3_S plane offsets for this K block rather than retaining
+            // loop-invariant derived addresses across the decode-heavy walk.
+            if constexpr (Rows != 4 || Ops::instruction == Dot::ASIMD)
+                asm("" : "+r"(column) : "r"(block));
             const auto metadata = multi_scale::payloadWord<11, Ops>(unit, 2, column);
             // Align both groups' first high bits to bit 8; each pair then
             // shifts by 2 * Pair with an immediate rather than a live mask.
