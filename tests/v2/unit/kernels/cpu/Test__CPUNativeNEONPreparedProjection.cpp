@@ -285,12 +285,13 @@ template <typename Ops> void verifyAllCompact()
  * @tparam Codebook Exact compact source identity.
  * @tparam Rows Physical rows sharing the K walk.
  * @tparam Ops Explicitly admitted integer instruction family.
+ * @tparam Tree Contiguous or ordered-partition compact K walk.
  * @param policy Select ordinary additions or the GPU-aligned ordered-NaN program.
  * @details BackendNative plus OrderedPartitions is intentionally called directly:
  * the ordinary projection tile selects a contiguous tree for BackendNative and
  * therefore does not certify this independently supported compact entry.
  */
-template <int Codebook, std::size_t Rows, typename Ops>
+template <int Codebook, std::size_t Rows, typename Ops, ms::Reduction Tree = ms::Reduction::OrderedPartitions>
 void verifyCompactOrderedPolicy(CPUProjectionNumericalPolicy policy)
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
@@ -313,7 +314,8 @@ void verifyCompactOrderedPolicy(CPUProjectionNumericalPolicy policy)
                 std::array<const Q8_1Block *, Rows> inputs{};
                 for (std::size_t row = 0; row < Rows; ++row)
                     inputs[row] = activation.data() + row * blocks;
-                const int partitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(blocks * 32);
+                const int partitions = Tree == ms::Reduction::OrderedPartitions
+                    ? MoEProjectionNumericalContract::orderedKPartitionsForWidth(blocks * 32) : 1;
                 const int span = (blocks + partitions - 1) / partitions;
                 for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
                 {
@@ -321,12 +323,18 @@ void verifyCompactOrderedPolicy(CPUProjectionNumericalPolicy policy)
                     std::array<float *, Rows> outputs{};
                     for (std::size_t row = 0; row < Rows; ++row)
                         outputs[row] = grouped.data() + row * stride + chunk * 64;
-                    ms::dispatchOrdered<4, Rows, Ops>(packed, inputs, outputs, chunk, blocks, partitions, span, columns);
+                    if constexpr (Tree == ms::Reduction::OrderedPartitions)
+                        ms::dispatchOrdered<4, Rows, Ops>(packed, inputs, outputs, chunk, blocks, partitions, span, columns);
+                    else
+                        ms::dispatch<4, Rows, Ops>(packed, inputs, outputs, chunk, 0, blocks, false, columns);
                     for (std::size_t row = 0; row < Rows; ++row)
                     {
                         const std::array<const Q8_1Block *, 1> input{inputs[row]};
                         const std::array<float *, 1> output{serial.data() + row * stride + chunk * 64};
-                        ms::dispatchOrdered<4, 1, Ops>(packed, input, output, chunk, blocks, partitions, span, columns);
+                        if constexpr (Tree == ms::Reduction::OrderedPartitions)
+                            ms::dispatchOrdered<4, 1, Ops>(packed, input, output, chunk, blocks, partitions, span, columns);
+                        else
+                            ms::dispatch<4, 1, Ops>(packed, input, output, chunk, 0, blocks, false, columns);
                     }
                 }
                 for (std::size_t row = 0; row < Rows; ++row)
@@ -362,6 +370,8 @@ template <typename Ops> void verifyCompactOrderedPolicies()
     verifyCompactOrderedPolicy<12, 4, Ops>(CPUProjectionNumericalPolicy::BackendNative);
     verifyCompactOrderedPolicy<17, 2, Ops>(CPUProjectionNumericalPolicy::BackendNative);
     verifyCompactOrderedPolicy<17, 2, Ops>(CPUProjectionNumericalPolicy::GPUAlignedExpert);
+    verifyCompactOrderedPolicy<17, 2, Ops, ms::Reduction::Contiguous>(CPUProjectionNumericalPolicy::BackendNative);
+    verifyCompactOrderedPolicy<17, 2, Ops, ms::Reduction::Contiguous>(CPUProjectionNumericalPolicy::GPUAlignedExpert);
 }
 
 /** @brief Cover all registered sources and physical encodings on both arithmetic policies. */
