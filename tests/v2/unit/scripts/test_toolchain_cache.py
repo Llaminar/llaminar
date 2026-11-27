@@ -239,10 +239,17 @@ class ToolchainCacheTests(unittest.TestCase):
                 self.assertRegex(step["run"], r'--build-context "\$(TOOLCHAIN_CONTEXT|\{TOOLCHAIN_CONTEXT:\?\})"')
         # No PR step, of any kind, may export to the trusted registry cache, in
         # any spelling (quoted, unquoted or --cache-to=).
+        # Allowlist: the only cache a PR may export is the job-scoped gha cache.
+        # Action steps' `with: cache-to` values are checked as well as shell runs.
         for step in pr_steps:
-            run = step.get("run", "")
+            exports = cache_to_types(step.get("run", ""))
+            action_cache = step.get("with", {}).get("cache-to", "")
+            if action_cache:
+                exports += [line.split("type=", 1)[1].split(",", 1)[0]
+                            if "type=" in line else "<untyped>"
+                            for line in action_cache.splitlines() if line.strip()]
             with self.subTest(step=step.get("name")):
-                self.assertNotIn("registry", cache_to_types(run))
+                self.assertTrue(all(kind == "gha" for kind in exports), exports)
         build = next(step for step in pr_builds if "--target test-runner" in step["run"])["run"]
         self.assertIn("--cache-from type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}", build)
         self.assertIn("--cache-from type=gha,scope=llaminar-build-neon-pr,", build)
@@ -268,6 +275,8 @@ class ToolchainCacheTests(unittest.TestCase):
         self.assertEqual(cache_to_types(
             'docker buildx build --cache-to type=gha,scope=s,mode=max .'), ["gha"])
         self.assertEqual(cache_to_types("echo no cache export"), [])
+        # A parameterised type is not provably gha; the allowlist rejects it.
+        self.assertEqual(cache_to_types('docker buildx build --cache-to "type=${KIND},ref=x" .'), ["${KIND}"])
         with self.assertRaises(AssertionError):
             cache_to_types("docker buildx build --cache-to ref=x .")
 
