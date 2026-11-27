@@ -404,8 +404,8 @@ class StaticSelectionNativeTest(unittest.TestCase):
             ("parent-not-needed", verbose.replace(needed_line, "libchild.so needed by "+str(child)),
              "parent does not prove DT_NEEDED"),
             ("wrong-found-path", verbose.replace(found_line, "found libchild.so at "+str(root/"libparent.so")),
-             "found path is not the unique missing input"),
-            ("failed-attempts-only", verbose.replace(found_line, ""), "missing native successful resolution")):
+             "already-traced DSO SONAME disagrees"),
+            ("failed-attempts-only", verbose.replace(found_line, ""), "ambiguous native DSO needed/found sequence")):
             (root / (label+".verbose")).write_text(changed)
             with self.subTest(boundary=label), self.assertRaisesRegex(ValueError, expected):
                 C._static_implicit_dsos(dependencies, traced, changed, root, target)
