@@ -1494,6 +1494,132 @@ bool CPUNativeQuantisedGemmKernel::execute_moe_grouped_fused_ffn(
         };
         OMP_WORKSHARE_REGION(run_single_pass);
     }
+    else if (route_rows <= 16 && num_experts <= 16 && intermediate <= 4096)
+    {
+        // Balanced low-M decode path (e.g. M=1..4 hybrid GPU+CPU follower with
+        // ~7-10 active experts on 28 physical cores):
+        // Splitting Gate and Up into independent 64-col tasks doubles Phase-1
+        // parallelism (e.g. 8 experts x 5 chunks x 2 = 80 tasks instead of 40,
+        // cutting worst-core load from 4 -> 3 GEMVs) and uses static worksharing
+        // with zero dynamic-scheduler atomic contention across Phase 1, SwiGLU
+        // quantization, and Phase 2 Down.
+        thread_local std::vector<float> decode_gate_scratch;
+        thread_local std::vector<float> decode_up_scratch;
+        const size_t total_inter = static_cast<size_t>(route_rows) * static_cast<size_t>(intermediate);
+        if (decode_gate_scratch.size() < total_inter)
+            decode_gate_scratch.resize(total_inter);
+        if (decode_up_scratch.size() < total_inter)
+            decode_up_scratch.resize(total_inter);
+
+        int row_cursor = 0;
+        for (size_t e = 0; e < num_experts; ++e)
+        {
+            expert_begins[e] = row_cursor;
+            gate_info[e] = prepareMatrixInfoCached(
+                gate_up_descriptors[2u * e].kernel->packed_, intermediate, hidden_width, workers, cache, tile_cache, tile_cache_count);
+            up_info[e] = prepareMatrixInfoCached(
+                gate_up_descriptors[2u * e + 1u].kernel->packed_, intermediate, hidden_width, workers, cache, tile_cache, tile_cache_count);
+            down_info[e] = prepareMatrixInfoCached(
+                down_descriptors[e].kernel->packed_, hidden_width, intermediate, workers, cache, tile_cache, tile_cache_count);
+            row_cursor += down_descriptors[e].rows;
+        }
+
+        const PreparedMatrixInfo *const gate_info_ptr = gate_info.data();
+        const PreparedMatrixInfo *const up_info_ptr = up_info.data();
+        const PreparedMatrixInfo *const down_info_ptr = down_info.data();
+        const int *const expert_begins_ptr = expert_begins.data();
+        const BatchedPrequantizedProjectionDesc *const down_desc_ptr = down_descriptors.data();
+        const int *const row_idx_ptr = router_row_indices.data();
+        float *const gate_scratch_ptr = decode_gate_scratch.data();
+        float *const up_scratch_ptr = decode_up_scratch.data();
+        const size_t n_gu_tasks = 2u * num_experts * static_cast<size_t>(gate_n_chunks);
+        const size_t n_swiglu_tasks = num_experts * static_cast<size_t>(gate_n_chunks);
+        const size_t n_down_tasks = num_experts * static_cast<size_t>(down_n_chunks);
+
+        auto run_decode_balanced = [=]()
+        {
+            // Phase 1a: Independent Gate & Up 64-col GEMVs across all workers.
+#pragma omp for schedule(static)
+            for (size_t t = 0; t < n_gu_tasks; ++t)
+            {
+                const bool is_up = (t & 1u) != 0u;
+                const size_t ec = t >> 1u;
+                const int e = static_cast<int>(ec / static_cast<size_t>(gate_n_chunks));
+                const int chunk = static_cast<int>(ec % static_cast<size_t>(gate_n_chunks));
+                const int cols = std::min(kChunkCols, intermediate - chunk * kChunkCols);
+                const int base_route = expert_begins_ptr[static_cast<size_t>(e)];
+                const int sr = down_desc_ptr[static_cast<size_t>(e)].rows;
+                const Q8_1Block *in_rows[16];
+                for (int r = 0; r < sr; ++r)
+                {
+                    const int unique_row = row_idx_ptr[base_route + r];
+                    in_rows[r] = unique_router_q8 +
+                                 static_cast<size_t>(unique_row) * static_cast<size_t>(router_q8_blocks_per_row);
+                }
+                alignas(64) float tmp_buf[16][kChunkCols];
+                const auto &info = is_up ? up_info_ptr[static_cast<size_t>(e)] : gate_info_ptr[static_cast<size_t>(e)];
+                runStripChunkOrdered(info, in_rows, sr, tmp_buf, chunk, cols, isa);
+                float *dst_base = is_up ? up_scratch_ptr : gate_scratch_ptr;
+                const int col_offset = chunk * kChunkCols;
+                for (int r = 0; r < sr; ++r)
+                {
+                    std::memcpy(
+                        dst_base + static_cast<size_t>(base_route + r) * static_cast<size_t>(intermediate) + col_offset,
+                        tmp_buf[r],
+                        static_cast<size_t>(cols) * sizeof(float));
+                }
+            }
+            // Implicit barrier publishes all Gate/Up scratch chunks.
+
+            // Phase 1b: Parallel SwiGLU -> Q8_1 quantization (~1 us across team).
+#pragma omp for schedule(static)
+            for (size_t t = 0; t < n_swiglu_tasks; ++t)
+            {
+                const int e = static_cast<int>(t / static_cast<size_t>(gate_n_chunks));
+                const int chunk = static_cast<int>(t % static_cast<size_t>(gate_n_chunks));
+                const int cols = std::min(kChunkCols, intermediate - chunk * kChunkCols);
+                const int base_route = expert_begins_ptr[static_cast<size_t>(e)];
+                const int sr = down_desc_ptr[static_cast<size_t>(e)].rows;
+                const int col_offset = chunk * kChunkCols;
+                const int q8_chunk_offset = chunk * 2;
+                for (int r = 0; r < sr; ++r)
+                {
+                    const size_t row_off = static_cast<size_t>(base_route + r) * static_cast<size_t>(intermediate) + col_offset;
+                    Q8_1Block *dst_q8 = activation_q8 +
+                        static_cast<size_t>(base_route + r) * static_cast<size_t>(activation_blocks_per_row) +
+                        q8_chunk_offset;
+                    quantizeSwiGLUChunkToQ8(
+                        gate_scratch_ptr + row_off, up_scratch_ptr + row_off, dst_q8, cols, swiglu_policy, isa);
+                }
+            }
+            // Implicit barrier publishes all activation_q8 rows.
+
+            // Phase 2: Static zero-atomic Down directly into destination route rows.
+#pragma omp for schedule(static) nowait
+            for (size_t t = 0; t < n_down_tasks; ++t)
+            {
+                const int e = static_cast<int>(t / static_cast<size_t>(down_n_chunks));
+                const int chunk = static_cast<int>(t % static_cast<size_t>(down_n_chunks));
+                const int cols = std::min(kChunkCols, hidden_width - chunk * kChunkCols);
+                const auto &d_desc = down_desc_ptr[static_cast<size_t>(e)];
+                const auto &d_info = down_info_ptr[static_cast<size_t>(e)];
+                const int sr = d_desc.rows;
+                const Q8_1Block *swiglu_rows[16];
+                for (int r = 0; r < sr; ++r)
+                    swiglu_rows[r] = d_desc.input_q8 + static_cast<size_t>(r) * static_cast<size_t>(activation_blocks_per_row);
+                alignas(64) float out_buf[16][kChunkCols];
+                runStripChunkOrdered(d_info, swiglu_rows, sr, out_buf, chunk, cols, isa);
+                const int col_offset = chunk * kChunkCols;
+                for (int r = 0; r < sr; ++r)
+                {
+                    float *dst = d_desc.output_rows.rowAddress(d_desc.output, d_desc.ldc, static_cast<size_t>(r)) +
+                                 col_offset;
+                    std::memcpy(dst, out_buf[r], static_cast<size_t>(cols) * sizeof(float));
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(run_decode_balanced);
+    }
     else
     {
         phase1_tasks.clear();

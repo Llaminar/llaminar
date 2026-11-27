@@ -1515,75 +1515,95 @@ namespace llaminar2
         if (parallelize)
         {
             bool protocol_ok = true;
-            // Team-local slices join before the caller's ready/consumed stores;
-            // every failure is flushed to all workers at the same barrier.
+            // Double-buffered overflow gather using the two existing half-slots
+            // (DOUBLE_BUFFER_SLOT_CAPACITY = 2 MiB each) of every rank's arena:
+            // non-root ranks stage slot `step` into half-buffer `step & 1` IN
+            // PARALLEL while root drains slot `step - 1` from `(step - 1) & 1`,
+            // cutting cross-socket barriers in half with zero extra memory.
+            constexpr size_t kSlotCap = ShmemSpinArena::DOUBLE_BUFFER_SLOT_CAPACITY;
+            const size_t overflow_elements =
+                maximum_participant_elements - ShmemSpinArena::CHUNK_CAPACITY;
+            const size_t total_slots = (overflow_elements + kSlotCap - 1u) / kSlotCap;
             auto copy_chunks = [&]()
             {
-                for (size_t chunk_offset = ShmemSpinArena::CHUNK_CAPACITY;
-                     chunk_offset < maximum_participant_elements && protocol_ok;
-                     chunk_offset += ShmemSpinArena::CHUNK_CAPACITY)
+                for (size_t step = 0u; step <= total_slots && protocol_ok; ++step)
                 {
-                    const size_t my_chunk_elements = chunk_offset < local_elements
-                        ? std::min(ShmemSpinArena::CHUNK_CAPACITY, local_elements - chunk_offset) : 0u;
-                    if (my_rank_ != root_rank)
+                    // Producer (non-root): write slot `step` into half-buffer `step & 1`.
+                    if (my_rank_ != root_rank && step < total_slots)
                     {
-                        const size_t slices = (my_chunk_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
-#pragma omp for schedule(static)
-                        for (size_t slice = 0u; slice < slices; ++slice)
+                        const size_t chunk_offset =
+                            ShmemSpinArena::CHUNK_CAPACITY + step * kSlotCap;
+                        const size_t my_chunk_elements = chunk_offset < local_elements
+                            ? std::min(kSlotCap, local_elements - chunk_offset) : 0u;
+                        if (my_chunk_elements > 0u)
                         {
-                            const size_t offset = slice * kWorkSliceElements;
-                            const size_t elements = std::min(kWorkSliceElements, my_chunk_elements - offset);
-                            std::memcpy(arena_->buffer_at(my_rank_) + offset,
-                                local_records + chunk_offset + offset, elements * sizeof(float));
-                        }
-                    }
-#pragma omp master
-                    {
-                        // The producer workshare has completed before release.
-                        protocol_ok = publishNextEpoch();
-                        if (my_rank_ == root_rank && protocol_ok)
-                            for (int rank = 0; rank < num_ranks_ && protocol_ok; ++rank)
-                                if (rank != root_rank)
-                                    protocol_ok = waitForPeerEpoch(rank, my_epoch_,
-                                        "waiting for a packed-record chunk", total_elements);
-                    }
-#pragma omp barrier
-                    if (!protocol_ok) break;
-                    if (my_rank_ == root_rank)
-                    {
-                        for (int rank = 0; rank < num_ranks_; ++rank)
-                        {
-                            if (rank == root_rank) continue;
-                            const size_t rank_elements = rooted_publication_element_counts_[static_cast<size_t>(rank)];
-                            const size_t chunk_elements = chunk_offset < rank_elements
-                                ? std::min(ShmemSpinArena::CHUNK_CAPACITY, rank_elements - chunk_offset) : 0u;
-                            const size_t slices = (chunk_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
+                            float *const dst_slot =
+                                arena_->buffer_at(my_rank_) + (step & 1u) * kSlotCap;
+                            const size_t slices =
+                                (my_chunk_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
 #pragma omp for schedule(static)
                             for (size_t slice = 0u; slice < slices; ++slice)
                             {
                                 const size_t offset = slice * kWorkSliceElements;
-                                const size_t elements = std::min(kWorkSliceElements, chunk_elements - offset);
-                                std::memcpy(root_records + rooted_publication_element_offsets_[static_cast<size_t>(rank)] +
-                                        chunk_offset + offset,
-                                    arena_->buffer_at(rank) + offset, elements * sizeof(float));
+                                const size_t elements =
+                                    std::min(kWorkSliceElements, my_chunk_elements - offset);
+                                std::memcpy(dst_slot + offset,
+                                    local_records + chunk_offset + offset,
+                                    elements * sizeof(float));
                             }
                         }
                     }
+
+                    // Consumer (root): concurrently drain previous slot `step - 1`
+                    // from disjoint half-buffer `(step - 1) & 1`.
+                    if (my_rank_ == root_rank && step > 0u)
+                    {
+                        const size_t prev_step = step - 1u;
+                        const size_t chunk_offset =
+                            ShmemSpinArena::CHUNK_CAPACITY + prev_step * kSlotCap;
+                        const size_t slot_base = (prev_step & 1u) * kSlotCap;
+                        for (int rank = 0; rank < num_ranks_; ++rank)
+                        {
+                            if (rank == root_rank) continue;
+                            const size_t rank_elements =
+                                rooted_publication_element_counts_[static_cast<size_t>(rank)];
+                            const size_t chunk_elements = chunk_offset < rank_elements
+                                ? std::min(kSlotCap, rank_elements - chunk_offset) : 0u;
+                            if (chunk_elements == 0u) continue;
+                            const float *const src_slot =
+                                arena_->buffer_at(rank) + slot_base;
+                            const size_t slices =
+                                (chunk_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
+#pragma omp for schedule(static)
+                            for (size_t slice = 0u; slice < slices; ++slice)
+                            {
+                                const size_t offset = slice * kWorkSliceElements;
+                                const size_t elements =
+                                    std::min(kWorkSliceElements, chunk_elements - offset);
+                                std::memcpy(
+                                    root_records +
+                                        rooted_publication_element_offsets_[static_cast<size_t>(rank)] +
+                                        chunk_offset + offset,
+                                    src_slot + offset,
+                                    elements * sizeof(float));
+                            }
+                        }
+                    }
+
+                    // Single all-to-all epoch barrier both publishes slot `step`
+                    // to root and retires slot `step - 1` for producer reuse.
 #pragma omp master
                     {
-                        // Root acknowledges only after every copy worker has
-                        // stopped reading the peer's sole reusable shared slot.
-                        if (my_rank_ == root_rank)
+                        protocol_ok = publishNextEpoch();
+                        if (protocol_ok)
                         {
-                            protocol_ok = publishNextEpoch();
-                        }
-                        else
-                        {
-                            protocol_ok = waitForPeerEpoch(root_rank, my_epoch_ + 1u,
-                                "waiting for root to consume a packed-record chunk", my_chunk_elements);
-                            if (protocol_ok)
+                            for (int rank = 0; rank < num_ranks_ && protocol_ok; ++rank)
                             {
-                                protocol_ok = publishNextEpoch();
+                                if (rank == my_rank_) continue;
+                                protocol_ok = waitForPeerEpoch(
+                                    rank, my_epoch_,
+                                    "double-buffered packed-record overflow chunk",
+                                    total_elements);
                             }
                         }
                     }

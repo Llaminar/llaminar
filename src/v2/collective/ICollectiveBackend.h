@@ -959,6 +959,24 @@ namespace llaminar2
         }
 
         /**
+         * @brief Execute participant-local fused FP32->FP16->rank-ordered-sum->FP32 peer push on one stream.
+         */
+        virtual bool allreduceFP32ViaFP16SingleDeviceOnStream(
+            void *buffer,
+            size_t count,
+            const NativeCollectiveRows *live_rows,
+            int device_idx,
+            void *stream)
+        {
+            (void)buffer;
+            (void)count;
+            (void)live_rows;
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Submit a grouped allreduce completed by a host-observed ticket.
          *
          * This contract is reserved for explicit heterogeneous graph boundaries

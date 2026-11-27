@@ -4258,17 +4258,29 @@ namespace llaminar2
          */
         bool any_native_bundle = false;
         bool all_native_bundles = true;
-        for (int expert_id : cpu_grouped_active_experts_)
+        // Cache resolved NativeQuantised pointers once per active expert to
+        // avoid 6 redundant RTTI dynamic_casts per active expert on hot prefill layers.
+        struct ResolvedNativeExpertTriple
         {
-            const bool native_gate =
+            CPUNativeQuantisedGemmKernel *gate = nullptr;
+            CPUNativeQuantisedGemmKernel *up = nullptr;
+            CPUNativeQuantisedGemmKernel *down = nullptr;
+        };
+        thread_local std::vector<ResolvedNativeExpertTriple> resolved_native_experts;
+        resolved_native_experts.resize(cpu_grouped_active_experts_.size());
+        for (size_t idx = 0; idx < cpu_grouped_active_experts_.size(); ++idx)
+        {
+            const int expert_id = cpu_grouped_active_experts_[idx];
+            auto *native_gate =
                 dynamic_cast<CPUNativeQuantisedGemmKernel *>(
-                    activeGateGemm(expert_id)) != nullptr;
-            const bool native_up =
+                    activeGateGemm(expert_id));
+            auto *native_up =
                 dynamic_cast<CPUNativeQuantisedGemmKernel *>(
-                    activeUpGemm(expert_id)) != nullptr;
-            const bool native_down =
+                    activeUpGemm(expert_id));
+            auto *native_down =
                 dynamic_cast<CPUNativeQuantisedGemmKernel *>(
-                    activeDownGemm(expert_id)) != nullptr;
+                    activeDownGemm(expert_id));
+            resolved_native_experts[idx] = {native_gate, native_up, native_down};
             const bool any_native = native_gate || native_up || native_down;
             const bool all_native = native_gate && native_up && native_down;
             if (any_native != all_native)
@@ -4591,23 +4603,18 @@ namespace llaminar2
             const int swiglu_q8_blocks_per_row =
                 (intermediate + Q8_1Block::BLOCK_SIZE - 1) /
                 Q8_1Block::BLOCK_SIZE;
-            for (int expert_id : cpu_grouped_active_experts_)
+            for (size_t idx = 0; idx < cpu_grouped_active_experts_.size(); ++idx)
             {
+                const int expert_id = cpu_grouped_active_experts_[idx];
                 const int expert_begin =
                     cpu_grouped_expert_offsets_[static_cast<size_t>(expert_id)];
                 const int expert_end =
                     cpu_grouped_expert_offsets_[
                         static_cast<size_t>(expert_id) + 1u];
                 const int expert_rows = expert_end - expert_begin;
-                auto *native_gate =
-                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
-                        activeGateGemm(expert_id));
-                auto *native_up =
-                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
-                        activeUpGemm(expert_id));
-                auto *native_down =
-                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
-                        activeDownGemm(expert_id));
+                auto *native_gate = resolved_native_experts[idx].gate;
+                auto *native_up = resolved_native_experts[idx].up;
+                auto *native_down = resolved_native_experts[idx].down;
                 if (!native_gate || !native_up || !native_down ||
                     gate_up_projection_count + 2 >
                         CPUNativeQuantisedGemmKernel::

@@ -733,11 +733,15 @@ namespace llaminar2::rocm::mapped_follower_moe
                 std::uint64_t observed = 0u;
                 while (true)
                 {
-                    observed = moe_activation_packet_device::loadSystemAcquire64(args.dispatch_launch.acquire.signal);
+                    observed = __hip_atomic_load(
+                        args.dispatch_launch.acquire.signal,
+                        __ATOMIC_RELAXED,
+                        __HIP_MEMORY_SCOPE_SYSTEM);
                     if (observed >= args.dispatch_launch.acquire.value)
                         break;
                     __builtin_amdgcn_s_sleep(1u);
                 }
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
                 burst_lds->dispatch_timeline = observed;
             }
             workgroupJoin<WorkgroupJoinMemory::GlobalAndLDS>();
@@ -1254,6 +1258,77 @@ namespace llaminar2::rocm::mapped_follower_moe
                         unsigned in_part = 0u;
                         unsigned done_parts = 0u;
 
+                        // When all u_blocks fit in free LDS (e.g. F=640 -> u_blocks=20 -> 20 KB),
+                        // compute all 4-wave K-blocks without inner barriers and perform ONE LDS
+                        // barrier + exact ascending RN fold per 64-col tile (10 barriers -> 1).
+                        // Keep the <255,255> dynamic-switch fallback single-copy for 0 memory spills.
+                        const unsigned avail_stage_bytes =
+                            (dynamic_bytes > down_q8_bytes) ? (dynamic_bytes - down_q8_bytes) : 0u;
+                        bool used_single_barrier = false;
+                        if constexpr (DownCB != kFastDynamicCodebook)
+                        {
+                            const bool single_barrier_stage =
+                                waveUniform((std::size_t(u_blocks) * 256u * sizeof(float)) <= avail_stage_bytes);
+                            if (single_barrier_stage)
+                            {
+                                used_single_barrier = true;
+                                const unsigned group_stride = u_blocks * 64u;
+                                if (valid_ready && lane < count)
+                                {
+#pragma unroll 1
+                                    for (unsigned b = sub; b < u_blocks; b += 4u)
+                                    {
+                                        const std::size_t idx = static_cast<std::size_t>(b) * H + n;
+                                        float contrib = 0.0f;
+                                        if (__builtin_expect(cb == DownCB, 1))
+                                        {
+                                            contrib = fastStreamBlockContributionIdx<DownCB>(
+                                                decoder, waveUniform(rec.payload), waveUniform(rec.scales),
+                                                waveUniform(rec.mins), waveUniform(rec.emins), idx, r_q8 + b);
+                                        }
+                                        else if constexpr (AllowExpanded)
+                                        {
+                                            if (cb == kNativeQuantisedExpandedInt8MinCodebook)
+                                            {
+                                                contrib = fastStreamBlockContributionIdx<kNativeQuantisedExpandedInt8MinCodebook>(
+                                                    decoder, waveUniform(rec.payload), waveUniform(rec.scales),
+                                                    waveUniform(rec.mins), waveUniform(rec.emins), idx, r_q8 + b);
+                                            }
+                                            else
+                                            {
+                                                __builtin_trap();
+                                            }
+                                        }
+                                        else
+                                        {
+                                            __builtin_trap();
+                                        }
+                                        down_stage[group * group_stride + b * 64u + lane] = contrib;
+                                    }
+                                }
+                                workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+                                if (sub == 0u && valid_ready && lane < count)
+                                {
+#pragma unroll 1
+                                    for (unsigned b = 0u; b < u_blocks; ++b)
+                                    {
+                                        const float c = down_stage[group * group_stride + b * 64u + lane];
+                                        part_acc = rocm_native_quantised_accumulate_rn(part_acc, c);
+                                        ++in_part;
+                                        if (__builtin_expect(in_part == u_width || (b + 1u) == u_blocks, 0))
+                                        {
+                                            const float pval = device_fp32_contract::multiply(part_acc, 1.0f);
+                                            raw = (u_parts == 1u) ? pval : rocm_native_quantised_accumulate_rn(raw, pval);
+                                            part_acc = 0.0f;
+                                            in_part = 0u;
+                                            ++done_parts;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (!used_single_barrier)
+                        {
 #pragma unroll 1
                         for (unsigned b0 = 0u; b0 < u_blocks; b0 += 4u)
                         {
@@ -1315,6 +1390,7 @@ namespace llaminar2::rocm::mapped_follower_moe
                             }
                             workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
                         }
+                        }
 
                         if (sub == 0u && valid_slot)
                         {
@@ -1335,20 +1411,20 @@ namespace llaminar2::rocm::mapped_follower_moe
                             }
                             if (use_vec4_store)
                             {
-                                auto wave_stage = down_stage + group * 256u;
+                                auto wave_stage = down_stage + group * (used_single_barrier ? (u_blocks * 64u) : 256u);
                                 wave_stage[lane] = out_val;
                                 asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
                                 if (lane < 16u)
                                 {
                                     auto src4 = reinterpret_cast<LdsPtr<const RawInt4>>(wave_stage);
-                                    auto *dst4 = reinterpret_cast<GlobalPtr<RawInt4>>(
+                                    auto *dst4 = reinterpret_cast<RawInt4 *>(
                                         mapped_out + std::size_t(orig_slot) * H + first);
-                                    dst4[lane] = src4[lane];
+                                    __builtin_nontemporal_store(src4[lane], dst4 + lane);
                                 }
                             }
                             else if (lane < count)
                             {
-                                mapped_out[std::size_t(orig_slot) * H + n] = out_val;
+                                __builtin_nontemporal_store(out_val, mapped_out + std::size_t(orig_slot) * H + n);
                             }
                         }
                         if (base_task + 4u < le || first + 64u < owned.end)
@@ -1358,8 +1434,9 @@ namespace llaminar2::rocm::mapped_follower_moe
             }
         }
 
-        // Flush every CU's PCIe mapped writes to host system memory before Barrier 2!
-        __threadfence_system();
+        // Coherent nontemporal stores to mapped host RAM retire on each CU's
+        // s_waitcnt vmcnt(0) inside Barrier 2; Block 0 then issues ONE system
+        // release fence after Barrier 2 instead of an 896-wave L2 flush storm.
         FastWeightedGridBarrier{LLAMINAR_FOLLOWER_FIELD(barrier_state)}.sync<2>();
 
         // =====================================================================

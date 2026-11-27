@@ -693,6 +693,11 @@ namespace llaminar2
             if (auto *rccl = dynamic_cast<RCCLBackend *>(backend_impl_.get()))
                 rccl->retireRankOrderedAttachmentAfterGraphRelease();
 #endif
+#ifdef HAVE_NCCL
+        if (!abort_requested_.load(std::memory_order_acquire))
+            if (auto *nccl = dynamic_cast<NCCLBackend *>(backend_impl_.get()))
+                nccl->retireRankOrderedAttachmentAfterGraphRelease();
+#endif
         abortBackendAfterGraphOwnersReleased();
         releaseGraphCaptureBoundaryDeviceWords();
         releaseFp16ScratchBuffers();
@@ -1167,17 +1172,19 @@ namespace llaminar2
 
         if (use_fp16_allreduce)
         {
+            const std::size_t fused_max_elements =
+                (backend_ == CollectiveBackendType::NCCL) ? 4096u : rankOrderedPushMaxElements;
             const bool can_fused_peer_push =
                 grouped_explicit_streams &&
-                backend_ == CollectiveBackendType::RCCL &&
+                (backend_ == CollectiveBackendType::RCCL || backend_ == CollectiveBackendType::NCCL) &&
                 backend_impl_ &&
                 backend_impl_->supportsFusedFP32ViaFP16AllreduceMultiOnStreams() &&
                 effective_count > 0 &&
-                effective_count <= rankOrderedPushMaxElements &&
+                effective_count <= fused_max_elements &&
                 (!live_rows ||
                  (live_rows->rows().capacity() > 0 &&
                   live_rows->elementsPerRow() > 0 &&
-                  live_rows->elementsPerRow() <= rankOrderedPushMaxElements / live_rows->rows().capacity()));
+                  live_rows->elementsPerRow() <= fused_max_elements / live_rows->rows().capacity()));
             if (can_fused_peer_push)
             {
                 const bool ar_ok = allreduceGroupedOnExplicitStreams(
@@ -4338,18 +4345,22 @@ namespace llaminar2
                     grouped_onstream_allreduce_ready_ &&
                     grouped_onstream_allreduce_result_ &&
                     !abort_requested_.load(std::memory_order_acquire);
+                const bool use_fused_fp16 = grouped_onstream_allreduce_fused_fp32_via_fp16_;
                 lock.unlock();
 
                 bool enqueue_ok = false;
                 if (ready_to_enqueue && backend_impl_)
                 {
-                    enqueue_ok = live_rows
-                        ? backend_impl_->nativeRowsOnStream(NativeRowCollective::AllReduce,
-                            buffer, buffer, *live_rows, dtype, CollectiveOp::ALLREDUCE_SUM,
-                            device_index, stream)
-                        : backend_impl_->allreduceSingleDeviceOnStream(
-                            buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
-                            device_index, stream);
+                    enqueue_ok = use_fused_fp16
+                        ? backend_impl_->allreduceFP32ViaFP16SingleDeviceOnStream(
+                            buffer, effective_count, live_rows, device_index, stream)
+                        : (live_rows
+                            ? backend_impl_->nativeRowsOnStream(NativeRowCollective::AllReduce,
+                                buffer, buffer, *live_rows, dtype, CollectiveOp::ALLREDUCE_SUM,
+                                device_index, stream)
+                            : backend_impl_->allreduceSingleDeviceOnStream(
+                                buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
+                                device_index, stream));
                 }
 
                 lock.lock();
@@ -4601,14 +4612,18 @@ namespace llaminar2
 
             grouped_onstream_allreduce_result_ = true;
             grouped_onstream_allreduce_ready_ = true;
+            const bool use_fused_fp16 = grouped_onstream_allreduce_fused_fp32_via_fp16_;
             grouped_onstream_allreduce_cv_.notify_all();
             lock.unlock();
 
-            const bool enqueue_ok = live_rows
-                ? backend_impl_->nativeRowsOnStream(NativeRowCollective::AllReduce,
-                    buffer, buffer, *live_rows, dtype, CollectiveOp::ALLREDUCE_SUM, device_index, stream)
-                : backend_impl_->allreduceSingleDeviceOnStream(
-                    buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM, device_index, stream);
+            const bool enqueue_ok = use_fused_fp16
+                ? backend_impl_->allreduceFP32ViaFP16SingleDeviceOnStream(
+                    buffer, effective_count, live_rows, device_index, stream)
+                : (live_rows
+                    ? backend_impl_->nativeRowsOnStream(NativeRowCollective::AllReduce,
+                        buffer, buffer, *live_rows, dtype, CollectiveOp::ALLREDUCE_SUM, device_index, stream)
+                    : backend_impl_->allreduceSingleDeviceOnStream(
+                        buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM, device_index, stream));
 
             lock.lock();
             if (!enqueue_ok)
@@ -5159,7 +5174,7 @@ namespace llaminar2
         case CollectiveBackendType::NCCL:
 #ifdef HAVE_CUDA
             LOG_DEBUG("LocalTPContext: Creating NCCL backend");
-            backend_impl_ = std::make_unique<NCCLBackend>();
+            backend_impl_ = std::make_unique<NCCLBackend>(nullptr, peer_quote);
 #else
             LOG_WARN("LocalTPContext: NCCL requested but CUDA not available, falling back to HOST");
             backend_impl_ = std::make_unique<HostBackend>();

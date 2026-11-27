@@ -167,6 +167,11 @@ __device__ __forceinline__ void completeProjectionTile32(
     const bool valid_col = col < n_cols;
     const uint8_t* payload = projection.weights.payload;
     const unsigned short* scales = static_cast<const unsigned short*>(projection.weights.scales);
+    using RawLdsInt4 = int __attribute__((ext_vector_type(4)));
+    const auto* act_lds = (const PreAttnQ8Block48 __attribute__((opencl_local))*)(
+        (const unsigned char __attribute__((opencl_local))*)activated);
+    auto* partials_lds = (float __attribute__((opencl_local))*)(
+        (unsigned char __attribute__((opencl_local))*)lds_partials);
 
     float result = 0.0f;
     if (valid_col && b_begin < b_end) {
@@ -184,17 +189,18 @@ __device__ __forceinline__ void completeProjectionTile32(
                 if (half_part == 0u)
                     sc_next = native_global_weight_read<unsigned short>(scales + next_elem);
             }
-            const int4 aq = (half_part == 0u) ? activated[b].q0 : activated[b].q1;
+            const RawLdsInt4 aq = reinterpret_cast<const RawLdsInt4 __attribute__((opencl_local))*>(
+                act_lds[b].qs)[half_part];
             int d = 0;
-            d = llaminar2::rocm_integer_contract::signedDot4(aq.x, w_cur.x, d);
-            d = llaminar2::rocm_integer_contract::signedDot4(aq.y, w_cur.y, d);
-            d = llaminar2::rocm_integer_contract::signedDot4(aq.z, w_cur.z, d);
-            d = llaminar2::rocm_integer_contract::signedDot4(aq.w, w_cur.w, d);
+            d = llaminar2::rocm_integer_contract::signedDot4(aq[0], w_cur.x, d);
+            d = llaminar2::rocm_integer_contract::signedDot4(aq[1], w_cur.y, d);
+            d = llaminar2::rocm_integer_contract::signedDot4(aq[2], w_cur.z, d);
+            d = llaminar2::rocm_integer_contract::signedDot4(aq[3], w_cur.w, d);
             const int full = d + __shfl_xor(d, 1, 64);
             if (half_part == 0u) {
                 const float ws = __half2float(__ushort_as_half(sc_cur));
                 result = numeric::add(result,
-                    llaminar2::device_native_quantised_contract::singleScaleBlock(full, ws, activated[b].scale));
+                    llaminar2::device_native_quantised_contract::singleScaleBlock(full, ws, act_lds[b].scale));
             }
             w_cur = w_next;
             sc_cur = sc_next;
@@ -202,13 +208,13 @@ __device__ __forceinline__ void completeProjectionTile32(
         }
     }
     if (half_part == 0u)
-        lds_partials[part * 32u + col_in_wave] = result;
+        partials_lds[part * 32u + col_in_wave] = result;
     __syncthreads();
     if (tid < 32u && (col_base + tid) < n_cols) {
         float total = 0.0f;
 #pragma unroll
         for (unsigned p = 0u; p < parts; ++p)
-            total = numeric::add(total, lds_partials[p * 32u + tid]);
+            total = numeric::add(total, partials_lds[p * 32u + tid]);
         const unsigned column = col_base + tid;
         projection.output[column] = total;
         if constexpr (InlineConv) if (do_conv) {
@@ -325,13 +331,15 @@ __device__ __forceinline__ void completeProjectionTile16(
 __device__ __forceinline__ float gdnOrderedQuarterDot8Lds(
     const float (&state)[8], const float* lds_vec, unsigned key_begin, int segment, int quarter)
 {
+    const auto* vec_lds = (const float __attribute__((opencl_local))*)(
+        (const unsigned char __attribute__((opencl_local))*)lds_vec);
     float accumulator = 0.0f;
 #pragma unroll 1
     for (int owner = 0; owner < 4; ++owner) {
         if (segment == owner) {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const float k_or_q = lds_vec[key_begin + static_cast<unsigned>(i)];
+                const float k_or_q = vec_lds[key_begin + static_cast<unsigned>(i)];
                 asm volatile("v_fma_f32 %0, %1, %2, %0" : "+v"(accumulator) : "v"(state[i]), "v"(k_or_q));
             }
         }

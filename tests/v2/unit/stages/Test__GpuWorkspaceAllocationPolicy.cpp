@@ -414,6 +414,23 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
             EXPECT_FALSE(hasRawGpuAllocationCall(remaining));
             continue;
         }
+        if (relative == "src/v2/collective/backends/CUDAPeerPushResources.cpp")
+        {
+            // The original collective owns both admitted allocations until
+            // its captured consumers retire. Reject any other raw operation.
+            auto remaining = removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+            for (const std::string call : {
+                     "cudaMalloc(&owner->slab_,owner->slab_lease_.bytes())",
+                     "cudaMalloc(&owner->table_,owner->table_lease_.bytes())",
+                     "cudaFree(table_)", "cudaFree(slab_)"})
+            {
+                const auto position = remaining.find(call);
+                ASSERT_NE(position, std::string::npos) << call;
+                remaining.erase(position, call.size());
+            }
+            EXPECT_FALSE(hasRawGpuAllocationCall(remaining));
+            continue;
+        }
         if (sanctioned.find(relative) == sanctioned.end())
             failures.push_back(relative);
     }

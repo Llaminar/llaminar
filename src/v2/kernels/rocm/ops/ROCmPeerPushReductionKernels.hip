@@ -39,6 +39,21 @@ namespace llaminar2
                 for (int i = 0; i < 4; ++i) p[i] = value[i];
         }
 
+        /** @brief Spin-wait on a peer epoch flag using relaxed loads, then acquire once on exit. */
+        __device__ __forceinline__ bool waitPeerEpochSystem(
+            const std::uint64_t *flag_addr, std::uint64_t target,
+            const volatile std::uint32_t *abort_flag) noexcept
+        {
+            while (__hip_atomic_load(flag_addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < target)
+            {
+                if (__atomic_load_n(abort_flag, __ATOMIC_RELAXED))
+                    return true;
+                __builtin_amdgcn_s_sleep(1);
+            }
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+            return false;
+        }
+
         /**
          * @brief Push one fixed block range, join original peer publications and fold ranks.
          *
@@ -78,10 +93,10 @@ namespace llaminar2
                     if (peer != binding.rank)
                     {
                         const auto index = (std::size_t(peer) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                        while (__hip_atomic_load(own.flags + index, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch - 1)
+                        if (waitPeerEpochSystem(own.flags + index, epoch - 1, binding.abort))
                         {
-                            if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                            __builtin_amdgcn_s_sleep(1);
+                            aborted = true;
+                            break;
                         }
                     }
                 if (__syncthreads_or(aborted)) return;
@@ -113,10 +128,10 @@ namespace llaminar2
                 if (peer != binding.rank)
                 {
                     const auto index = (std::size_t(peer) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                    while (__hip_atomic_load(own.flags + index, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch)
+                    if (waitPeerEpochSystem(own.flags + index, epoch, binding.abort))
                     {
-                        if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                        __builtin_amdgcn_s_sleep(1);
+                        aborted = true;
+                        break;
                     }
                 }
             if (__syncthreads_or(aborted)) return;
@@ -181,11 +196,8 @@ namespace llaminar2
                     if (threadIdx.x == 0)
                     {
                         const auto root_idx = (std::size_t(root) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                        while (__hip_atomic_load(own.flags + root_idx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch - 1)
-                        {
-                            if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                            __builtin_amdgcn_s_sleep(1);
-                        }
+                        if (waitPeerEpochSystem(own.flags + root_idx, epoch - 1, binding.abort))
+                            aborted = true;
                     }
                     if (__syncthreads_or(aborted)) return;
                 }
@@ -202,11 +214,11 @@ namespace llaminar2
                 }
                 __syncthreads();
                 if (threadIdx.x == 0)
-                {
                     *reinterpret_cast<volatile std::uint64_t *>(own.flags + flag_index) = epoch;
-                    __hip_atomic_store(binding.endpoints[root].flags + flag_index, epoch,
-                        __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-                }
+                for (int peer = threadIdx.x; peer < layout.participants; peer += blockDim.x)
+                    if (peer != binding.rank)
+                        __hip_atomic_store(binding.endpoints[peer].flags + flag_index, epoch,
+                            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
                 return;
             }
 
@@ -215,10 +227,10 @@ namespace llaminar2
                 if (peer != root)
                 {
                     const auto index = (std::size_t(peer) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                    while (__hip_atomic_load(own.flags + index, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch)
+                    if (waitPeerEpochSystem(own.flags + index, epoch, binding.abort))
                     {
-                        if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                        __builtin_amdgcn_s_sleep(1);
+                        aborted = true;
+                        break;
                     }
                 }
             if (__syncthreads_or(aborted)) return;
@@ -284,10 +296,10 @@ namespace llaminar2
                         if (peer != root)
                         {
                             const auto index = (std::size_t(peer) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                            while (__hip_atomic_load(own.flags + index, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch - 1)
+                            if (waitPeerEpochSystem(own.flags + index, epoch - 1, binding.abort))
                             {
-                                if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                                __builtin_amdgcn_s_sleep(1);
+                                aborted = true;
+                                break;
                             }
                         }
                     if (__syncthreads_or(aborted)) return;
@@ -322,11 +334,8 @@ namespace llaminar2
             if (threadIdx.x == 0)
             {
                 const auto root_idx = (std::size_t(root) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                while (__hip_atomic_load(own.flags + root_idx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch)
-                {
-                    if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                    __builtin_amdgcn_s_sleep(1);
-                }
+                if (waitPeerEpochSystem(own.flags + root_idx, epoch, binding.abort))
+                    aborted = true;
             }
             if (__syncthreads_or(aborted)) return;
             const std::size_t recv_offset = slot + std::size_t(root) * layout.bank_elements + first;
@@ -342,11 +351,11 @@ namespace llaminar2
             }
             __syncthreads();
             if (threadIdx.x == 0)
-            {
                 *reinterpret_cast<volatile std::uint64_t *>(own.flags + flag_index) = epoch;
-                __hip_atomic_store(binding.endpoints[root].flags + flag_index, epoch,
-                    __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-            }
+            for (int peer = threadIdx.x; peer < layout.participants; peer += blockDim.x)
+                if (peer != binding.rank)
+                    __hip_atomic_store(binding.endpoints[peer].flags + flag_index, epoch,
+                        __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
 
         using Half4Bits = std::uint32_t __attribute__((ext_vector_type(2)));
@@ -411,10 +420,10 @@ namespace llaminar2
                     if (peer != binding.rank)
                     {
                         const auto index = (std::size_t(peer) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                        while (__hip_atomic_load(own.flags + index, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch - 1)
+                        if (waitPeerEpochSystem(own.flags + index, epoch - 1, binding.abort))
                         {
-                            if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                            __builtin_amdgcn_s_sleep(1);
+                            aborted = true;
+                            break;
                         }
                     }
                 if (__syncthreads_or(aborted)) return;
@@ -445,10 +454,10 @@ namespace llaminar2
                 if (peer != binding.rank)
                 {
                     const auto index = (std::size_t(peer) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                    while (__hip_atomic_load(own.flags + index, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch)
+                    if (waitPeerEpochSystem(own.flags + index, epoch, binding.abort))
                     {
-                        if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                        __builtin_amdgcn_s_sleep(1);
+                        aborted = true;
+                        break;
                     }
                 }
             if (__syncthreads_or(aborted)) return;
@@ -528,10 +537,10 @@ namespace llaminar2
                     if (peer != binding.rank)
                     {
                         const auto index = (std::size_t(peer) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                        while (__hip_atomic_load(own.flags + index, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch - 1)
+                        if (waitPeerEpochSystem(own.flags + index, epoch - 1, binding.abort))
                         {
-                            if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                            __builtin_amdgcn_s_sleep(1);
+                            aborted = true;
+                            break;
                         }
                     }
                 if (__syncthreads_or(aborted)) return;
@@ -567,10 +576,10 @@ namespace llaminar2
                 if (peer != binding.rank)
                 {
                     const auto index = (std::size_t(peer) * layout.blocks + blockIdx.x) * layout.flag_stride;
-                    while (__hip_atomic_load(own.flags + index, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch)
+                    if (waitPeerEpochSystem(own.flags + index, epoch, binding.abort))
                     {
-                        if (__atomic_load_n(binding.abort, __ATOMIC_RELAXED)) { aborted = true; break; }
-                        __builtin_amdgcn_s_sleep(1);
+                        aborted = true;
+                        break;
                     }
                 }
             if (__syncthreads_or(aborted)) return;

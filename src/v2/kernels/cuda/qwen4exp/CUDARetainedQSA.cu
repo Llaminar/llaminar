@@ -106,7 +106,7 @@ namespace
         dst_codes[lane] = static_cast<int8_t>(q);
     }
 
-    /** @brief Coalesced 256B/warp 8-column Q8_0 sub-tile (4-CTA/SM low-register schedule). */
+    /** @brief Coalesced 256B/warp 8-column Q8_0 sub-tile (zero register spills). */
     __device__ __forceinline__ float qsaAccumulateQ8SubTile8(
         const DeviceNativeQuantisedMatrixDesc &w,
         const uint16_t *w_scales,
@@ -149,6 +149,50 @@ namespace
         return sum;
     }
 
+    /** @brief Coalesced 512B/warp 16-column Q8_0 sub-tile (2 lanes/col int4, zero register spills). */
+    __device__ __forceinline__ float qsaAccumulateQ8SubTile16(
+        const DeviceNativeQuantisedMatrixDesc &w,
+        const uint16_t *w_scales,
+        const int8_t *act_codes,
+        const float *act_scales,
+        unsigned col_sub,
+        unsigned blk_begin,
+        unsigned blk_end,
+        unsigned lane)
+    {
+        const unsigned n = static_cast<unsigned>(w.n);
+        const unsigned col_in_sub = lane >> 1; // 0..15
+        const unsigned half_part = lane & 1u;  // 0..1 (16B int4 per lane)
+        const unsigned col = col_sub + col_in_sub;
+        const bool valid_col = col < n;
+        if (blk_begin >= blk_end)
+            return 0.0f;
+
+        unsigned elem = blk_begin * n + col;
+        float sum = 0.0f;
+#pragma unroll 1
+        for (unsigned b = blk_begin; b < blk_end; ++b)
+        {
+            const int4 w4 = valid_col
+                ? reinterpret_cast<const int4 *>(w.payload + static_cast<std::size_t>(elem) * 32u)[half_part]
+                : make_int4(0, 0, 0, 0);
+            const int4 a4 = reinterpret_cast<const int4 *>(act_codes + b * 32u)[half_part];
+            int d = __dp4a(w4.x, a4.x, 0);
+            d = __dp4a(w4.y, a4.y, d);
+            d = __dp4a(w4.z, a4.z, d);
+            d = __dp4a(w4.w, a4.w, d);
+            d += __shfl_xor_sync(0xffffffffu, d, 1);
+            if (half_part == 0u && valid_col)
+            {
+                const float ws = __half2float(__ushort_as_half(w_scales[elem]));
+                sum = __fadd_rn(sum,
+                    device_native_quantised_contract::singleScaleBlock(d, ws, act_scales[b]));
+            }
+            elem += n;
+        }
+        return sum;
+    }
+
     /** @brief Complete 32-column Q8_0 projection tile, optionally deinterleaving Wq directly into Q + fa_gate. */
     template <bool GeneralCodebooks>
     __device__ __forceinline__ void qsaCompleteTile32(
@@ -177,22 +221,45 @@ namespace
             const unsigned chunk = min(kMaxKPartitions, kb - p_base);
             if constexpr (!GeneralCodebooks)
             {
-                const unsigned col_in_sub = lane >> 2;
-                const unsigned q_part = lane & 3u;
                 const auto *w_scales = static_cast<const uint16_t *>(w.scales);
-                const unsigned total_warp_tasks = 4u * chunk;
-#pragma unroll 1
-                for (unsigned task = warp; task < total_warp_tasks; task += 8u)
+                if ((chunk & 3u) == 0u)
                 {
-                    const unsigned dp = task >> 2;
-                    const unsigned p = p_base + dp;
-                    const unsigned st = task & 3u;
-                    const unsigned blk_begin = p * bps;
-                    const unsigned blk_end = min(blocks, blk_begin + bps);
-                    const float sum = qsaAccumulateQ8SubTile8(
-                        w, w_scales, act_codes, act_scales, col_base + st * 8u, blk_begin, blk_end, lane);
-                    if (q_part == 0u)
-                        partials[dp][st * 8u + col_in_sub] = sum;
+                    // 512B/warp LDG.E.128 path (2 sub-tiles x 16 cols, 1 shuffle/block).
+                    const unsigned col_in_sub = lane >> 1;
+                    const unsigned half_part = lane & 1u;
+                    const unsigned total_warp_tasks = 2u * chunk;
+#pragma unroll 1
+                    for (unsigned task = warp; task < total_warp_tasks; task += 8u)
+                    {
+                        const unsigned dp = task >> 1;
+                        const unsigned p = p_base + dp;
+                        const unsigned st = task & 1u;
+                        const unsigned blk_begin = p * bps;
+                        const unsigned blk_end = min(blocks, blk_begin + bps);
+                        const float sum = qsaAccumulateQ8SubTile16(
+                            w, w_scales, act_codes, act_scales, col_base + st * 16u, blk_begin, blk_end, lane);
+                        if (half_part == 0u)
+                            partials[dp][st * 16u + col_in_sub] = sum;
+                    }
+                }
+                else
+                {
+                    const unsigned col_in_sub = lane >> 2;
+                    const unsigned q_part = lane & 3u;
+                    const unsigned total_warp_tasks = 4u * chunk;
+#pragma unroll 1
+                    for (unsigned task = warp; task < total_warp_tasks; task += 8u)
+                    {
+                        const unsigned dp = task >> 2;
+                        const unsigned p = p_base + dp;
+                        const unsigned st = task & 3u;
+                        const unsigned blk_begin = p * bps;
+                        const unsigned blk_end = min(blocks, blk_begin + bps);
+                        const float sum = qsaAccumulateQ8SubTile8(
+                            w, w_scales, act_codes, act_scales, col_base + st * 8u, blk_begin, blk_end, lane);
+                        if (q_part == 0u)
+                            partials[dp][st * 8u + col_in_sub] = sum;
+                    }
                 }
             }
             else

@@ -2205,9 +2205,10 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             }
             if (cfg.rank_ordered_resources)
             {
-                if (cfg.local_tp_backend != CollectiveBackendType::RCCL ||
-                    cfg.rank_ordered_resources->device != cfg.device || !cfg.device.is_rocm())
-                    throw std::invalid_argument("Native peer reduction BOM lost its original RCCL participant");
+                const bool rocm_match = (cfg.local_tp_backend == CollectiveBackendType::RCCL && cfg.device.is_rocm());
+                const bool cuda_match = (cfg.local_tp_backend == CollectiveBackendType::NCCL && cfg.device.is_cuda());
+                if ((!rocm_match && !cuda_match) || cfg.rank_ordered_resources->device != cfg.device)
+                    throw std::invalid_argument("Native peer reduction BOM lost its original GPU collective participant");
                 collective_bytes = checkedAdd(collective_bytes, cfg.rank_ordered_resources->device_bytes,
                     "native rank-ordered connector backing");
             }

@@ -18,6 +18,7 @@
 #include "NCCLBackend.h"
 #include "NCCLNetworkPolicy.h"
 #include "../coordinators/NCCLCoordinator.h"
+#include "collective/RankOrderedPeerPushOptIn.h"
 #include "../../utils/Logger.h"
 #include "../../utils/VramBillOfMaterials.h"
 
@@ -197,8 +198,8 @@ namespace llaminar2
     // Constructor / Destructor
     // =========================================================================
 
-    NCCLBackend::NCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx)
-        : mpi_ctx_(std::move(mpi_ctx))
+    NCCLBackend::NCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx, RankOrderedQuotePolicy peer_quote)
+        : mpi_ctx_(std::move(mpi_ctx)), peer_quote_(peer_quote)
     {
         LOG_DEBUG("NCCLBackend: Created" << (mpi_ctx_ ? " with MPI context (world_size=" + std::to_string(mpi_ctx_->world_size()) + ")" : " (single-process mode)"));
     }
@@ -411,7 +412,8 @@ namespace llaminar2
             }
 
             // Create and initialize the coordinator
-            coordinator_ = std::make_unique<NCCLCoordinator>();
+            const auto peer_request = cudaPeerPushRequest(peer_quote_);
+            coordinator_ = std::make_unique<NCCLCoordinator>(peer_request);
             if (!coordinator_->initialize(device_ordinals_))
             {
                 last_error_ = "NCCLCoordinator initialization failed: " + coordinator_->lastError();
@@ -450,6 +452,14 @@ namespace llaminar2
         {
             coordinator_->setComputeStreams(compute_streams);
         }
+    }
+
+    void NCCLBackend::retireRankOrderedAttachmentAfterGraphRelease() noexcept
+    {
+#ifdef HAVE_NCCL
+        if (coordinator_)
+            coordinator_->retireRankOrderedAttachmentAfterGraphRelease();
+#endif
     }
 
     void NCCLBackend::shutdown()
@@ -1524,6 +1534,78 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLBackend::supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept
+    {
+#ifdef HAVE_NCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ &&
+               coordinator_->supportsFusedFP32ViaFP16AllreduceMultiOnStreams();
+#else
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::allreduceFP32ViaFP16MultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        const std::vector<void *> &streams,
+        const std::vector<NativeCollectiveRows> &live_rows)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_ || !is_multi_gpu_single_process_ || !coordinator_)
+        {
+            last_error_ = "NCCLBackend not ready for fused FP32-via-FP16 allreduce";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (buffers.size() != static_cast<size_t>(num_ranks_) ||
+            streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer/stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_->allreduceFP32ViaFP16MultiOnStreams(buffers, count, streams, live_rows))
+        {
+            last_error_ = "NCCLCoordinator allreduceFP32ViaFP16MultiOnStreams failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)buffers; (void)count; (void)streams; (void)live_rows;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::allreduceFP32ViaFP16SingleDeviceOnStream(
+        void *buffer,
+        size_t count,
+        const NativeCollectiveRows *live_rows,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_ || !is_multi_gpu_single_process_ || !coordinator_)
+        {
+            last_error_ = "NCCLBackend not ready for single-device fused FP32-via-FP16 allreduce";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_->allreduceFP32ViaFP16SingleDeviceOnStream(buffer, count, live_rows, device_idx, stream))
+        {
+            last_error_ = "NCCLCoordinator allreduceFP32ViaFP16SingleDeviceOnStream failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)buffer; (void)count; (void)live_rows; (void)device_idx; (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLBackend::allreduceWithSidebandsMultiOnStreams(
         const std::vector<void *> &buffers,
         size_t count,
@@ -1847,6 +1929,46 @@ namespace llaminar2
 #else
         (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
         return NativeCollectiveEnqueueResult::failure("NCCL not available");
+#endif
+    }
+
+    bool NCCLBackend::hasRankOrderedPeerPush() const noexcept
+    {
+#ifdef HAVE_NCCL
+        return coordinator_ && coordinator_->hasRankOrderedPeerPush();
+#else
+        return false;
+#endif
+    }
+
+    std::vector<RankOrderedNativeResources> NCCLBackend::rankOrderedResources() const
+    {
+#ifdef HAVE_NCCL
+        return coordinator_ ? coordinator_->rankOrderedResources() : std::vector<RankOrderedNativeResources>{};
+#else
+        return {};
+#endif
+    }
+
+    bool NCCLBackend::prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+#ifdef HAVE_NCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ && coordinator_->prepareRankOrderedResources(memory);
+#else
+        (void)memory;
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+        const NativeCollectiveRows &rows, int participant, void *stream)
+    {
+#ifdef HAVE_NCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ &&
+            coordinator_->rankOrderedFP32OnStream(send, banks, output, rows, participant, stream);
+#else
+        (void)send; (void)banks; (void)output; (void)rows; (void)participant; (void)stream;
+        return false;
 #endif
     }
 

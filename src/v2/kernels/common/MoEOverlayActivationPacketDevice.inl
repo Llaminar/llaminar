@@ -157,11 +157,29 @@ namespace llaminar2::moe_activation_packet_device
 #endif
     }
 
+    /** @brief Load one peer-owned publication word at system scope without fence spam during spin-waits. */
+    __device__ __forceinline__ std::uint64_t loadSystemRelaxed64(
+        const std::uint64_t *address) noexcept
+    {
+#if defined(__CUDA_ARCH__)
+        cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system> reference(
+            *const_cast<std::uint64_t *>(address));
+        return reference.load(cuda::memory_order_relaxed);
+#elif defined(__HIP_DEVICE_COMPILE__)
+        return __hip_atomic_load(
+            address,
+            __ATOMIC_RELAXED,
+            __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+        return *address;
+#endif
+    }
+
     /** @brief Device-side unsigned-GEQ wait for a TransferEngine-bound edge. */
     __device__ __forceinline__ void waitSystemAcquire64(
         const MoEOverlayActivationTimelineWaitDeviceBinding &binding) noexcept
     {
-        while (loadSystemAcquire64(binding.signal) < binding.value)
+        while (loadSystemRelaxed64(binding.signal) < binding.value)
         {
 #if defined(__CUDA_ARCH__)
             __nanosleep(64u);
@@ -169,6 +187,11 @@ namespace llaminar2::moe_activation_packet_device
             __builtin_amdgcn_s_sleep(1u);
 #endif
         }
+#if defined(__CUDA_ARCH__)
+        cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
+#elif defined(__HIP_DEVICE_COMPILE__)
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#endif
     }
 
     /** @brief Publish a TransferEngine-bound edge with system-release ordering. */
@@ -4674,11 +4697,167 @@ namespace llaminar2::moe_activation_packet_device
             // group share one 10 KB FP32 hidden vector written ONCE across PCIe
             // and released behind ONE system fence instead of N redundant copies
             // and N fences.
+            // Assign one warp per lane (when lane_count <= num_warps) so all
+            // lane metadata/descriptor PCIe writes execute in parallel without
+            // intra-warp divergence, while copying the 10 KB shared hidden row
+            // in parallel across remaining warps (or all threads).
             __shared__ std::uint32_t s_any_active_row;
+            __shared__ std::int32_t s_lane_entries[32];
+            __shared__ std::int32_t s_lane_live_rows[32];
+            __shared__ std::uint32_t s_lane_staged[32];
+            __shared__ std::int32_t s_expert_ids[32][16];
+            __shared__ float s_route_weights[32][16];
+            __shared__ std::int32_t s_orig_slots[32][16];
+            __shared__ std::int32_t s_compact_slots[32][16];
             if (threadIdx.x == 0u)
                 s_any_active_row = 0u;
-            __syncthreads();
             if (threadIdx.x < launch.lane_count)
+            {
+                s_lane_entries[threadIdx.x] = 0;
+                s_lane_live_rows[threadIdx.x] = 0;
+                s_lane_staged[threadIdx.x] = 0u;
+            }
+            __syncthreads();
+
+#if defined(__CUDA_ARCH__)
+            constexpr std::uint32_t kWarpSize = 32u;
+#else
+            constexpr std::uint32_t kWarpSize = 64u;
+#endif
+            const std::uint32_t warp_id = threadIdx.x / kWarpSize;
+            const std::uint32_t lane_in_warp = threadIdx.x % kWarpSize;
+            const std::uint32_t num_warps = blockDim.x / kWarpSize;
+            const bool warp_per_lane = (launch.lane_count <= num_warps);
+
+            if (warp_per_lane)
+            {
+                if (warp_id < launch.lane_count)
+                {
+                    const auto &lane_launch = launch.lanes[warp_id];
+                    const auto &pkt = lane_launch.packet;
+                    if (lane_in_warp == 0u)
+                    {
+                        if (lane_launch.admission_wait.signal != nullptr)
+                            waitSystemAcquire64(lane_launch.admission_wait);
+                        if (pkt.physical_rows == 1 && pkt.packet.top_k <= 16)
+                        {
+                            const auto preparation = prepareDispatchMetadata(pkt);
+                            if (preparation.valid())
+                            {
+                                std::uint64_t compact_rows = 0u;
+                                std::uint64_t compact_entries = 0u;
+                                std::int32_t first_row_id = -1;
+                                bool ok = true;
+                                if (preparation.active_rows == 1)
+                                {
+                                    for (std::int32_t slot = 0; slot < pkt.packet.top_k; ++slot)
+                                    {
+                                        std::int32_t expert = -1;
+                                        std::int32_t route_participant = -1;
+                                        float weight = 0.0f;
+                                        if (!decodeDispatchRoute(
+                                                pkt, preparation.route_participants,
+                                                static_cast<std::size_t>(slot),
+                                                &expert, &weight, &route_participant))
+                                        {
+                                            publishFailure(
+                                                pkt.control, pkt.grant,
+                                                MoEOverlayActivationEndpoint::Continuation,
+                                                MoEOverlayActivationOperation::PublishDispatch,
+                                                MoEOverlayActivationStatusCode::PayloadMismatch,
+                                                pkt.stage_ordinal, pkt.model_layer_index, 0u);
+                                            ok = false;
+                                            break;
+                                        }
+                                        if (route_participant != pkt.target_participant_id)
+                                            continue;
+                                        if (compact_entries >= pkt.packet.entry_capacity)
+                                        {
+                                            publishFailure(
+                                                pkt.control, pkt.grant,
+                                                MoEOverlayActivationEndpoint::Continuation,
+                                                MoEOverlayActivationOperation::PublishDispatch,
+                                                MoEOverlayActivationStatusCode::PayloadMismatch,
+                                                pkt.stage_ordinal, pkt.model_layer_index, 0u);
+                                            ok = false;
+                                            break;
+                                        }
+                                        s_expert_ids[warp_id][compact_entries] = expert;
+                                        s_route_weights[warp_id][compact_entries] = weight;
+                                        s_orig_slots[warp_id][compact_entries] = slot;
+                                        s_compact_slots[warp_id][compact_entries] =
+                                            static_cast<std::int32_t>(compact_entries);
+                                        ++compact_entries;
+                                    }
+                                    if (ok && compact_entries > 0u)
+                                    {
+                                        if (pkt.packet.row_capacity == 0u)
+                                        {
+                                            publishFailure(
+                                                pkt.control, pkt.grant,
+                                                MoEOverlayActivationEndpoint::Continuation,
+                                                MoEOverlayActivationOperation::PublishDispatch,
+                                                MoEOverlayActivationStatusCode::PayloadMismatch,
+                                                pkt.stage_ordinal, pkt.model_layer_index, 0u);
+                                            ok = false;
+                                        }
+                                        else
+                                        {
+                                            first_row_id = 0;
+                                            compact_rows = 1u;
+                                        }
+                                    }
+                                }
+                                if (ok)
+                                {
+                                    finishDispatchMetadata(pkt, compact_rows, compact_entries, first_row_id);
+                                    s_lane_entries[warp_id] = static_cast<std::int32_t>(compact_entries);
+                                    s_lane_live_rows[warp_id] = static_cast<std::int32_t>(compact_rows);
+                                    s_lane_staged[warp_id] = 1u;
+                                    if (compact_rows == 1u && first_row_id >= 0)
+                                        s_any_active_row = 1u;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            packDispatchMetadata(pkt);
+                            if (pkt.grant->state == raw(MoEOverlayActivationEndpointState::Active) &&
+                                pkt.grant->code == raw(MoEOverlayActivationStatusCode::Success) &&
+                                pkt.grant->live_rows == 1u &&
+                                pkt.grant->single_row_id >= 0)
+                            {
+                                s_any_active_row = 1u;
+                            }
+                        }
+                    }
+#if defined(__CUDA_ARCH__)
+                    __syncwarp();
+#endif
+                    if (s_lane_staged[warp_id] != 0u)
+                    {
+                        const std::int32_t entries = s_lane_entries[warp_id];
+                        const std::int32_t live_r = s_lane_live_rows[warp_id];
+                        if (lane_in_warp == 0u)
+                        {
+                            pkt.packet.entry_offsets[0] = 0;
+                            if (live_r == 1)
+                            {
+                                pkt.packet.row_ids[0] = 0;
+                                pkt.packet.entry_offsets[1] = entries;
+                            }
+                        }
+                        if (static_cast<std::int32_t>(lane_in_warp) < entries)
+                        {
+                            pkt.packet.expert_ids[lane_in_warp] = s_expert_ids[warp_id][lane_in_warp];
+                            pkt.packet.route_weights[lane_in_warp] = s_route_weights[warp_id][lane_in_warp];
+                            pkt.packet.original_route_slots[lane_in_warp] = s_orig_slots[warp_id][lane_in_warp];
+                            pkt.packet.compact_route_slots[lane_in_warp] = s_compact_slots[warp_id][lane_in_warp];
+                        }
+                    }
+                }
+            }
+            else if (threadIdx.x < launch.lane_count)
             {
                 const auto &lane_launch = launch.lanes[threadIdx.x];
                 if (lane_launch.admission_wait.signal != nullptr)
@@ -4711,8 +4890,18 @@ namespace llaminar2::moe_activation_packet_device
                     const std::size_t vecs = width >> 2u;
                     const auto *__restrict__ src4 = reinterpret_cast<const float4 *>(src);
                     auto *__restrict__ dst4 = reinterpret_cast<float4 *>(dst);
-                    for (std::size_t v = threadIdx.x; v < vecs; v += blockDim.x)
-                        dst4[v] = src4[v];
+                    const std::size_t stride = blockDim.x;
+                    for (std::size_t v0 = threadIdx.x; v0 < vecs; v0 += 2u * stride)
+                    {
+                        const std::size_t v1 = v0 + stride;
+                        const float4 r0 = src4[v0];
+                        float4 r1{};
+                        if (v1 < vecs)
+                            r1 = src4[v1];
+                        dst4[v0] = r0;
+                        if (v1 < vecs)
+                            dst4[v1] = r1;
+                    }
                     copied = vecs << 2u;
                 }
 #endif

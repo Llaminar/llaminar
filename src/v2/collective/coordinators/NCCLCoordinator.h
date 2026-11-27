@@ -30,6 +30,8 @@
 #pragma once
 
 #include "collective/NativeCollectiveBytes.h"
+#include "collective/RankOrderedPeerPushOptIn.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include "ICollectiveCoordinator.h"
 #include "../ICollectiveBackend.h" // For CollectiveDataType, CollectiveOp
@@ -38,6 +40,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -46,6 +49,7 @@
 
 namespace llaminar2
 {
+    class CUDAPeerPushResources;
 
     /**
      * @brief Dedicated coordinator thread for NCCL collective operations
@@ -61,6 +65,8 @@ namespace llaminar2
     {
     public:
         NCCLCoordinator();
+        /** @brief Bind the original model's admitted CUDA P2P peer-push selection before communicator creation. */
+        explicit NCCLCoordinator(RankOrderedPeerPushRequest request);
         ~NCCLCoordinator() override;
 
         // Non-copyable, non-movable (owns thread state)
@@ -286,8 +292,36 @@ namespace llaminar2
          * @param stream Exact original producer/consumer stream.
          * @return Successful native enqueue, with no host count read or fallback.
          */
+        /** @copydoc ICollectiveBackend::nativeBroadcastBytesOnStream */
         NativeCollectiveEnqueueResult nativeBroadcastBytesOnStream(const void* send, void* receive,
             const NativeCollectiveBytes& bytes, int root, int participant, void* stream);
+
+        /** @copydoc ICollectiveBackend::rankOrderedResources */
+        std::vector<RankOrderedNativeResources> rankOrderedResources() const;
+        /** @return Whether this original communicator quoted the prepared CUDA direct peer-push transport. */
+        bool hasRankOrderedPeerPush() const noexcept { return !rank_ordered_resources_.empty(); }
+        /** @return Whether fused FP32-via-FP16 direct peer push is prepared and ready. */
+        bool supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept;
+        /** @copydoc ICollectiveBackend::allreduceFP32ViaFP16MultiOnStreams */
+        bool allreduceFP32ViaFP16MultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {});
+        /** @copydoc ICollectiveBackend::allreduceFP32ViaFP16SingleDeviceOnStream */
+        bool allreduceFP32ViaFP16SingleDeviceOnStream(
+            void *buffer,
+            size_t count,
+            const NativeCollectiveRows *live_rows,
+            int device_idx,
+            void *stream);
+        /** @copydoc ICollectiveBackend::prepareRankOrderedResources */
+        bool prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory);
+        /** @brief Retire the original model's CUDA peer attachment after its graph owner releases all readers. */
+        void retireRankOrderedAttachmentAfterGraphRelease() noexcept;
+        /** @copydoc ICollectiveBackend::rankOrderedFP32OnStream */
+        bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+            const NativeCollectiveRows &rows, int participant, void *stream);
 
         /** @copydoc ICollectiveBackend::nativeRowsOnStream */
         bool nativeRowsOnStream(
@@ -558,6 +592,13 @@ namespace llaminar2
 
         // NCCL state (owned by coordinator thread)
         // Stored as void* to avoid including nccl.h in public header
+        RankOrderedPeerPushRequest rank_ordered_request_ = RankOrderedPeerPushRequest::Disabled;
+        bool rank_ordered_push_selected_ = false;
+        std::vector<RankOrderedNativeResources> rank_ordered_resources_;
+        struct RankOrderedAttachment;
+        std::unique_ptr<RankOrderedAttachment> rank_ordered_attachment_;
+        enum class RankOrderedPreparationState { Unselected, Quoted, Preparing, Ready, Failed, Retired };
+        RankOrderedPreparationState rank_ordered_state_ = RankOrderedPreparationState::Unselected;
         std::vector<void *> comms_;             // ncclComm_t[]
         std::vector<void *> streams_;           // cudaStream_t[] - one per device
         std::vector<void *> completion_events_; // cudaEvent_t[] - signaled after each collective

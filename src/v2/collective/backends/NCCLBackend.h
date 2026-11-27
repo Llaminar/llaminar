@@ -60,7 +60,8 @@ namespace llaminar2
          *                If provided and world_size > 1, uses MPI to broadcast
          *                NCCL unique ID for distributed communicator setup.
          */
-        explicit NCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx = nullptr);
+        explicit NCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
+                             RankOrderedQuotePolicy peer_quote = RankOrderedQuotePolicy::ExplicitOnly);
         ~NCCLBackend() override;
 
         // =====================================================================
@@ -272,6 +273,18 @@ namespace llaminar2
             CollectiveOp op,
             const std::vector<void *> &streams) override;
         bool supportsAllreduceMultiOnStreams() const override;
+        bool supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept override;
+        bool allreduceFP32ViaFP16MultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {}) override;
+        bool allreduceFP32ViaFP16SingleDeviceOnStream(
+            void *buffer,
+            size_t count,
+            const NativeCollectiveRows *live_rows,
+            int device_idx,
+            void *stream) override;
 
         bool allreduceWithSidebandsMultiOnStreams(
             const std::vector<void *> &buffers,
@@ -332,6 +345,16 @@ namespace llaminar2
          */
         NativeCollectiveEnqueueResult nativeBroadcastBytesOnStream(const void* send, void* receive,
             const NativeCollectiveBytes& bytes, int root, int participant, void* stream) override;
+
+        /** @copydoc ICollectiveBackend::rankOrderedResources */
+        std::vector<RankOrderedNativeResources> rankOrderedResources() const override;
+        /** @copydoc ICollectiveBackend::hasRankOrderedPeerPush */
+        bool hasRankOrderedPeerPush() const noexcept override;
+        /** @copydoc ICollectiveBackend::prepareRankOrderedResources */
+        bool prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory) override;
+        /** @copydoc ICollectiveBackend::rankOrderedFP32OnStream */
+        bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+            const NativeCollectiveRows &rows, int participant, void *stream) override;
 
         /** @copydoc ICollectiveBackend::nativeRowsOnStream */
         bool nativeRowsOnStream(
@@ -484,11 +507,16 @@ namespace llaminar2
         int localRank() const { return local_rank_; }
 
     private:
+        friend class LocalTPContext;
+        /** @brief End the original model's CUDA peer lease after its last graph reader. */
+        void retireRankOrderedAttachmentAfterGraphRelease() noexcept;
+
         bool initialized_ = false;
         std::string last_error_;
         int num_ranks_ = 0;
         int local_rank_ = 0;
         std::shared_ptr<IMPIContext> mpi_ctx_;
+        RankOrderedQuotePolicy peer_quote_ = RankOrderedQuotePolicy::ExplicitOnly;
         bool is_multi_gpu_single_process_ = false;
 
 #ifdef HAVE_NCCL

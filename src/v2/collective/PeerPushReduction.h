@@ -172,4 +172,34 @@ namespace llaminar2
     bool launchROCmPeerPushFP32ViaFP16(const PeerPushBinding &binding, const float *input, float *output,
         const std::int32_t *live_rows, std::size_t rows, std::size_t columns,
         unsigned long long *payload_bytes, unsigned long long *metadata_bytes, void *stream);
+
+    /**
+     * @brief Query the CUDA direct peer-push kernel's cold simultaneous block capacity on the current GPU.
+     * @param capacity Host result; not an execution-state observation.
+     * @return False on runtime/property failure. Never called during capture or replay.
+     */
+    bool cudaPeerPushResidentCapacity(std::size_t &capacity);
+
+    /** @brief Enqueue one lossless CUDA FP32 direct-push allreduce on its exact stream. */
+    bool launchCUDAPeerPushFP32(const PeerPushBinding &binding, const float *input, float *output,
+        const std::int32_t *live_rows, std::size_t rows, std::size_t columns,
+        unsigned long long *payload_bytes, unsigned long long *metadata_bytes, void *stream);
+
+    /** @brief Enqueue one lossless CUDA FP32 rooted direct-push sum reduction on its exact stream. */
+    bool launchCUDAPeerPushReduceFP32(const PeerPushBinding &binding, const float *input,
+        float *output, int root, std::size_t count, void *stream);
+
+    /** @brief Enqueue one lossless CUDA FP32 rooted direct-push broadcast (arbitrary count) on its exact stream. */
+    bool launchCUDAPeerPushBroadcastFP32(const PeerPushBinding &binding, const float *input,
+        float *output, int root, std::size_t count, void *stream);
+
+    /** @brief Enqueue one CUDA FP16 direct-push allreduce sum in exact ascending rank order. */
+    bool launchCUDAPeerPushFP16(const PeerPushBinding &binding, const void *input, void *output,
+        const std::int32_t *live_rows, std::size_t rows, std::size_t columns,
+        unsigned long long *payload_bytes, unsigned long long *metadata_bytes, void *stream);
+
+    /** @brief Enqueue one fused CUDA FP32->FP16->rank-ordered-sum->FP32 direct-push allreduce. */
+    bool launchCUDAPeerPushFP32ViaFP16(const PeerPushBinding &binding, const float *input, float *output,
+        const std::int32_t *live_rows, std::size_t rows, std::size_t columns,
+        unsigned long long *payload_bytes, unsigned long long *metadata_bytes, void *stream);
 }

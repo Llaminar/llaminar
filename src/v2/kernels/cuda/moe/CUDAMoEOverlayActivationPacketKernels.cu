@@ -652,8 +652,13 @@ extern "C" bool cudaMoEOverlayFoldNodeLocalCanonicalRoutes(
         static_cast<std::size_t>(launch->physical_rows) * launch->top_k;
     llaminar2::moe_node_local_route_device::validateSparseRouteSlotsKernel
         <<<blocksFor(route_slots), kThreads, 0u, cuda_stream>>>(*launch);
+    const bool use_vec4_fixed =
+        launch->payload_precision ==
+            llaminar2::MoENodeLocalRoutePayloadPrecision::FixedPoint32Adaptive16 &&
+        launch->ownership != llaminar2::MoENodeLocalRouteOwnership::ContinuationCohort &&
+        launch->top_k <= 32u && ((launch->d_model & 3u) == 0u);
     const dim3 fold_grid(
-        blocksFor(static_cast<std::size_t>(launch->d_model)),
+        blocksFor(static_cast<std::size_t>(use_vec4_fixed ? (launch->d_model >> 2u) : launch->d_model)),
         launch->physical_rows);
     llaminar2::moe_node_local_route_device::foldSparseCanonicalRoutesKernel
         <<<fold_grid, kThreads, 0u, cuda_stream>>>(*launch);

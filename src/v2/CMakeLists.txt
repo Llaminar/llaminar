@@ -432,6 +432,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDARowSelectKernels.cu      # Graph-capturable one-row hidden-state selection
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
         kernels/cuda/ops/CUDATPRankOrderedReductionKernels.cu # Batch-invariant rank-ordered TP sums
+        kernels/cuda/ops/CUDAPeerPushReductionKernels.cu # Register-resident CUDA direct P2P reductions & streaming broadcasts
         kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K + Logit penalty kernels for GPU-side sampling
         kernels/cuda/ops/CUDASamplingSpeculativeKernels.cu # Speculative verify + processed-logit sampling kernels
         kernels/cuda/ops/CUDASamplingGenerationControlKernels.cu # Device generation control, commit boundary, MTP penalties
@@ -577,11 +578,13 @@ if(HAVE_CUDA)
     target_sources(cuda_backend PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLBackend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLDynamicLoader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/CUDAPeerPushResources.cpp
     )
     # Set NCCLBackend source files to be compiled with C++ compiler, not nvcc
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLBackend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/NCCLDynamicLoader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/collective/backends/CUDAPeerPushResources.cpp
         PROPERTIES LANGUAGE CXX
     )
     

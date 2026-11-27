@@ -726,8 +726,6 @@ namespace llaminar2::moe_node_local_route_device
         MoENodeLocalRouteConsumeLaunch launch)
     {
         const auto *const validation_status = launch.validation_status;
-        const std::uint32_t column =
-            static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         const std::uint32_t row = blockIdx.y;
         if (row >= launch.physical_rows)
             return;
@@ -739,11 +737,124 @@ namespace llaminar2::moe_node_local_route_device
             *validation_status ==
             static_cast<std::int32_t>(
                 raw(MoENodeLocalRouteExchangeCode::Success));
+        const bool use_vec4_fixed =
+            fixed_point_fold && launch.top_k <= 32u && ((launch.d_model & 3u) == 0u);
+        __shared__ std::uint8_t s_route_kind[32];
+        __shared__ const void *s_route_ptr[32];
+        if (use_vec4_fixed && validation_ok)
+        {
+            // Resolve each route slot's source kind and row base pointer ONCE per
+            // block in shared memory instead of repeating 10x participant/peer
+            // lookups on every column thread.
+            if (threadIdx.x < launch.top_k)
+            {
+                const std::uint32_t slot = row * launch.top_k + threadIdx.x;
+                const std::int32_t participant =
+                    routeParticipantForSlot(launch.domain_assignment, slot);
+                const std::size_t slot_base =
+                    static_cast<std::size_t>(slot) * launch.d_model;
+                std::uint8_t kind = 0u;
+                const void *ptr = nullptr;
+                if (participant == launch.root_participant)
+                {
+                    kind = 1u; // Root FP32 -> quantizePrefillFixed32
+                    ptr = launch.root_canonical_route_contributions + slot_base;
+                }
+                else if (participant < 0 &&
+                         launch.external_route_source ==
+                             MoEExternalCanonicalRouteSource::RootCanonicalRouteBank)
+                {
+                    kind = 2u; // External bit-cast int32 in root bank
+                    ptr = launch.root_canonical_route_contributions + slot_base;
+                }
+                else if (participant >= 0)
+                {
+                    const auto *peer = peerForParticipant(launch, participant);
+                    if (peer)
+                    {
+                        ptr = peer->route_payload + slot_base;
+                        if (peer->mapped_route_payload == peer->route_payload)
+                        {
+                            const std::uint64_t tag =
+                                loadPeerPublished(peer->slot_epochs + slot);
+                            kind = ((tag >> 63u) != 0u) ? 4u : 3u; // 3: direct int16, 4: direct int32
+                        }
+                        else
+                        {
+                            kind = 5u; // Staged local VRAM bit-cast int32
+                        }
+                    }
+                }
+                s_route_kind[threadIdx.x] = kind;
+                s_route_ptr[threadIdx.x] = ptr;
+            }
+            __syncthreads();
+        }
+        if (use_vec4_fixed)
+        {
+            const std::uint32_t vec_col =
+                static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+            const std::uint32_t col4 = vec_col * 4u;
+            if (col4 >= launch.d_model)
+                return;
+            const std::size_t out_vec_idx =
+                (static_cast<std::size_t>(row) * launch.d_model + col4) >> 2u;
+            auto *out4 = reinterpret_cast<float4 *>(launch.dense_output);
+            if (!validation_ok)
+            {
+                const float qnan = __int_as_float(0x7fc00000);
+                out4[out_vec_idx] = make_float4(qnan, qnan, qnan, qnan);
+                return;
+            }
+            std::int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+#pragma unroll 1
+            for (std::uint32_t route = 0u; route < launch.top_k; ++route)
+            {
+                const std::uint8_t kind = s_route_kind[route];
+                const void *ptr = s_route_ptr[route];
+                if (kind == 1u)
+                {
+                    const float4 v = reinterpret_cast<const float4 *>(ptr)[vec_col];
+                    a0 += moe_activation_packet_device::quantizePrefillFixed32(v.x);
+                    a1 += moe_activation_packet_device::quantizePrefillFixed32(v.y);
+                    a2 += moe_activation_packet_device::quantizePrefillFixed32(v.z);
+                    a3 += moe_activation_packet_device::quantizePrefillFixed32(v.w);
+                }
+                else if (kind == 2u || kind == 5u)
+                {
+                    const int4 v = reinterpret_cast<const int4 *>(ptr)[vec_col];
+                    a0 += v.x; a1 += v.y; a2 += v.z; a3 += v.w;
+                }
+                else if (kind == 3u)
+                {
+                    const auto *src16 = static_cast<const std::int16_t *>(ptr) + col4;
+                    a0 += static_cast<std::int32_t>(loadPeerPublished(src16 + 0u));
+                    a1 += static_cast<std::int32_t>(loadPeerPublished(src16 + 1u));
+                    a2 += static_cast<std::int32_t>(loadPeerPublished(src16 + 2u));
+                    a3 += static_cast<std::int32_t>(loadPeerPublished(src16 + 3u));
+                }
+                else if (kind == 4u)
+                {
+                    const float4 vf = moe_activation_packet_device::loadPeerPublishedFloat4(
+                        reinterpret_cast<const float4 *>(ptr) + vec_col);
+                    int4 vi{};
+                    __builtin_memcpy(&vi, &vf, sizeof(vi));
+                    a0 += vi.x; a1 += vi.y; a2 += vi.z; a3 += vi.w;
+                }
+            }
+            constexpr float kInv = moe_activation_packet_device::kMoEPrefillFixedPointInvScale;
+            out4[out_vec_idx] = make_float4(
+                static_cast<float>(a0) * kInv,
+                static_cast<float>(a1) * kInv,
+                static_cast<float>(a2) * kInv,
+                static_cast<float>(a3) * kInv);
+            return;
+        }
+        const std::uint32_t column =
+            static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         __shared__ unsigned int s_slot_wide_mask;
         if (fixed_point_fold && validation_ok && launch.top_k <= 32u)
         {
-            // Cache direct-P2P adaptive 16/32-bit slot tags once per block
-            // before any per-thread column return so __syncthreads() stays uniform.
             if (threadIdx.x == 0u)
                 s_slot_wide_mask = 0u;
             __syncthreads();

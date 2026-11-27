@@ -438,6 +438,8 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # before freeing PMA allocations. Ready per-token execution never waits.
         ("src/v2/collective/backends/ROCmPeerPushResources.cpp", "ROCmPeerPushResources::publish", "raw_stream", 1),
         ("src/v2/collective/backends/ROCmPeerPushResources.cpp", "ROCmPeerPushResources::~ROCmPeerPushResources", "raw_stream", 1),
+        ("src/v2/collective/backends/CUDAPeerPushResources.cpp", "CUDAPeerPushResources::publish", "raw_stream", 1),
+        ("src/v2/collective/backends/CUDAPeerPushResources.cpp", "CUDAPeerPushResources::~CUDAPeerPushResources", "raw_stream", 1),
         # Untimed planning observations retain their terminal host destinations,
         # including on failure from any one of the evidence plane copies.
         ("src/v2/planning/PlanningGPUCohortServiceMeasurement.cpp", "PlanningGPUExpertMeasurement::measurePreparedCohort", "backend_sync_copy", 1),

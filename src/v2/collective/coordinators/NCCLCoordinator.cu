@@ -24,6 +24,8 @@
 #include "backends/NativeDeviceBinding.h"
 #include "../NativeReduceScatterContract.h"
 #include "../NativeCollectiveRowsContract.h"
+#include "../PeerPushReduction.h"
+#include "../backends/CUDAPeerPushResources.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -33,6 +35,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <future>
 #include <optional>
 #include <cerrno>
 #include <cstdlib>
@@ -47,11 +50,32 @@ namespace nccl = llaminar2::nccl_dynamic;
 
 namespace llaminar2
 {
+    /** @brief One quoted CUDA model attachment owning PMA leases and direct-P2P inbox storage. */
+    struct NCCLCoordinator::RankOrderedAttachment final
+    {
+        std::shared_ptr<PhysicalMemoryAuthority> memory;
+        std::vector<PhysicalMemoryOwnerReservation> host_reservations;
+        std::vector<PhysicalMemoryOwnerReservation> device_reservations;
+        // Reverse member destruction frees GPU allocations before returning PMA reservations.
+        std::vector<std::unique_ptr<CUDAPeerPushResources>> storage;
+    };
+
+    namespace nccl_backend_detail
+    {
+        bool cudaEnablePeerAccessDevice(int peer_device);
+    }
 
     namespace
     {
         constexpr const char *kNCCLGraphMixingEnvironment =
             "NCCL_GRAPH_MIXING_SUPPORT";
+        // Economical envelope for CUDA PCIe/PXB In-Band LL direct P2P collectives:
+        // covers single-row M=1 decode allreduces (<= 4096 elements, ~3.0 us vs
+        // ~11.9 us NCCL) while preserving NCCL's bulk PCIe/DMA engine (~12.9 GB/s,
+        // 99% PCIe Gen3 x16 roofline) for M>=2 verifier/prefill and asymmetric
+        // rooted Reduce/Broadcast collectives.
+        constexpr std::size_t kCUDAPeerPushLLEconomicalMaxFP32 = 4096u;
+        constexpr std::size_t kCUDAPeerPushLLEconomicalMaxFP16 = 4096u;
 
 #ifdef HAVE_NCCL
         /**
@@ -286,6 +310,12 @@ namespace llaminar2
     // ============================================================================
 
     NCCLCoordinator::NCCLCoordinator()
+    {
+        LOG_DEBUG("[NCCLCoordinator] Created");
+    }
+
+    NCCLCoordinator::NCCLCoordinator(RankOrderedPeerPushRequest request)
+        : rank_ordered_request_(request)
     {
         LOG_DEBUG("[NCCLCoordinator] Created");
     }
@@ -898,6 +928,93 @@ namespace llaminar2
                  {"network", "Socket"}});
         }
 
+        // Evaluate arbitrary-size (N >= 2) complete directed CUDA P2P clique for direct peer-push.
+        rank_ordered_push_selected_ = false;
+        rank_ordered_resources_.clear();
+        rank_ordered_state_ = RankOrderedPreparationState::Unselected;
+        if (rank_ordered_request_ == RankOrderedPeerPushRequest::Required ||
+            (rank_ordered_request_ == RankOrderedPeerPushRequest::Automatic && num_devices_ >= 2))
+        {
+            bool complete_p2p = (num_devices_ >= 2);
+            for (int i = 0; complete_p2p && i < num_devices_; ++i)
+            {
+                for (int j = 0; complete_p2p && j < num_devices_; ++j)
+                {
+                    if (i == j) continue;
+                    int can_access = 0;
+                    const cudaError_t err = cudaDeviceCanAccessPeer(&can_access, device_ordinals_[i], device_ordinals_[j]);
+                    if (err != cudaSuccess || can_access == 0)
+                        complete_p2p = false;
+                }
+            }
+            if (!complete_p2p)
+            {
+                if (rank_ordered_request_ == RankOrderedPeerPushRequest::Required)
+                {
+                    last_error_ = "CUDA direct peer-push required (LLAMINAR_CUDA_PEER_PUSH=1) but complete directed P2P clique is unavailable";
+                    LOG_ERROR("[NCCLCoordinator] " << last_error_);
+                    cleanupOnThread();
+                    return;
+                }
+            }
+            else
+            {
+                const std::size_t required_blocks = PeerPushLayout::blocksFor(rankOrderedPushMaxElements);
+                std::size_t min_residency = std::numeric_limits<std::size_t>::max();
+                bool residency_ok = true;
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    std::size_t dev_residency = 0;
+                    if (cudaSetDevice(device_ordinals_[i]) != cudaSuccess ||
+                        !cudaPeerPushResidentCapacity(dev_residency))
+                    {
+                        residency_ok = false;
+                        break;
+                    }
+                    if (dev_residency < min_residency)
+                        min_residency = dev_residency;
+                }
+                if (!residency_ok || min_residency < required_blocks)
+                {
+                    if (rank_ordered_request_ == RankOrderedPeerPushRequest::Required)
+                    {
+                        last_error_ = "CUDA direct peer-push required but simultaneous SM block residency is insufficient";
+                        LOG_ERROR("[NCCLCoordinator] " << last_error_);
+                        cleanupOnThread();
+                        return;
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        const auto layout = PeerPushLayout::create(rankOrderedPushMaxElements, num_devices_, min_residency);
+                        rank_ordered_resources_.reserve(static_cast<std::size_t>(num_devices_));
+                        for (int i = 0; i < num_devices_; ++i)
+                        {
+                            rank_ordered_resources_.push_back({
+                                DeviceId::cuda(device_ordinals_[i]),
+                                layout.inboxBytes() + layout.flagBytes() + layout.endpointBytes(),
+                                1u});
+                        }
+                        rank_ordered_push_selected_ = true;
+                        rank_ordered_state_ = RankOrderedPreparationState::Quoted;
+                        LOG_INFO("[NCCLCoordinator] Quoted CUDA direct P2P peer-push for "
+                                 << num_devices_ << " GPUs (blocks=" << layout.blocks
+                                 << ", residency=" << min_residency
+                                 << ", bytes/gpu=" << (layout.inboxBytes() + layout.flagBytes() + layout.endpointBytes()) << ")");
+                    }
+                    catch (const std::exception &error)
+                    {
+                        last_error_ = std::string("CUDA direct peer-push cold quotation failed: ") + error.what();
+                        LOG_ERROR("[NCCLCoordinator] " << last_error_);
+                        cleanupOnThread();
+                        return;
+                    }
+                }
+            }
+        }
+
         init_success_.store(true);
         LOG_INFO("[NCCLCoordinator] Native communicator profile="
             << ncclCommunicatorProfileName(communicator_policy_.profile)
@@ -928,6 +1045,11 @@ namespace llaminar2
             }
         }
         comms_.clear();
+
+        // Release peer-push PMA-owned device buffers before tearing down streams.
+        rank_ordered_state_ = RankOrderedPreparationState::Retired;
+        rank_ordered_attachment_.reset();
+        rank_ordered_resources_.clear();
 
         // Destroy completion events
         for (int i = 0; i < static_cast<int>(completion_events_.size()); ++i)
@@ -1103,6 +1225,39 @@ namespace llaminar2
         ScopedCudaDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
 
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            (dtype == CollectiveDataType::FLOAT32 || dtype == CollectiveDataType::FLOAT16) &&
+            op == CollectiveOp::ALLREDUCE_SUM &&
+            count > 0 && count <= (dtype == CollectiveDataType::FLOAT32 ? kCUDAPeerPushLLEconomicalMaxFP32 : kCUDAPeerPushLLEconomicalMaxFP16))
+        {
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                    return false;
+                }
+                const bool accepted = (dtype == CollectiveDataType::FLOAT32)
+                    ? launchCUDAPeerPushFP32(
+                          rank_ordered_attachment_->storage.at(i)->binding(),
+                          static_cast<const float *>(buffers[i]),
+                          static_cast<float *>(buffers[i]),
+                          nullptr, 1, count, nullptr, nullptr, streams[i])
+                    : launchCUDAPeerPushFP16(
+                          rank_ordered_attachment_->storage.at(i)->binding(),
+                          buffers[i], buffers[i],
+                          nullptr, 1, count, nullptr, nullptr, streams[i]);
+                if (!accepted)
+                {
+                    last_error_ = "CUDA peer-push multi-stream allreduce enqueue failed";
+                    return false;
+                }
+            }
+            return true;
+        }
+
         nccl::ncclResult_t r = nccl::ncclGroupStart();
         if (r != nccl::ncclSuccess)
         {
@@ -1256,6 +1411,58 @@ namespace llaminar2
 
         ScopedCudaDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        if (sidebands.empty() &&
+            rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            (dtype == CollectiveDataType::FLOAT32 || dtype == CollectiveDataType::FLOAT16) &&
+            op == CollectiveOp::ALLREDUCE_SUM &&
+            count > 0 && count <= (dtype == CollectiveDataType::FLOAT32 ? kCUDAPeerPushLLEconomicalMaxFP32 : kCUDAPeerPushLLEconomicalMaxFP16))
+        {
+            const bool use_rows = !live_rows.empty();
+            bool rows_ok = !use_rows || live_rows.size() == static_cast<size_t>(num_devices_);
+            for (int i = 0; rows_ok && use_rows && i < num_devices_; ++i)
+                rows_ok = useNativeRankOrderedPush(true, live_rows[i].rows().capacity(), live_rows[i].elementsPerRow());
+            if (rows_ok)
+            {
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+                    if (err != cudaSuccess)
+                    {
+                        last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                        return false;
+                    }
+                    const bool accepted = (dtype == CollectiveDataType::FLOAT32)
+                        ? launchCUDAPeerPushFP32(
+                              rank_ordered_attachment_->storage.at(i)->binding(),
+                              static_cast<const float *>(buffers[i]),
+                              static_cast<float *>(buffers[i]),
+                              use_rows ? live_rows[i].rows().countOwner() : nullptr,
+                              use_rows ? live_rows[i].rows().capacity() : 1,
+                              use_rows ? live_rows[i].elementsPerRow() : count,
+                              use_rows ? live_rows[i].payloadReceipt() : nullptr,
+                              nullptr,
+                              streams[i])
+                        : launchCUDAPeerPushFP16(
+                              rank_ordered_attachment_->storage.at(i)->binding(),
+                              buffers[i],
+                              buffers[i],
+                              use_rows ? live_rows[i].rows().countOwner() : nullptr,
+                              use_rows ? live_rows[i].rows().capacity() : 1,
+                              use_rows ? live_rows[i].elementsPerRow() : count,
+                              use_rows ? live_rows[i].payloadReceipt() : nullptr,
+                              nullptr,
+                              streams[i]);
+                    if (!accepted)
+                    {
+                        last_error_ = "CUDA peer-push sideband-free multi-stream allreduce enqueue failed";
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
 
         nccl::ncclResult_t r = nccl::ncclGroupStart();
         if (r != nccl::ncclSuccess)
@@ -1702,6 +1909,29 @@ namespace llaminar2
         // 2. Launch allreduce directly on the caller's stream.
         //    No cross-stream event sync needed — the caller's stream provides
         //    ordering (prior compute → allreduce → subsequent compute).
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            (dtype == CollectiveDataType::FLOAT32 || dtype == CollectiveDataType::FLOAT16) &&
+            op == CollectiveOp::ALLREDUCE_SUM &&
+            count > 0 && count <= (dtype == CollectiveDataType::FLOAT32 ? kCUDAPeerPushLLEconomicalMaxFP32 : kCUDAPeerPushLLEconomicalMaxFP16))
+        {
+            const bool accepted = (dtype == CollectiveDataType::FLOAT32)
+                ? launchCUDAPeerPushFP32(
+                      rank_ordered_attachment_->storage.at(device_idx)->binding(),
+                      static_cast<const float *>(buffer),
+                      static_cast<float *>(buffer),
+                      nullptr, 1, count, nullptr, nullptr, caller_stream)
+                : launchCUDAPeerPushFP16(
+                      rank_ordered_attachment_->storage.at(device_idx)->binding(),
+                      buffer, buffer,
+                      nullptr, 1, count, nullptr, nullptr, caller_stream);
+            if (!accepted)
+            {
+                last_error_ = "CUDA peer-push single-device allreduce enqueue failed";
+                return false;
+            }
+            return true;
+        }
         nccl::ncclResult_t r = nccl::ncclAllReduce(
             buffer, buffer, count,
             toNcclDataTypeInt(toDataTypeInt(dtype)), toNcclRedOpInt(toOpInt(op)),
@@ -1834,6 +2064,271 @@ namespace llaminar2
 #endif
     }
 
+    std::vector<RankOrderedNativeResources> NCCLCoordinator::rankOrderedResources() const
+    {
+        return rank_ordered_resources_;
+    }
+
+    bool NCCLCoordinator::supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept
+    {
+#ifdef HAVE_NCCL
+        return initialized_.load() &&
+               rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+               rank_ordered_attachment_ != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::allreduceFP32ViaFP16MultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        const std::vector<void *> &streams,
+        const std::vector<NativeCollectiveRows> &live_rows)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+        if (buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_) ||
+            (!live_rows.empty() && live_rows.size() != static_cast<size_t>(num_devices_)))
+        {
+            last_error_ = "Buffer/stream/rows count does not match device count";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+        if (rank_ordered_state_ != RankOrderedPreparationState::Ready || !rank_ordered_attachment_)
+        {
+            last_error_ = "CUDA peer-push resources not ready for fused FP32-via-FP16 allreduce";
+            return false;
+        }
+        if (count == 0 || count > rankOrderedPushMaxElements)
+        {
+            last_error_ = "CUDA fused FP32-via-FP16 peer-push count out of admitted range";
+            return false;
+        }
+        const bool use_rows = !live_rows.empty();
+        ScopedCudaDeviceRestore restore_caller_device;
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!buffers[i] || !streams[i])
+            {
+                last_error_ = "Null buffer or stream in CUDA fused FP32-via-FP16 allreduce";
+                return false;
+            }
+            cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                return false;
+            }
+            const bool accepted = launchCUDAPeerPushFP32ViaFP16(
+                rank_ordered_attachment_->storage.at(i)->binding(),
+                static_cast<const float *>(buffers[i]),
+                static_cast<float *>(buffers[i]),
+                use_rows ? live_rows[i].rows().countOwner() : nullptr,
+                use_rows ? live_rows[i].rows().capacity() : 1,
+                use_rows ? live_rows[i].elementsPerRow() : count,
+                use_rows ? live_rows[i].payloadReceipt() : nullptr,
+                nullptr,
+                streams[i]);
+            if (!accepted)
+            {
+                last_error_ = "CUDA fused FP32-via-FP16 peer-push enqueue failed";
+                return false;
+            }
+        }
+        return true;
+#else
+        (void)buffers; (void)count; (void)streams; (void)live_rows;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::allreduceFP32ViaFP16SingleDeviceOnStream(
+        void *buffer,
+        size_t count,
+        const NativeCollectiveRows *live_rows,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() ||
+            rank_ordered_state_ != RankOrderedPreparationState::Ready ||
+            !rank_ordered_attachment_ ||
+            device_idx < 0 || device_idx >= num_devices_ ||
+            !buffer || !stream ||
+            count == 0 || count > rankOrderedPushMaxElements)
+        {
+            last_error_ = "CUDA fused FP32-via-FP16 single-device peer-push invalid state or arguments";
+            return false;
+        }
+        const auto binding = bindNativeDevice(device_ordinals_[device_idx],
+            [](int *observed) { return cudaGetDevice(observed); },
+            [](int selected) { return cudaSetDevice(selected); });
+        if (!binding.succeeded())
+        {
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "cudaGetDevice failed: " : "cudaSetDevice failed: ") +
+                cudaGetErrorString(static_cast<cudaError_t>(binding.native_status));
+            return false;
+        }
+        const bool accepted = launchCUDAPeerPushFP32ViaFP16(
+            rank_ordered_attachment_->storage.at(device_idx)->binding(),
+            static_cast<const float *>(buffer),
+            static_cast<float *>(buffer),
+            live_rows ? live_rows->rows().countOwner() : nullptr,
+            live_rows ? live_rows->rows().capacity() : 1,
+            live_rows ? live_rows->elementsPerRow() : count,
+            live_rows ? live_rows->payloadReceipt() : nullptr,
+            nullptr,
+            stream);
+        if (!accepted)
+        {
+            last_error_ = "CUDA fused FP32-via-FP16 single-device peer-push enqueue failed";
+            return false;
+        }
+        return true;
+#else
+        (void)buffer; (void)count; (void)live_rows; (void)device_idx; (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || !memory || rank_ordered_resources_.size() != comms_.size() ||
+            rank_ordered_resources_.empty())
+            throw std::logic_error("NCCL peer-push preparation requires its original cold quote and admitted PMA");
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready)
+        {
+            const auto &owner = rank_ordered_attachment_->memory;
+            if (memory != owner || memory.owner_before(owner) || owner.owner_before(memory))
+                throw std::logic_error("NCCL peer-push cannot borrow storage admitted by another PMA");
+            return true;
+        }
+        if (rank_ordered_state_ != RankOrderedPreparationState::Quoted || rank_ordered_attachment_)
+            throw std::logic_error("Failed/active NCCL peer preparation must retire; it cannot be retried");
+
+        auto attachment = std::make_unique<RankOrderedAttachment>();
+        attachment->memory = memory;
+        for (const auto &resource : rank_ordered_resources_)
+        {
+            attachment->device_reservations.push_back(memory->reserveNewAllocations(
+                resource.device, PhysicalMemoryOwner::LocalCollective, resource.device_bytes));
+            if (resource.hostBytes())
+                attachment->host_reservations.push_back(memory->reserveNewAllocations(
+                    DeviceId::cpu(), PhysicalMemoryOwner::LocalCollective, resource.hostBytes()));
+        }
+
+        auto prepare = std::make_shared<std::packaged_task<void()>>([this]
+        {
+            auto &owned = *rank_ordered_attachment_;
+            const auto layout = PeerPushLayout::create(rankOrderedPushMaxElements, num_devices_,
+                PeerPushLayout::blocksFor(rankOrderedPushMaxElements));
+            std::vector<PeerPushEndpoint> endpoints;
+            endpoints.reserve(comms_.size());
+            for (std::size_t i = 0; i < comms_.size(); ++i)
+            {
+                const auto device = rank_ordered_resources_[i].device;
+                if (cudaSetDevice(device.ordinal) != cudaSuccess)
+                    throw std::runtime_error("NCCL peer push cannot select its original participant");
+                for (const auto peer : device_ordinals_)
+                {
+                    if (peer == device.ordinal) continue;
+                    int can_access = 0;
+                    if (cudaDeviceCanAccessPeer(&can_access, device.ordinal, peer) != cudaSuccess ||
+                        can_access == 0 ||
+                        !nccl_backend_detail::cudaEnablePeerAccessDevice(peer))
+                        throw std::runtime_error("NCCL direct peer push requires every original directed P2P edge");
+                }
+                ncclLlaminarCompletionAuthority original{};
+                if (nccl::nativeCompletionAuthority(static_cast<nccl::ncclComm_t>(comms_[i]), &original) != nccl::ncclSuccess ||
+                    !original.abortFlag)
+                    throw std::runtime_error("NCCL peer push lost the original native abort authority");
+                if (layout.inboxBytes() + layout.flagBytes() + layout.endpointBytes() != rank_ordered_resources_[i].device_bytes)
+                    throw std::logic_error("NCCL peer-push layout changed after admission");
+                auto storage = CUDAPeerPushResources::create(device, owned.device_reservations[i],
+                    layout, static_cast<int>(i), original.abortFlag, streams_[i]);
+                endpoints.push_back(storage->endpoint());
+                owned.storage.push_back(std::move(storage));
+            }
+            for (std::size_t i = 0; i < endpoints.size(); ++i)
+            {
+                if (cudaSetDevice(device_ordinals_[i]) != cudaSuccess)
+                    throw std::runtime_error("NCCL peer push cannot publish on its original participant");
+                owned.storage[i]->publish(endpoints, streams_[i]);
+            }
+        });
+        auto done = prepare->get_future();
+        rank_ordered_attachment_ = std::move(attachment);
+        rank_ordered_state_ = RankOrderedPreparationState::Preparing;
+        try
+        {
+            enqueueWork([prepare] { (*prepare)(); });
+            done.get();
+        }
+        catch (...)
+        {
+            rank_ordered_state_ = RankOrderedPreparationState::Failed;
+            throw;
+        }
+        rank_ordered_state_ = RankOrderedPreparationState::Ready;
+        LOG_INFO("[NCCLCoordinator] CUDA direct P2P peer-push resources prepared and ready for "
+                 << num_devices_ << " GPUs");
+        return true;
+#else
+        (void)memory;
+        return false;
+#endif
+    }
+
+    void NCCLCoordinator::retireRankOrderedAttachmentAfterGraphRelease() noexcept
+    {
+        if (rank_ordered_state_ != RankOrderedPreparationState::Ready)
+            return;
+        rank_ordered_attachment_.reset();
+        rank_ordered_state_ = RankOrderedPreparationState::Quoted;
+    }
+
+    bool NCCLCoordinator::rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+        const NativeCollectiveRows &rows, int participant, void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || rank_ordered_state_ != RankOrderedPreparationState::Ready || !banks ||
+            !nativeCollectiveRowsValid(NativeRowCollective::AllReduce, send, output, rows,
+                CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM, num_devices_, participant, stream))
+            return false;
+        if (cudaSetDevice(device_ordinals_[participant]) != cudaSuccess || cudaGetLastError() != cudaSuccess)
+            return false;
+        const bool accepted = launchCUDAPeerPushFP32(rank_ordered_attachment_->storage.at(participant)->binding(),
+            static_cast<const float *>(send), static_cast<float *>(output), rows.rows().countOwner(),
+            rows.rows().capacity(), rows.elementsPerRow(), rows.payloadReceipt(), nullptr, stream);
+        if (!accepted)
+        {
+            LOG_ERROR("NCCL CUDA direct peer-push enqueue failed participant=" << participant);
+            return false;
+        }
+        const auto enqueue_error = cudaGetLastError();
+        if (enqueue_error != cudaSuccess)
+        {
+            LOG_ERROR("NCCL native rank-ordered runtime enqueue failed participant=" << participant
+                      << " status=" << cudaGetErrorString(enqueue_error));
+            return false;
+        }
+        return true;
+#else
+        (void)send; (void)banks; (void)output; (void)rows; (void)participant; (void)stream;
+        return false;
+#endif
+    }
+
     bool NCCLCoordinator::nativeRowsOnStream(
         NativeRowCollective operation, const void *send, void *receive,
         const NativeCollectiveRows &rows, CollectiveDataType dtype,
@@ -1859,6 +2354,42 @@ namespace llaminar2
         {
             last_error_ = std::string("NCCL live-row producer failed: ") + cudaGetErrorString(producer_error);
             return false;
+        }
+        if (operation == NativeRowCollective::AllReduce &&
+            rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            (dtype == CollectiveDataType::FLOAT32 || dtype == CollectiveDataType::FLOAT16) &&
+            reduction == CollectiveOp::ALLREDUCE_SUM &&
+            useNativeRankOrderedPush(true, rows.rows().capacity(), rows.elementsPerRow()) &&
+            rows.bankElements() <= (dtype == CollectiveDataType::FLOAT32 ? kCUDAPeerPushLLEconomicalMaxFP32 : kCUDAPeerPushLLEconomicalMaxFP16))
+        {
+            const bool accepted = (dtype == CollectiveDataType::FLOAT32)
+                ? launchCUDAPeerPushFP32(
+                      rank_ordered_attachment_->storage.at(participant)->binding(),
+                      static_cast<const float *>(send),
+                      static_cast<float *>(receive),
+                      rows.rows().countOwner(),
+                      rows.rows().capacity(),
+                      rows.elementsPerRow(),
+                      payload_bytes,
+                      nullptr,
+                      stream)
+                : launchCUDAPeerPushFP16(
+                      rank_ordered_attachment_->storage.at(participant)->binding(),
+                      send,
+                      receive,
+                      rows.rows().countOwner(),
+                      rows.rows().capacity(),
+                      rows.elementsPerRow(),
+                      payload_bytes,
+                      nullptr,
+                      stream);
+            if (!accepted)
+            {
+                last_error_ = "CUDA peer-push native-rows allreduce enqueue failed";
+                return false;
+            }
+            return true;
         }
         const auto native_op = operation == NativeRowCollective::AllGather ? nccl::ncclSum :
             toNcclRedOpInt(toOpInt(reduction));

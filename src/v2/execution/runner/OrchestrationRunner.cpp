@@ -1753,11 +1753,21 @@ namespace llaminar2
         }
 
         // Create LOCAL TP context using factory function
+        const bool all_cuda_local_tp =
+            plan_.local_tp_devices.size() >= 2 &&
+            std::all_of(plan_.local_tp_devices.begin(), plan_.local_tp_devices.end(),
+                        [](const GlobalDeviceAddress &addr)
+                        { return addr.toLocalDeviceId().is_cuda(); }) &&
+            (plan_.local_tp_backend == CollectiveBackendType::NCCL ||
+             plan_.local_tp_backend == CollectiveBackendType::AUTO);
+        const bool admit_measured_peer_push =
+            (config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesGFX906MI50Kernels()) ||
+            all_cuda_local_tp;
         local_tp_ctx_ = createLocalTPContext(
             plan_.local_tp_devices,
             plan_.local_tp_weights,
             plan_.local_tp_backend,
-            config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesGFX906MI50Kernels()
+            admit_measured_peer_push
                 ? RankOrderedQuotePolicy::MeasuredDomain : RankOrderedQuotePolicy::ExplicitOnly);
         if (!local_tp_ctx_)
         {

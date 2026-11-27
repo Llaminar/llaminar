@@ -54,6 +54,25 @@ namespace llaminar2
     }
 
     /**
+     * @brief Resolve process/owner policy for CUDA direct P2P peer-push collectives.
+     * @param owner Native transport ownership of the actual model's LocalTP context.
+     * @return Frozen request: Automatic when MeasuredDomain, Disabled when ExplicitOnly,
+     *         overridable via LLAMINAR_CUDA_PEER_PUSH=0|1.
+     */
+    inline RankOrderedPeerPushRequest cudaPeerPushRequest(RankOrderedQuotePolicy owner)
+    {
+        static const auto request = [] {
+            const auto *value = DebugEnv::envValue("LLAMINAR_CUDA_PEER_PUSH");
+            if (!value) return RankOrderedPeerPushRequest::Automatic;
+            if (DebugEnv::isTruthyEnvValue(value)) return RankOrderedPeerPushRequest::Required;
+            if (DebugEnv::isFalseyEnvValue(value)) return RankOrderedPeerPushRequest::Disabled;
+            throw std::invalid_argument("LLAMINAR_CUDA_PEER_PUSH requires a boolean value");
+        }();
+        return request == RankOrderedPeerPushRequest::Automatic && owner == RankOrderedQuotePolicy::ExplicitOnly
+            ? RankOrderedPeerPushRequest::Disabled : request;
+    }
+
+    /**
      * @brief Select the measured rank-local transport before quoting any device storage.
      * @param request Frozen startup override.
      * @param coverage Directed peer data for exactly these participants.
