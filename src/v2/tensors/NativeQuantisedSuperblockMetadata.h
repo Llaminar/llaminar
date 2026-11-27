@@ -341,7 +341,8 @@ namespace llaminar2::native_quantised_superblock
             else if constexpr (Codebook == 16)
             {
                 // code bits 0..2: scale selector; bit 3: delta sign (qh bit 15).
-                const float dl = d * (2.0f * static_cast<float>(code & 7u) + 1.0f);
+                // The odd multiplier is exact in integers; no floating add may contract.
+                const float dl = d * static_cast<float>(2u * (code & 7u) + 1u);
                 const float delta = (code & 8u) ? -0.125f : 0.125f;
                 out.primary = preparedHalfBits(dl);
                 out.secondary = preparedHalfBits(dl * delta);
@@ -349,8 +350,9 @@ namespace llaminar2::native_quantised_superblock
             else if constexpr (Codebook == 17)
             {
                 // code bits 0..2: low 3-bit scale; bits 3..5: high 3-bit scale.
-                out.primary = preparedHalfBits(d * (2.0f * static_cast<float>(code & 7u) + 1.0f));
-                out.secondary = preparedHalfBits(d * (2.0f * static_cast<float>((code >> 3) & 7u) + 1.0f));
+                // Preserve the exact odd multipliers without compiler-dependent FMA formation.
+                out.primary = preparedHalfBits(d * static_cast<float>(2u * (code & 7u) + 1u));
+                out.secondary = preparedHalfBits(d * static_cast<float>(2u * ((code >> 3) & 7u) + 1u));
             }
             else if constexpr (Codebook == 9)
             {

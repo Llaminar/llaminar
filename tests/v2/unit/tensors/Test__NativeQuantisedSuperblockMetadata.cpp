@@ -153,6 +153,8 @@ namespace llaminar2::native_quantised_superblock::test
             {
                 const std::uint16_t qh = static_cast<std::uint16_t>(qh_high << 12);
                 const float dl = df * (2.0f * static_cast<float>((qh >> 12) & 7) + 1.0f);
+                // Keep the floating-expression oracle independent of production's integer multiplier.
+                ASSERT_EQ(cph(dl), cph(df * static_cast<float>(2u * (qh_high & 7u) + 1u)));
                 const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
                 const auto m = decodeSuperblockMetadata<16>(qh_high, packSuperblockWord(d));
                 ASSERT_EQ(m.primary, cph(dl)) << d << ' ' << qh_high;
@@ -168,6 +170,11 @@ namespace llaminar2::native_quantised_superblock::test
             const float df = refWiden(d);
             for (std::uint32_t code = 0; code < 64; ++code)
             {
+                // Exhaust all scale bits and codes against the original floating expression.
+                ASSERT_EQ(cph(df * (2.0f * static_cast<float>(code & 7u) + 1.0f)),
+                    cph(df * static_cast<float>(2u * (code & 7u) + 1u)));
+                ASSERT_EQ(cph(df * (2.0f * static_cast<float>(code >> 3) + 1.0f)),
+                    cph(df * static_cast<float>(2u * (code >> 3) + 1u)));
                 const auto m = decodeSuperblockMetadata<17>(code, packSuperblockWord(d));
                 ASSERT_EQ(m.primary, cph(df * (2.0f * static_cast<float>(code & 7) + 1.0f))) << d << ' ' << code;
                 ASSERT_EQ(m.secondary, cph(df * (2.0f * static_cast<float>(code >> 3) + 1.0f))) << d << ' ' << code;
