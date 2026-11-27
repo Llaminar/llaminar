@@ -25,15 +25,22 @@
 #include <utility>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 
 namespace llaminar2::cpu::native_quantised
 {
 #if defined(__GNUC__) && !defined(__clang__)
 #define LLAMINAR_NEON_PROJECTION_EXACT __attribute__((optimize("fp-contract=off", "no-associative-math")))
 #define LLAMINAR_NEON_PROJECTION_CODED __attribute__((optimize("fp-contract=off", "no-associative-math", "no-thread-jumps")))
+#define LLAMINAR_NEON_PROJECTION_EXACT_UNSCHEDULED \
+    __attribute__((optimize("fp-contract=off", "no-associative-math", "no-schedule-insns")))
+#define LLAMINAR_NEON_PROJECTION_CODED_UNSCHEDULED \
+    __attribute__((optimize("fp-contract=off", "no-associative-math", "no-thread-jumps", "no-schedule-insns")))
 #else
 #define LLAMINAR_NEON_PROJECTION_EXACT
 #define LLAMINAR_NEON_PROJECTION_CODED
+#define LLAMINAR_NEON_PROJECTION_EXACT_UNSCHEDULED
+#define LLAMINAR_NEON_PROJECTION_CODED_UNSCHEDULED
 #endif
 
     class CPUNativeNEONProjectionBatch;
@@ -1409,6 +1416,51 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
+         * @brief Tile programs compiled without GCC's pre-allocation instruction scheduler.
+         * @details Keys are the tile witness's program keys,
+         * rows:family:policy:encoding:map:minimum (family 0 ASIMD, 1 SDOT, 2 SMMLA;
+         * policy 1 the ordered expert tree; a coded program's map is its codebook).
+         * The first scheduling pass hoists every load of a K block ahead of its
+         * decode, which in these programs keeps more vectors live than the register
+         * file holds and spills accumulators or partition totals around the K walk.
+         * Without it the instructions keep source order, with the same operations,
+         * operands and rounding: scheduling never changes arithmetic. Each entry was
+         * measured per program with the GCC 14 tile register and stack-traffic witness.
+         */
+        static constexpr std::string_view kUnscheduledPrograms[] = {
+            "1:0:1:3:11:0", "1:1:0:1:0:0", "1:1:0:2:0:0", "1:1:1:2:0:0", "1:1:1:3:11:0", "2:0:1:3:11:0",
+            "2:1:0:2:0:0", "2:1:1:3:11:0", "2:2:0:3:11:0", "2:2:0:4:2:0", "2:2:1:3:11:0", "2:2:1:4:2:0",
+            "2:2:1:7:0:0", "2:2:1:7:1:1", "3:0:0:2:0:0", "3:0:0:3:11:0", "3:0:1:3:7:1", "3:0:1:3:11:0",
+            "3:1:0:2:0:0", "3:1:0:3:11:0", "3:1:1:3:7:1", "3:1:1:3:11:0", "3:2:0:2:0:0", "3:2:0:3:11:0",
+            "3:2:0:4:2:0", "3:2:1:2:0:0", "3:2:1:3:11:0", "3:2:1:4:2:0", "3:2:1:6:1:1", "4:0:0:2:0:0",
+            "4:0:0:3:11:0", "4:0:0:6:1:1", "4:0:1:3:7:1", "4:0:1:3:11:0", "4:1:0:3:11:0", "4:1:0:4:2:0",
+            "4:1:0:7:0:0", "4:1:0:7:1:1", "4:1:1:3:7:1", "4:1:1:3:11:0", "4:1:1:6:1:1", "4:1:1:7:1:1",
+            "4:2:0:3:11:0", "4:2:0:4:2:0", "4:2:1:3:11:0", "4:2:1:4:2:0", "4:2:1:6:1:1",
+        };
+
+        /** @brief Whether the program of these tile arguments is listed in kUnscheduledPrograms. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical, int Map, bool WithMinimum>
+        static consteval bool unscheduledProgram() noexcept
+        {
+            const int fields[] = {static_cast<int>(Rows), static_cast<int>(Ops::instruction), static_cast<int>(Policy),
+                                  static_cast<int>(Physical), Map, WithMinimum ? 1 : 0};
+            for (const std::string_view key : kUnscheduledPrograms)
+            {
+                std::size_t at = 0;
+                bool same = true;
+                for (const int field : fields)
+                {
+                    int value = 0;
+                    while (at < key.size() && key[at] != ':') value = value * 10 + (key[at++] - '0');
+                    ++at;
+                    same = same && value == field;
+                }
+                if (same) return true;
+            }
+            return false;
+        }
+
+        /**
          * @brief Execute the source's exact block program with a fixed serial/grouped K tree.
          * @tparam Ops Admitted integer instruction implementation.
          * @tparam Policy Backend-native FMA or separately rounded expert program.
@@ -1418,14 +1470,34 @@ namespace llaminar2::cpu::native_quantised
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
                   NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
+            requires(!unscheduledProgram<Ops, Policy, Physical, static_cast<int>(Map), WithMinimum>())
         LLAMINAR_NEON_PROJECTION_EXACT void run() const noexcept
+        {
+            executeBlockProgram<Ops, Policy, Physical, Map, WithMinimum, Strips, 0>();
+        }
+
+        /** @brief run() of a program listed in kUnscheduledPrograms: the same body without pre-allocation scheduling. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
+                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
+            requires(unscheduledProgram<Ops, Policy, Physical, static_cast<int>(Map), WithMinimum>())
+        LLAMINAR_NEON_PROJECTION_EXACT_UNSCHEDULED void run() const noexcept
         {
             executeBlockProgram<Ops, Policy, Physical, Map, WithMinimum, Strips, 0>();
         }
 
         /** @brief Execute a coded tile with the same FP32 tree and a source-specific decoder. */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, int Codebook, int Strips>
+            requires(!unscheduledProgram<Ops, Policy, Encoding::CompactMultiScale, Codebook, Codebook == 7>())
         LLAMINAR_NEON_PROJECTION_CODED void runCoded() const noexcept
+        {
+            constexpr bool minimum = Codebook == 7;
+            executeBlockProgram<Ops, Policy, Encoding::CompactMultiScale, NibbleMap::Centered, minimum, Strips, Codebook>();
+        }
+
+        /** @brief runCoded() of a program listed in kUnscheduledPrograms, without pre-allocation scheduling. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, int Codebook, int Strips>
+            requires(unscheduledProgram<Ops, Policy, Encoding::CompactMultiScale, Codebook, Codebook == 7>())
+        LLAMINAR_NEON_PROJECTION_CODED_UNSCHEDULED void runCoded() const noexcept
         {
             constexpr bool minimum = Codebook == 7;
             executeBlockProgram<Ops, Policy, Encoding::CompactMultiScale, NibbleMap::Centered, minimum, Strips, Codebook>();
