@@ -85,10 +85,11 @@ namespace llaminar2::test
         /** @brief Zero-initialized device bytes released at scope exit. */
         struct DeviceBytes
         {
-            explicit DeviceBytes(std::size_t bytes) : size(bytes ? bytes : 1)
+            explicit DeviceBytes(hipStream_t producer, std::size_t bytes) : stream(producer), size(bytes ? bytes : 1)
             {
+                if (!stream) throw std::invalid_argument("Device bytes require an exact producer stream");
                 checked(hipMalloc(&data, size));
-                checked(hipMemset(data, 0, size));
+                checked(hipMemsetAsync(data, 0, size, stream));
             }
             ~DeviceBytes() { (void)hipFree(data); }
             DeviceBytes(const DeviceBytes &) = delete;
@@ -97,9 +98,11 @@ namespace llaminar2::test
             template <class T> std::vector<T> download() const
             {
                 std::vector<T> out(size / sizeof(T));
-                checked(hipMemcpy(out.data(), data, out.size() * sizeof(T), hipMemcpyDeviceToHost));
+                checked(hipMemcpyAsync(out.data(), data, out.size() * sizeof(T), hipMemcpyDeviceToHost, stream));
+                checked(hipStreamSynchronize(stream));
                 return out;
             }
+            hipStream_t stream; ///< Exact initialization and readback ordering authority.
             void *data = nullptr;
             std::size_t size;
         };
@@ -184,12 +187,12 @@ namespace llaminar2::test
             const std::size_t block_count = static_cast<std::size_t>(N) * blocks;
             const int payload_bytes = repackPayloadBytesPerBlock(*format);
 
-            DeviceBytes raw(tensor->size_bytes());
-            checked(hipMemcpy(raw.data, tensor->raw_data(), tensor->size_bytes(), hipMemcpyHostToDevice));
-            DeviceBytes legacy_payload(block_count * payload_bytes), coded_payload(block_count * payload_bytes);
-            DeviceBytes legacy_scales(block_count * 2), legacy_mins(block_count * 2), legacy_emins(block_count * 4);
+            DeviceBytes raw(stream_, tensor->size_bytes());
+            checked(hipMemcpyAsync(raw.data, tensor->raw_data(), tensor->size_bytes(), hipMemcpyHostToDevice, stream_));
+            DeviceBytes legacy_payload(stream_, block_count * payload_bytes), coded_payload(stream_, block_count * payload_bytes);
+            DeviceBytes legacy_scales(stream_, block_count * 2), legacy_mins(stream_, block_count * 2), legacy_emins(stream_, block_count * 4);
             const auto planes = sb::planeBytes(codebook, N, static_cast<std::uint32_t>(blocks), phase);
-            DeviceBytes codes(planes.code), superblocks(planes.superblock);
+            DeviceBytes codes(stream_, planes.code), superblocks(stream_, planes.superblock);
 
             const auto layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded,
                                                               phase);
@@ -298,18 +301,18 @@ namespace llaminar2::test
                     for (int i = 0; i < 32; ++i)
                         block_sums[static_cast<std::size_t>(r) * blocks + b] +=
                             activation[static_cast<std::size_t>(r) * K + b * 32 + i];
-            DeviceBytes a(activation.size()), sa(block_scales.size() * 4), sums(block_sums.size() * 4),
-                sr(row_scales.size() * 4);
-            checked(hipMemcpy(a.data, activation.data(), activation.size(), hipMemcpyHostToDevice));
-            checked(hipMemcpy(sa.data, block_scales.data(), sa.size, hipMemcpyHostToDevice));
-            checked(hipMemcpy(sums.data, block_sums.data(), sums.size, hipMemcpyHostToDevice));
-            checked(hipMemcpy(sr.data, row_scales.data(), sr.size, hipMemcpyHostToDevice));
+            DeviceBytes a(stream_, activation.size()), sa(stream_, block_scales.size() * 4), sums(stream_, block_sums.size() * 4),
+                sr(stream_, row_scales.size() * 4);
+            checked(hipMemcpyAsync(a.data, activation.data(), activation.size(), hipMemcpyHostToDevice, stream_));
+            checked(hipMemcpyAsync(sa.data, block_scales.data(), sa.size, hipMemcpyHostToDevice, stream_));
+            checked(hipMemcpyAsync(sums.data, block_sums.data(), sums.size, hipMemcpyHostToDevice, stream_));
+            checked(hipMemcpyAsync(sr.data, row_scales.data(), sr.size, hipMemcpyHostToDevice, stream_));
             // IQ4_XS's physical 24 executes IQ4_NL's certified arithmetic policy.
             const std::uint8_t policy = codebook == 24 ? std::uint8_t{4} : codebook;
-            DeviceBytes partials(static_cast<std::size_t>(128) * max_rows * N * sizeof(float));
+            DeviceBytes partials(stream_, static_cast<std::size_t>(128) * max_rows * N * sizeof(float));
             const auto run = [&](const MetadataPlanes &meta, int rows) {
                 const auto *weights = meta.coded() ? coded_payload.as<uint8_t>() : legacy_payload.as<uint8_t>();
-                DeviceBytes out(static_cast<std::size_t>(rows) * N * sizeof(float));
+                DeviceBytes out(stream_, static_cast<std::size_t>(rows) * N * sizeof(float));
                 // Production executes NativeQuantised projections inside captured
                 // graphs; record and replay exactly that path.
                 checked(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal));

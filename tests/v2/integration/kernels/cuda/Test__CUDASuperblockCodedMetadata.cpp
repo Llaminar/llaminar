@@ -82,10 +82,11 @@ namespace llaminar2::test
         /** @brief Zero-initialized device bytes released at scope exit. */
         struct DeviceBytes
         {
-            explicit DeviceBytes(std::size_t bytes) : size(bytes ? bytes : 1)
+            explicit DeviceBytes(cudaStream_t producer, std::size_t bytes) : stream(producer), size(bytes ? bytes : 1)
             {
+                if (!stream) throw std::invalid_argument("Device bytes require an exact producer stream");
                 checked(cudaMalloc(&data, size));
-                checked(cudaMemset(data, 0, size));
+                checked(cudaMemsetAsync(data, 0, size, stream));
             }
             ~DeviceBytes() { (void)cudaFree(data); }
             DeviceBytes(const DeviceBytes &) = delete;
@@ -94,9 +95,11 @@ namespace llaminar2::test
             template <class T> std::vector<T> download() const
             {
                 std::vector<T> out(size / sizeof(T));
-                checked(cudaMemcpy(out.data(), data, out.size() * sizeof(T), cudaMemcpyDeviceToHost));
+                checked(cudaMemcpyAsync(out.data(), data, out.size() * sizeof(T), cudaMemcpyDeviceToHost, stream));
+                checked(cudaStreamSynchronize(stream));
                 return out;
             }
+            cudaStream_t stream; ///< Exact initialization and readback ordering authority.
             void *data = nullptr;
             std::size_t size;
         };
@@ -178,12 +181,12 @@ namespace llaminar2::test
             const std::size_t block_count = static_cast<std::size_t>(N) * blocks;
             const int payload_bytes = repackPayloadBytesPerBlock(*format);
 
-            DeviceBytes raw(tensor->size_bytes());
-            checked(cudaMemcpy(raw.data, tensor->raw_data(), tensor->size_bytes(), cudaMemcpyHostToDevice));
-            DeviceBytes legacy_payload(block_count * payload_bytes), coded_payload(block_count * payload_bytes);
-            DeviceBytes legacy_scales(block_count * 2), legacy_mins(block_count * 2), legacy_emins(block_count * 4);
+            DeviceBytes raw(stream_, tensor->size_bytes());
+            checked(cudaMemcpyAsync(raw.data, tensor->raw_data(), tensor->size_bytes(), cudaMemcpyHostToDevice, stream_));
+            DeviceBytes legacy_payload(stream_, block_count * payload_bytes), coded_payload(stream_, block_count * payload_bytes);
+            DeviceBytes legacy_scales(stream_, block_count * 2), legacy_mins(stream_, block_count * 2), legacy_emins(stream_, block_count * 4);
             const auto planes = sb::planeBytes(codebook, N, static_cast<std::uint32_t>(blocks), phase);
-            DeviceBytes codes(planes.code), superblocks(planes.superblock);
+            DeviceBytes codes(stream_, planes.code), superblocks(stream_, planes.superblock);
 
             const auto layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded,
                                                               phase);
@@ -281,14 +284,14 @@ namespace llaminar2::test
                     for (int i = 0; i < 32; ++i)
                         activation_sums[static_cast<std::size_t>(b) * max_rows + r] +=
                             activation[static_cast<std::size_t>(r) * K + b * 32 + i];
-            DeviceBytes a(activation.size()), sa(activation_scales.size() * 4), sums(activation_sums.size() * 4);
-            checked(cudaMemcpy(a.data, activation.data(), activation.size(), cudaMemcpyHostToDevice));
-            checked(cudaMemcpy(sa.data, activation_scales.data(), sa.size, cudaMemcpyHostToDevice));
-            checked(cudaMemcpy(sums.data, activation_sums.data(), sums.size, cudaMemcpyHostToDevice));
+            DeviceBytes a(stream_, activation.size()), sa(stream_, activation_scales.size() * 4), sums(stream_, activation_sums.size() * 4);
+            checked(cudaMemcpyAsync(a.data, activation.data(), activation.size(), cudaMemcpyHostToDevice, stream_));
+            checked(cudaMemcpyAsync(sa.data, activation_scales.data(), sa.size, cudaMemcpyHostToDevice, stream_));
+            checked(cudaMemcpyAsync(sums.data, activation_sums.data(), sums.size, cudaMemcpyHostToDevice, stream_));
 
             auto *gemv = cudaGemvContext_create(0);
             ASSERT_NE(gemv, nullptr);
-            DeviceBytes partials(static_cast<std::size_t>(64) * max_rows * N * sizeof(float));
+            DeviceBytes partials(stream_, static_cast<std::size_t>(64) * max_rows * N * sizeof(float));
             cudaGemvContext_bindWorkspace(gemv, partials.as<float>(), partials.size);
             auto *prefill = cudaPrefillContext_create(0);
             ASSERT_NE(prefill, nullptr);
@@ -298,7 +301,7 @@ namespace llaminar2::test
             const std::uint8_t policy = codebook == 24 ? std::uint8_t{4} : codebook;
             ASSERT_TRUE(cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(codebook, policy, max_rows, N, K, 0,
                                                                               &prefill_bytes, &prefill_partitions));
-            DeviceBytes prefill_partials(prefill_bytes);
+            DeviceBytes prefill_partials(stream_, prefill_bytes);
             cudaPrefillContext_bindWorkspace(prefill, prefill_partials.as<float>(), prefill_bytes);
 
             // A forced staging/tile combination the dispatcher does not admit
@@ -307,7 +310,7 @@ namespace llaminar2::test
             bool require_admission = true, admitted = true;
             const auto run = [&](const NativeQuantisedMetadataPlanes &meta, int rows) {
                 const auto *weights = meta.coded() ? coded_payload.as<uint8_t>() : legacy_payload.as<uint8_t>();
-                DeviceBytes out(static_cast<std::size_t>(rows) * N * sizeof(float));
+                DeviceBytes out(stream_, static_cast<std::size_t>(rows) * N * sizeof(float));
                 bool ok = false;
                 // Production executes every NativeQuantised projection inside a
                 // captured graph, whose dispatch policy differs from eager
