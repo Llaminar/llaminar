@@ -170,14 +170,15 @@ class StaticSelectionNativeTest(unittest.TestCase):
         subprocess.run(args, check=True)
         obj = (root / "f.o").read_bytes()
         objdump = subprocess.check_output([compiler, "-print-prog-name=objdump"], text=True).strip()
-        listing = subprocess.check_output([objdump, "-dr", str(root / "f.o")], text=True)
+        listing, _, _ = C.disassemble(objdump, root / "f.o")
         (root / "f.disassembly").write_text(listing)
         image = C.read_object(obj)
         unit = C.make_unit("winner", image, C.normalize_disassembly(listing, image))
         target = "_Z6chosenILi7EEiv"
         self.assertEqual(unit.functions[target], "weak")
         # Original direct vocabulary rejects this actual default-visible winner.
-        self.assertIsNotNone(C.CallModel.select(unit, unit, target, dict(binding="direct")))
+        self.assertEqual(C.CallModel.select(unit, unit, target, dict(binding="direct")),
+                         "direct binding without a non-preemptibility proof")
         authority = C.verify_static_executable_selection(args, root, root / "app", root / "valid", unit, obj, obj, target)
         model = C.CallModel({"winner": unit}, {target: authority})
         self.assertEqual(model.resolve(unit, target), ("helper", unit, target))
@@ -217,8 +218,23 @@ class StaticSelectionNativeTest(unittest.TestCase):
                 change(data)
                 (root / "app").write_bytes(data)
             return edit
-        inject("ordinary-dso", elf_edit(lambda d: d.__setitem__(slice(16,18), (1).to_bytes(2,"little"))),
-               "ET_EXEC or PIE")
+        def clear_pie(d):
+            headers, _ = C._static_elf(d)
+            self.assertEqual(int.from_bytes(d[16:18], "little"), 3)
+            for h in headers:
+                if h["type"] == 6:
+                    for b in range(h["offset"], h["offset"]+h["size"], 16):
+                        if int.from_bytes(d[b:b+8], "little") == 0x6ffffffb:
+                            flags = int.from_bytes(d[b+8:b+16], "little") & ~0x8000000
+                            d[b+8:b+16] = flags.to_bytes(8, "little")
+        def clear_interpreter(d):
+            offset = int.from_bytes(d[32:40], "little")
+            for i in range(int.from_bytes(d[56:58], "little")):
+                b = offset + i * 56
+                if int.from_bytes(d[b:b+4], "little") == 3:
+                    d[b:b+4] = bytes(4)
+        inject("ordinary-dso", elf_edit(clear_pie), "ET_EXEC or PIE")
+        inject("missing-interpreter", elf_edit(clear_interpreter), "ET_EXEC or PIE")
         inject("stale-elf", elf_edit(lambda d: d.__setitem__(-1, d[-1] ^ 1)), "artifact changed")
         # Identity controls use the actual selected object, not synthetic booleans.
         with self.assertRaisesRegex(ValueError, "audited Unit/B1"):
