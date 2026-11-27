@@ -1,7 +1,7 @@
 # ARM physical row-program routing — implementation checkpoint
 
-UNQUALIFIED: source checkpoints precede tests by owner instruction. Byte and
-stack acceptance require the final frozen source, not a prior passing build.
+CHECKED: all 24 routes pass the final frozen-source numerical and six canonical
+probe-TU gates below. This is not a production core/P2 economy certificate.
 No speed claim is made; payload rereads and slower-than-develop execution are
 accepted for this repair. Partition-carry/shared-decode optimization remains a
 separate follow-up, not discarded or implemented here. Retain economy16 and
@@ -46,8 +46,8 @@ Cross-ISA BackendNative arithmetic requires comparison against the retired
 SDOT program, including NaN/Inf/zero inputs; do not infer it from expert-policy
 correctness. Every unlisted key retains its original physical program. Source
 keys are rejected as targets (no routing chains). Expected retired source
-counts: NEON 5, DOTPROD 20, I8MM 24. Final replacement bytes and stack traffic
-must be measured anew after the five additional K1/K17 routes.
+counts: NEON 5, DOTPROD 20, I8MM 24. Final replacement bytes and canonical
+probe-TU stack traffic were remeasured after all five K1/K17 routes.
 
 ## Proof inventory and numerical contracts
 
@@ -92,3 +92,38 @@ native receipts live under `runs/rowpairs74`; final scope is six canonical probe
 TU gates (three envelopes, Release and Integration) and prepared numerics.
 Production core/P2 economy qualification remains separately deferred by owner;
 canonical probe success must not be described as a core/P2 stack certificate.
+
+## Final checked scope — 24 routes
+
+Frozen implementation: local `0167e8b283677948bbe8bf55ae08ee6b0162540d`,
+integrated by parent at `1c77fd693` (including the subsequent documentation).
+The current checker is `740635537a38cfcab8c73fcb0708f98b0efd47626dfac161ba28689334c63a31`.
+
+- I8MM Integration prepared-projection build passed; all five selected preflight
+  CTests passed in 2.18 s: full PreparedProjection, row-decomposition bytes,
+  compiled inventory contract, compact ordered numerical policy, and tail
+  padding. These execute ASIMD, SDOT and I8MM production dispatch, both policies,
+  and the original-versus-routed exceptional-value comparisons.
+- All six canonical probe builds passed sealed admission, strict stack and
+  fused stages: NEON, DOTPROD and I8MM, each in Integration and Release.
+  Each admission has zero failures; each stack receipt has `failing: []`.
+- Actual live tile-program counts are 91, 172 and 240 respectively in both
+  configurations. The exact-set audit proves the 5/20/24 retired source
+  programs absent and the actual replacement union present.
+- Complete stack comparison `results` dictionaries are identical between
+  Release and Integration for every envelope. No live ceiling/count increased.
+- Registered `V2_Integration_CPUNativeNEONTileRegisters` CTest verification passed
+  on all six builds (6.56–17.28 s), authenticating the final receipts.
+
+Native evidence is retained under
+`factory@192.168.178.80:~/pr73-arm-stack-q5/runs/rowpairs24/`, including
+`source.sha256`, build/test logs, all six gate records and verification logs.
+Original-baseline regeneration is retained locally under
+`/tmp/pr73-fs-regen/out/rowpairs-baseline/`: two byte-identical complete
+regenerations using the original 63b053401 source and exact pinned image
+`sha256:f5278e5275deeb87b375803825072df2c20cc85c31c469ec40a2c2ceeb531603`.
+Only the checker hash and three record hashes changed in the committed table;
+all 414 baseline keys/counts/roles/geometries remained identical.
+
+Core/P2 economy, timing and later shared-decode optimization remain explicitly
+outside this checked scope. No retained economy16 artifacts were modified.
