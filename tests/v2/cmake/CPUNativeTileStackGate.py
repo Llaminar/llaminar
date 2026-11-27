@@ -56,9 +56,12 @@ def digest(data: bytes) -> str:
 
 def dispatch_text(source: str) -> str:
     """The text of the tile's dispatch() (signature through its closing brace): the transcribed rules' authority."""
-    if source.count(DISPATCH_SIGNATURE) != 1:
+    signatures = (DISPATCH_SIGNATURE, DISPATCH_SIGNATURE.replace(
+        "> void dispatch", "> [[gnu::always_inline]] inline void dispatch"))
+    found = [signature for signature in signatures if signature in source]
+    if len(found) != 1 or source.count(found[0]) != 1:
         raise ValueError("the tile source has no unique dispatch()")
-    start = source.index(DISPATCH_SIGNATURE)
+    start = source.index(found[0])
     position = source.index("{", start)
     depth, position = 1, position + 1
     while depth:

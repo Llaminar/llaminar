@@ -367,7 +367,7 @@ namespace llaminar2::cpu::native_quantised
          * @tparam Policy Immutable complete projection arithmetic identity.
          * @pre requireExecutable() admitted the publication.
          */
-        template <typename Ops, CPUProjectionNumericalPolicy Policy, int Strips = 0> void dispatch() const noexcept
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, int Strips = 0> [[gnu::always_inline]] inline void dispatch() const noexcept
         {
             switch (weights_.encoding)
             {
