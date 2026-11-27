@@ -674,9 +674,31 @@ class ObservedFormsTest(unittest.TestCase):
         moved = self.run_body("\tadd\tx9, sp, #16\n\tsubs\tx10, x9, x3\n\tstr\tq0, [x10]\n\tret\n")
         self.assertEqual((moved.spills, moved.errors), (1, []))  # subs of a stack address: unknown-offset stack
 
+    def test_unscaled_binary16_load_has_the_semantics_of_ldr_h(self) -> None:
+        # ldur h is the unscaled-offset spelling of ldr h: same 2-byte footprint, stack class by base provenance.
+        for spelling in ("ldr", "ldur"):
+            instruction = CHECKER.Instruction(f"{spelling}\th30, [x4, #-32]", CHECKER.GENERIC)
+            with self.subTest(spelling=spelling):
+                self.assertTrue(instruction.admitted())
+                self.assertEqual(CHECKER.footprint(instruction, "h30"), 2)
+        frame, exit_ = "\tstp\tx29, x30, [sp, #-48]!\n\tmov\tx29, sp\n", "\tldp\tx29, x30, [sp], #48\n\tret\n"
+        for base in ("[x29, #-2]", "[sp, #18]"):
+            with self.subTest(base=base):
+                # A stack reload of a binary16 value is FP/SIMD stack traffic, counted like ldr h.
+                ldur = self.run_body(frame + f"\tstr\th0, [sp, #18]\n\tldur\th1, {base}\n" + exit_)
+                ldr = self.run_body(frame + "\tstr\th0, [sp, #18]\n\tldr\th1, [sp, #18]\n" + exit_)
+                self.assertEqual((ldur.spills, ldur.errors), (2, []))
+                self.assertEqual((ldur.spills, ldur.errors), (ldr.spills, ldr.errors))
+                counts, _, errors = traffic(frame + f"\tldur\th1, {base}\n" + exit_)
+                self.assertEqual((errors, {k: v for k, v in counts.items() if v}), ([], {"fp": {"0": 1}}))
+        # A heap (descriptor) load is no stack traffic, and the h write clobbers a callee-saved v8-v15 low half.
+        heap = self.run_body("\tldur\th1, [x0, #-2]\n\tret\n")
+        self.assertEqual((heap.spills, heap.errors), (0, []))
+        self.fatal("\tldur\th8, [x0, #-2]\n\tret\n", "clobbers callee-saved v8 before saving it")
+
     def test_neighbouring_unobserved_forms_stay_outside_the_grammar(self) -> None:
         for form in ("smov\tx9, v1.h[2]", "fadd\th0, h1, h2", "stp\th0, h1, [sp]", "ccmp\tx1, #0, #4, ne",
-                     "subs\tw1, w2, w3, lsl #2", "ushr\ts0, s1, #3"):
+                     "subs\tw1, w2, w3, lsl #2", "ushr\ts0, s1, #3", "stur\th0, [x29, #-2]", "ldur\tb0, [x29, #-1]"):
             with self.subTest(form=form):
                 self.fatal(f"\t{form}\n\tret\n", "admitted grammar")
 

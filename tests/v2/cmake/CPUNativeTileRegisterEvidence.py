@@ -360,7 +360,12 @@ usra v,v,imm|uxtw x,w|xtn v,v|zip1 v,v,v|zip2 v,v,v
     "|smov w,v[]"
     #   scalar FP pair store (footprint 2 x 4 bytes; through a stack address it is FP/SIMD spill traffic, never an
     #   ABI save - ABI_REGISTER admits only whole d/q views):
-    "|stp s,s,mem".split("|"))
+    "|stp s,s,mem"
+    #   scalar binary16 load with an unscaled (negative) offset, the LDUR spelling of `ldr h,mem` (GNU-14 I8MM,
+    #   unscheduled ordered/backend Q5_K row-pair programs 2:2:x:3:7:1 and 4:2:x:3:7:1, binary16 header staging):
+    #   footprint 2 bytes; stack class from the base register's provenance; an h write zeroes bits 16-127, so on
+    #   v8-v15 it is a callee-saved clobber (writes_callee_saved_half) - exactly the semantics of `ldr h,mem`:
+    "|ldur h,mem".split("|"))
 # Admitted instruction grammar. Anything else is a structural failure.
 LOADS = frozenset("ldr ldur ldp ldpsw ldrb ldrh ldrsb ldrsh ldrsw ldurb ldurh ldursb ldursh ldursw "
                   "ld1 ld1r ld2 ld2r ld3 ld3r ld4 ld4r".split())
