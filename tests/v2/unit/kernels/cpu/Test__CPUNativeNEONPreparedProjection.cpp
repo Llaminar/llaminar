@@ -929,6 +929,7 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsInvalidSourceMetadataBeforeAnyWri
 /** @test Native metadata widening and half conversion cover every possible persisted word. */
 TEST_F(CPUNativeNEONPreparedProjection, EveryHalfAndOpaqueWordHasExactBits)
 {
+    ASSERT_TRUE(cpu::ARMFloatingPointProfile::admitted(cpu::ARMFloatingPointProfile::current()));
     using Ops = ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>;
     for (int first = 0; first < 65536; first += 4)
     {
