@@ -333,7 +333,9 @@ namespace llaminar2
     /**
      * @test Initial expert planning preserves coded planes and exactly matches the BOM.
      *
-     * Real native operands enter the production service planner. Host-backed
+     * Every native format enters the production service planner in both layouts.
+     * Noncoded source-native plans must also remain identical to the old call.
+     * Host-backed
      * mock allocations measure persistent pool bytes, with no staging region.
      * The literal former call (omitting the coded declaration) must overallocate
      * at least one matrix, so a pool self-consistency check cannot mask the bug.
@@ -347,8 +349,6 @@ namespace llaminar2
         {
             const auto *metadata = native_quantised_formats::forQuantType(entry.label);
             ASSERT_NE(metadata, nullptr);
-            if (!gpuPreparedWeightCodedDeclaration(*metadata, Layout::SourceNative, device))
-                continue;
             for (const auto layout : {Layout::SourceNative, Layout::MigrationReusable})
             for (const int n : {1, 17, 128})
             for (const int k : {256, 512})
@@ -383,9 +383,13 @@ namespace llaminar2
                     canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins,
                     nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)),
                     source->size_bytes(), {0});
-                if (layout == Layout::SourceNative && declaration &&
-                    original.totalPlannedBytes() > bom.gpu_live_bytes)
-                    ++original_mismatches;
+                if (layout == Layout::SourceNative)
+                {
+                    if (declaration && original.totalPlannedBytes() > bom.gpu_live_bytes)
+                        ++original_mismatches;
+                    if (!declaration)
+                        EXPECT_EQ(original.totalPlannedBytes(), pool->totalPlannedBytes());
+                }
             }
         }
         EXPECT_GT(original_mismatches, 0u);
