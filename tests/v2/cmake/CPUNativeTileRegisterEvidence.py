@@ -4159,9 +4159,55 @@ def compact_programs(image: ObjectImage) -> dict[str, tuple[str, str]]:
     return found
 
 
+def row_decomposition_keys(root: Path | None = None) -> dict[tuple, tuple[tuple, tuple]]:
+    """Read exact source/replacement keys from the production C++ routing authority, not a second key list.
+
+    The native CTest dump compares these parsed keys with the compiled constexpr table.
+    Unknown table syntax fails closed rather than silently retaining a Cartesian inventory.
+    """
+    root = root or Path(__file__).resolve().parents[3]
+    gemm = root / "src/v2/kernels/cpu/gemm"
+    source = (gemm / "CPUNativeNEONRowDecomposition.h").read_text()
+    table = source.split("kNEONRowDecompositions[] = {", 1)[1].split("};", 1)[0]
+    encoding_source = (gemm / "CPUNativeQuantisedPreparedFootprint.h").read_text()
+    encoding_body = encoding_source.split("enum class CPUNativeQuantisedEncoding", 1)[1].split("};", 1)[0]
+    encodings = {name: int(number) for name, number in re.findall(r"(\w+)\s*=\s*(\d+)", encoding_body)}
+    entry = re.compile(r"\{([34]), NEONRowDot::(\w+), NEONRowEncoding::(\w+), (\d+), "
+                       r"(true|false), NEONRowDot::(\w+), NEONRowDot::(\w+)\},")
+    result = {}
+    for line in table.splitlines():
+        if not line.strip():
+            continue
+        match = entry.fullmatch(line.strip())
+        if not match:
+            raise ValueError(f"unrecognized NEON row-decomposition entry: {line}")
+        rows, family, encoding, mapping, minimum, pair, tail = match.groups()
+        rows, family, encoding = int(rows), DOTS[family], encodings[encoding]
+        suffix = (1, encoding, int(mapping), int(minimum == "true"), 0)
+        key = (rows, family, *suffix)
+        if key in result:
+            raise ValueError(f"duplicate NEON row-decomposition key: {key}")
+        result[key] = ((2, DOTS[pair], *suffix), (rows - 2, DOTS[tail], *suffix))
+    if not result:
+        raise ValueError("empty NEON row-decomposition table")
+    return result
+
+
+def dispatched_tile_keys(rows: int, family: int) -> set[tuple]:
+    """Exact leaf union of one production dispatcher; retired wide keys cannot enter the probe."""
+    routing = row_decomposition_keys()
+    result = set()
+    for policy in (0, 1):
+        for encoding, mapping, minimum in (*DISPATCH,
+                *((CODED_ENCODING, codebook, minimum) for codebook, minimum in CODED_DISPATCH)):
+            key = (rows, family, policy, encoding, mapping, minimum, 0)
+            result.update(routing.get(key, (key,)))
+    return result
+
+
 def audit_dispatcher(name: str, body: list[str], rows: int, leaf: int, programs: dict[tuple, str]) -> list[str]:
     """The execute<Dot>() dispatcher admits no loop and no branch, tail call or call into the tile class other
-    than an audited tile program of its own rows and integer family (calls outside the class - the compact
+    than an audited exact leaf of its typed row-decomposition union (calls outside the class - the compact
     implementation, the FPCR profile, the stack protector - are its own concern, not tile code)."""
     analysis = Analysis(name, body, GENERIC, set())
     analysis.link()
@@ -4169,7 +4215,8 @@ def audit_dispatcher(name: str, body: list[str], rows: int, leaf: int, programs:
     errors = list(analysis.errors)
     if analysis.loops:
         errors.append("the dispatcher holds a loop")
-    admitted = {symbol for key, symbol in programs.items() if key[0] == rows and key[1] == leaf}
+    allowed = dispatched_tile_keys(rows, leaf)
+    admitted = {symbol for key, symbol in programs.items() if key in allowed}
     for block in analysis.blocks:
         for instruction in block.instructions:
             if instruction.base not in BRANCHES or not instruction.operands:
@@ -4362,11 +4409,7 @@ def audit(data: bytes, disassembly: str, mode: str, traffic: dict | None = None,
     for entry in ENVELOPE_PROGRAMS[mode]:
         rows, dot = entry.split(":")
         leaf = 1 if dot == "I8MM" and rows == "1" else DOTS[dot]
-        for policy in (0, 1):
-            for encoding, nibble_map, minimum in DISPATCH:
-                expected.add((int(rows), leaf, policy, encoding, nibble_map, minimum, 0))
-            for codebook, minimum in CODED_DISPATCH:
-                expected.add((int(rows), leaf, policy, CODED_ENCODING, codebook, minimum, 0))
+        expected.update(dispatched_tile_keys(int(rows), leaf))
     bodies = normalize_disassembly(disassembly, image)
     tile_symbols = sorted({symbol.name for symbol in image.symbols
                            if symbol.kind != "section" and TILE_RUN.search(symbol.name)})

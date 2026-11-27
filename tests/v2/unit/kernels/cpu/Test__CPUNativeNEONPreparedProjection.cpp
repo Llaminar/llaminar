@@ -26,6 +26,7 @@
 #include <cmath>
 #include <initializer_list>
 #include <cstring>
+#include <cstdio>
 #include <span>
 #include <vector>
 
@@ -872,6 +873,14 @@ template <typename Ops> void verifyRowDecompositionPolicies()
     verifyRowDecomposition<Ops, 4, P::GPUAlignedExpert>();
     verifyRowDecomposition<Ops, 3, P::BackendNative>();
     verifyRowDecomposition<Ops, 4, P::BackendNative>();
+}
+
+/** @test Export the actual compiled routing authority for the checker-inventory contract. */
+TEST_F(CPUNativeNEONPreparedProjection, DumpRowDecompositionKeys)
+{
+    for (const auto &key : kNEONRowDecompositions)
+        std::printf("NEON_ROW_ROUTE %d:%d:1:%d:%d:%d %d %d\n", key.rows, int(key.family),
+            int(key.encoding), key.map, int(key.minimum), int(key.pair_family), int(key.tail_family));
 }
 
 /** @test Original wide and installed row-pair programs have identical output and guard bytes. */
