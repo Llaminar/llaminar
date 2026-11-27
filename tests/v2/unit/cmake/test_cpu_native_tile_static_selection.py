@@ -61,7 +61,8 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
     def test_ninja_version_rejects_unknown_suffix_and_multiple_lines(self):
         for version in (b"1.13.0\n", b"1.13.0.git.kitware.jobserver-pipe-1\n"):
             self.assertTrue(C._static_ninja_version(version))
-        for version in (b"1.13.0.git.foreign\n", b"1.13.0\n1.14.0\n", b"not Ninja\n"):
+        for version in (b"1.13.0.git.foreign\n", b"1.13.0.git.kitware.jobserver-pipe-2\n",
+                        b"1.13.0.git.other\n", b"1.13.0\n1.14.0\n", b"not Ninja\n"):
             self.assertFalse(C._static_ninja_version(version))
 
     def test_ninja_record_requires_exact_output_valid_mtime_and_complete_nonempty_count(self):

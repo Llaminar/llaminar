@@ -2173,7 +2173,7 @@ def _static_emulation(tokens: list[str], supported: str) -> str:
 def _static_ninja_version(data: bytes) -> bool:
     """Recognize native releases and the exact observed builder-owned Ninja stamp."""
     return bool(re.fullmatch(rb"[0-9]+\.[0-9]+(?:\.[0-9]+)?\n?", data) or
-                data == b"1.13.0.git.kitware.jobserver-pipe-1\n")
+                data.removesuffix(b"\n") == b"1.13.0.git.kitware.jobserver-pipe-1")
 
 
 def _static_ninja_record(text: str, target: str, mtime_ns: int, cwd: Path) -> set[Path]:
