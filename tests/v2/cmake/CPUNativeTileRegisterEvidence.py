@@ -755,8 +755,7 @@ def _memo(key: tuple, compute):
 def read_object(data: bytes) -> ObjectImage:
     """Sections (with executable extents) and the complete symbol table, read from the object itself."""
     return copy.deepcopy(_memo(("object", hashlib.sha256(data).digest()),
-                               lambda: _read_macho(data) if object_format(data) else _read_elf(data)))._replace(
-                                   object_sha256=hashlib.sha256(data).digest())
+                               lambda: _read_macho(data) if object_format(data) else _read_elf(data)))
 
 
 def image_fingerprint(image: ObjectImage) -> bytes:
@@ -873,7 +872,7 @@ def _read_elf(data: bytes) -> ObjectImage:
             ranges = parse_lsda(data[lsda["offset"]:lsda["offset"] + lsda["size"]], at, length)
             for name in names_at:
                 landing[name] = [(start + low, start + high, start + pad) for low, high, pad in ranges]
-    return ObjectImage(False, sections, symbols, relocations, section_relocations, landing)
+    return ObjectImage(False, sections, symbols, relocations, section_relocations, landing, hashlib.sha256(data).digest())
 
 
 def _eh_relocations(data: bytes, header: dict, headers: list[dict], placed: list[tuple[int, int]]) \
@@ -1091,7 +1090,7 @@ def _read_macho(data: bytes) -> ObjectImage:
             if address % 4 or address >= sections[name].size:
                 raise ValueError(f"relocation address {address:#x} is not an instruction of {name}")
             _add_relocation(relocations, name, sections[name].address + address, (name_of, indexed[symbol], 0))
-    return ObjectImage(True, sections, symbols, relocations)
+    return ObjectImage(True, sections, symbols, relocations, object_sha256=hashlib.sha256(data).digest())
 
 
 def function_extents(image: ObjectImage) -> dict[str, tuple[str, int, int]]:
@@ -2214,7 +2213,10 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     match = re.findall(r"^ld_file_name\s*=\s*(\S+)\s*$", debug, re.M)
     if len(match) != 1:
         raise ValueError("collect2 did not identify its actual linker")
-    linker = Path(match[0]).resolve(strict=True)
+    observed_linker = Path(match[0])
+    linker = observed_linker.resolve(strict=True)
+    (artifacts / "linker-paths.json").write_text(json.dumps(dict(
+        observed=str(observed_linker), resolved=str(linker))))
     triplet = run("driver-triplet", [str(driver), "-dumpmachine"]).strip()
     if not re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)+", triplet):
         raise ValueError("unsupported static driver triplet")
