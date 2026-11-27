@@ -367,6 +367,71 @@ class StaticSelectionNativeTest(unittest.TestCase):
                 authority.check(unit, target)
 
 
+        # Real transitive native DSO input: --trace does not print libchild.so,
+        # while BFD's own verbose needed/found pair and DT_NEEDED bytes do.
+        (root / "child.cpp").write_text('extern "C" int child(){return 1;}\n')
+        (root / "parent.cpp").write_text('extern "C" int child(); extern "C" int parent(){return child();}\n')
+        for name in ("child", "parent"):
+            command = [compiler, "-shared", "-fPIC", str(root / (name+".cpp")), "-Wl,-soname,lib"+name+".so",
+                       "-o", str(root / ("lib"+name+".so"))]
+            if name == "parent":
+                command += ["-L"+str(root), "-lchild"]
+            subprocess.run(command, check=True)
+        dso_args = ["-Wl,--dependency-file="+str(root / "dso-production.d")
+                    if a.startswith("-Wl,--dependency-file=") else a for a in args]
+        dso_args[dso_args.index("-o")+1] = str(root / "dso-app")
+        dso_args += ["-Wl,--no-as-needed", str(root / "libparent.so"), "-Wl,--as-needed", "-Wl,-rpath,"+str(root)]
+        subprocess.run(dso_args, check=True)
+        dso_authority = C.verify_static_executable_selection(dso_args, root, root / "dso-app", root / "dso-valid",
+                                                            unit, obj, obj, target)
+        dso_authority.check(unit, target)
+        with self.assertRaisesRegex(ValueError, "requires the verifier's selected target"):
+            C.capture_static_link(dso_args, root, root / "dso-app", root / "missing-dso-target")
+        directory = root / "dso-valid"
+        verbose = (directory / "verbose.stdout").read_text() + (directory / "verbose.stderr").read_text()
+        traced = C._static_trace_paths((directory / "instrumented.stdout").read_text(), root)
+        deptext = (directory / "instrumented.d").read_text().replace("\\\n", "").split("\n\n", 1)[0]
+        dependencies = {(root / p).resolve() for p in deptext.split(":", 1)[1].split()}
+        child = (root / "libchild.so").resolve()
+        self.assertEqual(dependencies-traced, {child})
+        needed_line = next(line for line in verbose.splitlines() if line.startswith("libchild.so needed by "))
+        found_line = next(line for line in verbose.splitlines() if line.startswith("found libchild.so at "))
+        for label, changed, expected in (
+            ("found-without-needed", verbose.replace(needed_line, ""), "unmatched, wrong-name or duplicate"),
+            ("wrong-needed-name", verbose.replace(found_line, found_line.replace("libchild.so at", "libother.so at")),
+             "unmatched, wrong-name or duplicate"),
+            ("two-found", verbose+"\n"+found_line, "unmatched, wrong-name or duplicate"),
+            ("parent-not-needed", verbose.replace(needed_line, "libchild.so needed by "+str(child)),
+             "parent does not prove DT_NEEDED"),
+            ("wrong-found-path", verbose.replace(found_line, "found libchild.so at "+str(root/"libparent.so")),
+             "found path is not the unique missing input"),
+            ("failed-attempts-only", verbose.replace(found_line, ""), "missing native successful resolution")):
+            (root / (label+".verbose")).write_text(changed)
+            with self.subTest(boundary=label), self.assertRaisesRegex(ValueError, expected):
+                C._static_implicit_dsos(dependencies, traced, changed, root, target)
+        with self.assertRaisesRegex(ValueError, "extra trace input"):
+            C._static_implicit_dsos(dependencies, traced | {root / "f.o"}, verbose, root, target)
+        original_child = child.read_bytes()
+        for label, replacement, expected in (
+            ("implicit-object", obj, "not an ELF DSO"),
+            ("implicit-archive", (root/"f.a").read_bytes(), "requires ELF64"),
+            ("implicit-script", b"GROUP(libc.so)\n", "requires ELF64"),
+            ("implicit-pie", (root/"dso-app").read_bytes(), "PIE, not a DSO"),
+            ("wrong-soname", original_child.replace(b"libchild.so\x00", b"libwrong.so\x00"), "SONAME disagrees")):
+            child.write_bytes(replacement)
+            (root / (label+".input")).write_bytes(replacement)
+            with self.subTest(boundary=label), self.assertRaisesRegex(ValueError, expected):
+                C._static_implicit_dsos(dependencies, traced, verbose, root, target)
+            child.write_bytes(original_child)
+        (root/"target-child.cpp").write_text('extern "C" int exported() __asm__("'+target+'");\n'
+                                              'extern "C" int exported(){return 9;}\n')
+        subprocess.run([compiler, "-shared", "-fPIC", str(root/"target-child.cpp"),
+                        "-Wl,-soname,libchild.so", "-o", str(root/"target-child.so")], check=True)
+        child.write_bytes((root/"target-child.so").read_bytes())
+        with self.assertRaisesRegex(ValueError, "defines the selected target in dynsym"):
+            C._static_implicit_dsos(dependencies, traced, verbose, root, target)
+        child.write_bytes(original_child)
+
     def test_native_complete_closure_mutation_controls(self):
         compiler = shutil.which(os.environ.get("LLAMINAR_STATIC_TEST_GXX", "g++-14"))
         self.assertIsNotNone(compiler, "native closure controls require GNU14")
@@ -450,13 +515,19 @@ class StaticSelectionNativeTest(unittest.TestCase):
                 data[-1] ^= 1
                 p.write_bytes(data)
             fault("different-" + label, transaction(label), change_elf, f"static {label} differs from production")
+        def change_verbose_elf(directory, command, result):
+            p = Path(command[command.index("-o")+1])
+            data = bytearray(p.read_bytes())
+            data[-1] ^= 1
+            p.write_bytes(data)
+        fault("different-verbose", transaction("verbose"), change_verbose_elf, "static verbose differs from production")
         def drop_trace(directory, command, result):
             (directory / "unmodified-native-trace.stdout").write_bytes(result.stdout)
             lines = result.stdout.splitlines(keepends=True)
             self.assertGreater(len(lines), 2)
             result.stdout = b"".join(lines[1:])
         fault("trace-dependency-mismatch", transaction("instrumented"), drop_trace,
-              "trace/dependency input set mismatch")
+              "implicit DSO closure requires the verifier's selected target")
         # A genuinely incomplete production dependency inventory is rejected before
         # any claimed closure, even though the original executable is unchanged.
         dep = root / "production.d"
