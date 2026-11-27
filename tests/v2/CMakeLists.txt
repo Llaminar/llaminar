@@ -9099,6 +9099,36 @@ add_v2_test(V2_Integration_PooledStageConsumption
     MPI_PROCS 1 NO_MODELS TIMEOUT 60
     ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledStageConsumption)
+# R26 O1: register the pooled caller/P2 negatives and matrix by name so the
+# preflight lane owns them, not only the Unit lane.
+add_v2_test(V2_Integration_PooledStepGuard
+    COMMAND $<TARGET_FILE:v2_test_attention_compute_stage>
+            --gtest_filter=PooledStepGuard.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Pooled;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledStepGuard)
+add_v2_test(V2_Integration_PooledMatrix
+    COMMAND $<TARGET_FILE:v2_test_attention_compute_stage>
+            --gtest_filter=PooledMatrix.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Pooled;Matrix;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledMatrix)
+add_v2_test(V2_Integration_PooledAppendReplay
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+            --gtest_filter=PooledAppendReplay.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Pooled;Replay;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledAppendReplay)
+add_v2_test(V2_Integration_PooledDenseDecode
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+            --gtest_filter=PooledDenseDecode.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Pooled;Runner;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledDenseDecode)
 # These production workspace descriptors query immutable physical-device
 # properties. Keep their proof in both backend preflight lanes, not Unit.
 foreach(V2_ATTENTION_BACKEND CUDA ROCm)
