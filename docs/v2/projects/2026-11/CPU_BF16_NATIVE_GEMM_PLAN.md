@@ -143,31 +143,58 @@ mirror, the production library path) vs the native AVX512-BF16 route,
 
 | M | N | K | oneDNN | native AVX512-BF16 | native / oneDNN |
 |---|---|---|---|---|---|
-| 16 | 4096 | 4096 | 0.264–7.7 ms (0.07–2.0 TF/s)* | 0.990 ms (0.54 TF/s) | 0.13×–3.7×* |
-| 32 | 4096 | 4096 | 0.342–0.532 ms (2.0–3.1 TF/s) | 1.944 ms (0.55 TF/s) | 3.9–5.7× |
-| 96 | 4096 | 4096 | 0.745–1.367 ms (2.4–4.3 TF/s) | 5.748 ms (0.56 TF/s) | 4.2–6.3× |
-| 32 | 8192 | 8192 | 1.404–1.412 ms (3.0–3.1 TF/s) | 6.491 ms (0.66 TF/s) | 4.6× |
+| 16 | 4096 | 4096 | 0.266–0.444 ms (1.3–2.0 TF/s)* | 0.573 ms (0.94 TF/s) | 1.3–2.1×* |
+| 32 | 4096 | 4096 | 0.338–0.535 ms (2.0–3.2 TF/s) | 1.121 ms (0.96 TF/s) | 2.1–3.3× |
+| 96 | 4096 | 4096 | 0.777–1.359 ms (2.4–4.1 TF/s) | 3.333 ms (0.97 TF/s) | 2.4–4.2× |
+| 32 | 8192 | 8192 | 1.401–2.266 ms (1.9–3.1 TF/s) | 4.729 ms (0.91 TF/s) | 2.1–3.3× |
 
-*The M=16 oneDNN rows include a 7.7 ms outlier from shared-node
-interference; see the interpretation below.
+*Run-to-run ranges reflect the shared node (production vLLM on the host).
 
-Interpretation: the first-slice native route was **7-15× slower than the
-library** on this AVX512-BF16 host. After the first tuning pass (4×4 M/N
-register blocking, then 32×128 cache-panel blocking) the native route is
-**~550-660 GF/s (2.2-2.6× the first slice) with the gap narrowed to
-~4-4.6×** (M=16: 0.99 ms vs oneDNN's 0.26-7.7 ms — oneDNN shows strong
-run-to-run variance from the shared node, 2-4 TF/s typical). The route was
-made economical by blocking (weight reuse), not by changing arithmetic: the
-same fixed lane partitions, K-ascending chunk order and final tree are
-preserved (the determinism suite stays byte-green).
+### Kernel bring-up history within this slice
 
-Remaining gap attribution (quantified for the next work package):
-- NO packed weight layout: every B chunk is an unaligned load; oneDNN's
-  BLAS path uses pre-packed panel weights from its own format dialogue.
-- No prefetch/double-buffering, and the per-output 16-lane final reduction
-  is ~4 shuffle+add ops per output word.
-- Cross-route difference typical ~0.1% (different fixed trees), which is
-  not a contract violation (per-route determinism is).
+- Intrinsic 4×4 (committed fce10b6ed): 0.57 TF/s, load-issue limited
+  (~0.45 vdpbf16/cycle per thread).
+- Hand-scheduled 4×4 software pipeline (`avx512Bf16TileKernel`): 0.96 TF/s
+  (1.65×). One chunk of latency overlap, exact 32-ZMM allocation
+  (16 accumulators + 2×8 double-buffer; callee-saved zmm16-31 wrapped),
+  countdown loop with byte-unit counter (the element-vs-byte unit bug was
+  the reason the first asm build seemed to hit 1.9-2.0 TF/s — it silently
+  processed only half the chunks), base+offset addressing, accumulator
+  publish + restore inside the same asm block.
+- Correctness: byte-exact vs the documented lane-contract oracle for the
+  K sweep (64..4096) and tail shapes (16x24x128, 9x17x320); the
+  `V2_Integration_CPU_BF16GemmNativeRoutes` suite stays 6/6.
+
+### Remaining gap analysis (next work package)
+
+Per thread: 0.96 TF/s ≈ 0.48 vdpbf16/cycle; the pure-FMA chain ceiling on
+this box is ~1.3-1.8/cycle (8 threads) and oneDNN runs at ~1.8/cycle.
+The 4×4 load:FMA ratio is 1:2, exactly balanced against 2 load ports, so
+the stall is latency/overlap: one chunk of lookahead (~8 FMA-cycles) does
+not cover the ~13-cycle L2 latency, and the 32-ZMM budget forbids a
+second lookahead set. Candidate next steps, in expected order:
+
+1. **4×6 microtile** (24 accumulators + 4 A regs + 4 B regs, two B chunks
+   as memory operands with a dedicated base pointer; 30-32 ZMM): 24 FMA
+   per phase (~12 cycles) improves the overlap and the load:FMA ratio to
+   1:2.4. Estimated 1.2-1.6 TF/s — likely still short of parity.
+2. **3×8 oneDNN-style tile** (24 C regs + 3 A + 2 B per phase) — the
+   reference kernel shape; requires the same lane-partition layout
+   reworked for 24 acc chunks and is the best shot at ≥2.5 TF/s.
+3. Only then: automatic default flip after isolation benchmarks.
+
+If the parity target remains unreachable by (2), the documented fallback
+is to keep the library oneDNN route as the production BF16 GEMM engine
+(the native route stays available with its deterministic contract and
+value as the AMX carrier), with the measurement recorded here.
+
+## Remaining follow-ups
+
+Default-engine flip after isolated
+`perf` measurements on true AMX hardware (this VM cannot execute tile data
+instructions), `PerfStats` counter registration, `M=1` native GEMV,
+fused-SwiGLU/LM-head gate sites, codegen-witness registration, image matrix
+and README synchronization.
 
 Max absolute difference between native and oneDNN outputs was ~4.0 on
 values of magnitude ~4096 (≈0.1%): both routes are FP32-accumulating
