@@ -1793,9 +1793,12 @@ class CallModelTest(unittest.TestCase):
         return CHECKER.traffic_record(analysis), analysis.errors
 
     def test_bounded_memcpy_admission(self) -> None:
-        # M-6 (reviewer 91): the admitted tail (candidate line 1110) is charged at sizeof(F) = 4 x Lanes = 16 bytes
-        # with its lower bound recorded; any other line, another source version, or a non-compact function FAILS.
-        record, errors = self.bounded(1110)
+        # Bind the fixture to the current source's exact admitted statement, not a historical line number.
+        import hashlib
+        source = (REPO / self.KERNELS).read_bytes()
+        admission = json.loads(CHECKER.BOUNDED_MEMCPY_PATH.read_text())
+        line = admission["trees"][hashlib.sha256(source).hexdigest()]["lines"][0]
+        record, errors = self.bounded(line)
         self.assertEqual(errors, [])
         counts = present(record["counts"])
         self.assertEqual({kind: counts[kind] for kind in ("ext_call", "ext_bytes", "ext_accesses")},
@@ -1804,13 +1807,14 @@ class CallModelTest(unittest.TestCase):
         self.assertEqual((site["lower_bytes"], site["upper_bytes"], site["loop"], site["placement"], site["sides"]),
                          (4, 16, 1, "column-tail", 1))
         self.assertEqual(site["text"], "std::memcpy(&acc[row],output[row]+column,(columns-column)*sizeof(float));")
-        for line, fragment in ((1352, "not an admitted line"), (1109, "not an admitted line")):
-            with self.subTest(line=line):
-                self.assertTrue(any(fragment in error for error in self.bounded(line)[1]), self.bounded(line)[1])
+        for adjacent in (line - 1, line + 1):
+            with self.subTest(line=adjacent):
+                self.assertTrue(any("not an admitted line" in error for error in self.bounded(adjacent)[1]),
+                                self.bounded(adjacent)[1])
         changed = (REPO / self.KERNELS).read_text().replace("Lanes <= columns", "Lanes<=columns", 1)
         self.assertTrue(any("not an admitted line of this source version" in error
-                            for error in self.bounded(1110, changed)[1]))
-        self.assertTrue(any("no program key" in error for error in self.bounded(1110, name="f")[1]))
+                            for error in self.bounded(line, changed)[1]))
+        self.assertTrue(any("no program key" in error for error in self.bounded(line, name="f")[1]))
 
     def test_cold_paths(self) -> None:
         # Control 10: a throw sequence is admitted only when every path ends in a never-returning call.
