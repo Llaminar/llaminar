@@ -22024,16 +22024,17 @@ add_v2_test(V2_Integration_CPUFlashAttentionAQ8NativeEntries
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionAQ8NativeEntries)
 
 # Wo transpose benchmark - compares row-major vs column-major GEMV.
-# The microbenchmark is written in AVX-512 intrinsics, so only x86 targets build it.
-if(V2_CPU_TARGET_X86)
+# The microbenchmark is written in AVX-512 intrinsics, so only the canonical
+# AVX512 build compiles it. It inherits that build's CPU envelope and carries no
+# target-level -m options; OpenMP comes from the configured runtime target.
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
 add_executable(v2_perf_wo_transpose performance/Microbench__WoTranspose.cpp)
 target_link_libraries(v2_perf_wo_transpose
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
+    OpenMP::OpenMP_CXX
 )
-target_compile_options(v2_perf_wo_transpose PRIVATE -mavx512f -mavx512dq -fopenmp)
-target_link_libraries(v2_perf_wo_transpose gomp)
 add_v2_test(V2_Perf_WoTranspose
     COMMAND $<TARGET_FILE:v2_perf_wo_transpose>
     LABELS "V2;Performance;Wo;Transpose;GEMV"
