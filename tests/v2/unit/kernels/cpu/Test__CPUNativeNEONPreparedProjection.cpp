@@ -834,12 +834,46 @@ void verifyRowDecomposition()
             continue;
         for (const int n : {1, 3, 4, 63, 64, 65})
             for (const int blocks : {1, 2, 7, 16, 17, 33})
+                for (const int exceptional : {0, 1, 2, 3})
             {
                 NativeQuantisedPreparedByteFixture fixture(*source.metadata, n, blocks * 32);
                 fixture.descriptor.numerical_policy = Policy;
                 fixture.seedPayloadAndMetadata();
+                constexpr std::array<std::uint16_t, 8> special{
+                    0x7e11, 0xfe45, 0x7c00, 0xfc00, 0x8000, 0x0000, 0x7d55, 0x3c00};
+                if (exceptional & 2)
+                {
+                    const auto layout = fixture.view();
+                    for (int column = 0; column < n; ++column)
+                        for (int block = 0; block < blocks; ++block)
+                        {
+                            const auto word = special[(column + block) % special.size()];
+                            const int chunk = column / 64, local = column % 64;
+                            if (layout.superblockCoded())
+                            {
+                                if (block % 8 == 0)
+                                {
+                                    const auto codebook = superblockMetadataCodebook(layout.encoding, layout.codebook_id);
+                                    const auto later = special[(column + block + 1) % special.size()];
+                                    coded_metadata::storeSuperblockWord(
+                                        fixture.bytes.data() + layout.geometry().headerOffset(chunk, block),
+                                        codebook, local, std::uint32_t(word) | (std::uint32_t(later) << 16));
+                                }
+                            }
+                            else
+                            {
+                                const auto offset = layout.geometry().blockOffset(chunk, block) +
+                                    layout.data_stride + local * 2;
+                                std::memcpy(fixture.bytes.data() + offset, &word, sizeof(word));
+                            }
+                        }
+                }
                 const auto packed = fixture.view();
-                const auto activation = activationRows(blocks, Rows);
+                auto activation = activationRows(blocks, Rows);
+                if (exceptional & 1)
+                    for (std::size_t row = 0; row < Rows; ++row)
+                        for (int block = 0; block < blocks; ++block)
+                            activation[row * blocks + block].d = special[(row + block) % special.size()];
                 const int stride = n + 3;
                 const float dirty = std::bit_cast<float>(0x7fc12345u);
                 std::vector<float> installed(Rows * stride, dirty), wide(Rows * stride, dirty);
@@ -864,7 +898,8 @@ void verifyRowDecomposition()
                             CPUNativeNEONProjectionTile<Rows>::bind(packed, input, reference, chunk));
                     }
                     ASSERT_EQ(std::memcmp(installed.data(), wide.data(), installed.size() * sizeof(float)), 0)
-                        << "rows=" << Rows << " n=" << n << " blocks=" << blocks;
+                        << "rows=" << Rows << " n=" << n << " blocks=" << blocks
+                        << " exceptional=" << exceptional << " policy=" << int(Policy);
                 }
             }
     }
