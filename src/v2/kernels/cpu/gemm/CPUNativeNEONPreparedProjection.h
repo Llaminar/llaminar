@@ -292,7 +292,7 @@ namespace llaminar2::cpu::native_quantised
          * @param chunk Physical chunk inside the matrix.
          * @return Tile ready for executeAdmitted(); no check is repeated per task.
          */
-        [[nodiscard]] static CPUNativeNEONProjectionTile admitted(CPUNativeQuantisedWeightView weights,
+        [[nodiscard, gnu::always_inline]] static inline CPUNativeNEONProjectionTile admitted(CPUNativeQuantisedWeightView weights,
             const std::array<std::span<const Q8_1Block>, Rows> &activation,
             const std::array<std::span<float>, Rows> &output, int chunk) noexcept
         {
@@ -341,7 +341,7 @@ namespace llaminar2::cpu::native_quantised
          * @param columns Live columns in this chunk.
          * @param partitions Canonical partition count; requireOrderedPartitionWidth() admits the plan (cold, fatal).
          */
-        CPUNativeNEONProjectionTile(CPUNativeQuantisedWeightView weights,
+        [[gnu::always_inline]] CPUNativeNEONProjectionTile(CPUNativeQuantisedWeightView weights,
             const std::array<std::span<const Q8_1Block>, Rows> &activation,
             const std::array<std::span<float>, Rows> &output, int chunk, int columns, int partitions)
             : weights_(weights), activation_(activation), output_(output), chunk_(chunk), columns_(columns),
