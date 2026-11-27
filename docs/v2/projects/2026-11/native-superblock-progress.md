@@ -116,3 +116,28 @@ reporter translation unit directly.
 
 These device-free contract tests claim no kernel, stack, numerical or backend
 qualification.
+
+## NEON tile register pressure (GCC 14)
+
+The stack gate compares every native NEON tile program with its develop
+`63b053401` analogue (`CPUNativeTileStackTable.json`). The repairs keep the
+decode, the INT32 group order, the FP32 block program, the block order and the
+partition tree. Several are per-program choices that were measured with the
+GCC 14 witness in the pinned toolchain:
+
+- `opaqueStripColumn()`: whether an empty register barrier re-derives the strip
+  column in every K block;
+- `q5GroupFifth()`: which fifth-bit addressing a Q5 program uses;
+- the ordered `-0` partition seed (`orderedPartitionSeedNEON()`) and the
+  programs that keep the partition-0 select instead;
+- the backend-native row-pair accumulator carry, and `no-thread-jumps` on
+  `runCoded()`;
+- the single-row SDOT barriers around the Q5_K/IQ3_S group decodes and the
+  coded factor phase.
+
+None of these choices changes arithmetic, but each one depends on the
+compiler's register allocation. On a compiler or flag change, measure them
+again: run the tile proof driver for NEON, NEON_DOTPROD and NEON_I8MM
+(Integration and Release). Regenerate the committed fingerprints only with
+`tests/v2/cmake/CPUNativeTileCountRegeneration.py`, which reads every count
+from the attempts' own records, and review its printed changes.

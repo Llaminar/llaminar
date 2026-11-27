@@ -50,11 +50,10 @@ namespace llaminar2::cpu::native_quantised
             const float16x4_t half = vreinterpret_f16_u16(vdup_n_u16(value));
             return vgetq_lane_f32(vcvt_f32_f16(half), 0);
         }
-        // Exponent 31 only: fp16_to_fp32()'s infinity/NaN expansion, by bit
-        // placement and without a call, so a large tile program never depends
-        // on GCC's inlining budget for this cold path.
-        return std::bit_cast<float>(((std::uint32_t{value} & 0x8000u) << 16) | 0x7F800000u |
-                                    ((std::uint32_t{value} & 0x03FFu) << 13));
+        // Exponent 31 only: fp16_to_fp32()'s own infinity/NaN expansion, used
+        // directly so a large tile program never depends on GCC's inlining
+        // budget for this cold path.
+        return std::bit_cast<float>(llaminar2::fp16NonFiniteToFP32Bits(value));
 #else
         return llaminar2::fp16_to_fp32(value);
 #endif
