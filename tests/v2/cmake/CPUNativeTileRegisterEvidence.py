@@ -5389,9 +5389,12 @@ def require_registers(counts: dict[str, int], identity: str, mode: str, budget: 
     # The coded Q4_K leaf replaces the former Q4_K identity-nibble leaf;
     # its same-width Q4_1 neighbour retains the identical qualified ceiling.
     limits = dict(limits)
+    retired = {":".join(map(str, key[:-1])) for key in row_decomposition_keys()}
     for key, ceiling in tuple(limits.items()):
         if key.endswith(":0:1:1"):
-            limits[key.removesuffix(":0:1:1") + ":6:1:1"] = ceiling
+            coded = key.removesuffix(":0:1:1") + ":6:1:1"
+            if coded not in retired:
+                limits[coded] = ceiling
     failures = [failure["detail"] for failure in register_failures(counts, limits)]
     if failures:
         raise ValueError(f"native NEON tile register policy violated ({len(failures)}): " + "; ".join(failures[:6]))
