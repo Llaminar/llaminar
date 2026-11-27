@@ -4197,6 +4197,17 @@ def row_decomposition_keys(root: Path | None = None) -> dict[tuple, tuple[tuple,
     return result
 
 
+def reject_retired_tile_programs(bodies: dict, prefix: str) -> None:
+    """Reject retired source symbols in production copies as well as in the complete probe inventory."""
+    retired = row_decomposition_keys()
+    for name in bodies:
+        if TILE_RUN.search(name) and tile_match(name, prefix):
+            fields = program_fields(name)
+            # Strips is a tournament selector, not permission to restore a retired source program.
+            if (*fields[:-1], 0) in retired:
+                raise ValueError(f"retired NEON source program remains instantiated: {name}")
+
+
 def dispatched_tile_keys(rows: int, family: int) -> set[tuple]:
     """Exact leaf union of one production dispatcher; retired wide keys cannot enter the probe."""
     routing = row_decomposition_keys()
@@ -5003,6 +5014,7 @@ def tile_chain_evidence(data: bytes, disassembly: str, assembly: str, copy: str,
     dot_contribution + correction): listed and counted, never ordered (its NaN payload order is the T-2
     definition's inventory item). Tile programs have no output seed. Returns {key@copy: {"sites", "offchain"}}."""
     image, bodies, sites = bound_ordered_sites(data, disassembly, assembly)
+    reject_retired_tile_programs(bodies, image.prefix)
     locations: dict[str, list[str]] = {}
     assembly_functions(assembly, set(bodies), image.macho, locations)
     names = [name for name in sorted(bodies) if TILE_RUN.search(name) and tile_match(name, image.prefix)
@@ -5066,6 +5078,7 @@ def compact_ordered_add_evidence(data: bytes, disassembly: str, assembly: str, c
     {key@copy: {"sites", "scalar"}} (instruction indices; "scalar" lists every proven compiler fadd) for exact
     committed counts (require_compact_ordered_adds())."""
     image, bodies, sites = bound_ordered_sites(data, disassembly, assembly)
+    reject_retired_tile_programs(bodies, image.prefix)
     locations: dict[str, list[str]] = {}
     assembly_functions(assembly, set(bodies), image.macho, locations)
     result: dict[str, dict] = {}
