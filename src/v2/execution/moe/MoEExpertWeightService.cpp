@@ -27,6 +27,7 @@
 #include "../../kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "../../loaders/MmapRegion.h"
 #include "../../loaders/BoundedGPUExpertSource.h"
+#include "MoEExpertGPUWeightPlan.h"
 #include "../../loaders/ExpertGemmRegistry.h"
 #include "../../loaders/GPUVramPreflight.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
@@ -2390,8 +2391,6 @@ namespace llaminar2
                 }
 #endif
 
-                const int N = static_cast<int>(view->rows());
-                const int K = static_cast<int>(view->cols());
                 const size_t raw_bytes = quantizedViewRawBytes(*view);
                 if (raw_bytes == 0)
                 {
@@ -2403,14 +2402,8 @@ namespace llaminar2
                 // Unique name per expert per group
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
-                orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
-                                         vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
-                                         vnni->has_emins,
-                                         nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
-                                         raw_bytes, {0},
-                                         gpuPreparedWeightCodedDeclaration(
-                                             *view, GPUPreparedWeightPoolLayout::SourceNative,
-                                             ctx.device_id));
+                planMoEExpertGPUWeight(*orchestrator, ctx.device_id, slot_name, *view,
+                                       raw_bytes, GPUPreparedWeightPoolLayout::SourceNative);
                 max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
                 ++total_planned;
             }

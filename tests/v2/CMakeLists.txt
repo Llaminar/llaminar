@@ -32039,6 +32039,15 @@ add_v2_test(V2_Integration_BoundedGPUWeightSource
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_BoundedGPUWeightSource)
 
+# Initial MoE pools must materialize the same coded geometry admitted by the BOM.
+add_v2_test(V2_Integration_InitialMoEExpertCodedPoolGeometry
+    COMMAND $<TARGET_FILE:v2_test_load_orchestrator>
+        --gtest_filter=Test__LoadOrchestrator.InitialMoEExpertCodedPoolPlanMatchesPhysicalPreparedBytes
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;WeightLoading;MoE;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_InitialMoEExpertCodedPoolGeometry)
+
 # Failed conversion retires previously accepted work before destroying its events.
 add_v2_test(V2_Integration_GPUWeightSourceFailureRetirement
     COMMAND $<TARGET_FILE:v2_test_load_orchestrator>
