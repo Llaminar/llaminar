@@ -348,5 +348,108 @@ class StaticSelectionNativeTest(unittest.TestCase):
                 authority.check(unit, target)
 
 
+    def test_native_complete_closure_mutation_controls(self):
+        compiler = shutil.which(os.environ.get("LLAMINAR_STATIC_TEST_GXX", "g++-14"))
+        self.assertIsNotNone(compiler, "native closure controls require GNU14")
+        base = os.environ.get("LLAMINAR_STATIC_TEST_ARTIFACTS")
+        if base:
+            Path(base).mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="static-closure-", dir=base))
+        print(f"Retained native closure controls: {root}", flush=True)
+        shadow = root / "shadow"
+        shadow.mkdir()
+        # These are real native tool/input copies, never changes to installed SDK
+        # files. -B makes the fixture's production link actually select them.
+        for name in ("Scrt1.o", "crti.o", "crtbeginS.o", "crtendS.o", "crtn.o", "liblto_plugin.so"):
+            source = subprocess.check_output([compiler, "-print-file-name=" + name], text=True).strip()
+            self.assertTrue(Path(source).is_file(), source)
+            shutil.copy2(source, shadow / name)
+        collect = subprocess.check_output([compiler, "-print-prog-name=collect2"], text=True).strip()
+        shutil.copy2(collect, shadow / "collect2")
+        (root / "main.cpp").write_text("int main(){return 0;}\n")
+        subprocess.run([compiler, "-c", str(root / "main.cpp"), "-o", str(root / "main.o")], check=True)
+        script = root / "extra.ld"
+        script.write_text("SECTIONS { .proof_note : { BYTE(0x73) } } INSERT AFTER .comment;\n")
+        options = ["-B" + str(shadow) + "/", "-fuse-ld=bfd", str(root / "main.o"),
+                   "-Wl,-T," + str(script), "-Wl,--dependency-file=" + str(root / "production.d"),
+                   "-o", str(root / "app")]
+        response = root / "link.rsp"
+        response.write_text(" ".join(options))
+        args = [compiler, "@" + str(response)]
+        subprocess.run(args, check=True)
+        baseline = C.capture_static_link(args, root, root / "app", root / "valid")
+        for name in ("Scrt1.o", "liblto_plugin.so", "collect2"):
+            self.assertIn(str(shadow / name), baseline["files"], f"native production did not select {name}")
+        self.assertIn(str(script), baseline["files"])
+        originals = {p: p.read_bytes() for p in (shadow / "Scrt1.o", shadow / "liblto_plugin.so",
+                                                shadow / "collect2", response, script, root / "production.d")}
+        native_run = subprocess.run
+
+        def fault(label, when, mutate, expected):
+            directory = root / label
+            fired = False
+            def invoke(command, **kw):
+                nonlocal fired
+                result = native_run(command, **kw)
+                if not fired and when(command):
+                    fired = True
+                    mutate(directory, command, result)
+                return result
+            with mock.patch.dict(os.environ, dict(os.environ), clear=True):
+                with mock.patch.object(C.subprocess, "run", invoke):
+                    with self.subTest(boundary=label), self.assertRaisesRegex(ValueError, expected):
+                        C.capture_static_link(args, root, root / "app", directory)
+            self.assertTrue(fired, label)
+            # Preserve the exact injected bytes; fixture reset is outside capture.
+            for p, data in originals.items():
+                if p.read_bytes() != data:
+                    (directory / ("injected-" + p.name)).write_bytes(p.read_bytes())
+                    p.write_bytes(data)
+            args[:] = [compiler, "@" + str(response)]
+
+        def transaction(label):
+            return lambda command: "-o" in command and Path(command[command.index("-o")+1]).name == label + ".elf"
+        def append(path):
+            return lambda directory, command, result: path.write_bytes(path.read_bytes() + b"\nchanged\n")
+        fault("mutated-crt", transaction("map"), append(shadow / "Scrt1.o"), "input changed between transactions")
+        fault("mutated-plugin", transaction("map"), append(shadow / "liblto_plugin.so"), "static input changed:")
+        fault("mutated-tool", transaction("map"), append(shadow / "collect2"), "static input changed:")
+        fault("mutated-response", transaction("map"), append(response), "static input changed:")
+        fault("mutated-script", transaction("map"), append(script), "input changed between transactions")
+        fault("mutated-production-deps", transaction("map"), append(root / "production.d"), "static input changed:")
+        fault("mutated-default-script", lambda c: "--verbose" in c and (root / "mutated-default-script/default-script.txt").exists(),
+              lambda directory, command, result: append(directory / "default-script.txt")(directory, command, result),
+              "static input changed:")
+        fault("environment-during-capture", transaction("control"),
+              lambda directory, command, result: os.environ.__setitem__("LIBRARY_PATH", "/injected"),
+              "environment changed during capture")
+        fault("argv-during-capture", transaction("control"),
+              lambda directory, command, result: args.append("-O3"), "original argv changed during capture")
+        for label in ("control", "map"):
+            def change_elf(directory, command, result):
+                p = Path(command[command.index("-o")+1])
+                data = bytearray(p.read_bytes())
+                data[-1] ^= 1
+                p.write_bytes(data)
+            fault("different-" + label, transaction(label), change_elf, f"static {label} differs from production")
+        def drop_trace(directory, command, result):
+            (directory / "unmodified-native-trace.stdout").write_bytes(result.stdout)
+            lines = result.stdout.splitlines(keepends=True)
+            self.assertGreater(len(lines), 2)
+            result.stdout = b"".join(lines[1:])
+        fault("trace-dependency-mismatch", transaction("instrumented"), drop_trace,
+              "trace/dependency input set mismatch")
+        # A genuinely incomplete production dependency inventory is rejected before
+        # any claimed closure, even though the original executable is unchanged.
+        dep = root / "production.d"
+        text = dep.read_text()
+        implicit = next(p for p in baseline["files"] if Path(p).name == "Scrt1.o")
+        dep.write_text(text.replace(implicit, ""))
+        with self.assertRaisesRegex(ValueError, "debug dependency set differs from production"):
+            C.capture_static_link(args, root, root / "app", root / "dropped-implicit-crt")
+        (root / "dropped-implicit-crt/injected-production.d").write_bytes(dep.read_bytes())
+        dep.write_bytes(originals[dep])
+
+
 if __name__ == "__main__":
     unittest.main()
