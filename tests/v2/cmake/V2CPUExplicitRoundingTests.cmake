@@ -122,6 +122,11 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Numerics ByteExact Regression)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONPreparedProjection)
+    v2_add_core_free_test(V2_Integration_CPUNativeNEONRowDecomposition
+        COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
+            --gtest_filter=CPUNativeNEONPreparedProjection.RowDecompositionMatchesOriginalWideProgram
+        LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Numerics ByteExact Regression)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeNEONRowDecomposition)
     # Direct compact entries admit ordered K trees independently of FP policy;
     # ordinary projection tiles do not exercise BackendNative + ordered tree.
     v2_add_core_free_test(V2_Integration_CPUNativeNEONCompactOrderedNumericalPolicy
