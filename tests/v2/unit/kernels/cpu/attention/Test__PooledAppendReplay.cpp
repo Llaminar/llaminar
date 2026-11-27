@@ -166,7 +166,11 @@ TEST(PooledAppendReplay, RecordedSixRowDecodeReproducesFrozenBytes)
     const size_t width = static_cast<size_t>(trace.kv_heads * trace.dimension);
     PooledKVDecodeBinding binding(pool.get(), table.get(), /*request_id=*/5,
         /*slot=*/0, trace.kv_heads, trace.dimension, trace.page_tokens,
-        /*layers=*/1, /*admitted_issuances=*/trace.total_rows);
+        /*layers=*/1, /*admitted_issuances=*/trace.total_rows,
+        // The frozen replay recording was captured on the COW path; the
+        // in-place tail is the production default but this fixture drives
+        // the recording's exact path.
+        /*persistent_tail=*/false);
 
     for (int step = 0; step < trace.total_rows; ++step)
     {
