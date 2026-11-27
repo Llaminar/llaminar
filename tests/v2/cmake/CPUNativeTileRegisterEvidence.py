@@ -1892,6 +1892,339 @@ def import_symbols(image: ObjectImage) -> frozenset:
                      and symbol.binding == "global" and count[symbol.name] == 1)
 
 
+# Static executable selection deliberately has no JSON/digest constructor. The native
+# transaction below is the only producer; persisted records are diagnostic recipes.
+_STATIC_SELECTION_KEY = object()
+
+
+class TypedStaticExecutableSelection:
+    """Ephemeral authority for one audited Unit selected by a complete native link."""
+
+    def __init__(self, key, unit: "Unit", target: str, files: dict[str, str], environment: dict) -> None:
+        if key is not _STATIC_SELECTION_KEY:
+            raise ValueError("static selection requires the native verifier")
+        self.unit, self.target = unit, target
+        self.files, self.environment = dict(files), dict(environment)
+
+    def check(self, unit: "Unit", target: str) -> None:
+        """Recheck retained bytes and process environment at the call-model boundary."""
+        if unit != self.unit or target != self.target:
+            raise ValueError("static selected Unit/target changed")
+        if dict(os.environ) != self.environment:
+            raise ValueError("static link environment changed")
+        for path, digest in self.files.items():
+            if _static_hash(Path(path).read_bytes()) != digest:
+                raise ValueError(f"static input changed: {path}")
+
+
+def _static_hash(data: bytes) -> str:
+    """SHA256 of an actual artifact, not a caller assertion."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _static_elf(data: bytes) -> tuple[list[dict], list[str]]:
+    """Read bounded ELF64 little-endian section records, including non-code inputs."""
+    if data[:6] != b"\x7fELF\x02\x01" or _field(data, 58, 2) != 64:
+        raise ValueError("static input requires ELF64 little endian")
+    count, offset, strings = _field(data, 60, 2), _field(data, 40, 8), _field(data, 62, 2)
+    if not 0 < strings < count or offset + count * 64 > len(data):
+        raise ValueError("static ELF section bounds")
+    headers = []
+    for i in range(count):
+        b = offset + i * 64
+        h = dict(name=_field(data, b, 4), type=_field(data, b+4, 4), flags=_field(data, b+8, 8),
+                 address=_field(data, b+16, 8), offset=_field(data, b+24, 8), size=_field(data, b+32, 8),
+                 link=_field(data, b+40, 4), entsize=_field(data, b+56, 8))
+        if h["type"] != 8 and h["offset"] + h["size"] > len(data):
+            raise ValueError("static ELF section payload bounds")
+        headers.append(h)
+    s = headers[strings]
+    return headers, [_string(data, s["offset"] + h["name"], s["offset"] + s["size"]) for h in headers]
+
+
+def _static_symbols(data: bytes, headers: list[dict], kind: int) -> list[tuple]:
+    """Return raw symbol identity including dynamic undefined entries."""
+    result = []
+    for h in headers:
+        if h["type"] != kind:
+            continue
+        if h["entsize"] != 24 or h["size"] % 24 or not 0 < h["link"] < len(headers):
+            raise ValueError("static symbol table bounds")
+        s = headers[h["link"]]
+        for b in range(h["offset"] + 24, h["offset"] + h["size"], 24):
+            result.append((_string(data, s["offset"] + _field(data, b, 4), s["offset"] + s["size"]),
+                           _field(data, b+4, 1), _field(data, b+5, 1), _field(data, b+6, 2),
+                           _field(data, b+8, 8), _field(data, b+16, 8)))
+    return result
+
+
+def _static_members(data: bytes) -> list[tuple[int, int, bytes, str, bytes]]:
+    """Extract regular ar members with ordinal/header-offset/raw-name identity; thin fails."""
+    if not data.startswith(b"!<arch>\n"):
+        raise ValueError("static archive is not a regular archive")
+    offset, ordinal, names, result = 8, 0, b"", []
+    while offset < len(data):
+        h = data[offset:offset+60]
+        if len(h) != 60 or h[58:] != b"`\n":
+            raise ValueError("static archive header")
+        try:
+            size = int(h[48:58])
+        except ValueError:
+            raise ValueError("static archive size") from None
+        body = data[offset+60:offset+60+size]
+        if len(body) != size or size < 0:
+            raise ValueError("static archive bounds")
+        raw = h[:16]
+        name = raw.rstrip().decode("ascii")
+        if name == "//":
+            names = body
+        elif name not in ("/", "/SYM64/"):
+            if name.startswith("/"):
+                n = int(name[1:])
+                end = names.find(b"/\n", n)
+                if end < n:
+                    raise ValueError("static archive long name")
+                name = names[n:end].decode("utf-8")
+            else:
+                name = name.removesuffix("/")
+            if name.startswith("#1/"):
+                raise ValueError("unsupported BSD archive member")
+            result.append((ordinal, offset, raw, name, body))
+        offset += 60 + size + size % 2
+        ordinal += 1
+    if offset != len(data):
+        raise ValueError("static archive trailing bytes")
+    return result
+
+
+def _static_response(argv: list[str], cwd: Path, files: dict) -> list[str]:
+    """Expand bounded GNU response tokens; preserve every response file as an input."""
+    result = []
+    for arg in argv:
+        if arg.startswith("@"):
+            p = (cwd / arg[1:]).resolve(strict=True)
+            if str(p) in files:
+                raise ValueError("recursive/duplicate static response file")
+            data = p.read_bytes()
+            files[str(p)] = _static_hash(data)
+            result.extend(_static_response(shlex.split(data.decode()), cwd, files))
+        else:
+            result.append(arg)
+    return result
+
+
+def _static_options(argv: list[str]) -> None:
+    """Reject rewriting/selection-changing options even through forwarding and responses."""
+    tokens = [token for arg in argv for token in arg.removeprefix("-Wl,").split(",")]
+    for t in tokens:
+        if (t in ("-r", "--relocatable", "--gc-sections", "-shared", "--shared") or
+                t.startswith(("-flto", "--icf", "--plugin-opt", "-fuse-linker-plugin"))):
+            raise ValueError(f"unsupported static link option: {t}")
+
+
+def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Path) -> dict:
+    """Capture a bounded GNU14/ld.bfd production edge; diagnostics never mint authority.
+
+    Caller supplies the exact ordered Ninja driver edge, not a shell command. Every
+    preparation/relink changes only the mechanically specified tokens. Artifact
+    directories must be dedicated: prior authority is retired before any operation.
+    All subprocesses inherit the same captured environment, including unset/empty
+    distinctions (the complete mapping is retained, not a selected variable subset).
+    """
+    artifacts.mkdir(parents=True, exist_ok=True)
+    proof = artifacts / "selection-recipe.json"
+    proof.unlink(missing_ok=True)
+    cwd, output, artifacts = cwd.resolve(strict=True), output.resolve(strict=True), artifacts.resolve()
+    env, files = dict(os.environ), {}
+    args = _static_response(list(argv), cwd, files)
+    _static_options(args)
+    if args.count("-o") != 1 or args.index("-o") + 1 >= len(args):
+        raise ValueError("static edge needs exactly one separate -o output")
+    oi = args.index("-o") + 1
+    if (cwd / args[oi]).resolve() != output:
+        raise ValueError("static output does not match edge")
+    if any("--dependency-file" in a or "-Map" in a or "--trace" in a for a in args):
+        raise ValueError("production edge already has unsupported diagnostic side outputs")
+    driver = Path(args[0]).resolve(strict=True)
+    args[0] = str(driver)
+    files[str(driver)] = _static_hash(driver.read_bytes())
+    production = output.read_bytes()
+    (artifacts / "production.elf").write_bytes(production)
+
+    def run(label: str, command: list[str]) -> str:
+        """Retain exact argv, environment and both output streams, even on failure."""
+        (artifacts / f"{label}.json").write_text(json.dumps(dict(argv=command, cwd=str(cwd), env=env), indent=2))
+        r = subprocess.run(command, cwd=cwd, env=env, capture_output=True, timeout=120)
+        (artifacts / f"{label}.stdout").write_bytes(r.stdout)
+        (artifacts / f"{label}.stderr").write_bytes(r.stderr)
+        if r.returncode:
+            raise ValueError(f"static {label} failed ({r.returncode})")
+        return (r.stdout + r.stderr).decode("utf-8")
+
+    version = run("driver-version", [str(driver), "-dumpfullversion"])
+    if not version.startswith("14."):
+        raise ValueError("static capture supports GNU14 only")
+    jobs = run("driver-jobs", args + ["-###"])
+    collect = [shlex.split(line)[0] for line in jobs.splitlines() if line.lstrip().startswith('"/')
+               and "collect2" in line]
+    if len(collect) != 1:
+        raise ValueError("static driver must expose one collect2 job")
+    cp = Path(collect[0]).resolve(strict=True)
+    files[str(cp)] = _static_hash(cp.read_bytes())
+    debug_args = args.copy()
+    debug_args[oi] = str(artifacts / "debug.elf")
+    debug = run("collect2-debug", debug_args + ["-debug"])
+    match = re.findall(r"^ld_file_name\s*=\s*(\S+)\s*$", debug, re.M)
+    if len(match) != 1:
+        raise ValueError("collect2 did not identify its actual linker")
+    linker = Path(match[0]).resolve(strict=True)
+    if linker.name != "ld.bfd":
+        raise ValueError("static selection requires actual ld.bfd")
+    files[str(linker)] = _static_hash(linker.read_bytes())
+    if "GNU ld" not in run("linker-version", [str(linker), "--version"]):
+        raise ValueError("static linker is not GNU bfd")
+    if (artifacts / "debug.elf").read_bytes() != production:
+        raise ValueError("collect2 debug preparation changed production bytes")
+    default_script = run("default-script", [str(linker), "--verbose"])
+    (artifacts / "default-script.txt").write_text(default_script)
+    # GNU14 exposes the plugin on the actual job even when there is no LTO work.
+    job_tokens = [token for line in jobs.splitlines() if "collect2" in line for token in shlex.split(line)]
+    for i, token in enumerate(job_tokens):
+        if token in ("-plugin", "--plugin"):
+            p = Path(job_tokens[i+1]).resolve(strict=True)
+            files[str(p)] = _static_hash(p.read_bytes())
+    dep = artifacts / "native.d"
+    instrument = args + ["-Wl,--trace", f"-Wl,--dependency-file={dep}"]
+    transactions = []
+    for label in ("instrumented", "control", "map"):
+        command = instrument.copy()
+        command[oi] = str(artifacts / f"{label}.elf")
+        if label == "map":
+            command += [f"-Wl,-Map={artifacts / 'native.map'}"]
+        trace = run(label, command)
+        if (artifacts / f"{label}.elf").read_bytes() != production:
+            raise ValueError(f"static {label} differs from production")
+        dependency = dep.read_bytes()
+        (artifacts / f"{label}.d").write_bytes(dependency)
+        # Restrict grammar rather than guessing make quoting or trace diagnostics.
+        text = dependency.decode().replace("\\\n", "")
+        first = text.split("\n\n", 1)[0]
+        if ":" not in first or "\\" in first:
+            raise ValueError("unsupported static dependency grammar")
+        paths = first.split(":", 1)[1].split()
+        traced = [line.strip() for line in trace.splitlines() if line.strip()]
+        def canonical(items):
+            return {(cwd / p).resolve(strict=True) for p in items}
+        dependencies, traces = canonical(paths), canonical(traced)
+        if dependencies != traces or not dependencies:
+            raise ValueError("static trace/dependency input set mismatch")
+        inventory = {}
+        for p in dependencies:
+            data = p.read_bytes()
+            inventory[str(p)] = _static_hash(data)
+            objects = [m[4] for m in _static_members(data)] if data.startswith(b"!<arch>\n") else [data]
+            if data.startswith(b"!<thin>"):
+                raise ValueError("thin static archive unsupported")
+            for obj in objects:
+                if obj.startswith(b"\x7fELF"):
+                    _, names = _static_elf(obj)
+                    if any(n.startswith(".gnu.lto_") for n in names):
+                        raise ValueError("GNU LTO input is not static selection evidence")
+        if transactions and transactions[0] != inventory:
+            raise ValueError("static input changed between transactions")
+        transactions.append(inventory)
+        files.update(inventory)
+    if dict(os.environ) != env:
+        raise ValueError("static environment changed during capture")
+    if run("default-script-after", [str(linker), "--verbose"]) != default_script:
+        raise ValueError("static default script changed")
+    files[str(output)] = _static_hash(production)
+    for path, digest in files.items():
+        if _static_hash(Path(path).read_bytes()) != digest:
+            raise ValueError(f"static input changed: {path}")
+    for p in artifacts.iterdir():
+        if p.is_file() and p != proof:
+            files[str(p)] = _static_hash(p.read_bytes())
+    recipe = dict(schema=1, argv=argv, cwd=str(cwd), output=str(output), env=env, files=files)
+    proof.write_text(json.dumps(recipe, indent=2))
+    return recipe
+
+
+def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path, artifacts: Path,
+                                       unit: "Unit", object_bytes: bytes, replay_bytes: bytes,
+                                       target: str) -> TypedStaticExecutableSelection:
+    """Reconstruct native closure and prove the kept input owns the actual AArch64 callee."""
+    recipe = capture_static_link(argv, cwd, output, artifacts)
+    # A capture recipe is never itself sufficient: the following proof uses bytes.
+    image = read_object(object_bytes)
+    if object_bytes != replay_bytes or unit.object_identity != image_fingerprint(image):
+        raise ValueError("static selected object differs from audited Unit/B1 replay")
+    data = output.read_bytes()
+    headers, names = _static_elf(data)
+    if _field(data, 18, 2) != 183:
+        raise ValueError("static selected executable must be AArch64")
+    typ = _field(data, 16, 2)
+    po, pe, pn = _field(data, 32, 8), _field(data, 54, 2), _field(data, 56, 2)
+    if pe != 56 or po + pe * pn > len(data):
+        raise ValueError("static program header bounds")
+    interp = any(_field(data, po+i*pe, 4) == 3 for i in range(pn))
+    pie = any(_field(data, b, 8) == 0x6ffffffb and _field(data, b+8, 8) & 0x8000000
+              for h in headers if h["type"] == 6
+              for b in range(h["offset"], h["offset"] + h["size"], 16))
+    if typ != 2 and not (typ == 3 and interp and pie):
+        raise ValueError("static executable requires ET_EXEC or PIE with PT_INTERP and DF_1_PIE")
+    if any(s[0] == target for s in _static_symbols(data, headers, 11)):
+        raise ValueError("static selected target appears in dynsym")
+    symbols = [s for s in _static_symbols(data, headers, 2) if s[0] == target]
+    if len(symbols) != 1:
+        raise ValueError("ambiguous final static symbol")
+    _, info, visibility, section, address, size = symbols[0]
+    if info != 0x22 or visibility != 0 or not 0 < section < len(headers) or size == 0:
+        raise ValueError("static final symbol is not unique weak/default STT_FUNC")
+    final = headers[section]
+    if not final["flags"] & 4 or not final["address"] <= address < address+size <= final["address"]+final["size"]:
+        raise ValueError("static final symbol outside executable section")
+    originals = [s for s in image.symbols if s.name == target]
+    if len(originals) != 1 or originals[0].binding != "weak" or originals[0].visibility != "default":
+        raise ValueError("ambiguous static input symbol")
+    original = originals[0]
+    mapping = (artifacts / "native.map").read_text()
+    boundary = "Linker script and memory map"
+    if mapping.count(boundary) != 1 or mapping.count("Discarded input sections") != 1:
+        raise ValueError("ambiguous GNU map kept/discarded boundary")
+    discarded, kept = mapping.split(boundary)
+    if discarded.index("Discarded input sections") > len(discarded):
+        raise ValueError("static discarded boundary")
+    # GNU map input-section lines may wrap once between section name and address.
+    intervals = re.findall(r"^ (\.[^\s]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+([^\n]+)$", kept, re.M)
+    owners = [(n, int(a, 16), int(s, 16), p.strip()) for n,a,s,p in intervals
+              if int(a, 16) <= address < address+size <= int(a, 16)+int(s, 16)]
+    if len(owners) != 1:
+        raise ValueError("static map has ambiguous/missing kept owner")
+    name, placed, extent, owner = owners[0]
+    member = re.fullmatch(r"(.+)\(([^()]+)\)", owner)
+    p = (cwd / (member[1] if member else owner)).resolve(strict=True)
+    if str(p) not in recipe["files"]:
+        raise ValueError("static map owner outside input closure")
+    selected = p.read_bytes()
+    if member:
+        matches = [m for m in _static_members(selected) if m[3] == member[2]]
+        if len(matches) != 1:
+            raise ValueError("ambiguous archive member identity")
+        selected = matches[0][4]
+        (artifacts / "selected-member.json").write_text(json.dumps(dict(
+            archive=str(p), ordinal=matches[0][0], header_offset=matches[0][1], raw_name=matches[0][2].hex())))
+    if selected != object_bytes or name != original.section or extent != image.sections[name].size:
+        raise ValueError("static kept member/section differs from audited object")
+    if placed + original.value != address or original.size != size:
+        raise ValueError("static input/final symbol extent mismatch")
+    files = dict(recipe["files"])
+    for p in artifacts.iterdir():
+        if p.is_file():
+            files[str(p.resolve())] = _static_hash(p.read_bytes())
+    return TypedStaticExecutableSelection(_STATIC_SELECTION_KEY, unit, target, files, recipe["env"])
+
+
 class Unit(NamedTuple):
     """One audited object (a translation unit's copy): its normalised bodies, defined function bindings, unique
     strongly bound imports and the symbols proven never to return."""
@@ -1903,6 +2236,7 @@ class Unit(NamedTuple):
     noreturn: frozenset
     visibility: dict = {}  # Raw name -> visibility of each defined function.
     macho: bool = False
+    object_identity: bytes = b""
 
 
 def make_unit(copy: str, image: ObjectImage, bodies: dict) -> Unit:
@@ -1919,7 +2253,7 @@ def make_unit(copy: str, image: ObjectImage, bodies: dict) -> Unit:
                                              for name, bindings in functions.items()},
                 imports, frozenset(noreturn),
                 {name: values.pop() if len(values) == 1 else "ambiguous" for name, values in visibility.items()},
-                image.macho)
+                image.macho, image_fingerprint(image))
 
 
 class CallContext(NamedTuple):
@@ -1970,6 +2304,15 @@ class CallModel:
             if record is None:
                 return "fail", None, (f"unsupported call boundary (a {binding} definition executes the link-selected "
                                        f"copy; no link-selection record: un-audited weak copy): {target}")
+            if isinstance(record, TypedStaticExecutableSelection):
+                copy = record.unit
+                try:
+                    record.check(copy, target)
+                except ValueError as error:
+                    return "fail", None, str(error)
+                if self.units.get(copy.copy) != copy:
+                    return "fail", None, "static selected Unit is not registered"
+                return "helper", copy, target
             copy = self.units.get(record.get("copy"))
             if copy is None or target not in copy.bodies or copy.functions.get(target) is None:
                 return "fail", None, f"unsupported call boundary (the link-selected copy is not audited): {target}"
