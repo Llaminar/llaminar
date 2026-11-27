@@ -1395,6 +1395,13 @@ function(llaminar_configure_pre_tokenizer)
     set(PCRE2_SUPPORT_JIT OFF)
     set(PCRE2_BUILD_PCRE2GREP OFF)
     set(PCRE2_BUILD_TESTS OFF)
+    # pcre2 10.49 probes the compiler's __CET__ default (INTEL_CET_ENABLED) and
+    # then appends -mshstk to its C flags. -mshstk only enables shadow-stack
+    # intrinsics, which only its sljit JIT uses, and the JIT is disabled above.
+    # Pre-answering the probe keeps pcre2 inside the canonical CPU envelope
+    # (V2_Integration_CPUHostCompileContract). The compiler's own CET
+    # instrumentation (-fcf-protection, __CET__) is unchanged.
+    set(INTEL_CET_ENABLED OFF)
     FetchContent_MakeAvailable(pcre2)
     set(UTF8PROC_ENABLE_TESTING OFF CACHE BOOL "Disable utf8proc upstream test downloads" FORCE)
     set(UTF8PROC_INSTALL OFF CACHE BOOL "Keep utf8proc private to the tokenizer" FORCE)
