@@ -183,9 +183,10 @@ int main()
     # The BF16/AMX envelopes declare hardware dot-product instructions on top of
     # the AVX512-VNNI envelope. Verify the real toolchain assembles the same
     # portable shim the production kernel uses: memcpy-based BF16 chunk loads
-    # (both GCC and Clang vector ABIs) and the GCC/Clang-shared AMX builtins.
-    # A toolchain that cannot assemble the declared contract is a configure
-    # error for that envelope, never a silent downgrade.
+    # (GCC and Clang vector ABIs) and the canonical <immintrin.h> AMX macros
+    # (_tile_*), the API the GNU x86 toolchain exposes. A toolchain that cannot
+    # assemble the declared contract is a configure error for that envelope,
+    # never a silent downgrade.
     if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512BF16" OR LLAMINAR_CPU_ISA_UPPER STREQUAL "AMXBF16")
         include(CheckCXXSourceCompiles)
         set(CMAKE_REQUIRED_QUIET ON)
@@ -222,13 +223,13 @@ int main()
     alignas(64) std::uint16_t a_data[16 * 16] = {};
     alignas(64) std::uint16_t b_data[16 * 16] = {};
     alignas(64) float c_data[16 * 16] = {};
-    __builtin_ia32_tileloadconfig(cfg);
-    __builtin_ia32_tilezero(2);
-    __builtin_ia32_tileloadd64(0, a_data, 32);
-    __builtin_ia32_tileloadd64(1, b_data, 32);
-    __builtin_ia32_tdpbf16ps(2, 0, 1);
-    __builtin_ia32_tilestored64(2, c_data, 64);
-    __builtin_ia32_tilerelease();
+    _tile_loadconfig(cfg);
+    _tile_zero(2);
+    _tile_loadd(0, a_data, 32);
+    _tile_loadd(1, b_data, 32);
+    _tile_dpbf16ps(2, 0, 1);
+    _tile_stored(2, c_data, 64);
+    _tile_release();
     return c_data[0] == 0.0f ? 0 : 1;
 }
 ]=]

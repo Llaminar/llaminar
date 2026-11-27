@@ -444,9 +444,10 @@ namespace llaminar2
              * The layout matches the hardware 64-byte tile config consumed by
              * tileloadconfig: palette 1 is the 16-bit floating-point palette
              * (A/B tiles 16 rows × 32 bytes = 16 BF16; D tiles 16 rows × 64
-             * bytes = 16 FP32). The struct is declared here instead of relying
-             * on either compiler's header spelling so GCC and Clang builds use
-             * one definition.
+             * bytes = 16 FP32). The struct is declared here with the hardware
+             * layout; the GNU <immintrin.h> `_tile_loadconfig` accepts the
+             * config through a `const void *`, so the kernel does not depend
+             * on either compiler's header spelling.
              */
             struct alignas(64) AMXPalette1Config
             {
@@ -471,6 +472,15 @@ namespace llaminar2
              * it executes a worksharing chunk) owns exactly one scope per
              * GEMM; tile state is always released before the thread leaves the
              * kernel so no stale tile data leaks into later kernels.
+             *
+             * The load/release/tile instructions are reached through the
+             * canonical `<immintrin.h>` AMX macros (`_tile_loadconfig`,
+             * `_tile_release`, `_tile_loadd`, `_tile_stored`, `_tile_zero`,
+             * `_tile_dpbf16ps`), the API the GNU x86 toolchain (the canonical
+             * x86 deployment compiler) exposes. The configure-time envelope
+             * probe compiles the same calls, so a toolchain with a different
+             * AMX intrinsic ABI fails configuration instead of emitting a
+             * binary that cannot be built here.
              */
             class AMXTileScope final
             {
@@ -481,11 +491,11 @@ namespace llaminar2
                     config.tile[AMX_TILE_A] = {16, 32}; // 16 rows × 16 BF16
                     config.tile[AMX_TILE_B] = {16, 32};
                     config.tile[AMX_TILE_D] = {16, 64}; // 16 rows × 16 FP32
-                    __builtin_ia32_tileloadconfig(&config);
+                    _tile_loadconfig(&config);
                 }
                 ~AMXTileScope() noexcept
                 {
-                    __builtin_ia32_tilerelease();
+                    _tile_release();
                 }
                 AMXTileScope(const AMXTileScope &) = delete;
                 AMXTileScope &operator=(const AMXTileScope &) = delete;
@@ -494,25 +504,25 @@ namespace llaminar2
             /** @brief Zero one FP32 destination tile before accumulation. */
             inline void amxZeroTile(int tile) noexcept
             {
-                __builtin_ia32_tilezero(tile);
+                _tile_zero(tile);
             }
 
             /** @brief Load one 16×16 BF16 tile from a 64-byte-aligned buffer. */
             inline void amxLoadBf16Tile(int tile, const void *base) noexcept
             {
-                __builtin_ia32_tileloadd64(tile, base, 32);
+                _tile_loadd(tile, base, 32);
             }
 
             /** @brief Store one 16×16 FP32 tile to a 64-byte-aligned buffer. */
             inline void amxStoreF32Tile(int tile, void *base) noexcept
             {
-                __builtin_ia32_tilestored64(tile, base, 64);
+                _tile_stored(tile, base, 64);
             }
 
             /** @brief Accumulate A×B into the destination tile (16×16×16). */
             inline void amxDpbf16(int dst, int a, int b) noexcept
             {
-                __builtin_ia32_tdpbf16ps(dst, a, b);
+                _tile_dpbf16ps(dst, a, b);
             }
 
             /**
