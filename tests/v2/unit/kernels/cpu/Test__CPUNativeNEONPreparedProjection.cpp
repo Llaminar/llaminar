@@ -36,7 +36,7 @@ namespace llaminar2::cpu::native_quantised
 struct CPUNativeNEONProjectionWideOracle
 {
     /** @brief Execute the original physical tile on the same admitted row spans and K tree. */
-    template <typename Ops, CPUProjectionNumericalPolicy Policy, std::size_t Rows>
+    template <typename Ops, CPUProjectionNumericalPolicy Policy, std::size_t Rows, int Strips = 0>
     static void execute(const CPUNativeNEONProjectionTile<Rows> &tile)
     {
         using Tile = CPUNativeNEONProjectionTile<Rows>;
@@ -46,16 +46,16 @@ struct CPUNativeNEONProjectionWideOracle
         {
         case E::CompactMultiScale:
             if (tile.weights_.codebook_id == 7)
-                return tile.template runCoded<Ops, Policy, 7, 0>();
-            return tile.template runCoded<Ops, Policy, 11, 0>();
+                return tile.template runCoded<Ops, Policy, 7, Strips>();
+            return tile.template runCoded<Ops, Policy, 11, Strips>();
         case E::NibbleLUTSourceScale:
-            return tile.template run<Ops, Policy, E::NibbleLUTSourceScale, M::NonLinear, false, 0>();
+            return tile.template run<Ops, Policy, E::NibbleLUTSourceScale, M::NonLinear, false, Strips>();
         case E::Q4KSuperblockCoded:
-            return tile.template run<Ops, Policy, E::Q4KSuperblockCoded, M::Unsigned, true, 0>();
+            return tile.template run<Ops, Policy, E::Q4KSuperblockCoded, M::Unsigned, true, Strips>();
         case E::Q5NativeSingleScale:
             if (tile.weights_.is_asymmetric)
-                return tile.template run<Ops, Policy, E::Q5NativeSingleScale, M::Unsigned, true, 0>();
-            return tile.template run<Ops, Policy, E::Q5NativeSingleScale, M::Centered, false, 0>();
+                return tile.template run<Ops, Policy, E::Q5NativeSingleScale, M::Unsigned, true, Strips>();
+            return tile.template run<Ops, Policy, E::Q5NativeSingleScale, M::Centered, false, Strips>();
         default: throw std::invalid_argument("wide oracle requires a row-decomposition source");
         }
     }
@@ -766,7 +766,30 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
                     input[row] = {activation.data() + (first + row) * blocks, std::size_t(blocks)};
                     output[row] = {bank.data() + (first + row) * n + chunk * 64, std::size_t(columns)};
                 }
-                CPUNativeNEONProjectionTile<R>::bind(packed, input, output, chunk).template executeWith<Ops, Strips>();
+                const auto tile = CPUNativeNEONProjectionTile<R>::bind(packed, input, output, chunk);
+                // This primitive grouping oracle deliberately observes the original instruction
+                // family, even when production statically selects another exact leaf. The
+                // separate row-routing regression proves the actual dispatch output bytes.
+                const auto policy = expert ? CPUProjectionNumericalPolicy::GPUAlignedExpert
+                                           : CPUProjectionNumericalPolicy::BackendNative;
+                const bool retired = std::any_of(std::begin(kNEONRowDecompositions),
+                    std::end(kNEONRowDecompositions), [&](const auto &key) {
+                        return key.rows == R && key.family == Ops::instruction && key.policy == policy &&
+                            key.encoding == packed.encoding &&
+                            (packed.encoding != CPUNativeQuantisedEncoding::CompactMultiScale ||
+                             key.map == packed.codebook_id);
+                    });
+                if (retired)
+                {
+                    if (expert)
+                        CPUNativeNEONProjectionWideOracle::execute<Ops,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert, R, Strips>(tile);
+                    else
+                        CPUNativeNEONProjectionWideOracle::execute<Ops,
+                            CPUProjectionNumericalPolicy::BackendNative, R, Strips>(tile);
+                }
+                else
+                    tile.template executeWith<Ops, Strips>();
             };
             if (rows_per_tile == 1)
                 for (std::size_t row = 0; row < Rows; ++row) bind.template operator()<1>(row);
