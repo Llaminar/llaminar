@@ -16,8 +16,9 @@ identity, the tokenized inline-assembly guard (nested asm, label context,
 opaque directives), and proof binding through scripted stand-in tools
 (dependency closure, symlinks, inputs changing during the build, executed
 command, driver jobs and their programs, precompiled headers, object,
-disassembler, budget, translation unit). Expected program keys are written out
-here, never derived from checker tables.
+disassembler, budget, translation unit). Dispatch formats and ISA families are written out independently here; the live
+program keys apply the production typed row-routing table, not the historical
+Cartesian set of source programs.
 """
 from __future__ import annotations
 
@@ -51,8 +52,27 @@ SPEC.loader.exec_module(CHECKER)
 DISPATCHED = [(1, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1), (7, 0, 0), (7, 1, 1),
               # runCoded<Codebook>: CompactMultiScale (3), map = source codebook 7 (Q5_K, minimum) / 11 (IQ3_S).
               (3, 7, 1), (3, 11, 0)]
-NEON_KEYS = sorted((rows, 0, policy, encoding, nibble_map, minimum)
-                   for rows in (1, 2, 3, 4) for policy in (0, 1) for encoding, nibble_map, minimum in DISPATCHED)
+def fixture_keys(mode: str = "NEON") -> list[tuple]:
+    """Live physical leaves for independently listed dispatch formats and ISA families.
+
+    Synthetic bodies test analyzer features, not native code generation. Routing
+    changes their inventory only; it must not resurrect a retired source symbol.
+    """
+    routing = CHECKER.row_decomposition_keys()
+    families = {"NEON": (0,), "NEON_DOTPROD": (0, 1), "NEON_I8MM": (0, 1, 2)}[mode]
+    leaves = set()
+    for family in families:
+        for rows in (1, 2, 3, 4):
+            if family == 2 and rows == 1:
+                continue  # I8MM's single-row work is already covered by DotProd.
+            for policy in (0, 1):
+                for encoding, mapping, minimum in DISPATCHED:
+                    key = (rows, family, policy, encoding, mapping, minimum, 0)
+                    leaves.update(leaf[:-1] for leaf in routing.get(key, (key,)))
+    return sorted(leaves)
+
+
+NEON_KEYS = fixture_keys()
 NEON_INVENTORY = "1:ASIMD,2:ASIMD,3:ASIMD,4:ASIMD"
 FATAL = "_ZN9llaminar23cpu16native_quantised28CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
 CLEAN = "\tstp\tx29, x30, [sp, #-16]!\n\tmov\tx29, sp\n\tsdot\tv0.4s, v1.16b, v2.16b\n\tldp\tx29, x30, [sp], #16\n\tret"
@@ -3362,11 +3382,21 @@ class InventoryTest(unittest.TestCase):
             CHECKER.program_key(name(1, 1, 0, 1, 0, 1, strips=2))
         self.assertEqual(CHECKER.program_key(name(1, 1, 0, 1, 0, 1)), "1:1:0:1:0:1")
 
-    def test_envelope_inventory_matches_the_written_out_keys(self) -> None:
+    def test_envelope_inventory_matches_the_live_typed_routing_leaves(self) -> None:
         for macho in (False, True):
             counts = audit_witness(macho=macho)
             self.assertEqual(sorted(tuple(map(int, CHECKER.program_key(n).split(":"))) for n in counts), NEON_KEYS)
-        self.assertEqual(len(NEON_KEYS), 96)
+        historical = {(rows, 0, policy, *dispatch) for rows in (1, 2, 3, 4)
+                      for policy in (0, 1) for dispatch in DISPATCHED}
+        retired = {key[:-1] for key in CHECKER.row_decomposition_keys() if key[1] == 0}
+        self.assertEqual(set(NEON_KEYS), historical - retired)
+
+    def test_retired_source_programs_remain_rejected(self) -> None:
+        for key in CHECKER.row_decomposition_keys():
+            for macho in (False, True):
+                with self.subTest(key=key, macho=macho):
+                    with self.assertRaisesRegex(ValueError, "outside the NEON inventory|retired NEON source"):
+                        audit_witness(extra=[(name(*key), ORDERED_CLEAN if key[2] else CLEAN)], macho=macho)
 
     def test_missing_duplicate_empty_and_unexpected_programs(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing"):
@@ -3432,8 +3462,8 @@ class InventoryTest(unittest.TestCase):
             return CHECKER.audit(witness_object(programs(dispatchers=False) + base + [(dispatcher(2), body)] + (extra or [])),
                                  disassembly(programs(dispatchers=False) + base + [(dispatcher(2), body)] + (extra or [])),
                                  "NEON")
-        self.assertEqual(len(run(f"\tcbz\tw0, .La\n\tb\t{name(2, 0, 0, 0, 0, 0)}\n.La:\n\tb\t{name(2, 0, 1, 3, 7, 1)}")), 96)
-        self.assertEqual(len(run("\tbl\tcompactKernel\n\tret", [("compactKernel", "\tret")])), 96)
+        self.assertEqual(len(run(f"\tcbz\tw0, .La\n\tb\t{name(2, 0, 0, 0, 0, 0)}\n.La:\n\tb\t{name(2, 0, 1, 3, 7, 1)}")), len(NEON_KEYS))
+        self.assertEqual(len(run("\tbl\tcompactKernel\n\tret", [("compactKernel", "\tret")])), len(NEON_KEYS))
         with self.assertRaisesRegex(ValueError, "unaudited tile member"):
             run(f"\tb\t{name(3, 0, 0, 0, 0, 0)}")  # another tile's program
         with self.assertRaisesRegex(ValueError, "holds a loop"):
@@ -3508,11 +3538,12 @@ class PolicyTest(unittest.TestCase):
                 continue
             self.assertEqual(sorted(envelopes), ["NEON", "NEON_DOTPROD", "NEON_I8MM"])
             for mode, limits in envelopes.items():
-                # GNU-14 also bounds the coded runCoded programs (develop's actual Q5_K/IQ3_S counts); AppleClang has
-                # no coded ceilings yet, so a coded program fails closed there ("has no budget").
-                coded = {"NEON": 12, "NEON_DOTPROD": 24, "NEON_I8MM": 36}[mode] if identity == "GNU-14" else 0
-                self.assertEqual(len(limits), {"NEON": 54, "NEON_DOTPROD": 108, "NEON_I8MM": 162}[mode] + coded)
-                self.assertEqual(sum(key.split(":")[3] == "3" for key in limits), coded)
+                # The compact Q4_K ceilings are inherited from the Q4_1 neighbour;
+                # compare the expanded dataset against live grouped leaves, not
+                # the pre-routing Cartesian count. AppleClang has no coded ceilings.
+                expected = {":".join(map(str, key)) for key in fixture_keys(mode)
+                            if key[0] != 1 and (identity == "GNU-14" or key[3] != 3)}
+                self.assertEqual(set(CHECKER.expanded_register_limits(limits)), expected)
                 self.assertTrue(all(not key.startswith("1:") and value >= 0 for key, value in limits.items()))
 
     def test_codegen_profile_lists_name_audited_programs(self) -> None:
