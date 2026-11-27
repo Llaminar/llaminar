@@ -101,3 +101,42 @@ instead of relying on library reproducibility.
    and record IPC / cache evidence in the plan's sibling evidence doc.
 4. Re-run serial-byte-exact CPU suites (floating skinny, MTP verifier, native
    quantised) to prove the default route and exact lanes are untouched.
+
+## Validation evidence (2026-11, Intel Sapphire Rapids-class VM)
+
+Build trees (Integration, `AMXBF16` and `AVX512BF16`, ccache):
+
+| Check | Result |
+|---|---|
+| Configure probes (AVX512-BF16, AMX tile) with GCC 15.3 | PASS |
+| `V2_Integration_CPU_BF16GemmNativeRoutes` on `AVX512BF16` tree | 6/6 PASS |
+| Same suite on `AMXBF16` tree | 6 PASS + 3 AMX tests SKIP |
+
+Key findings folded into the code:
+
+- **AMX TILECFG layout**: the 64-byte tilecfg image is header (16 bytes) +
+  16 uint16 col words at offset 16 + 16 uint8 row counts at offset 48 (the
+  oneDNN packed layout). The earlier paired {rows, colsb} descriptor table
+  caused #GP in `ldtilecfg`. Fixed with a `static_assert(sizeof == 64)`.
+- **Functional AMX admission**: this VM backfills the AMX feature leaf and
+  executes `ldtilecfg`/`tilerelease` but the tile data opcodes
+  (`tilezero`/`tileloadd`/`tdpbf16ps`/`tilestored`) raise #UD. CPUID+XCR0
+  alone admitted it; a one-time functional probe (real `tilezero` under a
+  temporary SIGILL handler) now gates the AMXBF16 envelope, the BF16 engine
+  admission and the AMX tests, so the AMXBF16 binary fails fast on such
+  hosts while AVX512-BF16 remains first-class.
+- **GCC 15 base-branch defect**: `nativeQuantisedFP16ScaleToFP32` fell off
+  the end for exponent-31 words under `__F16C__` (undefined NaN/Inf scales);
+  fixed with the scalar bit expansion and an exhaustive 65,536-word
+  regression in `Test__CPUCodedCompactUnits`.
+- **Environment**: the box needed user-space OpenMPI 4.1.6 compiled from
+  source with `--with-devel-headers` (conda's package strips the ORTE
+  private headers `orte_config.h` etc. that `NativeMPISessionSchizo.cpp`
+  needs), ccache, and a raised memory limit; all recorded in
+  `README-BUILD-BF16.md` on the validation worktree.
+
+Remaining follow-ups are unchanged: default-engine flip after isolated
+`perf` measurements on true AMX hardware (this VM cannot execute tile data
+instructions), `PerfStats` counter registration, `M=1` native GEMV,
+fused-SwiGLU/LM-head gate sites, codegen-witness registration, image matrix
+and README synchronization.
