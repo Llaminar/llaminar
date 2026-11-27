@@ -48,6 +48,8 @@ namespace llaminar2
              */
             std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage>
                 canonical_route_ticket_storage;
+            /** True when downstream GPU reducer folds bit-cast int32 fixed-point rows. */
+            bool output_fixed_point_int32_bits = false;
         };
 
         static_assert(StageParamsRequired<Params>);

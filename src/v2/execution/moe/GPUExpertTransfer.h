@@ -242,6 +242,21 @@ public:
         const DeviceId& device,
         void* stream);
 
+    /**
+     * @brief Authenticate and enable one directed same-backend GPU peer-access edge.
+     *
+     * Setup-only helper allowing kernels or transfers executing on @p destination
+     * to dereference device allocations resident on @p source over direct peer access.
+     * Restores the caller's ambient GPU ordinal before returning.
+     *
+     * @param source Distinct same-backend GPU owning the target allocation.
+     * @param destination Same-backend GPU whose kernels/streams access @p source.
+     * @return True only when the runtime exposes and enables direct peer access.
+     */
+    static bool prepareDirectPeerAccess(
+        const DeviceId& source,
+        const DeviceId& destination) noexcept;
+
 };
 
 } // namespace llaminar2

@@ -76,10 +76,13 @@ namespace llaminar2
              * A failed native allocation leaves a null owner whose destruction
              * rolls back the claim. No second live ledger is maintained here. */
             WorkspaceAllocation(DeviceId device, IBackend *backend, size_t bytes,
-                size_t buffer_count, PhysicalMemoryAllocationLease claim)
+                size_t buffer_count, PhysicalMemoryAllocationLease claim,
+                bool peer_coherent = false)
                 : claim(std::move(claim)), device(device), backend(backend),
                   bytes(bytes), buffer_count(buffer_count),
-                  base(backend->allocate(bytes, device.is_cpu() ? 0 : device.ordinal)) {}
+                  base(peer_coherent
+                           ? backend->allocatePeerCoherent(bytes, device.is_cpu() ? 0 : device.ordinal)
+                           : backend->allocate(bytes, device.is_cpu() ? 0 : device.ordinal)) {}
             WorkspaceAllocation(const WorkspaceAllocation &) = delete;
             WorkspaceAllocation &operator=(const WorkspaceAllocation &) = delete;
 
@@ -164,6 +167,16 @@ namespace llaminar2
             return;
         }
         domain_it->second[slot_] = false;
+    }
+
+    void DeviceWorkspaceManager::setMemoryCoherence(MemoryCoherence coherence)
+    {
+        if (block_ != nullptr || !extension_blocks_.empty())
+        {
+            throw std::logic_error(
+                "DeviceWorkspaceManager::setMemoryCoherence must be called before allocation");
+        }
+        memory_coherence_ = coherence;
     }
 
     DeviceWorkspaceManager::DeviceWorkspaceManager(
@@ -1403,7 +1416,8 @@ namespace llaminar2
         // Allocate single contiguous block
         int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
         auto allocation = std::make_shared<detail::WorkspaceAllocation>(
-            device_, backend, total_size, placements.size(), std::move(allocation_lease));
+            device_, backend, total_size, placements.size(), std::move(allocation_lease),
+            memory_coherence_ == MemoryCoherence::PeerCoherent);
         block_ = allocation->base;
         if (!block_)
         {
@@ -1570,7 +1584,8 @@ namespace llaminar2
         }
 
         auto allocation = std::make_shared<detail::WorkspaceAllocation>(
-            device_, backend, total_size, buffers.size(), std::move(allocation_lease));
+            device_, backend, total_size, buffers.size(), std::move(allocation_lease),
+            memory_coherence_ == MemoryCoherence::PeerCoherent);
         void *extension_base = allocation->base;
         if (!extension_base)
         {

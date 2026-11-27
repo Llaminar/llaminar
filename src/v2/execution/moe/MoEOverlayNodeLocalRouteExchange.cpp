@@ -14,6 +14,8 @@
 
 #include "transfer/TransferEngine.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/moe/GPUExpertTransfer.h"
+#include "backends/ComputeBackend.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/NativeContextPreparation.h"
 #include "planning/RankHardwareOwnership.h"
@@ -425,6 +427,29 @@ namespace llaminar2
          * the explicit external-registration contract inside TransferEngine;
          * this owner must not recreate either policy with a private mmap.
          */
+        // Determine direct GPU-to-GPU P2P eligibility BEFORE allocating Root
+        // VRAM so ROCm allocates L2-uncached peer-coherent VRAM when any peer
+        // writes directly over PCIe BAR (on gfx906 PCIe peer writes do not
+        // invalidate Root's L2 cache, mirroring ROCmPeerPushResources).
+        std::size_t direct_p2p_lane_count = 0u;
+        for (auto &layout : layouts)
+        {
+            if (layout.producer_device.type == config_.root_device.type &&
+                DeviceManager::instance()
+                    .peerAccessAvailable(layout.producer_device, config_.root_device)
+                    .value_or(false) &&
+                GPUExpertTransfer::prepareDirectPeerAccess(
+                    /*source=*/config_.root_device,
+                    /*destination=*/layout.producer_device))
+            {
+                layout.direct_p2p_to_root = true;
+                ++direct_p2p_lane_count;
+            }
+        }
+        const bool any_peer_direct_p2p = direct_p2p_lane_count > 0u;
+        const bool all_peers_direct_p2p =
+            !layouts.empty() && direct_p2p_lane_count == layouts.size();
+
         TransferEngine transfer_engine;
         std::shared_ptr<MappedHostTransferRegion> region;
         std::shared_ptr<DeviceTransferBuffer> root_staging;
@@ -443,13 +468,16 @@ namespace llaminar2
             const auto schema = routeRootWorkspace(root_staging_bytes);
             workspace = std::make_unique<DeviceWorkspaceManager>(config_.root_device,
                 schema.total_bytes_with_alignment(), memory_, PhysicalMemoryOwner::ActivationTransportStaging);
+            if (any_peer_direct_p2p)
+                workspace->setMemoryCoherence(DeviceWorkspaceManager::MemoryCoherence::PeerCoherent);
             if (!workspace->allocate(schema))
                 throw std::runtime_error("Node-local route could not materialize its admitted original root workspace");
             lease = workspace->retainBuffer("node_local_route_root", 0, root_staging_bytes);
         } else {
             // This private constructor is reachable only from the explicit test friend.
             region = transfer_engine.allocateMappedHostRegion(mapping_bytes, config_.devices);
-            root_staging = transfer_engine.allocateDeviceTransferBuffer(root_staging_bytes, config_.root_device);
+            root_staging = transfer_engine.allocateDeviceTransferBuffer(
+                root_staging_bytes, config_.root_device, /*peer_coherent=*/any_peer_direct_p2p);
         }
         if (!region || !region->isBound() || (!lease && (!root_staging || !root_staging->isBound())))
             throw std::runtime_error("Node-local route exchange failed to bind its declared storage");
@@ -504,6 +532,7 @@ namespace llaminar2
         root_staging_ = std::move(root_staging);
         root_workspace_ = std::move(workspace);
         root_lease_ = std::move(lease);
+        all_peers_direct_p2p_ = all_peers_direct_p2p;
         materialized_ = true;
 
         PerfStatsCollector::addCounter(
@@ -515,6 +544,7 @@ namespace llaminar2
             {{"identity", config_.identity},
              {"participants", std::to_string(endpoints_.size())},
              {"peer_lanes", std::to_string(lanes_.size())},
+             {"direct_p2p_lanes", std::to_string(direct_p2p_lane_count)},
              {"route_capacity", std::to_string(route_capacity_)},
              {"d_model", std::to_string(d_model_)},
              {"root_staging_bytes",
@@ -527,6 +557,12 @@ namespace llaminar2
     {
         std::lock_guard lock(mutex_);
         return materialized_;
+    }
+
+    bool MoEOverlayNodeLocalRouteExchange::allPeersDirectP2P() const noexcept
+    {
+        std::lock_guard lock(mutex_);
+        return materialized_ && all_peers_direct_p2p_;
     }
 
     int MoEOverlayNodeLocalRouteExchange::rootParticipant() const noexcept
@@ -567,17 +603,33 @@ namespace llaminar2
         auto *const mapped_route_payload = static_cast<float *>(
             mapped_region_->deviceAlias(
                 alias_device, lane.payload_offset));
-        float *route_payload = nullptr;
-        if (alias_device == config_.root_device)
+        float *root_vram_payload = nullptr;
+        if (alias_device == config_.root_device || lane.direct_p2p_to_root)
         {
             if (!root_lease_ && (!root_staging_ || !root_staging_->isBound()))
             {
                 throw std::logic_error(
                     "node-local route exchange root scratch is unavailable");
             }
-            route_payload = static_cast<float *>(
+            root_vram_payload = static_cast<float *>(
                 root_lease_ ? root_lease_->data(lane.root_staging_offset) :
                     root_staging_->mutableDeviceData(lane.root_staging_offset));
+        }
+        float *route_payload = nullptr;
+        const float *effective_mapped_payload = mapped_route_payload;
+        if (lane.direct_p2p_to_root)
+        {
+            // Peer writes sparse live rows directly into Root's admitted VRAM
+            // slice over direct GPU P2P, avoiding any Host RAM bounce. On Root,
+            // mapped_route_payload aliases route_payload so staging skips the
+            // lane and fold/decode read local VRAM with L1-bypassing loads.
+            route_payload = root_vram_payload;
+            if (alias_device == config_.root_device)
+                effective_mapped_payload = root_vram_payload;
+        }
+        else if (alias_device == config_.root_device)
+        {
+            route_payload = root_vram_payload;
         }
         else
         {
@@ -591,7 +643,7 @@ namespace llaminar2
                 mapped_region_->deviceAlias(
                     alias_device, lane.slot_epochs_offset)),
             .route_payload = route_payload,
-            .mapped_route_payload = mapped_route_payload,
+            .mapped_route_payload = effective_mapped_payload,
             .producer_participant = lane.producer_participant,
             .route_capacity = route_capacity_,
             .d_model = d_model_,
@@ -764,6 +816,7 @@ namespace llaminar2
             << " root_device=" << config_.root_device.toString()
             << " root_participant=" << root_participant_
             << " materialized=" << (materialized_ ? "true" : "false")
+            << " direct_p2p=" << (all_peers_direct_p2p_ ? "true" : "false")
             << " route_capacity=" << route_capacity_
             << " max_rows=" << max_rows_
             << " d_model=" << d_model_

@@ -568,6 +568,12 @@ namespace llaminar2::moe_node_local_route_device
             return;
         }
         const auto lane = launch.peers[peer_index];
+        if (lane.mapped_route_payload == lane.route_payload)
+        {
+            // Direct P2P peer already wrote its sparse live slots into Root's
+            // local VRAM slice; foldSparseCanonicalRoutesKernel reads directly.
+            return;
+        }
         const std::uint32_t live_slots =
             launch.physical_rows * launch.top_k;
         __shared__ std::uint32_t s_slot_wide;
@@ -723,26 +729,60 @@ namespace llaminar2::moe_node_local_route_device
         const std::uint32_t column =
             static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         const std::uint32_t row = blockIdx.y;
-        if (row >= launch.physical_rows || column >= launch.d_model)
+        if (row >= launch.physical_rows)
+            return;
+        const bool fixed_point_fold =
+            launch.payload_precision ==
+                MoENodeLocalRoutePayloadPrecision::FixedPoint32Adaptive16 &&
+            launch.ownership != MoENodeLocalRouteOwnership::ContinuationCohort;
+        const bool validation_ok =
+            *validation_status ==
+            static_cast<std::int32_t>(
+                raw(MoENodeLocalRouteExchangeCode::Success));
+        __shared__ unsigned int s_slot_wide_mask;
+        if (fixed_point_fold && validation_ok && launch.top_k <= 32u)
+        {
+            // Cache direct-P2P adaptive 16/32-bit slot tags once per block
+            // before any per-thread column return so __syncthreads() stays uniform.
+            if (threadIdx.x == 0u)
+                s_slot_wide_mask = 0u;
+            __syncthreads();
+            if (threadIdx.x < launch.top_k)
+            {
+                const std::uint32_t slot = row * launch.top_k + threadIdx.x;
+                const std::int32_t participant =
+                    routeParticipantForSlot(launch.domain_assignment, slot);
+                if (participant >= 0 && participant != launch.root_participant)
+                {
+                    const auto *peer = peerForParticipant(launch, participant);
+                    if (peer && peer->mapped_route_payload == peer->route_payload)
+                    {
+                        const std::uint64_t tag =
+                            loadPeerPublished(peer->slot_epochs + slot);
+                        if ((tag >> 63u) != 0u)
+                            atomicOr(&s_slot_wide_mask, 1u << threadIdx.x);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if (column >= launch.d_model)
             return;
         const std::size_t output_index =
             static_cast<std::size_t>(row) * launch.d_model + column;
-        if (*validation_status !=
-            static_cast<std::int32_t>(
-                raw(MoENodeLocalRouteExchangeCode::Success)))
+        if (!validation_ok)
         {
             launch.dense_output[output_index] = __int_as_float(0x7fc00000);
             return;
         }
 
-        if (launch.payload_precision ==
-                MoENodeLocalRoutePayloadPrecision::FixedPoint32Adaptive16 &&
-            launch.ownership != MoENodeLocalRouteOwnership::ContinuationCohort)
+        if (fixed_point_fold)
         {
             // Placement-invariant exact integer accumulation across all local,
             // node-local peer, and heterogeneous remote GPU participants.
             // Remote slots and staged peers carry bit-cast int32 fixed-point
-            // values (scale 2^12); local root slots are quantized identically.
+            // values (scale 2^12); direct-P2P peers carry adaptive int16/int32
+            // directly in Root VRAM and are read with L1-bypassing loads.
             std::int32_t acc = 0;
 #pragma unroll 1
             for (std::uint32_t route = 0u; route < launch.top_k; ++route)
@@ -750,8 +790,9 @@ namespace llaminar2::moe_node_local_route_device
                 const std::uint32_t slot = row * launch.top_k + route;
                 const std::int32_t participant =
                     routeParticipantForSlot(launch.domain_assignment, slot);
-                const std::size_t elem =
-                    static_cast<std::size_t>(slot) * launch.d_model + column;
+                const std::size_t slot_base =
+                    static_cast<std::size_t>(slot) * launch.d_model;
+                const std::size_t elem = slot_base + column;
                 if (participant == launch.root_participant)
                 {
                     acc += moe_activation_packet_device::quantizePrefillFixed32(
@@ -771,10 +812,33 @@ namespace llaminar2::moe_node_local_route_device
                     const auto *peer = peerForParticipant(launch, participant);
                     if (peer)
                     {
-                        std::int32_t q = 0;
-                        const float raw = peer->route_payload[elem];
-                        __builtin_memcpy(&q, &raw, sizeof(q));
-                        acc += q;
+                        if (peer->mapped_route_payload == peer->route_payload)
+                        {
+                            const bool is_wide = (launch.top_k <= 32u)
+                                ? ((s_slot_wide_mask & (1u << route)) != 0u)
+                                : ((loadPeerPublished(peer->slot_epochs + slot) >> 63u) != 0u);
+                            if (!is_wide)
+                            {
+                                const auto *src16 = reinterpret_cast<const std::int16_t *>(
+                                    peer->route_payload + slot_base);
+                                acc += static_cast<std::int32_t>(
+                                    loadPeerPublished(src16 + column));
+                            }
+                            else
+                            {
+                                std::int32_t q = 0;
+                                const float raw = loadPeerPublished(peer->route_payload + elem);
+                                __builtin_memcpy(&q, &raw, sizeof(q));
+                                acc += q;
+                            }
+                        }
+                        else
+                        {
+                            std::int32_t q = 0;
+                            const float raw = peer->route_payload[elem];
+                            __builtin_memcpy(&q, &raw, sizeof(q));
+                            acc += q;
+                        }
                     }
                 }
             }
@@ -809,7 +873,10 @@ namespace llaminar2::moe_node_local_route_device
                         added_root = true;
                         added_operand = true;
                     }
-                    const float partial = peer.route_payload[element];
+                    const float partial =
+                        (peer.mapped_route_payload == peer.route_payload)
+                            ? loadPeerPublished(peer.route_payload + element)
+                            : peer.route_payload[element];
                     contribution = added_operand ? device_fp32_contract::add(contribution, partial) : partial;
                     added_operand = true;
                 }
@@ -831,12 +898,15 @@ namespace llaminar2::moe_node_local_route_device
                 const auto *peer = peerForParticipant(launch, participant);
                 if (peer)
                 {
-                    // Root bindings point at root-device scratch, not mapped
-                    // peer memory. The preceding staging kernel supplies the
-                    // stream-ordered write; normal device caching is valid.
-                    contribution = peer->route_payload[
-                        static_cast<std::size_t>(slot) * launch.d_model +
-                        column];
+                    // Staged peers were written on this stream (normal caching);
+                    // direct-P2P peers wrote into Root VRAM from a peer GPU, so
+                    // bypass L1 via loadPeerPublished to observe coherent L2/VRAM.
+                    const std::size_t elem =
+                        static_cast<std::size_t>(slot) * launch.d_model + column;
+                    contribution =
+                        (peer->mapped_route_payload == peer->route_payload)
+                            ? loadPeerPublished(peer->route_payload + elem)
+                            : peer->route_payload[elem];
                 }
             }
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)

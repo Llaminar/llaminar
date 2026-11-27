@@ -1058,7 +1058,7 @@ namespace llaminar2
         }
     }
 
-    void DeviceTransferBuffer::bind(IBackend *backend)
+    void DeviceTransferBuffer::bind(IBackend *backend, bool peer_coherent)
     {
         if (!backend)
         {
@@ -1072,8 +1072,11 @@ namespace llaminar2
             throw std::logic_error(
                 "DeviceTransferBuffer cannot change backend after binding");
         }
-        void *const allocation = backend->allocate(
-            bytes_, device_.gpu_ordinal());
+        void *const allocation = peer_coherent
+                                     ? backend->allocatePeerCoherent(
+                                           bytes_, device_.gpu_ordinal())
+                                     : backend->allocate(
+                                           bytes_, device_.gpu_ordinal());
         if (!allocation)
         {
             throw std::runtime_error(
@@ -1654,7 +1657,8 @@ namespace llaminar2
     std::shared_ptr<DeviceTransferBuffer>
     TransferEngine::allocateDeviceTransferBuffer(
         size_t bytes,
-        DeviceId device) const
+        DeviceId device,
+        bool peer_coherent) const
     {
         if (bytes == 0u || !device.is_gpu())
         {
@@ -1670,7 +1674,7 @@ namespace llaminar2
         }
         auto buffer = std::shared_ptr<DeviceTransferBuffer>(
             new DeviceTransferBuffer(bytes, device));
-        buffer->bind(backend);
+        buffer->bind(backend, peer_coherent);
         return buffer;
     }
 

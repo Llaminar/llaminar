@@ -590,6 +590,25 @@ namespace llaminar2
         virtual void *allocate(size_t bytes, int device_id) = 0;
 
         /**
+         * @brief Allocate device memory coherent with direct GPU-to-GPU peer writes.
+         *
+         * On CUDA, standard device allocations are already L2-coherent with peer
+         * BAR1 writes observed through cache-volatile loads (__ldcv), so CUDA
+         * inherits @ref allocate. On ROCm, PCIe peer BAR writes bypass the
+         * receiver's L2 cache, so ROCmBackend overrides this to allocate uncached
+         * device memory (`hipDeviceMallocUncached`) under the same canonical
+         * pointer registry and capture-lease contract as @ref allocate.
+         *
+         * @param bytes Number of bytes to allocate
+         * @param device_id GPU device ID (0-based)
+         * @return Pointer to allocated memory (nullptr on failure); release with @ref free.
+         */
+        virtual void *allocatePeerCoherent(size_t bytes, int device_id)
+        {
+            return allocate(bytes, device_id);
+        }
+
+        /**
          * @brief Free device memory
          *
          * @param ptr Device pointer to free (may be nullptr)

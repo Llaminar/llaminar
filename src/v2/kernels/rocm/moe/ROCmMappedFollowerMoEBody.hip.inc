@@ -1345,7 +1345,7 @@ namespace llaminar2::rocm::mapped_follower_moe
         {
             followerPackReturnMetadataGranted(args.return_launch.packet);
             __threadfence_system();
-            moe_activation_packet_device::storeSystemRelease64(args.return_launch.publication);
+            moe_activation_packet_device::storeSystemRelaxed64(args.return_launch.publication);
 
             // Off critical path: publish dynamic service telemetry sample (zero __udivdi3).
             auto *layer_tel = LLAMINAR_FOLLOWER_FIELD(service_telemetry_layer);

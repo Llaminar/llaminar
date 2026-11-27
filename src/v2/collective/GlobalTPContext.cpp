@@ -1105,6 +1105,60 @@ namespace llaminar2
             root_index,gathered,stage,ranges,selected);
     }
 
+    bool GlobalTPContext::gatherReplicatedCPUExpertRoutesToRoot(
+        const ExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+        const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
+        size_t capacity,int root_index,size_t& gathered,const std::string& stage,
+        std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected)
+    {
+        gathered=0;
+        selected=CPURootedPublicationTransport::MPIBandwidth;
+        const auto& cohort=source.cohort();
+        const size_t maximum=std::numeric_limits<size_t>::max();
+        const auto reject=[&](const char* reason) {
+            LOG_ERROR("GlobalTPContext replicated CPU route gather rejected: reason="<<reason
+                <<" domain="<<domain_id_<<" member="<<my_rank_in_domain_
+                <<" stage="<<stage<<" layer="<<source.layer()
+                <<" live_records="<<packet.live_entry_count);
+            return false;
+        };
+        const bool valid_phase =
+            packet.key.histogram_source == ExpertHistogramSource::PrefillChunk ||
+            packet.key.histogram_source == ExpertHistogramSource::DecodeToken ||
+            packet.key.histogram_source == ExpertHistogramSource::GroupedVerifier;
+        if(!authenticatesOriginalCPUExpertBorrow(owner) || !cohort ||
+           scope()!=TPScope::NODE_LOCAL || domain_size_<=1 || my_rank_in_domain_<0 ||
+           my_rank_in_domain_>=domain_size_ || root_index<0 || root_index>=domain_size_ ||
+           (my_rank_in_domain_==root_index && local!=root) ||
+           source.participantIndex()!=static_cast<size_t>(my_rank_in_domain_) ||
+           cohort->participants().size()!=static_cast<size_t>(domain_size_) ||
+           world_ranks_.size()!=cohort->participants().size() ||
+           !valid_phase ||
+           !packet.key.isValid() || packet.key.layer_idx!=source.layer() ||
+           !packet.residency_epoch || packet.target_participant!=source.participant().participant_id ||
+           packet.d_model<=0 || packet.d_model!=source.ownership().geometry().model_columns ||
+           packet.top_k<=0 || packet.live_entry_count>packet.entry_capacity ||
+           packet.live_entry_count>capacity/static_cast<size_t>(domain_size_))
+            return reject("original_source_packet_authority");
+        for(size_t member=0;member<cohort->participants().size();++member)
+            if(world_ranks_[member]!=cohort->participants()[member].world_rank)
+                return reject("original_cohort_rank_order");
+        const size_t width=static_cast<size_t>(packet.d_model)+1u;
+        if(width>maximum/sizeof(float) || capacity>maximum/(width*sizeof(float)))
+            return reject("original_byte_geometry_overflow");
+        const size_t per_member_bytes=packet.live_entry_count*width*sizeof(float);
+        // Every cohort member observes the identical replicated live route set
+        // across PrefillChunk, DecodeToken, and GroupedVerifier even when the
+        // continuation root and remote follower allocate different bucket row
+        // capacities. Deriving transport strictly from per_member_bytes avoids
+        // capacity-induced rank divergence and keeps decode/verifier on 2-epoch ShmemSpin.
+        if(dynamic_cast<ShmemSpinBackend*>(backend_.get()))
+            selected=CPURootedPublicationTransportPolicy::selectReplicatedCohortGather(
+                per_member_bytes);
+        return gatherVariableFloatRecordsToRootImpl(local,packet.live_entry_count,root,capacity,width,
+            root_index,gathered,stage,ranges,selected);
+    }
+
     bool GlobalTPContext::gatherVariableFloatRecordsToRootImpl(
         const float *local_records,
         size_t local_record_count,

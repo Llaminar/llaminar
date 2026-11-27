@@ -150,6 +150,7 @@ namespace llaminar2
                 .d_model = params_.d_model,
                 .payload = storage.metadataOnly() ? MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion
                                                   : MoEOverlayCanonicalRouteTicketPayload::CanonicalRows,
+                .output_fixed_point_int32_bits = params_.output_fixed_point_int32_bits ? 1u : 0u,
             };
             if (!moe_kernel_ ||
                 !moe_kernel_->consumeMoEOverlayCanonicalRouteTicket(

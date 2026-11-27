@@ -167,8 +167,10 @@ TEST(Test__ShmemSpinBackend, RootedPublicationTransportPolicyHasExactBoundaries)
     constexpr size_t qwen36_top_k = 8u;
     constexpr size_t serial_decode_gather_bytes =
         qwen36_top_k * (qwen36_d_model + 1u) * sizeof(float);
-    constexpr size_t two_row_gather_bytes =
-        2u * serial_decode_gather_bytes;
+    constexpr size_t qfn_m8_verifier_gather_bytes =
+        8u * 10u * 2u * (2560u + 1u) * sizeof(float);
+    constexpr size_t over_chunk_gather_bytes =
+        Policy::kPackedGatherSharedMemoryMaxBytes + 4096u;
     EXPECT_EQ(
         Policy::select(
             Operation::PackedRecordGather,
@@ -177,7 +179,12 @@ TEST(Test__ShmemSpinBackend, RootedPublicationTransportPolicyHasExactBoundaries)
     EXPECT_EQ(
         Policy::select(
             Operation::PackedRecordGather,
-            two_row_gather_bytes),
+            qfn_m8_verifier_gather_bytes),
+        Transport::SharedMemoryLatency);
+    EXPECT_EQ(
+        Policy::select(
+            Operation::PackedRecordGather,
+            over_chunk_gather_bytes),
         Transport::MPIBandwidth);
 
     constexpr size_t four_row_broadcast_bytes =
@@ -283,6 +290,37 @@ TEST(Test__ShmemSpinBackend, ReplicatedPrefillCohortSelectionIsDegreeIndependent
                     ? Transport::SharedMemoryParallel : Transport::MPIBandwidth);
             }
         }
+}
+
+/** @test Replicated CPU joint-cohort transport selection derives strictly from live bytes, never asymmetric root/follower capacities. */
+TEST(Test__ShmemSpinBackend, ReplicatedCohortSelectionIgnoresAsymmetricCapacity)
+{
+    using Policy = CPURootedPublicationTransportPolicy;
+    using Transport = CPURootedPublicationTransport;
+    constexpr size_t kChunk = Policy::kReplicatedParallelGatherMinMemberBytes;
+    constexpr size_t kLatMax = Policy::kPackedGatherSharedMemoryMaxBytes;
+
+    // Empty, M=1 decode (~80 KiB), M=8 grouped verifier (~800 KiB), and exact boundary all stay on ShmemSpin.
+    for (size_t live : {size_t{0}, size_t{1}, size_t{80u * 1024u}, size_t{800u * 1024u}, kLatMax})
+        EXPECT_EQ(Policy::selectReplicatedCohortGather(live), Transport::SharedMemoryLatency);
+    // Intermediate band between latency max and full parallel chunk selects MPIBandwidth identically on every rank.
+    for (size_t live : {kLatMax + 1u, kChunk - 1u})
+        EXPECT_EQ(Policy::selectReplicatedCohortGather(live), Transport::MPIBandwidth);
+    // Full prefill chunks (>= 4 MiB per member) select parallel ShmemSpin identically on every rank.
+    for (size_t live : {kChunk, kChunk + 1u, 10u * kChunk})
+        EXPECT_EQ(Policy::selectReplicatedCohortGather(live), Transport::SharedMemoryParallel);
+
+    // Replay odd and power-of-two degrees where root allocates decode capacity and followers allocate prefill capacity.
+    for (int degree : {2, 3, 4, 8})
+    {
+        for (size_t live_routes : {size_t{0}, size_t{8}, size_t{80}, size_t{4000}})
+        {
+            const size_t per_member_bytes = live_routes * 2561u * sizeof(float);
+            const auto root_transport = Policy::selectReplicatedCohortGather(per_member_bytes);
+            for (int member = 1; member < degree; ++member)
+                EXPECT_EQ(Policy::selectReplicatedCohortGather(per_member_bytes), root_transport);
+        }
+    }
 }
 
 TEST(Test__ShmemSpinBackend, SharedMemoryPathDetectionIsSizeTotal)

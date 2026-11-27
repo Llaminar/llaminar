@@ -191,6 +191,30 @@ namespace llaminar2::moe_activation_packet_device
     }
 
     /**
+     * @brief Publish a TransferEngine-bound edge after an explicit `__threadfence_system()`.
+     *
+     * Avoids emitting redundant serialized per-lane system barriers when a batch
+     * kernel has already fenced all payload and metadata writes once across the CTA.
+     */
+    __device__ __forceinline__ void storeSystemRelaxed64(
+        const MoEOverlayActivationTimelinePublishDeviceBinding &binding) noexcept
+    {
+#if defined(__CUDA_ARCH__)
+        cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system> reference(
+            *binding.signal);
+        reference.store(binding.value, cuda::memory_order_relaxed);
+#elif defined(__HIP_DEVICE_COMPILE__)
+        __hip_atomic_store(
+            binding.signal,
+            binding.value,
+            __ATOMIC_RELAXED,
+            __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+        *binding.signal = binding.value;
+#endif
+    }
+
+    /**
      * @brief Snapshot a naturally aligned protocol record with fresh loads.
      *
      * Protocol records are fixed-width, 64-byte-aligned ABI objects. Loading
@@ -713,6 +737,151 @@ namespace llaminar2::moe_activation_packet_device
 #endif
         for (std::size_t col = cleared + threadIdx.x; col < width; col += blockDim.x)
             destination[col] = 0.0f;
+    }
+
+    /** @brief Unpack one peer-published signed int16 fixed-point row into local VRAM as FP32. */
+    __device__ __forceinline__ void copyPeerPublishedFixed16ToFP32(
+        const std::int16_t *__restrict__ source,
+        float *__restrict__ destination,
+        std::size_t width) noexcept
+    {
+        auto unpackToFP32 = [](uint4 packed, float4 &lo, float4 &hi) noexcept {
+            auto s16 = [](std::uint16_t raw16) -> float {
+                return static_cast<float>(static_cast<std::int16_t>(raw16)) *
+                       kMoEPrefillFixedPointInvScale;
+            };
+            lo.x = s16(static_cast<std::uint16_t>(packed.x & 0xffffu));
+            lo.y = s16(static_cast<std::uint16_t>(packed.x >> 16u));
+            lo.z = s16(static_cast<std::uint16_t>(packed.y & 0xffffu));
+            lo.w = s16(static_cast<std::uint16_t>(packed.y >> 16u));
+            hi.x = s16(static_cast<std::uint16_t>(packed.z & 0xffffu));
+            hi.y = s16(static_cast<std::uint16_t>(packed.z >> 16u));
+            hi.z = s16(static_cast<std::uint16_t>(packed.w & 0xffffu));
+            hi.w = s16(static_cast<std::uint16_t>(packed.w >> 16u));
+        };
+        std::size_t copied = 0u;
+#if defined(__CUDA_ARCH__)
+        if ((width & 7u) == 0u &&
+            (((reinterpret_cast<std::uintptr_t>(source) |
+               reinterpret_cast<std::uintptr_t>(destination)) & 15u) == 0u))
+        {
+            const std::size_t chunks = width >> 3u;
+            const auto *__restrict__ src_u4 = reinterpret_cast<const uint4 *>(source);
+            auto *__restrict__ dst4 = reinterpret_cast<float4 *>(destination);
+            const std::size_t stride = blockDim.x;
+            for (std::size_t c0 = threadIdx.x; c0 < chunks; c0 += 4u * stride)
+            {
+                const std::size_t c1 = c0 + stride;
+                const std::size_t c2 = c0 + 2u * stride;
+                const std::size_t c3 = c0 + 3u * stride;
+                const uint4 p0 = loadPeerPublishedUint4(src_u4 + c0);
+                uint4 p1{}, p2{}, p3{};
+                if (c1 < chunks) p1 = loadPeerPublishedUint4(src_u4 + c1);
+                if (c2 < chunks) p2 = loadPeerPublishedUint4(src_u4 + c2);
+                if (c3 < chunks) p3 = loadPeerPublishedUint4(src_u4 + c3);
+                float4 lo0{}, hi0{}, lo1{}, hi1{}, lo2{}, hi2{}, lo3{}, hi3{};
+                unpackToFP32(p0, lo0, hi0);
+                dst4[c0 * 2u] = lo0;
+                dst4[c0 * 2u + 1u] = hi0;
+                if (c1 < chunks) { unpackToFP32(p1, lo1, hi1); dst4[c1 * 2u] = lo1; dst4[c1 * 2u + 1u] = hi1; }
+                if (c2 < chunks) { unpackToFP32(p2, lo2, hi2); dst4[c2 * 2u] = lo2; dst4[c2 * 2u + 1u] = hi2; }
+                if (c3 < chunks) { unpackToFP32(p3, lo3, hi3); dst4[c3 * 2u] = lo3; dst4[c3 * 2u + 1u] = hi3; }
+            }
+            copied = chunks << 3u;
+        }
+#elif defined(__HIP_DEVICE_COMPILE__)
+        if ((width & 7u) == 0u &&
+            (((reinterpret_cast<std::uintptr_t>(source) |
+               reinterpret_cast<std::uintptr_t>(destination)) & 15u) == 0u))
+        {
+            const std::size_t chunks = width >> 3u;
+            const auto *__restrict__ src_u4 = reinterpret_cast<const uint4 *>(source);
+            auto *__restrict__ dst4 = reinterpret_cast<float4 *>(destination);
+            const std::size_t stride = blockDim.x;
+            for (std::size_t c0 = threadIdx.x; c0 < chunks; c0 += 2u * stride)
+            {
+                const std::size_t c1 = c0 + stride;
+                const uint4 p0 = loadPeerPublishedUint4(src_u4 + c0);
+                uint4 p1{};
+                if (c1 < chunks) p1 = loadPeerPublishedUint4(src_u4 + c1);
+                float4 lo0{}, hi0{}, lo1{}, hi1{};
+                unpackToFP32(p0, lo0, hi0);
+                dst4[c0 * 2u] = lo0;
+                dst4[c0 * 2u + 1u] = hi0;
+                if (c1 < chunks) { unpackToFP32(p1, lo1, hi1); dst4[c1 * 2u] = lo1; dst4[c1 * 2u + 1u] = hi1; }
+            }
+            copied = chunks << 3u;
+        }
+#endif
+        for (std::size_t col = copied + threadIdx.x; col < width; col += blockDim.x)
+            destination[col] = static_cast<float>(loadPeerPublished(source + col)) *
+                               kMoEPrefillFixedPointInvScale;
+    }
+
+    /** @brief Unpack one peer-published signed int32 fixed-point row into local VRAM as FP32. */
+    __device__ __forceinline__ void copyPeerPublishedFixed32ToFP32(
+        const std::int32_t *__restrict__ source,
+        float *__restrict__ destination,
+        std::size_t width) noexcept
+    {
+        auto convert4 = [](uint4 p) -> float4 {
+            return make_float4(
+                static_cast<float>(static_cast<std::int32_t>(p.x)) * kMoEPrefillFixedPointInvScale,
+                static_cast<float>(static_cast<std::int32_t>(p.y)) * kMoEPrefillFixedPointInvScale,
+                static_cast<float>(static_cast<std::int32_t>(p.z)) * kMoEPrefillFixedPointInvScale,
+                static_cast<float>(static_cast<std::int32_t>(p.w)) * kMoEPrefillFixedPointInvScale);
+        };
+        std::size_t copied = 0u;
+#if defined(__CUDA_ARCH__)
+        if ((width & 3u) == 0u &&
+            (((reinterpret_cast<std::uintptr_t>(source) |
+               reinterpret_cast<std::uintptr_t>(destination)) & 15u) == 0u))
+        {
+            const std::size_t vecs = width >> 2u;
+            const auto *__restrict__ src_u4 = reinterpret_cast<const uint4 *>(source);
+            auto *__restrict__ dst4 = reinterpret_cast<float4 *>(destination);
+            const std::size_t stride = blockDim.x;
+            for (std::size_t v0 = threadIdx.x; v0 < vecs; v0 += 4u * stride)
+            {
+                const std::size_t v1 = v0 + stride;
+                const std::size_t v2 = v0 + 2u * stride;
+                const std::size_t v3 = v0 + 3u * stride;
+                const uint4 p0 = loadPeerPublishedUint4(src_u4 + v0);
+                uint4 p1{}, p2{}, p3{};
+                if (v1 < vecs) p1 = loadPeerPublishedUint4(src_u4 + v1);
+                if (v2 < vecs) p2 = loadPeerPublishedUint4(src_u4 + v2);
+                if (v3 < vecs) p3 = loadPeerPublishedUint4(src_u4 + v3);
+                dst4[v0] = convert4(p0);
+                if (v1 < vecs) dst4[v1] = convert4(p1);
+                if (v2 < vecs) dst4[v2] = convert4(p2);
+                if (v3 < vecs) dst4[v3] = convert4(p3);
+            }
+            copied = vecs << 2u;
+        }
+#elif defined(__HIP_DEVICE_COMPILE__)
+        if ((width & 3u) == 0u &&
+            (((reinterpret_cast<std::uintptr_t>(source) |
+               reinterpret_cast<std::uintptr_t>(destination)) & 15u) == 0u))
+        {
+            const std::size_t vecs = width >> 2u;
+            const auto *__restrict__ src_u4 = reinterpret_cast<const uint4 *>(source);
+            auto *__restrict__ dst4 = reinterpret_cast<float4 *>(destination);
+            const std::size_t stride = blockDim.x;
+            for (std::size_t v0 = threadIdx.x; v0 < vecs; v0 += 2u * stride)
+            {
+                const std::size_t v1 = v0 + stride;
+                const uint4 p0 = loadPeerPublishedUint4(src_u4 + v0);
+                uint4 p1{};
+                if (v1 < vecs) p1 = loadPeerPublishedUint4(src_u4 + v1);
+                dst4[v0] = convert4(p0);
+                if (v1 < vecs) dst4[v1] = convert4(p1);
+            }
+            copied = vecs << 2u;
+        }
+#endif
+        for (std::size_t col = copied + threadIdx.x; col < width; col += blockDim.x)
+            destination[col] = static_cast<float>(loadPeerPublished(source + col)) *
+                               kMoEPrefillFixedPointInvScale;
     }
 
     /** @return Raw fixed-width value for one strongly typed protocol enum. */
@@ -3663,6 +3832,7 @@ namespace llaminar2::moe_activation_packet_device
     {
         __shared__ std::uint64_t block_live_entries;
         __shared__ std::uint32_t block_ticket_valid;
+        __shared__ std::uint32_t block_fixed_point;
         const auto control = snapshotPeerPublishedBlock(launch.control);
         if (threadIdx.x == 0u)
         {
@@ -3670,11 +3840,15 @@ namespace llaminar2::moe_activation_packet_device
                 static_cast<MoEOverlayCanonicalRouteTicketStatus>(
                     control.publication_status);
             const bool success_payload =
-                publication_status ==
-                MoEOverlayCanonicalRouteTicketStatus::Success;
+                moeOverlayCanonicalRouteTicketStatusSucceeded(publication_status);
             const bool abort_payload =
                 publication_status ==
                 MoEOverlayCanonicalRouteTicketStatus::Aborted;
+            block_fixed_point =
+                publication_status ==
+                        MoEOverlayCanonicalRouteTicketStatus::SuccessFixedPoint32Adaptive16
+                    ? 1u
+                    : 0u;
             block_ticket_valid =
                 success_payload && control.valid() &&
                         control.publicationPending() &&
@@ -3715,7 +3889,71 @@ namespace llaminar2::moe_activation_packet_device
                 compact_slot = loadPeerPublished(launch.compact_route_slots + compact_entry);
             }
             __syncthreads();
-            if (original_slot >= 0 && compact_slot >= 0 &&
+            if (block_fixed_point != 0u)
+            {
+                if (original_slot >= 0 &&
+                    static_cast<std::size_t>(original_slot) < launch.route_capacity)
+                {
+                    const std::size_t destination =
+                        static_cast<std::size_t>(original_slot) * launch.d_model;
+                    if (compact_slot == kMoEOverlayCanonicalTicketZeroSlot)
+                    {
+                        // Duplicate route for an already-folded token: zero locally with zero PCIe reads.
+                        zeroLocalFP32Row(
+                            launch.canonical_route_contributions_fp32 + destination,
+                            launch.d_model);
+                    }
+                    else if (compact_slot >= 0)
+                    {
+                        const bool is_wide =
+                            (compact_slot & kMoEOverlayCanonicalTicketCompactWideFlag) != 0;
+                        const std::size_t src_row = static_cast<std::size_t>(
+                            compact_slot & kMoEOverlayCanonicalTicketCompactSlotMask);
+                        if (src_row < launch.route_capacity)
+                        {
+                            const std::size_t source = src_row * launch.d_model;
+                            if (launch.output_fixed_point_int32_bits != 0u)
+                            {
+                                if (!is_wide)
+                                {
+                                    copyPeerPublishedFixed16ToInt32Bits(
+                                        reinterpret_cast<const std::int16_t *>(
+                                            launch.compact_preweighted_contributions_fp32 + source),
+                                        launch.canonical_route_contributions_fp32 + destination,
+                                        launch.d_model);
+                                }
+                                else
+                                {
+                                    copyPeerPublishedRow(
+                                        launch.compact_preweighted_contributions_fp32 + source,
+                                        launch.canonical_route_contributions_fp32 + destination,
+                                        launch.d_model);
+                                }
+                            }
+                            else
+                            {
+                                if (!is_wide)
+                                {
+                                    copyPeerPublishedFixed16ToFP32(
+                                        reinterpret_cast<const std::int16_t *>(
+                                            launch.compact_preweighted_contributions_fp32 + source),
+                                        launch.canonical_route_contributions_fp32 + destination,
+                                        launch.d_model);
+                                }
+                                else
+                                {
+                                    copyPeerPublishedFixed32ToFP32(
+                                        reinterpret_cast<const std::int32_t *>(
+                                            launch.compact_preweighted_contributions_fp32 + source),
+                                        launch.canonical_route_contributions_fp32 + destination,
+                                        launch.d_model);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else if (original_slot >= 0 && compact_slot >= 0 &&
                 static_cast<std::size_t>(original_slot) < launch.route_capacity &&
                 static_cast<std::size_t>(compact_slot) < launch.route_capacity)
             {
@@ -3773,6 +4011,7 @@ namespace llaminar2::moe_activation_packet_device
         __shared__ std::uint64_t block_published_sequence;
         __shared__ std::uint32_t block_ticket_valid;
         __shared__ std::uint32_t block_ack_valid;
+        __shared__ std::uint32_t block_fixed_point;
         __shared__ std::int32_t shared_original_slots[32];
         __shared__ std::int32_t shared_compact_slots[32];
 
@@ -3783,11 +4022,15 @@ namespace llaminar2::moe_activation_packet_device
                 static_cast<MoEOverlayCanonicalRouteTicketStatus>(
                     control.publication_status);
             const bool success_payload =
-                publication_status ==
-                MoEOverlayCanonicalRouteTicketStatus::Success;
+                moeOverlayCanonicalRouteTicketStatusSucceeded(publication_status);
             const bool abort_payload =
                 publication_status ==
                 MoEOverlayCanonicalRouteTicketStatus::Aborted;
+            block_fixed_point =
+                publication_status ==
+                        MoEOverlayCanonicalRouteTicketStatus::SuccessFixedPoint32Adaptive16
+                    ? 1u
+                    : 0u;
             const bool common_ok =
                 control.valid() && control.publicationPending() &&
                 control.route_capacity ==
@@ -3820,6 +4063,66 @@ namespace llaminar2::moe_activation_packet_device
             __syncthreads();
 
             const std::size_t width = static_cast<std::size_t>(launch.d_model);
+            if (block_fixed_point != 0u)
+            {
+                for (std::size_t entry = 0u; entry < block_live_entries; ++entry)
+                {
+                    const std::int32_t original_slot = shared_original_slots[entry];
+                    const std::int32_t compact_slot = shared_compact_slots[entry];
+                    if (original_slot < 0 ||
+                        static_cast<std::size_t>(original_slot) >= launch.route_capacity)
+                        continue;
+                    const std::size_t destination =
+                        static_cast<std::size_t>(original_slot) * width;
+                    if (compact_slot == kMoEOverlayCanonicalTicketZeroSlot)
+                    {
+                        zeroLocalFP32Row(
+                            launch.canonical_route_contributions_fp32 + destination, width);
+                    }
+                    else if (compact_slot >= 0)
+                    {
+                        const bool is_wide =
+                            (compact_slot & kMoEOverlayCanonicalTicketCompactWideFlag) != 0;
+                        const std::size_t src_row = static_cast<std::size_t>(
+                            compact_slot & kMoEOverlayCanonicalTicketCompactSlotMask);
+                        if (src_row < launch.route_capacity)
+                        {
+                            const std::size_t source = src_row * width;
+                            if (launch.output_fixed_point_int32_bits != 0u)
+                            {
+                                if (!is_wide)
+                                    copyPeerPublishedFixed16ToInt32Bits(
+                                        reinterpret_cast<const std::int16_t *>(
+                                            launch.compact_preweighted_contributions_fp32 + source),
+                                        launch.canonical_route_contributions_fp32 + destination,
+                                        width);
+                                else
+                                    copyPeerPublishedRow(
+                                        launch.compact_preweighted_contributions_fp32 + source,
+                                        launch.canonical_route_contributions_fp32 + destination,
+                                        width);
+                            }
+                            else
+                            {
+                                if (!is_wide)
+                                    copyPeerPublishedFixed16ToFP32(
+                                        reinterpret_cast<const std::int16_t *>(
+                                            launch.compact_preweighted_contributions_fp32 + source),
+                                        launch.canonical_route_contributions_fp32 + destination,
+                                        width);
+                                else
+                                    copyPeerPublishedFixed32ToFP32(
+                                        reinterpret_cast<const std::int32_t *>(
+                                            launch.compact_preweighted_contributions_fp32 + source),
+                                        launch.canonical_route_contributions_fp32 + destination,
+                                        width);
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
             const bool vec_aligned =
                 (width % 4u == 0u) &&
@@ -3911,6 +4214,7 @@ namespace llaminar2::moe_activation_packet_device
 #endif
                 }
             }
+            }
             __syncthreads();
         }
 
@@ -3944,8 +4248,7 @@ namespace llaminar2::moe_activation_packet_device
             static_cast<MoEOverlayCanonicalRouteTicketStatus>(
                 control.publication_status);
         const bool success_payload =
-            publication_status ==
-            MoEOverlayCanonicalRouteTicketStatus::Success;
+            moeOverlayCanonicalRouteTicketStatusSucceeded(publication_status);
         const bool abort_payload =
             publication_status ==
             MoEOverlayCanonicalRouteTicketStatus::Aborted;
@@ -4184,6 +4487,8 @@ namespace llaminar2::moe_activation_packet_device
         auto *s_compact_slots = shared.s_compact_slots;
         if (threadIdx.x == 0u)
         {
+            if (launch.admission_wait.signal != nullptr)
+                waitSystemAcquire64(launch.admission_wait);
             staged_meta = 0u;
             live_entries = 0u;
             if (packet.physical_rows == 1 && packet.packet.top_k > 0 && packet.packet.top_k <= 32)
@@ -4328,7 +4633,7 @@ namespace llaminar2::moe_activation_packet_device
         if (threadIdx.x == 0u)
         {
             __threadfence_system();
-            storeSystemRelease64(launch.publication);
+            storeSystemRelaxed64(launch.publication);
         }
     }
 
@@ -4376,6 +4681,8 @@ namespace llaminar2::moe_activation_packet_device
             if (threadIdx.x < launch.lane_count)
             {
                 const auto &lane_launch = launch.lanes[threadIdx.x];
+                if (lane_launch.admission_wait.signal != nullptr)
+                    waitSystemAcquire64(lane_launch.admission_wait);
                 packDispatchMetadata(lane_launch.packet);
                 if (lane_launch.packet.grant->state ==
                         raw(MoEOverlayActivationEndpointState::Active) &&
@@ -4413,12 +4720,14 @@ namespace llaminar2::moe_activation_packet_device
                     dst[col] = src[col];
             }
             __syncthreads();
+            // Issue ONE system fence for all metadata + shared-hidden writes,
+            // then publish every lane's timeline signal in parallel with relaxed
+            // system stores instead of N serialized membar.sys round trips.
             if (threadIdx.x == 0u)
-            {
                 __threadfence_system();
-                for (std::uint32_t lane = 0u; lane < launch.lane_count; ++lane)
-                    storeSystemRelease64(launch.lanes[lane].publication);
-            }
+            __syncthreads();
+            if (threadIdx.x < launch.lane_count)
+                storeSystemRelaxed64(launch.lanes[threadIdx.x].publication);
             return;
         }
         __shared__ SingleRowDispatchShared shared;
@@ -4595,7 +4904,7 @@ namespace llaminar2::moe_activation_packet_device
         if (threadIdx.x == 0u)
         {
             __threadfence_system();
-            storeSystemRelease64(launch.publication);
+            storeSystemRelaxed64(launch.publication);
         }
     }
 

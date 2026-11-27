@@ -585,10 +585,12 @@ namespace llaminar2
 
         /**
          * @brief Allocate this identity once through its resolved backend.
+         * @param backend Exact backend owning @ref device_.
+         * @param peer_coherent Request peer-coherent (uncached-on-ROCm) VRAM when true.
          * @throws std::logic_error if a second backend attempts to rebind it.
          * @throws std::runtime_error when allocation fails.
          */
-        void bind(IBackend *backend);
+        void bind(IBackend *backend, bool peer_coherent = false);
 
         void *allocation_ = nullptr; ///< Stable address embedded by graph capture.
         size_t bytes_ = 0u; ///< Immutable byte capacity.
@@ -1600,7 +1602,8 @@ namespace llaminar2
          * @return Shared RAII owner suitable for graph-family retention.
          */
         [[nodiscard]] std::shared_ptr<DeviceTransferBuffer>
-        allocateDeviceTransferBuffer(size_t bytes, DeviceId device) const;
+        allocateDeviceTransferBuffer(
+            size_t bytes, DeviceId device, bool peer_coherent = false) const;
 
         /**
          * @brief Allocate two shared slabs and partition them into exclusive slots.

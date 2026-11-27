@@ -853,8 +853,14 @@ namespace llaminar2
 
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
+        /** @copydoc IBackend::allocatePeerCoherent */
+        void *allocatePeerCoherent(size_t bytes, int device_id) override;
 
         void free(void *ptr, int device_id) override;
+    private:
+        /** @brief Shared canonical allocation path supporting standard or uncached peer-coherent VRAM. */
+        void *allocateWithCoherence(size_t bytes, int device_id, bool peer_coherent);
+    public:
 
         /** @copydoc IBackend::retainNativeAllocation */
         NativeAllocationCaptureLease retainNativeAllocation(

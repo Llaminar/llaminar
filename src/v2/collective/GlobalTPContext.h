@@ -67,9 +67,13 @@ namespace llaminar2
      */
     struct CPURootedPublicationTransportPolicy
     {
-        /** Includes Qwen3.6 top-8, d=2048 serial decode (65,568 bytes). */
+        /**
+         * Covers Qwen3.6 (top-8, d=2048) and Qwen3.8-Flash-Next (top-10, d=2560)
+         * serial decode (~200 KiB) and grouped M=8 verifier (~1.56 MiB) in one
+         * inline pre-staged 2-epoch ShmemSpin chunk (parallelized above 256 KiB).
+         */
         static constexpr size_t kPackedGatherSharedMemoryMaxBytes =
-            96u * 1024u;
+            2u * 1024u * 1024u;
         /** Includes compact d=2048 verifier groups through M=4. */
         static constexpr size_t kBroadcastSharedMemoryMaxBytes =
             32u * 1024u;
@@ -92,6 +96,26 @@ namespace llaminar2
             return per_member_live_bytes >= kReplicatedParallelGatherMinMemberBytes
                 ? CPURootedPublicationTransport::SharedMemoryParallel
                 : select(CPURootedPublicationOperation::PackedRecordGather,declared_bytes);
+        }
+
+        /**
+         * @brief Select transport for any replicated CPU joint-cohort gather purely from live bytes.
+         *
+         * Because continuation roots and rank-batch followers may allocate different
+         * bucket row capacities (e.g., M=1 decode root vs M=512 follower), transport
+         * selection for replicated cohorts MUST derive from the identical live byte
+         * count per member rather than local allocation capacity.
+         *
+         * @param per_member_live_bytes Exact replicated live record bytes of ONE member.
+         * @return SharedMemoryParallel for >= 4 MiB chunks, SharedMemoryLatency for
+         *         <= kPackedGatherSharedMemoryMaxBytes, otherwise MPIBandwidth.
+         */
+        [[nodiscard]] static constexpr CPURootedPublicationTransport selectReplicatedCohortGather(
+            size_t per_member_live_bytes) noexcept
+        {
+            if (per_member_live_bytes >= kReplicatedParallelGatherMinMemberBytes)
+                return CPURootedPublicationTransport::SharedMemoryParallel;
+            return select(CPURootedPublicationOperation::PackedRecordGather, per_member_live_bytes);
         }
 
         /** @return Stable observation name for the exact selected native protocol. */
@@ -358,6 +382,17 @@ namespace llaminar2
          * The stage authenticates the original prepared bank and packet epoch first.
          */
         bool gatherReplicatedCPUExpertPrefillRoutesToRoot(
+            const ExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+            const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
+            size_t capacity,int root_index,size_t& gathered,const std::string& stage,
+            std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected);
+
+        /**
+         * @brief Gather replicated CPU joint-cohort routes across all execution phases
+         *        (`PrefillChunk`, `DecodeToken`, `GroupedVerifier`), selecting transport
+         *        strictly from live replicated bytes rather than local buffer capacity.
+         */
+        bool gatherReplicatedCPUExpertRoutesToRoot(
             const ExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
             const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
             size_t capacity,int root_index,size_t& gathered,const std::string& stage,

@@ -2469,6 +2469,17 @@ namespace llaminar2
 
     void *ROCmBackend::allocate(size_t bytes, int device_id)
     {
+        return allocateWithCoherence(bytes, device_id, /*peer_coherent=*/false);
+    }
+
+    void *ROCmBackend::allocatePeerCoherent(size_t bytes, int device_id)
+    {
+        return allocateWithCoherence(bytes, device_id, /*peer_coherent=*/true);
+    }
+
+    void *ROCmBackend::allocateWithCoherence(
+        size_t bytes, int device_id, bool peer_coherent)
+    {
         std::lock_guard<std::mutex> lifecycle_lock(
             rocmRuntimeResourceLifecycleMutex());
         if (device_id >= device_count_ || device_id < 0)
@@ -2501,7 +2512,9 @@ namespace llaminar2
          * `bytes + cushion <= free` test can reject an allocation the runtime
          * can satisfy and made prepared-model reuse topology-order dependent.
          */
-        err = hipMalloc(&ptr, bytes);
+        err = peer_coherent
+                  ? hipExtMallocWithFlags(&ptr, bytes, hipDeviceMallocUncached)
+                  : hipMalloc(&ptr, bytes);
         if (err != hipSuccess)
         {
             // Include memory diagnostics in the error message

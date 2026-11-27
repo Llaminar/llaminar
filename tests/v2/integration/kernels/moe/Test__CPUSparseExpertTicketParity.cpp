@@ -22,10 +22,12 @@
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/moe/CanonicalMoERouteRecord.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/IMoEKernel.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "kernels/cpu/moe/CPUCanonicalShardRouteRecords.h"
 #include "transfer/TransferEngine.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/CPUProjectionTestWorkspace.h"
@@ -394,6 +396,212 @@ void runSparseExpertTicketParity(DeviceId device)
         }
     }
 }
+
+/** @brief Replay MainPrefill per-token FixedPoint32Adaptive16 CPU canonical ticket
+ *         publication (both 1xCPU unsharded and odd-degree 3xCPU sharded) through
+ *         captured CUDA/ROCm ticket consumption for narrow int16, wide int32,
+ *         zero-sentinel duplicate routes, empty replay, and both int32-bit and FP32 outputs.
+ */
+void runPrefillFixedPointCanonicalTicketReplay(DeviceId device)
+{
+    if (!hasCPUBackend()) initCPUBackend(-1);
+    auto *backend = getBackendFor(device);
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() <= device.ordinal)
+        GTEST_SKIP() << device.toString() << " unavailable";
+    auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
+    ASSERT_NE(kernel, nullptr);
+
+    // Certify peer-coherent VRAM allocation contract (hipDeviceMallocUncached on ROCm, coherent on CUDA).
+    void *peer_coherent_buf = backend->allocatePeerCoherent(4096u, device.ordinal);
+    ASSERT_NE(peer_coherent_buf, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(peer_coherent_buf) & 255u, 0u);
+    backend->free(peer_coherent_buf, device.ordinal);
+
+    void *stream = backend->createStream(device.ordinal);
+    ASSERT_NE(stream, nullptr);
+    auto release_stream = [&](void *value) { backend->destroyStream(value, device.ordinal); };
+    std::unique_ptr<void, decltype(release_stream)> stream_owner(stream, release_stream);
+
+    constexpr int kRows = 4;
+    constexpr int kTopK = 4;
+    constexpr int kWidth = 64;
+    constexpr size_t kCapacity = static_cast<size_t>(kRows * kTopK);
+    constexpr float kScale = 4096.0f;
+    constexpr float kInvScale = 1.0f / 4096.0f;
+    constexpr float kClamp = 16000.0f;
+    auto quantize = [=](float v) -> int32_t {
+        const float cl = std::max(-kClamp, std::min(kClamp, v));
+        return static_cast<int32_t>(std::nearbyintf(cl * kScale));
+    };
+
+    const std::array<DeviceId, 1> endpoints{device};
+    auto metadata_arena = TransferEngine::instance().createMappedHostArena(endpoints);
+    auto contrib_arena = TransferEngine::instance().createMappedHostArena(endpoints);
+    auto contrib_region = contrib_arena->allocate(kCapacity * kWidth * sizeof(float), 64u);
+    auto ticket = std::make_shared<MoEOverlayCanonicalRouteReturnTicketStorage>();
+    ticket->bindFixedCapacity(0, kCapacity, kWidth, device, 1u, contrib_region, metadata_arena);
+    ticket->enablePrefillFixedPoint();
+    ASSERT_TRUE(ticket->prefillFixedPointEnabled());
+
+    // 3 tokens active:
+    //   tok 0 (slots 0, 2): narrow int16 sum fits in [-32768, 32767]
+    //   tok 1 (slot 5): wide int32 outlier (> 9.0 -> > 36864 > 32767)
+    //   tok 3 (slots 12, 13, 15): narrow 3-route pre-fold
+    const std::array<int32_t, 6> orig_slots{0, 2, 5, 12, 13, 15};
+    const std::array<int32_t, 6> comp_slots{0, 1, 4, 8, 9, 10};
+    const std::array<int32_t, 6> expert_ids{0, 1, 2, 0, 1, 2};
+    const std::array<float, 6> weights{0.5f, 0.25f, 1.0f, 0.3f, -0.4f, 0.6f};
+    const std::array<int, 3> selected_experts{0, 1, 2};
+
+    // Build 3-participant (odd degree) shard records + single-source rows with matching sums.
+    constexpr size_t kPop = 3u;
+    constexpr size_t kRecWidth = kWidth + 1u;
+    std::vector<float> records(kPop * orig_slots.size() * kRecWidth, 0.0f);
+    std::vector<float> single_source(kCapacity * kWidth, 0.0f);
+    std::array<RootedFloatRecordRange, kPop> ranges{};
+    for (size_t p = 0; p < kPop; ++p)
+        ranges[p] = RootedFloatRecordRange{static_cast<int>(p), p * orig_slots.size(), orig_slots.size()};
+
+    for (size_t e = 0; e < orig_slots.size(); ++e)
+    {
+        const bool is_wide_entry = (e == 2u);
+        for (int col = 0; col < kWidth; ++col)
+        {
+            const float p0 = is_wide_entry ? (4.5f + 0.01f * col) : (0.15f * ((col % 7) - 3));
+            const float p1 = is_wide_entry ? (3.5f - 0.005f * col) : (-0.10f * ((col % 5) - 2));
+            const float p2 = is_wide_entry ? (2.25f) : (0.08f * ((col % 3) - 1));
+            const float sum = (p0 + p1) + p2;
+            single_source[static_cast<size_t>(comp_slots[e]) * kWidth + col] = sum;
+            records[(ranges[0].first_record + e) * kRecWidth + col] = p0;
+            records[(ranges[1].first_record + e) * kRecWidth + col] = p1;
+            records[(ranges[2].first_record + e) * kRecWidth + col] = p2;
+        }
+        for (size_t p = 0; p < kPop; ++p)
+        {
+            ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(
+                records.data() + (ranges[p].first_record + e) * kRecWidth, kWidth,
+                static_cast<size_t>(orig_slots[e])));
+        }
+    }
+
+    // Compute exact expected per-token pre-folded int32 sums at first slot of each token, 0 on duplicate slots.
+    std::vector<int32_t> expected_i32(kCapacity * kWidth, 0);
+    const std::array<std::pair<size_t, size_t>, 3> runs{{{0, 2}, {2, 3}, {3, 6}}};
+    for (const auto &[begin, end] : runs)
+    {
+        const size_t first_slot = static_cast<size_t>(orig_slots[begin]);
+        for (size_t e = begin; e < end; ++e)
+        {
+            for (int col = 0; col < kWidth; ++col)
+            {
+                const float val = single_source[static_cast<size_t>(comp_slots[e]) * kWidth + col] * weights[e];
+                expected_i32[first_slot * kWidth + col] += quantize(val);
+            }
+        }
+    }
+
+    auto result = TestTensorFactory::createFP32({kCapacity, static_cast<size_t>(kWidth)});
+    ASSERT_TRUE(result->ensureOnDevice(device, stream));
+    TransferEngine::requireDeviceInput(result.get(), device, stream);
+    auto &context = GPUDeviceContextPool::instance().getContext(device);
+
+    for (uint32_t out_int32_bits : {1u, 0u})
+    {
+        MoEOverlayCanonicalRouteTicketConsumeLaunch launch{
+            .control = ticket->controlDeviceAlias(),
+            .original_route_slots = ticket->originalRouteSlotsDeviceAlias(),
+            .compact_route_slots = ticket->compactRouteSlotsDeviceAlias(),
+            .compact_preweighted_contributions_fp32 = ticket->contributionRowsDeviceAlias(),
+            .canonical_route_contributions_fp32 = static_cast<float *>(result->gpu_data_ptr()),
+            .route_capacity = kCapacity,
+            .d_model = kWidth,
+            .output_fixed_point_int32_bits = out_int32_bits};
+        auto graph = context.createGraphCapture(stream);
+        ASSERT_NE(graph, nullptr);
+        ScopedBackendGraphCapture capture(context, *graph, "CPU fixed-point prefill ticket replay");
+        ASSERT_TRUE(capture.begin());
+        ASSERT_TRUE(kernel->consumeMoEOverlayCanonicalRouteTicket(
+            MoEKernelLaunchContext{.stream = stream}, launch));
+        capture.finish();
+        ASSERT_TRUE(graph->instantiate());
+
+        // Replay 0: 3xCPU sharded combine + publish; Replay 1: 1xCPU unsharded publish; Replay 2: empty 0-entry replay.
+        for (int mode = 0; mode < 3; ++mode)
+        {
+            const uint64_t epoch = static_cast<uint64_t>(out_int32_bits * 10u + mode + 1u);
+            const size_t live_entries = (mode == 2) ? 0u : orig_slots.size();
+            MoEOverlaySparseRows input{};
+            input.key = makeMoEOverlayCollectiveKey(1, epoch, 0, 0, 0, 1, MoEOverlayCollectiveDirection::Dispatch);
+            input.key.histogram_source = ExpertHistogramSource::PrefillChunk;
+            input.residency_epoch = epoch;
+            input.d_model = kWidth;
+            input.top_k = kTopK;
+            input.row_capacity = kRows;
+            input.entry_capacity = kCapacity;
+            input.live_row_count = (mode == 2) ? 0u : 3u;
+            input.live_entry_count = live_entries;
+            input.original_route_slots_host = const_cast<int32_t *>(orig_slots.data());
+            input.compact_route_slots_host = const_cast<int32_t *>(comp_slots.data());
+            input.expert_ids_host = const_cast<int32_t *>(expert_ids.data());
+            input.route_weights_host = const_cast<float *>(weights.data());
+
+            ASSERT_TRUE(backend->memset(launch.canonical_route_contributions_fp32,
+                0, kCapacity * kWidth * sizeof(float), device.ordinal, stream));
+            ASSERT_TRUE(graph->launch());
+
+            auto pub = ticket->arm(epoch);
+            ASSERT_TRUE(pub);
+            if (mode == 0)
+            {
+                std::vector<int32_t> maps(kCapacity * kPop, -1);
+                std::vector<float> req_w(kCapacity, 0.0f);
+                std::vector<float> combined(kCapacity * kWidth, 0.0f);
+                cpu::moe::CanonicalShardRouteRecordArgs shard_args{
+                    records, ranges, {}, {}, selected_experts, maps, req_w, combined,
+                    /*original_expert_count=*/4, kRows, kTopK, kWidth,
+                    cpu::moe::CanonicalShardSparseRouteView{orig_slots, expert_ids, weights},
+                    std::nullopt};
+                ASSERT_TRUE(combineAndPublishMoEOverlayCanonicalShardRouteRows(*ticket, pub, input, shard_args));
+                // Verify narrow/wide/zero slot encoding produced by CPU pre-folder.
+                EXPECT_EQ(ticket->compactRouteSlotsHost()[0] & kMoEOverlayCanonicalTicketCompactWideFlag, 0);
+                EXPECT_EQ(ticket->compactRouteSlotsHost()[1], kMoEOverlayCanonicalTicketZeroSlot);
+                EXPECT_NE(ticket->compactRouteSlotsHost()[2] & kMoEOverlayCanonicalTicketCompactWideFlag, 0);
+                EXPECT_EQ(ticket->compactRouteSlotsHost()[3] & kMoEOverlayCanonicalTicketCompactWideFlag, 0);
+                EXPECT_EQ(ticket->compactRouteSlotsHost()[4], kMoEOverlayCanonicalTicketZeroSlot);
+                EXPECT_EQ(ticket->compactRouteSlotsHost()[5], kMoEOverlayCanonicalTicketZeroSlot);
+            }
+            else
+            {
+                ASSERT_TRUE(publishMoEOverlayCanonicalRouteRows(*ticket, pub, input,
+                    single_source, MoEOverlayCanonicalRouteSourceLayout::compactSlots()));
+            }
+
+            TransferEngine::publishDeviceWrite(result.get(), device, stream);
+            ASSERT_TRUE(result->ensureOnHost(stream));
+            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            ASSERT_TRUE(ticket->publicationSucceededFor(epoch));
+
+            for (size_t i = 0; i < kCapacity * kWidth; ++i)
+            {
+                const int32_t exp_q = (mode == 2) ? 0 : expected_i32[i];
+                if (out_int32_bits != 0u)
+                {
+                    int32_t got_q = 0;
+                    std::memcpy(&got_q, result->data() + i, sizeof(got_q));
+                    ASSERT_EQ(got_q, exp_q) << "mode=" << mode << " idx=" << i;
+                }
+                else
+                {
+                    const float exp_f = static_cast<float>(exp_q) * kInvScale;
+                    ASSERT_EQ(std::memcmp(result->data() + i, &exp_f, sizeof(float)), 0)
+                        << "mode=" << mode << " idx=" << i
+                        << " got=" << result->data()[i] << " exp=" << exp_f;
+                }
+            }
+        }
+    }
+}
 } // namespace
 
 #ifdef HAVE_CUDA
@@ -402,12 +610,22 @@ TEST(Test__CrossTierExpertArithmeticParity, CPUCanonicalSparseEndpointAllFormats
 {
     runSparseExpertTicketParity(DeviceId::cuda(0));
 }
+/** @brief MainPrefill FixedPoint32Adaptive16 CPU canonical ticket replay on CUDA. */
+TEST(Test__CrossTierExpertArithmeticParity, CPUPrefillFixedPointCanonicalTicketReplayCUDA)
+{
+    runPrefillFixedPointCanonicalTicketReplay(DeviceId::cuda(0));
+}
 #endif
 #ifdef HAVE_ROCM
 /** @brief Symmetric captured ROCm consumer certifies the same retained CPU publication. */
 TEST(Test__CrossTierExpertArithmeticParity, CPUCanonicalSparseEndpointAllFormatsROCm)
 {
     runSparseExpertTicketParity(DeviceId::rocm(0));
+}
+/** @brief MainPrefill FixedPoint32Adaptive16 CPU canonical ticket replay on ROCm. */
+TEST(Test__CrossTierExpertArithmeticParity, CPUPrefillFixedPointCanonicalTicketReplayROCm)
+{
+    runPrefillFixedPointCanonicalTicketReplay(DeviceId::rocm(0));
 }
 #endif
 } // namespace llaminar2::test

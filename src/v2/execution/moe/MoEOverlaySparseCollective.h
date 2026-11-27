@@ -383,6 +383,13 @@ namespace llaminar2
             bool publish(size_t live_entry_count) noexcept;
 
             /**
+             * @brief Release-publish MainPrefill per-token pre-folded fixed-point rows.
+             * @param live_entry_count Number of original route slots covered by the ticket.
+             * @return False for invalid ownership, metadata-only ticket, capacity, or sequence state.
+             */
+            bool publishFixedPointPrefill(size_t live_entry_count) noexcept;
+
+            /**
              * @brief Authenticate this exact armed sequence and residency epoch before payload writes.
              * @param storage Original bound ticket owner.
              * @param residency_epoch Consumed sparse packet's immutable epoch.
@@ -543,6 +550,15 @@ namespace llaminar2
         [[nodiscard]] int dModel() const noexcept { return d_model_; }
         /** @return Exact model layer represented by the ticket. */
         [[nodiscard]] int layerIndex() const noexcept { return layer_idx_; }
+        /**
+         * @brief Opt this MainPrefill ticket into per-token pre-folded FixedPoint32Adaptive16 wire format.
+         *
+         * Only MainPrefill buckets enable this mode during graph construction;
+         * decode and MTP verifier buckets retain exact FP32Canonical route transport.
+         */
+        void enablePrefillFixedPoint() noexcept { prefill_fixed_point_enabled_ = true; }
+        /** @return Whether MainPrefill fixed-point pre-folding is enabled on this ticket. */
+        [[nodiscard]] bool prefillFixedPointEnabled() const noexcept { return prefill_fixed_point_enabled_; }
 
         /** @return Host route-slot destination written by the CPU producer. */
         [[nodiscard]] int32_t *originalRouteSlotsHost() const noexcept;
@@ -573,10 +589,12 @@ namespace llaminar2
          * @brief Complete the exact lease and transfer payload ownership to GPU.
          * @param sequence Sequence authenticated by the unique producer lease.
          * @param live_entry_count Number of initialized compact route rows.
+         * @param fixed_point_prefill True to publish with SuccessFixedPoint32Adaptive16 status.
          * @return Whether the exact armed payload was release-published.
          */
         bool publishArmed(
-            uint64_t sequence, size_t live_entry_count) noexcept;
+            uint64_t sequence, size_t live_entry_count,
+            bool fixed_point_prefill = false) noexcept;
         /**
          * @brief Roll back one exact unpublished lease after CPU failure.
          * @param sequence Sequence authenticated by the expiring producer lease.
@@ -598,6 +616,7 @@ namespace llaminar2
         uint64_t workspace_generation_ = 0u;
         uint64_t armed_sequence_ = 0u;
         ProducerLifecycle producer_lifecycle_ = ProducerLifecycle::Unbound;
+        bool prefill_fixed_point_enabled_ = false;
         /** Original immutable setup purpose; never an executable capability. */
         std::optional<ForwardGraphSubmissionIntent> construction_intent_;
     };

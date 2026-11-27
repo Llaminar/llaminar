@@ -2413,6 +2413,12 @@ namespace llaminar2
                                             ? nullptr : mappedOverlayTicketArenaForDevice(device),
                                         joint_contributor ? MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion
                                                           : MoEOverlayCanonicalRouteTicketPayload::CanonicalRows);
+                                if (ordinary_prefill_graph && !mtp_sidecar_context &&
+                                    total_tokens > 1 && !mapped_intermediate_shards &&
+                                    !joint_contributor)
+                                {
+                                    canonical_route_ticket_storage->enablePrefillFixedPoint();
+                                }
                                 if (!joint_local_target) local_params
                                     .cpu_canonical_route_ticket_return =
                                     MoELocalExpertStage::
@@ -2949,6 +2955,59 @@ namespace llaminar2
                         wireMoEOverlayRankBatchForkJoin(graph, rank_batch_lanes, rank_local_lanes);
                 }
 
+                // Rank-symmetric MainPrefill fixed-point canonical fold policy:
+                // all continuation participants (root and non-root) must select
+                // the same payload precision so peer sparse routes and external
+                // GPU/CPU canonical tickets agree on bit-cast int32 vs FP32.
+                const bool all_external_participants_fixed_point_ready = [&]() -> bool {
+                    if (!owner_map_lifetime || owner_map_lifetime->participants().empty())
+                        return false;
+                    int root_world_rank = -1;
+                    if (const auto *root_desc =
+                            owner_map_lifetime->participantForId(continuation_root_participant);
+                        root_desc && root_desc->world_rank_known)
+                    {
+                        root_world_rank = root_desc->world_rank;
+                    }
+                    bool has_cpu_on_root_rank = false;
+                    for (const auto &p : owner_map_lifetime->participants())
+                    {
+                        if (p.device.is_cpu() &&
+                            (!distributed_overlay ||
+                             (p.world_rank_known && root_world_rank >= 0 &&
+                              p.world_rank == root_world_rank)))
+                        {
+                            has_cpu_on_root_rank = true;
+                            break;
+                        }
+                    }
+                    for (const auto &p : owner_map_lifetime->participants())
+                    {
+                        if (p.device.is_gpu())
+                            continue;
+                        if (!p.device.is_cpu())
+                            return false;
+                        const bool colocated_on_root_rank =
+                            !distributed_overlay ||
+                            (p.world_rank_known && root_world_rank >= 0 &&
+                             p.world_rank == root_world_rank);
+                        if (!colocated_on_root_rank &&
+                            !(has_cpu_on_root_rank &&
+                              config_.moe.expert_overlay_cpu_joint_context != nullptr))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                }();
+                const bool fold_uses_fixed_point_canonical_routes =
+                    captured_local_tp_continuation &&
+                    node_local_route_transport ==
+                        MoEOverlayNodeLocalRouteTransport::MappedSparse &&
+                    ordinary_prefill_graph && !mtp_sidecar_context &&
+                    !mapped_intermediate_shards &&
+                    all_external_participants_fixed_point_ready;
+
                 if (!pending_canonical_ticket_consumes.empty())
                 {
                     if (last_return_reduce.empty())
@@ -2967,6 +3026,8 @@ namespace llaminar2
                             consume_params.output = canonical_route_contributions;
                             consume_params.output_buffer_id = buffers.idFor(
                                 BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+                            consume_params.output_fixed_point_int32_bits =
+                                fold_uses_fixed_point_canonical_routes;
                         }
                         consume_params.layer_idx = layer_idx;
                         consume_params.bucket_rows = total_tokens;
@@ -3866,17 +3927,8 @@ namespace llaminar2
                      * the retained graph family. */
                     reduce_params.node_local_route_exchange =
                         use_mapped_sparse_routes ? route_exchange : nullptr;
-                    const bool all_overlay_participants_gpu =
-                        owner_map_lifetime &&
-                        !owner_map_lifetime->participants().empty() &&
-                        std::all_of(
-                            owner_map_lifetime->participants().begin(),
-                            owner_map_lifetime->participants().end(),
-                            [](const auto &p) { return p.device.is_gpu(); });
                     reduce_params.node_local_route_precision =
-                        (use_mapped_sparse_routes && ordinary_prefill_graph &&
-                         !mtp_sidecar_context && all_overlay_participants_gpu &&
-                         !has_rank_local_canonical_ticket_returns)
+                        fold_uses_fixed_point_canonical_routes
                             ? MoENodeLocalRoutePayloadPrecision::FixedPoint32Adaptive16
                             : MoENodeLocalRoutePayloadPrecision::FP32;
                     if (mapped_intermediate_shards)

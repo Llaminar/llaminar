@@ -115,4 +115,27 @@ namespace llaminar2
         return true;
     }
 
+    bool GPUExpertTransfer::prepareDirectPeerAccess(
+        const DeviceId &source,
+        const DeviceId &destination) noexcept
+    {
+        if (source.is_cuda() && destination.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            return detail::prepareDirectPeerAccessCUDABackend(source, destination);
+#else
+            return false;
+#endif
+        }
+        if (source.is_rocm() && destination.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            return detail::prepareDirectPeerAccessROCmBackend(source, destination);
+#else
+            return false;
+#endif
+        }
+        return false;
+    }
+
 }

@@ -248,16 +248,17 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
     const size_t receive_capacity=slots*p.original_source->cohort()->participants().size();
     std::optional<CPURootedPublicationTransport> selected_transport;
     bool gathered_ok=false;
-    if(sparse && source_phase==ExpertHistogramSource::PrefillChunk)
+    if(sparse)
     {
         auto* native=dynamic_cast<GlobalTPContext*>(p.tp);
         if(!native || !native->authenticatesOriginalCPUExpertBorrow(p.original_tp_owner))
-            return reject("original_replicated_prefill_context");
+            return reject("original_replicated_cohort_context");
         CPURootedPublicationTransport selected;
         // Prepared bank, packet epoch, exact member and packed count were
-        // authenticated above. Only this private native API may derive a common
-        // live-size choice from the producer's replicated cohort route set.
-        gathered_ok=native->gatherReplicatedCPUExpertPrefillRoutesToRoot(
+        // authenticated above. All cohort members hold the exact same live
+        // route set across prefill, decode, and grouped verifier regardless of
+        // local root/follower buffer capacity, so select strictly from live bytes.
+        gathered_ok=native->gatherReplicatedCPUExpertRoutesToRoot(
             *p.original_source,*sparse,p.original_tp_owner,records,records,receive_capacity,
             p.root_participant,gathered,p.stage_name,p.source_ranges,selected);
         selected_transport=selected;

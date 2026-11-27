@@ -2437,6 +2437,17 @@ namespace llaminar2
             {
                 return false;
             }
+            MoEOverlayActivationTimelineWaitDeviceBinding admission_wait{};
+            if (params_.transaction->stageOrdinal() == 0u &&
+                !bindKernelTimelineWait(
+                    lane,
+                    lane.admission_signal_offset,
+                    kMoEOverlayActivationAdmissionTimeline,
+                    &admission_wait,
+                    "dispatch batch admission"))
+            {
+                return false;
+            }
             const MoEOverlayActivationDispatchPackLaunch packet{
                 .hidden_rows_fp32 = static_cast<const float *>(params_.hidden->gpu_data_ptr()),
                 .route_expert_ids_fp32 =
@@ -2461,6 +2472,7 @@ namespace llaminar2
             MoEOverlayActivationSingleRowDispatchPackLaunch launch{
                 .packet = packet,
                 .publication = publication,
+                .admission_wait = admission_wait,
             };
             if (!launch.valid())
                 return false;
@@ -2712,16 +2724,20 @@ namespace llaminar2
             LOG_ERROR("[MoEOverlayActivationDispatchPackBatchStage] Descriptor input join failed");
             return false;
         }
-        for (const auto &lane : lanes)
+        // Stage 0 admission waits are fused in parallel inside
+        // packSingleRowDispatchBatchKernel; still join asynchronous grant
+        // initialization if cold capture preparation did not already do so.
+        if (transaction.stageOrdinal() == 0u && !grant_initialization_joined_)
         {
-            if (!waitForAdmissionIfFirstStage(
-                lane,
-                transaction.stageOrdinal(),
-                stream,
-                grant_initialization_joined_,
-                "continuation batch admission"))
+            for (const auto &lane : lanes)
             {
-                return false;
+                if (!joinGrantInitialization(
+                        lane,
+                        stream,
+                        "continuation batch admission"))
+                {
+                    return false;
+                }
             }
         }
         float *shared_single_row_hidden = nullptr;

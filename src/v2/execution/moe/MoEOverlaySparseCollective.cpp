@@ -9,7 +9,9 @@
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/moe/CanonicalMoERouteRecord.h"
 #include "execution/moe/MoEOverlayHostRowWork.h"
+#include "../../utils/CPUFeatures.h"
 #include "../../utils/OpenMPUtils.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
@@ -27,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <omp.h>
@@ -38,6 +41,9 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#if defined(__AVX512F__) || defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace llaminar2
 {
@@ -931,7 +937,20 @@ namespace llaminar2
         size_t live_entry_count) noexcept
     {
         if (!owner_ || sequence_ == 0u ||
-            !owner_->publishArmed(sequence_, live_entry_count))
+            !owner_->publishArmed(sequence_, live_entry_count, /*fixed_point_prefill=*/false))
+        {
+            return false;
+        }
+        owner_ = nullptr;
+        sequence_ = 0u;
+        return true;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::Publication::publishFixedPointPrefill(
+        size_t live_entry_count) noexcept
+    {
+        if (!owner_ || sequence_ == 0u ||
+            !owner_->publishArmed(sequence_, live_entry_count, /*fixed_point_prefill=*/true))
         {
             return false;
         }
@@ -982,10 +1001,12 @@ namespace llaminar2
     }
 
     bool MoEOverlayCanonicalRouteReturnTicketStorage::publishArmed(
-        uint64_t sequence, size_t live_entry_count) noexcept
+        uint64_t sequence, size_t live_entry_count,
+        bool fixed_point_prefill) noexcept
     {
         if (!hasValidBoundIdentity() ||
             producer_lifecycle_ != ProducerLifecycle::Armed ||
+            (fixed_point_prefill && metadataOnly()) ||
             (metadataOnly() ? live_entry_count != 0u : live_entry_count > route_capacity_) ||
             control_host_->residency_epoch == 0u || armed_sequence_ == 0u ||
             sequence != armed_sequence_)
@@ -1003,7 +1024,9 @@ namespace llaminar2
 
         control_host_->live_entry_count = live_entry_count;
         control_host_->publication_status = static_cast<std::int32_t>(
-            MoEOverlayCanonicalRouteTicketStatus::Success);
+            fixed_point_prefill
+                ? MoEOverlayCanonicalRouteTicketStatus::SuccessFixedPoint32Adaptive16
+                : MoEOverlayCanonicalRouteTicketStatus::Success);
         std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
             .store(armed_sequence_, std::memory_order_release);
         armed_sequence_ = 0u;
@@ -1080,9 +1103,9 @@ namespace llaminar2
             std::atomic_ref<std::uint64_t>(control_host_->consumed_sequence)
                 .load(std::memory_order_acquire);
         return published > consumed && published - consumed == 1u &&
-               control_host_->publication_status ==
-                   static_cast<std::int32_t>(
-                       MoEOverlayCanonicalRouteTicketStatus::Success) &&
+               moeOverlayCanonicalRouteTicketStatusSucceeded(
+                   static_cast<MoEOverlayCanonicalRouteTicketStatus>(
+                       control_host_->publication_status)) &&
                control_host_->residency_epoch != 0u &&
                (metadataOnly() ? control_host_->live_entry_count == 0u :
                    control_host_->live_entry_count <= route_capacity_);
@@ -1243,6 +1266,288 @@ namespace llaminar2
         return true;
     }
 
+    namespace
+    {
+        constexpr float kCPUPrefillFixedPointScale = 4096.0f;
+        constexpr float kCPUPrefillFixedPointClamp = 16000.0f;
+        constexpr size_t kCPUPrefillFixedStackWidthMax = 8192u;
+        constexpr size_t kCPUPrefillFixedStripeTokens = 4096u;
+
+        /**
+         * @brief Quantize one FP32 weighted route value to exact IEEE round-to-nearest-even
+         *        int32 fixed-point (`scale = 2^12`, clamped to `[-16000, 16000]`),
+         *        matching GPU `quantizePrefillFixed32` bit-for-bit.
+         */
+        inline int32_t quantizePrefillFixed32Scalar(float v) noexcept
+        {
+            const float clamped =
+                std::max(-kCPUPrefillFixedPointClamp, std::min(kCPUPrefillFixedPointClamp, v));
+            return static_cast<int32_t>(std::nearbyintf(clamped * kCPUPrefillFixedPointScale));
+        }
+
+        /**
+         * @brief Accumulate `quantize(src[c] * weight)` into `acc[c]` using runtime ISA dispatch
+         *        (`AVX-512` / `AVX2` / `Scalar`).
+         */
+        inline void accumulateWeightedFixed32Row(
+            int32_t *__restrict__ acc,
+            const float *__restrict__ src,
+            float weight,
+            size_t width,
+            bool first_route,
+            ISALevel isa,
+            bool check_finite,
+            bool &nonfinite_out) noexcept
+        {
+            size_t c = 0u;
+#if defined(__AVX512F__)
+            if (isa == ISALevel::AVX512 && !check_finite)
+            {
+                const __m512 v_w = _mm512_set1_ps(weight);
+                const __m512 v_scale = _mm512_set1_ps(kCPUPrefillFixedPointScale);
+                const __m512 v_pos = _mm512_set1_ps(kCPUPrefillFixedPointClamp);
+                const __m512 v_neg = _mm512_set1_ps(-kCPUPrefillFixedPointClamp);
+                for (; c + 16u <= width; c += 16u)
+                {
+                    const __m512 x = _mm512_mul_ps(_mm512_loadu_ps(src + c), v_w);
+                    const __m512 cl = _mm512_max_ps(v_neg, _mm512_min_ps(v_pos, x));
+                    const __m512i q = _mm512_cvt_roundps_epi32(
+                        _mm512_mul_ps(cl, v_scale),
+                        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    if (first_route)
+                    {
+                        _mm512_storeu_si512(reinterpret_cast<__m512i *>(acc + c), q);
+                    }
+                    else
+                    {
+                        const __m512i prev =
+                            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(acc + c));
+                        _mm512_storeu_si512(
+                            reinterpret_cast<__m512i *>(acc + c), _mm512_add_epi32(prev, q));
+                    }
+                }
+            }
+#endif
+#if defined(__AVX2__)
+            if ((isa == ISALevel::AVX2 || isa == ISALevel::AVX512) && !check_finite)
+            {
+                const __m256 v_w = _mm256_set1_ps(weight);
+                const __m256 v_scale = _mm256_set1_ps(kCPUPrefillFixedPointScale);
+                const __m256 v_pos = _mm256_set1_ps(kCPUPrefillFixedPointClamp);
+                const __m256 v_neg = _mm256_set1_ps(-kCPUPrefillFixedPointClamp);
+                for (; c + 8u <= width; c += 8u)
+                {
+                    const __m256 x = _mm256_mul_ps(_mm256_loadu_ps(src + c), v_w);
+                    const __m256 cl = _mm256_max_ps(v_neg, _mm256_min_ps(v_pos, x));
+                    const __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(cl, v_scale));
+                    if (first_route)
+                    {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(acc + c), q);
+                    }
+                    else
+                    {
+                        const __m256i prev =
+                            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(acc + c));
+                        _mm256_storeu_si256(
+                            reinterpret_cast<__m256i *>(acc + c), _mm256_add_epi32(prev, q));
+                    }
+                }
+            }
+#endif
+            (void)isa;
+            for (; c < width; ++c)
+            {
+                const float weighted = src[c] * weight;
+                if (check_finite && !std::isfinite(weighted))
+                    nonfinite_out = true;
+                const int32_t q = quantizePrefillFixed32Scalar(weighted);
+                acc[c] = first_route ? q : (acc[c] + q);
+            }
+        }
+
+        /**
+         * @brief Sum participant partials in exact ascending participant order, multiply
+         *        by router weight, quantize to exact fixed-point int32, and accumulate into `acc`.
+         */
+        inline void accumulateShardCombinedFixed32Row(
+            int32_t *__restrict__ acc,
+            const float *const *__restrict__ participant_rows,
+            size_t population,
+            float weight,
+            size_t width,
+            bool first_route,
+            ISALevel isa,
+            bool check_finite,
+            bool &nonfinite_out) noexcept
+        {
+            size_t c = 0u;
+#if defined(__AVX512F__)
+            if (isa == ISALevel::AVX512 && !check_finite)
+            {
+                const __m512 v_w = _mm512_set1_ps(weight);
+                const __m512 v_scale = _mm512_set1_ps(kCPUPrefillFixedPointScale);
+                const __m512 v_pos = _mm512_set1_ps(kCPUPrefillFixedPointClamp);
+                const __m512 v_neg = _mm512_set1_ps(-kCPUPrefillFixedPointClamp);
+                for (; c + 16u <= width; c += 16u)
+                {
+                    __m512 sum = _mm512_loadu_ps(participant_rows[0] + c);
+                    for (size_t p = 1u; p < population; ++p)
+                        sum = _mm512_add_ps(sum, _mm512_loadu_ps(participant_rows[p] + c));
+                    const __m512 x = _mm512_mul_ps(sum, v_w);
+                    const __m512 cl = _mm512_max_ps(v_neg, _mm512_min_ps(v_pos, x));
+                    const __m512i q = _mm512_cvt_roundps_epi32(
+                        _mm512_mul_ps(cl, v_scale),
+                        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    if (first_route)
+                    {
+                        _mm512_storeu_si512(reinterpret_cast<__m512i *>(acc + c), q);
+                    }
+                    else
+                    {
+                        const __m512i prev =
+                            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(acc + c));
+                        _mm512_storeu_si512(
+                            reinterpret_cast<__m512i *>(acc + c), _mm512_add_epi32(prev, q));
+                    }
+                }
+            }
+#endif
+#if defined(__AVX2__)
+            if ((isa == ISALevel::AVX2 || isa == ISALevel::AVX512) && !check_finite)
+            {
+                const __m256 v_w = _mm256_set1_ps(weight);
+                const __m256 v_scale = _mm256_set1_ps(kCPUPrefillFixedPointScale);
+                const __m256 v_pos = _mm256_set1_ps(kCPUPrefillFixedPointClamp);
+                const __m256 v_neg = _mm256_set1_ps(-kCPUPrefillFixedPointClamp);
+                for (; c + 8u <= width; c += 8u)
+                {
+                    __m256 sum = _mm256_loadu_ps(participant_rows[0] + c);
+                    for (size_t p = 1u; p < population; ++p)
+                        sum = _mm256_add_ps(sum, _mm256_loadu_ps(participant_rows[p] + c));
+                    const __m256 x = _mm256_mul_ps(sum, v_w);
+                    const __m256 cl = _mm256_max_ps(v_neg, _mm256_min_ps(v_pos, x));
+                    const __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(cl, v_scale));
+                    if (first_route)
+                    {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(acc + c), q);
+                    }
+                    else
+                    {
+                        const __m256i prev =
+                            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(acc + c));
+                        _mm256_storeu_si256(
+                            reinterpret_cast<__m256i *>(acc + c), _mm256_add_epi32(prev, q));
+                    }
+                }
+            }
+#endif
+            (void)isa;
+            for (; c < width; ++c)
+            {
+                float sum = participant_rows[0][c];
+                for (size_t p = 1u; p < population; ++p)
+                    sum += participant_rows[p][c];
+                const float weighted = sum * weight;
+                if (check_finite && !std::isfinite(weighted))
+                    nonfinite_out = true;
+                const int32_t q = quantizePrefillFixed32Scalar(weighted);
+                acc[c] = first_route ? q : (acc[c] + q);
+            }
+        }
+
+        /**
+         * @brief Adaptively pack one accumulated int32 row into mapped ticket storage as
+         *        either signed int16 (when all elements fit in `[-32768, 32767]`) or lossless
+         *        int32. Supports both out-of-place (`acc != dst_slot`) and in-place compaction.
+         * @return True if stored as 32-bit int32 (wide), false if stored as 16-bit int16.
+         */
+        inline bool packFixed32RowAdaptive(
+            const int32_t *acc,
+            float *dst_slot,
+            size_t width,
+            ISALevel isa) noexcept
+        {
+            bool is_wide = false;
+            size_t c = 0u;
+#if defined(__AVX512F__)
+            if (isa == ISALevel::AVX512)
+            {
+                const __m512i v_lo = _mm512_set1_epi32(-32768);
+                const __m512i v_hi = _mm512_set1_epi32(32767);
+                __mmask16 wide_mask = 0;
+                for (; c + 16u <= width; c += 16u)
+                {
+                    const __m512i v = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(acc + c));
+                    wide_mask |= _mm512_cmplt_epi32_mask(v, v_lo) | _mm512_cmpgt_epi32_mask(v, v_hi);
+                }
+                if (wide_mask != 0)
+                    is_wide = true;
+            }
+#endif
+#if defined(__AVX2__)
+            if (!is_wide && (isa == ISALevel::AVX2 || isa == ISALevel::AVX512))
+            {
+                const __m256i v_lo = _mm256_set1_epi32(-32768);
+                const __m256i v_hi = _mm256_set1_epi32(32767);
+                __m256i any_out = _mm256_setzero_si256();
+                for (; c + 8u <= width; c += 8u)
+                {
+                    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(acc + c));
+                    const __m256i lt = _mm256_cmpgt_epi32(v_lo, v);
+                    const __m256i gt = _mm256_cmpgt_epi32(v, v_hi);
+                    any_out = _mm256_or_si256(any_out, _mm256_or_si256(lt, gt));
+                }
+                if (!_mm256_testz_si256(any_out, any_out))
+                    is_wide = true;
+            }
+#endif
+            for (; !is_wide && c < width; ++c)
+            {
+                if (acc[c] < -32768 || acc[c] > 32767)
+                    is_wide = true;
+            }
+
+            if (is_wide)
+            {
+                auto *dst_i32 = reinterpret_cast<int32_t *>(dst_slot);
+                if (dst_i32 != acc)
+                    std::memcpy(dst_i32, acc, width * sizeof(int32_t));
+                return true;
+            }
+
+            auto *dst_i16 = reinterpret_cast<int16_t *>(dst_slot);
+            c = 0u;
+#if defined(__AVX512F__)
+            if (isa == ISALevel::AVX512)
+            {
+                for (; c + 16u <= width; c += 16u)
+                {
+                    const __m512i v = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(acc + c));
+                    const __m256i p = _mm512_cvtepi32_epi16(v);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst_i16 + c), p);
+                }
+            }
+#endif
+#if defined(__AVX2__)
+            if (isa == ISALevel::AVX2 || isa == ISALevel::AVX512)
+            {
+                for (; c + 16u <= width; c += 16u)
+                {
+                    const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(acc + c));
+                    const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(acc + c + 8u));
+                    const __m256i packed = _mm256_packs_epi32(lo, hi);
+                    const __m256i ordered = _mm256_permute4x64_epi64(packed, 0xD8);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst_i16 + c), ordered);
+                }
+            }
+#endif
+            (void)isa;
+            for (; c < width; ++c)
+                dst_i16[c] = static_cast<int16_t>(acc[c]);
+            return false;
+        }
+    } // namespace
+
     bool publishMoEOverlayCanonicalRouteRows(MoEOverlayCanonicalRouteReturnTicketStorage& ticket,
         MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
         const MoEOverlaySparseRows& input,std::span<const float> source,
@@ -1259,6 +1564,141 @@ namespace llaminar2
         for(size_t entry=0;entry<input.live_entry_count;++entry)
             if(!input.original_route_slots_host || input.original_route_slots_host[entry]<0 ||
                static_cast<size_t>(input.original_route_slots_host[entry])>=ticket.routeCapacity())return false;
+        if(ticket.prefillFixedPointEnabled() &&
+           input.key.histogram_source == ExpertHistogramSource::PrefillChunk)
+        {
+            if(!source_layout.compatibleWith(input.top_k) || input.d_model<=0 ||
+               input.top_k<=0 || input.live_row_count>input.row_capacity ||
+               input.live_entry_count>input.entry_capacity || (input.live_entry_count && !input.live_row_count))
+                return false;
+            const size_t count = input.live_entry_count;
+            if(count == 0u)
+                return publication.publishFixedPointPrefill(0u);
+            const auto maximum = std::numeric_limits<size_t>::max();
+            if(source.size()%width || source.size()>maximum/sizeof(float) ||
+               count>maximum/sizeof(int32_t) || !source.data() ||
+               !input.original_route_slots_host || !input.compact_route_slots_host || !input.route_weights_host)
+                return false;
+            const size_t ticket_payload_bytes = ticket.routeCapacity() * width * sizeof(float);
+            const auto overlaps = [](const void* a, size_t an, const void* b, size_t bn) {
+                if(!an || !bn) return false;
+                const auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
+                if(!a || !b || an > std::numeric_limits<uintptr_t>::max() - x ||
+                   bn > std::numeric_limits<uintptr_t>::max() - y) return true;
+                return x < y + bn && y < x + an;
+            };
+            if(overlaps(source.data(), source.size_bytes(), ticket.contributionRowsHost(), ticket_payload_bytes) ||
+               overlaps(input.original_route_slots_host, count*sizeof(int32_t), ticket.contributionRowsHost(), ticket_payload_bytes) ||
+               overlaps(input.compact_route_slots_host, count*sizeof(int32_t), ticket.contributionRowsHost(), ticket_payload_bytes) ||
+               overlaps(input.route_weights_host, count*sizeof(float), ticket.contributionRowsHost(), ticket_payload_bytes))
+                return false;
+            const size_t source_capacity = source.size() / width;
+            int32_t previous_original = -1, previous_compact = -1;
+            for(size_t entry = 0u; entry < count; ++entry)
+            {
+                const auto original_slot = input.original_route_slots_host[entry];
+                const auto compact_slot = input.compact_route_slots_host[entry];
+                if(original_slot <= previous_original || compact_slot <= previous_compact ||
+                   !std::isfinite(input.route_weights_host[entry]))
+                    return false;
+                const auto source_slot = source_layout.rowIndex(original_slot, compact_slot, input.top_k);
+                if(!source_slot || *source_slot >= source_capacity)
+                    return false;
+                previous_original = original_slot;
+                previous_compact = compact_slot;
+            }
+
+            const ISALevel isa = activeISALevel();
+            const bool check_finite = debugEnv().validation.fail_on_nan;
+            std::atomic<bool> any_nonfinite{false};
+            size_t next_entry = 0u;
+            size_t dest_row_base = 0u;
+            while(next_entry < count)
+            {
+                std::array<size_t, kCPUPrefillFixedStripeTokens + 1u> run_starts{};
+                size_t num_runs = 0u;
+                while(next_entry < count && num_runs < kCPUPrefillFixedStripeTokens)
+                {
+                    run_starts[num_runs++] = next_entry;
+                    const int32_t tok = input.original_route_slots_host[next_entry] / input.top_k;
+                    ++next_entry;
+                    while(next_entry < count &&
+                          input.original_route_slots_host[next_entry] / input.top_k == tok)
+                    {
+                        ++next_entry;
+                    }
+                }
+                run_starts[num_runs] = next_entry;
+
+                const auto process_run = [&](size_t r) {
+                    const size_t begin = run_starts[r];
+                    const size_t end = run_starts[r + 1u];
+                    const size_t dest_row = dest_row_base + r;
+                    float *const dst_slot = ticket.contributionRowsHost() + dest_row * width;
+                    bool local_nonfinite = false;
+                    bool is_wide = false;
+                    if(width <= kCPUPrefillFixedStackWidthMax)
+                    {
+                        alignas(64) std::array<int32_t, kCPUPrefillFixedStackWidthMax> acc_buf;
+                        for(size_t e = begin; e < end; ++e)
+                        {
+                            const size_t src_slot = *source_layout.rowIndex(
+                                input.original_route_slots_host[e],
+                                input.compact_route_slots_host[e], input.top_k);
+                            accumulateWeightedFixed32Row(
+                                acc_buf.data(), source.data() + src_slot * width,
+                                input.route_weights_host[e], width, e == begin,
+                                isa, check_finite, local_nonfinite);
+                        }
+                        is_wide = packFixed32RowAdaptive(acc_buf.data(), dst_slot, width, isa);
+                    }
+                    else
+                    {
+                        auto *const acc_in_place = reinterpret_cast<int32_t *>(dst_slot);
+                        for(size_t e = begin; e < end; ++e)
+                        {
+                            const size_t src_slot = *source_layout.rowIndex(
+                                input.original_route_slots_host[e],
+                                input.compact_route_slots_host[e], input.top_k);
+                            accumulateWeightedFixed32Row(
+                                acc_in_place, source.data() + src_slot * width,
+                                input.route_weights_host[e], width, e == begin,
+                                isa, check_finite, local_nonfinite);
+                        }
+                        is_wide = packFixed32RowAdaptive(acc_in_place, dst_slot, width, isa);
+                    }
+                    if(local_nonfinite)
+                        any_nonfinite.store(true, std::memory_order_relaxed);
+                    ticket.originalRouteSlotsHost()[begin] = input.original_route_slots_host[begin];
+                    ticket.compactRouteSlotsHost()[begin] =
+                        static_cast<int32_t>(dest_row) |
+                        (is_wide ? kMoEOverlayCanonicalTicketCompactWideFlag : 0);
+                    for(size_t e = begin + 1u; e < end; ++e)
+                    {
+                        ticket.originalRouteSlotsHost()[e] = input.original_route_slots_host[e];
+                        ticket.compactRouteSlotsHost()[e] = kMoEOverlayCanonicalTicketZeroSlot;
+                    }
+                };
+
+                constexpr size_t kParallelRuns = 8u;
+                if(!omp_in_parallel() && num_runs >= kParallelRuns)
+                {
+                    ::llaminar::v2::noteOpenMPTeamFork();
+#pragma omp parallel for schedule(static)
+                    for(int64_t r = 0; r < static_cast<int64_t>(num_runs); ++r)
+                        process_run(static_cast<size_t>(r));
+                }
+                else
+                {
+                    for(size_t r = 0u; r < num_runs; ++r)
+                        process_run(r);
+                }
+                dest_row_base += num_runs;
+            }
+            if(any_nonfinite.load(std::memory_order_relaxed))
+                return false;
+            return publication.publishFixedPointPrefill(count);
+        }
         if(!preweightMoEOverlayCanonicalRouteRows(input,source,source_layout,
             {ticket.contributionRowsHost(),ticket.routeCapacity()*width},
             MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot))return false;
@@ -1335,11 +1775,222 @@ namespace llaminar2
             for(const auto &in:inputs)if(overlaps(outputs[i].first,outputs[i].second,in.first,in.second))return false;
             for(size_t j=0;j<i;++j)if(overlaps(outputs[i].first,outputs[i].second,outputs[j].first,outputs[j].second))return false;
         }
+        if(ticket.prefillFixedPointEnabled() &&
+           input.key.histogram_source == ExpertHistogramSource::PrefillChunk)
+        {
+            if(original.rows < 0 || original.original_expert_count <= 0 ||
+               original.source_ranges.size() < 2u ||
+               original.source_ranges.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+                return false;
+            const size_t rows = static_cast<size_t>(original.rows);
+            const size_t top_k = static_cast<size_t>(original.top_k);
+            if(rows > maximum / top_k || rows * top_k > maximum / width ||
+               rows * top_k * width > maximum / sizeof(float))
+                return false;
+            const size_t slots = rows * top_k;
+            const size_t rec_width = width + 1u;
+            const size_t population = original.source_ranges.size();
+            if(original.records.size() % rec_width != 0u ||
+               !validRootedFloatRecordRanges(original.source_ranges, original.records.size() / rec_width) ||
+               !original.route_indices.empty() || !original.route_weights.empty() ||
+               count > slots || slots > maximum / population ||
+               original.participant_route_maps.size() < slots * population ||
+               original.required_route_weights.size() < slots ||
+               original.combined_route_rows.size() < slots * width ||
+               original.selected_expert_ids.empty())
+                return false;
+            int last_expert = -1;
+            for(const int expert : original.selected_expert_ids)
+            {
+                if(expert <= last_expert || expert >= original.original_expert_count)
+                    return false;
+                last_expert = expert;
+            }
+            // Validate scratch/input aliasing before writing participant_route_maps.
+            const std::array<std::pair<const void*, size_t>, 6> shard_inputs{{
+                {original.records.data(), original.records.size_bytes()},
+                {original.source_ranges.data(), original.source_ranges.size_bytes()},
+                {original.selected_expert_ids.data(), original.selected_expert_ids.size_bytes()},
+                {sparse.original_slots.data(), sparse.original_slots.size_bytes()},
+                {sparse.expert_ids.data(), sparse.expert_ids.size_bytes()},
+                {sparse.weights.data(), sparse.weights.size_bytes()}}};
+            const std::array<std::pair<const void*, size_t>, 2> shard_scratch{{
+                {original.participant_route_maps.data(), slots * population * sizeof(int32_t)},
+                {original.required_route_weights.data(), slots * sizeof(float)}}};
+            for(size_t i = 0u; i < shard_scratch.size(); ++i)
+            {
+                if(shard_scratch[i].second && !shard_scratch[i].first)
+                    return false;
+                for(const auto &in : shard_inputs)
+                    if(overlaps(shard_scratch[i].first, shard_scratch[i].second, in.first, in.second))
+                        return false;
+                for(size_t j = 0u; j < i; ++j)
+                    if(overlaps(shard_scratch[i].first, shard_scratch[i].second,
+                                shard_scratch[j].first, shard_scratch[j].second))
+                        return false;
+            }
+            for(size_t entry = 0u; entry < count; ++entry)
+            {
+                const auto slot = sparse.original_slots[entry];
+                const auto expert = sparse.expert_ids[entry];
+                if(static_cast<size_t>(slot) >= slots || expert < 0 ||
+                   expert >= original.original_expert_count ||
+                   !std::isfinite(sparse.weights[entry]) || sparse.weights[entry] == 0.0f ||
+                   !std::binary_search(original.selected_expert_ids.begin(),
+                                       original.selected_expert_ids.end(), expert))
+                    return false;
+            }
+            std::fill_n(original.participant_route_maps.data(), slots * population, int32_t{-1});
+            std::fill_n(original.required_route_weights.data(), slots, 0.0f);
+            for(const auto slot : sparse.original_slots)
+                original.required_route_weights[static_cast<size_t>(slot)] = 1.0f;
+            for(size_t p = 0u; p < population; ++p)
+            {
+                const auto range = original.source_ranges[p];
+                if(range.record_count > slots ||
+                   range.record_count > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+                    return false;
+                auto map = original.participant_route_maps.subspan(p * slots, slots);
+                const auto recs = original.records.subspan(
+                    range.first_record * rec_width, range.record_count * rec_width);
+                for(size_t rec = 0u; rec < range.record_count; ++rec)
+                {
+                    const auto slot = canonical_moe_route_record::readFlatRouteSlot(
+                        recs.data() + rec * rec_width, original.columns);
+                    if(slot >= slots || original.required_route_weights[slot] == 0.0f || map[slot] != -1)
+                        return false;
+                    map[slot] = static_cast<int32_t>(rec);
+                }
+                for(size_t slot = 0u; slot < slots; ++slot)
+                    if((map[slot] >= 0) != (original.required_route_weights[slot] != 0.0f))
+                        return false;
+            }
+            if(count == 0u)
+                return publication.publishFixedPointPrefill(0u);
+
+            const ISALevel isa = activeISALevel();
+            const bool check_finite = debugEnv().validation.fail_on_nan;
+            std::atomic<bool> any_nonfinite{false};
+            size_t next_entry = 0u;
+            size_t dest_row_base = 0u;
+            while(next_entry < count)
+            {
+                std::array<size_t, kCPUPrefillFixedStripeTokens + 1u> run_starts{};
+                size_t num_runs = 0u;
+                while(next_entry < count && num_runs < kCPUPrefillFixedStripeTokens)
+                {
+                    run_starts[num_runs++] = next_entry;
+                    const int32_t tok = input.original_route_slots_host[next_entry] / input.top_k;
+                    ++next_entry;
+                    while(next_entry < count &&
+                          input.original_route_slots_host[next_entry] / input.top_k == tok)
+                    {
+                        ++next_entry;
+                    }
+                }
+                run_starts[num_runs] = next_entry;
+
+                const auto process_run = [&](size_t r) {
+                    const size_t begin = run_starts[r];
+                    const size_t end = run_starts[r + 1u];
+                    const size_t dest_row = dest_row_base + r;
+                    float *const dst_slot = ticket.contributionRowsHost() + dest_row * width;
+                    bool local_nonfinite = false;
+                    bool is_wide = false;
+                    constexpr size_t kInlinePopulation = 32u;
+                    std::array<const float *, kInlinePopulation> inline_rows{};
+                    auto accumulate_entry = [&](int32_t *acc_ptr, size_t e, bool first_route) {
+                        const size_t slot = static_cast<size_t>(sparse.original_slots[e]);
+                        const float weight = sparse.weights[e];
+                        if(population <= kInlinePopulation)
+                        {
+                            for(size_t p = 0u; p < population; ++p)
+                            {
+                                const auto rec_idx = static_cast<size_t>(
+                                    original.participant_route_maps[p * slots + slot]);
+                                inline_rows[p] = original.records.data() +
+                                    (original.source_ranges[p].first_record + rec_idx) * rec_width;
+                            }
+                            accumulateShardCombinedFixed32Row(
+                                acc_ptr, inline_rows.data(), population, weight, width,
+                                first_route, isa, check_finite, local_nonfinite);
+                        }
+                        else
+                        {
+                            // Arbitrary participant count beyond inline stack array: zero heap alloc.
+                            for(size_t col = 0u; col < width; ++col)
+                            {
+                                float sum = 0.0f;
+                                for(size_t p = 0u; p < population; ++p)
+                                {
+                                    const auto rec_idx = static_cast<size_t>(
+                                        original.participant_route_maps[p * slots + slot]);
+                                    const float *row_p = original.records.data() +
+                                        (original.source_ranges[p].first_record + rec_idx) * rec_width;
+                                    sum = (p == 0u) ? row_p[col] : (sum + row_p[col]);
+                                }
+                                const float weighted = sum * weight;
+                                if(check_finite && !std::isfinite(weighted))
+                                    local_nonfinite = true;
+                                const int32_t q = quantizePrefillFixed32Scalar(weighted);
+                                acc_ptr[col] = first_route ? q : (acc_ptr[col] + q);
+                            }
+                        }
+                    };
+                    if(width <= kCPUPrefillFixedStackWidthMax)
+                    {
+                        alignas(64) std::array<int32_t, kCPUPrefillFixedStackWidthMax> acc_buf;
+                        for(size_t e = begin; e < end; ++e)
+                            accumulate_entry(acc_buf.data(), e, e == begin);
+                        is_wide = packFixed32RowAdaptive(acc_buf.data(), dst_slot, width, isa);
+                    }
+                    else
+                    {
+                        auto *const acc_in_place = reinterpret_cast<int32_t *>(dst_slot);
+                        for(size_t e = begin; e < end; ++e)
+                            accumulate_entry(acc_in_place, e, e == begin);
+                        is_wide = packFixed32RowAdaptive(acc_in_place, dst_slot, width, isa);
+                    }
+                    if(local_nonfinite)
+                        any_nonfinite.store(true, std::memory_order_relaxed);
+                    ticket.originalRouteSlotsHost()[begin] = input.original_route_slots_host[begin];
+                    ticket.compactRouteSlotsHost()[begin] =
+                        static_cast<int32_t>(dest_row) |
+                        (is_wide ? kMoEOverlayCanonicalTicketCompactWideFlag : 0);
+                    for(size_t e = begin + 1u; e < end; ++e)
+                    {
+                        ticket.originalRouteSlotsHost()[e] = input.original_route_slots_host[e];
+                        ticket.compactRouteSlotsHost()[e] = kMoEOverlayCanonicalTicketZeroSlot;
+                    }
+                };
+
+                constexpr size_t kParallelRuns = 8u;
+                if(!omp_in_parallel() && num_runs >= kParallelRuns)
+                {
+                    ::llaminar::v2::noteOpenMPTeamFork();
+#pragma omp parallel for schedule(static)
+                    for(int64_t r = 0; r < static_cast<int64_t>(num_runs); ++r)
+                        process_run(static_cast<size_t>(r));
+                }
+                else
+                {
+                    for(size_t r = 0u; r < num_runs; ++r)
+                        process_run(r);
+                }
+                dest_row_base += num_runs;
+            }
+            if(any_nonfinite.load(std::memory_order_relaxed))
+                return false;
+            return publication.publishFixedPointPrefill(count);
+        }
         auto args=original;
+        const size_t payload_bytes = count * width * sizeof(float);
         args.preweighted_output=cpu::moe::CanonicalRoutePreweightedOutput{
             {ticket.contributionRowsHost(),ticket.routeCapacity()*width},sparse.original_slots,
             {input.compact_route_slots_host,count},sparse.weights,
-            cpu::moe::PreweightedStoreLocality::SameSocketDDIO,
+            payload_bytes >= (2u * 1024u * 1024u)
+                ? cpu::moe::PreweightedStoreLocality::CrossSocketStreaming
+                : cpu::moe::PreweightedStoreLocality::SameSocketDDIO,
             /*skip_combined_store=*/true};
         if(!cpu::moe::combineCanonicalShardRouteRecords(args))return false;
         // Retain the existing diagnostic: NaN validation is outside normal
@@ -1384,9 +2035,9 @@ namespace llaminar2
          */
         return published != 0u && published >= consumed &&
                published - consumed <= 1u &&
-               control_host_->publication_status ==
-                   static_cast<std::int32_t>(
-                       MoEOverlayCanonicalRouteTicketStatus::Success) &&
+               moeOverlayCanonicalRouteTicketStatusSucceeded(
+                   static_cast<MoEOverlayCanonicalRouteTicketStatus>(
+                       control_host_->publication_status)) &&
                control_host_->residency_epoch == residency_epoch &&
                (metadataOnly() ? control_host_->live_entry_count == 0u :
                     control_host_->live_entry_count <= route_capacity_);

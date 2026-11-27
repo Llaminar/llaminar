@@ -3581,17 +3581,17 @@ foreach(V2_TICKET_BACKEND CUDA ROCm)
         set(V2_TICKET_TEST "V2_Integration_${V2_TICKET_BACKEND}_CPUSparseExpertTicketAllFormats")
         add_v2_test(${V2_TICKET_TEST}
             COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
-                    --gtest_filter=Test__CrossTierExpertArithmeticParity.CPUCanonicalSparseEndpointAllFormats${V2_TICKET_BACKEND}
+                    --gtest_filter=Test__CrossTierExpertArithmeticParity.CPUCanonicalSparseEndpointAllFormats${V2_TICKET_BACKEND}:Test__CrossTierExpertArithmeticParity.CPUPrefillFixedPointCanonicalTicketReplay${V2_TICKET_BACKEND}
                     --gtest_brief=1
-            LABELS "V2;Integration;${V2_TICKET_BACKEND};CPU;ExpertOverlay;AllFormats;GraphCapture;ByteExact;Lifecycle;Regression"
+            LABELS "V2;Integration;${V2_TICKET_BACKEND};CPU;ExpertOverlay;AllFormats;GraphCapture;ByteExact;Lifecycle;Replay;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 120)
         list(APPEND V2_CPU_SPARSE_TICKET_PREFLIGHT_TESTS ${V2_TICKET_TEST})
         if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
             add_v2_test(${V2_TICKET_TEST}_AVX2
                 COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
-                        --gtest_filter=Test__CrossTierExpertArithmeticParity.CPUCanonicalSparseEndpointAllFormats${V2_TICKET_BACKEND}
+                        --gtest_filter=Test__CrossTierExpertArithmeticParity.CPUCanonicalSparseEndpointAllFormats${V2_TICKET_BACKEND}:Test__CrossTierExpertArithmeticParity.CPUPrefillFixedPointCanonicalTicketReplay${V2_TICKET_BACKEND}
                         --gtest_brief=1
-                LABELS "V2;Integration;${V2_TICKET_BACKEND};CPU;AVX2;ExpertOverlay;AllFormats;GraphCapture;ByteExact;Lifecycle;Regression"
+                LABELS "V2;Integration;${V2_TICKET_BACKEND};CPU;AVX2;ExpertOverlay;AllFormats;GraphCapture;ByteExact;Lifecycle;Replay;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120
                 ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2")
             list(APPEND V2_CPU_SPARSE_TICKET_PREFLIGHT_TESTS ${V2_TICKET_TEST}_AVX2)
@@ -30843,7 +30843,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURootedTransport
 # Pure actual-resolver/selection replay; original native 2/4/8 owners prove copies separately.
 add_v2_test(V2_Integration_ReplicatedPrefillGatherSelectionReplay
     COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
-        --gtest_filter=Test__ShmemSpinBackend.ReplicatedPrefillTransportUsesOneFullRemoteChunk:Test__ShmemSpinBackend.ReplicatedPrefillCohortSelectionIsDegreeIndependent
+        --gtest_filter=Test__ShmemSpinBackend.ReplicatedPrefillTransportUsesOneFullRemoteChunk:Test__ShmemSpinBackend.ReplicatedPrefillCohortSelectionIsDegreeIndependent:Test__ShmemSpinBackend.ReplicatedCohortSelectionIgnoresAsymmetricCapacity
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Collective;ShmemSpin;Replay;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=FALSE")

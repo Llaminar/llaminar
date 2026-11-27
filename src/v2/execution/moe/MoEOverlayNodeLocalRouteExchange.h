@@ -168,6 +168,9 @@ namespace llaminar2
         /** @return Whether immutable mapped lanes have been registered. */
         [[nodiscard]] bool materialized() const noexcept;
 
+        /** @return Whether every non-root peer writes sparse payloads directly into root VRAM via P2P. */
+        [[nodiscard]] bool allPeersDirectP2P() const noexcept;
+
         /** @return Exact configured root accelerator. */
         [[nodiscard]] DeviceId rootDevice() const noexcept
         {
@@ -268,6 +271,7 @@ namespace llaminar2
             std::size_t slot_epochs_offset = 0u;
             std::size_t payload_offset = 0u;
             std::size_t root_staging_offset = 0u;
+            bool direct_p2p_to_root = false;
         };
 
         /** @brief Checked layout used identically by the quote and allocation. */
@@ -295,6 +299,7 @@ namespace llaminar2
         std::shared_ptr<const WorkspaceBufferLease> root_lease_;
         mutable std::mutex mutex_;
         bool materialized_ = false;
+        bool all_peers_direct_p2p_ = false;
         int root_participant_ = -1;
         std::uint32_t route_capacity_ = 0u;
         std::uint32_t max_rows_ = 0u;

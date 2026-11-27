@@ -2462,17 +2462,20 @@ namespace llaminar2
                         }
                         /*
                          * The acquire kernel above is the device-owned producer edge.
-                         * Pull only owner-selected mapped rows into stable root VRAM;
-                         * a fixed full-lane DMA would transfer mostly stale rows for a
-                         * sparse high-cardinality expert topology.
+                         * When all peers write sparse rows directly into Root VRAM via
+                         * P2P, no Host RAM staging pass is required; otherwise pull
+                         * only owner-selected mapped rows into stable root VRAM.
                          */
-                        if (!kernel->stageNodeLocalCanonicalRoutes(
-                                launch, consumption))
+                        if (!params_.node_local_route_exchange->allPeersDirectP2P())
                         {
-                            LOG_ERROR(
-                                "[MoECanonicalRouteReduceStage] Root sparse route "
-                                "owner-selected payload staging failed");
-                            return false;
+                            if (!kernel->stageNodeLocalCanonicalRoutes(
+                                    launch, consumption))
+                            {
+                                LOG_ERROR(
+                                    "[MoECanonicalRouteReduceStage] Root sparse route "
+                                    "owner-selected payload staging failed");
+                                return false;
+                            }
                         }
                         if (stage_only)
                             return true;

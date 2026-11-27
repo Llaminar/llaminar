@@ -216,7 +216,26 @@ namespace llaminar2
         Empty = 0,
         Success = 1,
         Aborted = 2,
+        /** MainPrefill per-token pre-folded int32 fixed-point (adaptive int16/int32 wire). */
+        SuccessFixedPoint32Adaptive16 = 3,
     };
+
+    /** @return Whether a canonical ticket publication status carries a valid non-abort payload. */
+    [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool
+    moeOverlayCanonicalRouteTicketStatusSucceeded(
+        MoEOverlayCanonicalRouteTicketStatus status) noexcept
+    {
+        return status == MoEOverlayCanonicalRouteTicketStatus::Success ||
+               status == MoEOverlayCanonicalRouteTicketStatus::SuccessFixedPoint32Adaptive16;
+    }
+
+    /** Bit flag in `compact_route_slots[entry]` indicating a wide int32 row in fixed-point prefill mode. */
+    inline constexpr std::int32_t kMoEOverlayCanonicalTicketCompactWideFlag = (1 << 30);
+    /** Bit mask extracting the compact row index from `compact_route_slots[entry]` in fixed-point prefill mode. */
+    inline constexpr std::int32_t kMoEOverlayCanonicalTicketCompactSlotMask =
+        kMoEOverlayCanonicalTicketCompactWideFlag - 1;
+    /** Sentinel in `compact_route_slots[entry]` indicating a zero-filled duplicate token slot. */
+    inline constexpr std::int32_t kMoEOverlayCanonicalTicketZeroSlot = -1;
 
     struct alignas(64) MoEOverlayCanonicalRouteTicketControl
     {
@@ -293,6 +312,8 @@ namespace llaminar2
         std::size_t route_capacity = 0u;
         std::int32_t d_model = 0;
         MoEOverlayCanonicalRouteTicketPayload payload = MoEOverlayCanonicalRouteTicketPayload::CanonicalRows;
+        /** Nonzero when downstream reducer expects bit-cast int32 fixed-point values (FixedPoint32Adaptive16). */
+        std::uint32_t output_fixed_point_int32_bits = 0u;
 
         /** @return Whether this original contributor owns only the terminal acknowledgement. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool metadataOnly() const noexcept
@@ -613,13 +634,18 @@ namespace llaminar2
     {
         MoEOverlayActivationDispatchPackLaunch packet{}; ///< Packet and route authority.
         MoEOverlayActivationTimelinePublishDeviceBinding publication{}; ///< Final release.
+        /** Optional leading admission acquire for stage_ordinal == 0 (avoids per-lane wait nodes). */
+        MoEOverlayActivationTimelineWaitDeviceBinding admission_wait{};
 
         /** @return Whether this is an exact one-row direct-mapped launch. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
+            const bool admission_ok =
+                (!admission_wait.signal && admission_wait.value == 0u) ||
+                admission_wait.valid();
             return packet.valid() && packet.physical_rows == 1 &&
-                   publication.valid();
+                   publication.valid() && admission_ok;
         }
     };
 

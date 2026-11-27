@@ -266,6 +266,19 @@ namespace llaminar2
     class DeviceWorkspaceManager
     {
     public:
+        /** @brief Device-cache coherence policy for backend VRAM blocks. */
+        enum class MemoryCoherence : uint8_t
+        {
+            Standard = 0, ///< Ordinary cached VRAM (`allocate`).
+            PeerCoherent, ///< Uncached-on-ROCm VRAM (`allocatePeerCoherent`) for direct P2P peer writes.
+        };
+
+        /**
+         * @brief Select device-memory coherence before allocating any blocks.
+         * @throws std::logic_error if blocks have already been allocated.
+         */
+        void setMemoryCoherence(MemoryCoherence coherence);
+
         /**
          * @brief Construct a workspace manager for a device
          * @param device Target device (CPU, CUDA, or ROCm)
@@ -769,6 +782,8 @@ namespace llaminar2
         /** Exact owner line selected at production construction. */
         PhysicalMemoryOwner physical_memory_owner_ =
             PhysicalMemoryOwner::ExecutionWorkspace;
+        /** Coherence policy for primary and extension device blocks. */
+        MemoryCoherence memory_coherence_ = MemoryCoherence::Standard;
 
         /**
          * @brief Host-only ownership registry for immutable graph metadata.
