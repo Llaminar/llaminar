@@ -6877,8 +6877,8 @@
    }
   }
  },
- "pr73-neon-stack-iq4-q5-scalar-half": {
-  "file_sha256": "76fb07fa7be84c25bf1cd2e907c65e5f8ccca907146d4cab5ed3b7e14ff0d524",
+ "pr73-neon-stack-iq4-ordered-address": {
+  "file_sha256": "6a071d8fdba94d86e60cd01123b6fadc4d68a2b19d96c82b54fff76c873835e1",
   "kernel_functions": [
    {
     "signature": "inline void executeBlockProgram() const noexcept"
@@ -7118,61 +7118,61 @@
     "trip": "4",
     "source": "runQ4K: group < 4 (two nibble groups each)"
    },
-   "1706": {
+   "1708": {
     "role": "column",
     "variable": "column",
     "trip": "C / (4 * S)",
     "source": "executeBlockProgram: panel walk"
    },
-   "1725": {
+   "1727": {
     "role": "column",
     "variable": "column",
     "trip": "C / 4",
     "source": "executeBlockProgram: strip walk"
    },
-   "1745": {
+   "1747": {
     "role": "partition",
     "variable": "partition",
     "trip": "P if (G or E != 3) else 1",
     "source": "executeBlockProgram: partitions_ when ordered or Coded == 0 (E != 3), else 1"
    },
-   "1805": {
+   "1807": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: low groups 0..3"
    },
-   "1808": {
+   "1810": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: high groups 4..7"
    },
-   "1818": {
+   "1820": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q5: Q5NativePayload::groups == 4"
    },
-   "1867": {
+   "1869": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run IQ4_XS grouped: group < 4 (two nibble groups each)"
    },
-   "1877": {
+   "1879": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run nibble: group < 4 (two nibble groups each)"
    },
-   "2090": {
+   "2092": {
     "role": "partition",
     "variable": "partition",
     "trip": "P",
     "source": "panel: partitions_"
    },
-   "2103": {
+   "2105": {
     "role": "group",
     "variable": "group",
     "trip": "8",
