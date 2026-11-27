@@ -6877,13 +6877,8 @@
    }
   }
  },
-<<<<<<< HEAD
- "pr73-neon-stack-iq4-ordered-address": {
-  "file_sha256": "6a071d8fdba94d86e60cd01123b6fadc4d68a2b19d96c82b54fff76c873835e1",
-=======
  "pr73-neon-stack-iq4-original-q5": {
   "file_sha256": "3d536d7c9484cd4cc2631e48cc58ab21128cd619593d6cfbe8c3e29b226d4d51",
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
   "kernel_functions": [
    {
     "signature": "inline void executeBlockProgram() const noexcept"
@@ -7123,101 +7118,61 @@
     "trip": "4",
     "source": "runQ4K: group < 4 (two nibble groups each)"
    },
-<<<<<<< HEAD
-   "1708": {
-=======
    "1691": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "column",
     "variable": "column",
     "trip": "C / (4 * S)",
     "source": "executeBlockProgram: panel walk"
    },
-<<<<<<< HEAD
-   "1727": {
-=======
    "1710": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "column",
     "variable": "column",
     "trip": "C / 4",
     "source": "executeBlockProgram: strip walk"
    },
-<<<<<<< HEAD
-   "1747": {
-=======
    "1730": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "partition",
     "variable": "partition",
     "trip": "P if (G or E != 3) else 1",
     "source": "executeBlockProgram: partitions_ when ordered or Coded == 0 (E != 3), else 1"
    },
-<<<<<<< HEAD
-   "1807": {
-=======
    "1790": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: low groups 0..3"
    },
-<<<<<<< HEAD
-   "1810": {
-=======
    "1793": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: high groups 4..7"
    },
-<<<<<<< HEAD
-   "1820": {
-=======
    "1803": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q5: Q5NativePayload::groups == 4"
    },
-<<<<<<< HEAD
-   "1869": {
-=======
    "1852": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run IQ4_XS grouped: group < 4 (two nibble groups each)"
    },
-<<<<<<< HEAD
-   "1879": {
-=======
    "1862": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run nibble: group < 4 (two nibble groups each)"
    },
-<<<<<<< HEAD
-   "2092": {
-=======
    "2073": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "partition",
     "variable": "partition",
     "trip": "P",
     "source": "panel: partitions_"
    },
-<<<<<<< HEAD
-   "2105": {
-=======
    "2086": {
->>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "8",
