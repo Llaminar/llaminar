@@ -1188,6 +1188,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
         source.moe_routed_prefill,
         source.moe_rebalance,
         source.prefix_cache,
+        source.paged_kv_tiers,
         source.mtp);
 
     RankExecutionPlan plan;
