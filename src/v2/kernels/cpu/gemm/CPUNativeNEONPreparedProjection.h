@@ -720,9 +720,9 @@ namespace llaminar2::cpu::native_quantised
                 I columns01[Pairs]{}, columns23[Pairs]{};
                 if constexpr (Rows >= 3)
                 {
-                    // The odd row needs its own SDOT chain. Four-row tiles
-                    // also bound decode live ranges with a two-pair unroll,
-                    // reducing spill pressure on the outer FP accumulators.
+                    // Three- and four-row tiles bound decode live ranges with
+                    // a two-pair unroll, retaining independent row dot chains
+                    // and reducing spill pressure on outer FP accumulators.
 #pragma GCC unroll 2
                     for (int group = 0; group < 8; group += 2)
                         consumePair<Ops>(std::bit_cast<int8x16_t>(multi_scale::decodeIQ3SGroup<4, Ops>(unit, column, group)),
