@@ -5697,13 +5697,16 @@ foreach(V2_RCCL_PATCH_CHAIN_SUITE Unit Integration)
 endforeach()
 set_property(TEST V2_Integration_RCCLPatchChain APPEND PROPERTY LABELS ProductionTestPreflight)
 include(cmake/V2RCCLSmallAllGatherTests.cmake)
-# One registration owns this device-free filter-partition contract.
-add_test(NAME V2_Unit_NativePayloadTestPartition
-    COMMAND ${Python3_EXECUTABLE} -B
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_payload_test_partition.py)
-set_tests_properties(V2_Unit_NativePayloadTestPartition PROPERTIES
-    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;BuildSystem;Regression;ProductionTestPreflight"
-    TIMEOUT 30)
+# Device-free filter-partition contract: Unit owns fast feedback; the
+# Integration registration carries it into ProductionTestPreflight.
+foreach(V2_NATIVE_PAYLOAD_PARTITION_SUITE Unit Integration)
+    add_test(NAME V2_${V2_NATIVE_PAYLOAD_PARTITION_SUITE}_NativePayloadTestPartition
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_payload_test_partition.py)
+    set_tests_properties(V2_${V2_NATIVE_PAYLOAD_PARTITION_SUITE}_NativePayloadTestPartition PROPERTIES
+        LABELS "V2;${V2_NATIVE_PAYLOAD_PARTITION_SUITE};CPU;DeviceFree;NativeQuantised;BuildSystem;Regression"
+        TIMEOUT 30)
+endforeach()
 foreach(V2_EXECUTION_REGISTRATION_SUITE Unit Integration)
     add_test(NAME V2_${V2_EXECUTION_REGISTRATION_SUITE}_CPUExecutionExactRegistration
         COMMAND ${Python3_EXECUTABLE}
@@ -10877,16 +10880,26 @@ target_link_libraries(v2_unit_native_quantised_file_density_all_formats GTest::g
 target_compile_features(v2_unit_native_quantised_file_density_all_formats PRIVATE cxx_std_20)
 add_v2_test(V2_Unit_NativeQuantisedFileDensityAllFormats
     COMMAND $<TARGET_FILE:v2_unit_native_quantised_file_density_all_formats>
-    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;Regression;ProductionTestPreflight"
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI)
+add_v2_test(V2_Integration_NativeQuantisedFileDensityAllFormats
+    COMMAND $<TARGET_FILE:v2_unit_native_quantised_file_density_all_formats>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;Memory;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedFileDensityAllFormats)
 
 # Native Q5 ordinary blocks retain file density and their original arithmetic.
 add_executable(v2_unit_cpu_q5_native_single_scale unit/kernels/cpu/Test__CPUQ5NativeSingleScale.cpp)
 target_link_libraries(v2_unit_cpu_q5_native_single_scale llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_CPUQ5NativeSingleScale
     COMMAND $<TARGET_FILE:v2_unit_cpu_q5_native_single_scale>
-    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;ByteExact;Regression;ProductionTestPreflight"
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI)
+add_v2_test(V2_Integration_CPUQ5NativeSingleScale
+    COMMAND $<TARGET_FILE:v2_unit_cpu_q5_native_single_scale>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQ5NativeSingleScale)
 if(LLAMINAR_CPU_ISA_UPPER MATCHES "^AVX(2|512)$")
     add_v2_test(V2_Integration_CPUQ5NativeSignedActivationSum
         COMMAND $<TARGET_FILE:v2_unit_cpu_q5_native_single_scale>
@@ -28793,8 +28806,14 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDe
 add_v2_test(V2_Unit_NativeQ5GPUStreamAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
         --gtest_filter=ExpertTierWeightStream.NativeQ5RejectsExpandedGpuDescriptor:ExpertTierWeightStream.NativeQ5FileDensityRoundTrip
-    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression;ProductionTestPreflight"
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI)
+add_v2_test(V2_Integration_NativeQ5GPUStreamAdmission
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.NativeQ5RejectsExpandedGpuDescriptor:ExpertTierWeightStream.NativeQ5FileDensityRoundTrip
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;Movement;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQ5GPUStreamAdmission)
 
 # Test: device-free arbitrary-tier composite wave protocol
 add_executable(v2_test_moe_overlay_tier_migration_transport
@@ -31934,7 +31953,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_GPUBlockingSynchronizationPolicy
     V2_Integration_GPUBlockingSynchronizationPolicyNegativeControls
     V2_Integration_CPUExecutionExactRegistration
-    V2_Unit_NativePayloadTestPartition
+    V2_Integration_NativePayloadTestPartition
     V2_Integration_MoEGlobalPipelineStageOwnership
     V2_Integration_MoEGlobalPipelineStagePreparation
     V2_Integration_ReplicatedPrefillGatherSelectionReplay
@@ -32753,8 +32772,14 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3STie
 add_v2_test(V2_Unit_CPUExpertNativeQ5SlotPublication
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
         --gtest_filter=CpuExpertSlotPool.NativeQ5SlotSealsExactPayloadAndRectangle
-    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression;ProductionTestPreflight"
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI)
+add_v2_test(V2_Integration_CPUExpertNativeQ5SlotPublication
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=CpuExpertSlotPool.NativeQ5SlotSealsExactPayloadAndRectangle
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;Movement;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUExpertNativeQ5SlotPublication)
 
 # Overlay slot reuse opens a new publication generation at the same address;
 # arrival admission is the only way the slot's engine becomes executable.

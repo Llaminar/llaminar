@@ -40,7 +40,7 @@ class NativePayloadPartitionTests(unittest.TestCase):
         leaves = section("if(V2_CPU_TARGET_X86)\n    add_executable(v2_unit_cpu_x86_coded_leaves",
                          "# Q6_K and IQ4_XS coded CPU units")
         gemv = section("set(V2_NATIVE_PAYLOAD_KPART_THREADS 32)",
-                       "# Every CPU NativeQuantised entry rejects")
+                       'include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUPublicationAdmissionTests.cmake")')
         heuristic = section("# x86 shared-K prefill and verifier-route cases;",
                             "foreach(V2_PREFILL_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)")
         cells_and_modes = ((cells, x86, selection)
