@@ -65,6 +65,22 @@ namespace llaminar2
 #endif
 #endif
 
+#ifndef LLAMINAR_COMPILED_WITH_AVX512_BF16
+#if defined(__AVX512BF16__)
+#define LLAMINAR_COMPILED_WITH_AVX512_BF16 1
+#else
+#define LLAMINAR_COMPILED_WITH_AVX512_BF16 0
+#endif
+#endif
+
+#ifndef LLAMINAR_COMPILED_WITH_AMX_BF16
+#if defined(__AMX_TILE__) && defined(__AMX_BF16__)
+#define LLAMINAR_COMPILED_WITH_AMX_BF16 1
+#else
+#define LLAMINAR_COMPILED_WITH_AMX_BF16 0
+#endif
+#endif
+
 #ifndef LLAMINAR_COMPILED_WITH_FP16FML
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
 #define LLAMINAR_COMPILED_WITH_FP16FML 1
@@ -120,6 +136,9 @@ namespace llaminar2
 #endif
 #if !LLAMINAR_COMPILED_WITH_NEON_I8MM && defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
 #error "The compiler enables I8MM outside the declared NEON_I8MM envelope"
+#endif
+#if LLAMINAR_COMPILED_WITH_AMX_BF16 && !LLAMINAR_COMPILED_WITH_AVX512_BF16
+#error "LLAMINAR_COMPILED_WITH_AMX_BF16 requires the AVX512-BF16 envelope"
 #endif
 
 #endif // host compiler coherence
@@ -243,6 +262,8 @@ namespace llaminar2
     // Forward declarations for activeISALevel()
     inline bool cpu_supports_avx2();
     inline bool cpu_supports_avx512();
+    inline bool cpu_supports_avx512_bf16();
+    inline bool cpu_supports_amx_bf16();
 
     /**
      * @brief Resolve a requested CPU ISA against the real compiled/native capabilities.
@@ -274,6 +295,19 @@ namespace llaminar2
         // The machine must still execute every instruction in the envelope.
         if (!cpu_supports_neon_i8mm())
             throw std::runtime_error("The NEON_I8MM binary requires native ARM I8MM support");
+#endif
+#if LLAMINAR_COMPILED_WITH_AMX_BF16
+        // The AMX-BF16 envelope carries tile instructions in the same binary;
+        // the machine must execute them (CPUID AMX-BF16 plus XCR0 tile state)
+        // before any BF16 GEMM tile path can run.
+        if (!cpu_supports_amx_bf16())
+            throw std::runtime_error("The AMXBF16 binary requires native AMX-BF16 support (Intel Sapphire Rapids or later with OS tile state)");
+#endif
+#if LLAMINAR_COMPILED_WITH_AVX512_BF16
+        // AVX512-BF16 is an AVX512-state instruction; the compiled envelope
+        // requires the executing machine to advertise it.
+        if (!cpu_supports_avx512_bf16())
+            throw std::runtime_error("The AVX512BF16 binary requires native AVX512-BF16 support (Intel Cooper Lake or later)");
 #endif
         if (env && *env)
         {

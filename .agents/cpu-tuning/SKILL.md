@@ -143,6 +143,13 @@ generation and runtime algorithm dispatch are independent measured axes, and
 the mixed regime must not reuse AVX2-only evidence implicitly. Tournament CSV
 and summaries must name both `codegen_isa` and `runtime_isa`.
 
+BF16 GEMM tuning on Intel Cooper Lake+ / Sapphire Rapids+ hosts uses the
+`AVX512BF16` and `AMXBF16` envelopes (see `cmake/CPUInstructionSet.cmake`);
+`LLAMINAR_CPU_BF16_GEMM_ENGINE=library|avx512bf16|amxbf16|auto` selects the
+homogeneous BF16 GEMM route explicitly (see
+`src/v2/kernels/cpu/gemm/CPUBF16Gemm.h`). Explicit native engines never
+degrade; evidence must name the resolved route.
+
 The driver selects one hardware thread per physical core on one socket, runs
 each `(native K/V format, head dimension)` family in a fresh process, and takes
 the median domain regret across fresh-process repeats. Its complete compact

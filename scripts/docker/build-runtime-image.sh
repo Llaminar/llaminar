@@ -29,7 +29,7 @@ Options:
       --build-type TYPE    LLAMINAR_BUILD_TYPE build arg. Default: Release.
       --variant VARIANT    Backend/runtime variant: full, cpu, cuda, rocm.
                            Default: full.
-      --cpu-isa ISA        LLAMINAR_CPU_ISA build arg: AVX512, AVX2 or NEON.
+      --cpu-isa ISA        LLAMINAR_CPU_ISA build arg: AVX512, AVX2, AVX512BF16, AMXBF16 or NEON.
                            NEON selects linux/arm64 with the cpu or cuda variant.
                            On ARM64 the CUDA default is 121 (NVIDIA GB10).
                            Dockerfile default if unset.
@@ -307,8 +307,8 @@ esac
 if [[ -n "${cpu_isa}" ]]; then
     cpu_isa="${cpu_isa^^}"
     case "${cpu_isa}" in
-        AVX512|AVX2|NEON) ;;
-        *) die "unsupported --cpu-isa '${cpu_isa}' (expected AVX512, AVX2, or NEON)" ;;
+        AVX512|AVX2|AVX512BF16|AMXBF16|NEON) ;;
+        *) die "unsupported --cpu-isa '${cpu_isa}' (expected AVX512, AVX2, AVX512BF16, AMXBF16, or NEON)" ;;
     esac
 fi
 
