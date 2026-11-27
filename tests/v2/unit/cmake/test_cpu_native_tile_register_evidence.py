@@ -2258,16 +2258,22 @@ class ChainCountsTest(unittest.TestCase):
         self.assertEqual(details[0], details[1])
 
     def test_closure_sources_drop_ambiguous_names(self) -> None:
+        # Hermetic: name the files relative to the test's own temporary directory. Its absolute location (CTest
+        # points TMPDIR into the build tree's tests/v2/mpi-sessions) must not reach source_name().
+        previous = os.getcwd()
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            paths = {}
-            for relative in ("a/src/v2/k.h", "a/include/arm_neon.h", "b/include/arm_neon.h", "a/include/other.h"):
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(relative)
-                paths[str(path)] = {}
-            self.assertEqual(CHECKER.closure_sources(paths), {"src/v2/k.h": "a/src/v2/k.h",
-                                                              "other.h": "a/include/other.h"})
+            os.chdir(directory)
+            try:
+                paths = {}
+                for relative in ("a/src/v2/k.h", "a/include/arm_neon.h", "b/include/arm_neon.h", "a/include/other.h"):
+                    path = Path(relative)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(relative)
+                    paths[relative] = {}
+                self.assertEqual(CHECKER.closure_sources(paths), {"src/v2/k.h": "a/src/v2/k.h",
+                                                                  "other.h": "a/include/other.h"})
+            finally:
+                os.chdir(previous)
 
 
 DRIVER_PATH = CHECKER_PATH.with_name("CPUNativeTileProofDriver.py")
