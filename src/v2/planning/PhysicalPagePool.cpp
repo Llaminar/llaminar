@@ -261,6 +261,22 @@ bool PhysicalPagePool::extendWithWitness(Grant &grant, std::size_t pages)
 
 std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmit(std::size_t pages)
 {
+    return admitLocked(pages, pages);
+}
+
+std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitTail(
+    std::size_t pages, std::size_t declared_peak)
+{
+    if (!pages || !declared_peak)
+        throw std::invalid_argument("Tail paper commitment requires positive pages and peak");
+    if (declared_peak < pages || declared_peak > geometry_.max_pages_per_request)
+        throw std::invalid_argument("Tail declared peak is outside the per-request bound");
+    return admitLocked(pages, declared_peak);
+}
+
+std::optional<PhysicalPagePool::Grant> PhysicalPagePool::admitLocked(
+    std::size_t pages, std::size_t declared_peak)
+{
     if (!pages || pages > geometry_.max_pages_per_request)
         throw std::invalid_argument("Page commitment is outside the declared per-request bound");
     if (pages > geometry_.frames - protected_pages_)
@@ -274,7 +290,7 @@ std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmit(std::size_t pa
         // Acquire retained ownership before mutating the request record.
         auto self = shared_from_this();
         ++request.generation;
-        request.declared_peak = pages;
+        request.declared_peak = declared_peak;
         request.remaining = pages;
         request.assigned = 0;
         request.live = true;
@@ -438,6 +454,36 @@ PhysicalPagePool::Frame &PhysicalPagePool::requireFrame(FrameHandle handle)
     return frame;
 }
 
+std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::prepareExclusiveTail(
+    const Grant &grant, FrameHandle handle, const CommittedPage &prior, std::size_t bytes)
+{
+    (void)require(grant);
+    auto &frame = requireFrame(handle);
+    // The prior must be THIS frame's CURRENT private committed publication and
+    // the ONLY pin (its own; no foreign reader/borrower is allowed).
+    if (!prior.pool_ || prior.pool_.get() != this || prior.handle_ != handle ||
+        frame.shared || frame.retiring || frame.writer || frame.pins != 1 ||
+        frame.committed_version != prior.version_ || frame.valid_bytes != prior.bytes_ ||
+        frame.record != grant.record_ || frame.request_generation != grant.generation_)
+        throw std::invalid_argument("Exclusive tail has no current private prior publication");
+    if (!bytes || bytes > geometry_.frame_bytes - frame.valid_bytes)
+        return std::nullopt;
+    if (frame.next_content_version == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("Page content version exhausted");
+    auto self = shared_from_this();
+    ++frame.next_content_version;
+    frame.writer = true;
+    frame.readers_closed = true;
+    // The plan ADDS one pin: during the step the frame has TWO publications
+    // (the prior prefix + the extending writer). The prior stays fully valid
+    // (its bytes are an unchanged prefix; its read/share only refuse because
+    // valid_bytes advanced). On plan failure the extra pin is released and
+    // the prior is untouched. On commit the prior snapshot later drops its
+    // pin, leaving one (the new publication) — never a double-unpin.
+    ++frame.pins;
+    return AppendPlan(std::move(self), handle, frame.next_content_version,
+        frame.valid_bytes, bytes);
+}
 std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::prepareAppend(
     const Grant &grant, FrameHandle handle, std::size_t bytes)
 {
@@ -458,12 +504,14 @@ std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::prepareAppend(
 }
 
 PhysicalPagePool::AppendPlan::AppendPlan(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle,
-    std::uint64_t version, std::size_t start, std::size_t count)
-    : pool_(std::move(pool)), handle_(handle), version_(version), start_(start), count_(count) {}
+    std::uint64_t version, std::size_t start, std::size_t count, bool inherits_pin)
+    : pool_(std::move(pool)), handle_(handle), version_(version), start_(start), count_(count),
+      inherits_pin_(inherits_pin) {}
 PhysicalPagePool::AppendPlan::~AppendPlan() { release(); }
 PhysicalPagePool::AppendPlan::AppendPlan(AppendPlan &&other) noexcept
     : pool_(std::move(other.pool_)), handle_(other.handle_), version_(other.version_),
-      start_(other.start_), count_(other.count_), copied_(other.copied_) {}
+      start_(other.start_), count_(other.count_), copied_(other.copied_),
+      inherits_pin_(other.inherits_pin_) {}
 PhysicalPagePool::AppendPlan &PhysicalPagePool::AppendPlan::operator=(AppendPlan &&other) noexcept
 {
     if (this != &other)
@@ -471,6 +519,7 @@ PhysicalPagePool::AppendPlan &PhysicalPagePool::AppendPlan::operator=(AppendPlan
         release();
         pool_ = std::move(other.pool_); handle_ = other.handle_; version_ = other.version_;
         start_ = other.start_; count_ = other.count_; copied_ = other.copied_;
+        inherits_pin_ = other.inherits_pin_;
     }
     return *this;
 }
@@ -520,6 +569,8 @@ PhysicalPagePool::CommittedPage PhysicalPagePool::AppendPlan::commit()
     frame.writer = false;
     frame.readers_closed = false;
     // Transfer the plan's pin, without an unowned interval, to the publication.
+    // An inherited-pin plan does NOT add a pin: the prior's single pin becomes
+    // the new publication's pin (the caller must relinquish the prior page).
     return CommittedPage(std::move(pool_), handle_, version_, start_ + count_);
 }
 void PhysicalPagePool::AppendPlan::release() noexcept
@@ -978,6 +1029,12 @@ std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::Grant::prepareAppe
     return pool_->prepareAppend(*this, handle, bytes);
 }
 
+std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::Grant::prepareExclusiveTail(
+    FrameHandle handle, const CommittedPage &prior, std::size_t bytes)
+{
+    if (!pool_) throw std::logic_error("Exclusive tail uses an empty page grant");
+    return pool_->prepareExclusiveTail(*this, handle, prior, bytes);
+}
 std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::Grant::prepareFreshWrite(FrameHandle handle, std::size_t bytes)
 {
     if (!pool_) throw std::logic_error("Fresh write uses an empty page grant");

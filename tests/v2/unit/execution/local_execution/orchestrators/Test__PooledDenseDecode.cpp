@@ -242,3 +242,110 @@ TEST(PooledDenseDecode, BindingToggleIsObservedByNextForwardGraph)
     EXPECT_EQ(prior_a2->snapshot.view().rows(), 3);
     EXPECT_TRUE(binding_b.priorFor(0) == nullptr); // Still never published.
 }
+
+/** @test P2 in-place private tail (design line 43): with the persistent tail
+ * grant, a decode step extends the request's OWN private tail FRAME in place
+ * instead of COW-copying the prior partial page. The pooled decode stays
+ * byte-identical to the contiguous control across a page boundary, and the
+ * in-place counter (not the COW counter) records the extension bytes. */
+TEST(PooledDenseDecode, RunnerInPlacePrivateTailMatchesControl)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 3> prompt{1, 3, 5};
+    constexpr int decode_steps = 9;
+    const std::array<int32_t, decode_steps> decode{2, 4, 6, 8, 10, 12, 14, 18, 20};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture control_fx(device, KVCachePrecision::FP32);
+    control_fx.config.mtp.enabled = false;
+    control_fx.config.mtp.graph_capacity_draft_tokens = 0;
+    control_fx.config.max_seq_len = 16;
+    test::TinyQwenForwardFixture pooled_fx(device, KVCachePrecision::FP32);
+    pooled_fx.config.mtp.enabled = false;
+    pooled_fx.config.mtp.graph_capacity_draft_tokens = 0;
+    pooled_fx.config.max_seq_len = 16;
+
+    std::unique_ptr<DeviceGraphOrchestrator> control_owner;
+    PreparedWeightStore control_store;
+    std::shared_ptr<QwenStandardGraph> control_builder;
+    make_runner(control_fx, control_owner, control_store, control_builder);
+    auto &control = *control_owner;
+    ASSERT_OK("control prefill", control.forward(prompt.data(), 3, 1) != nullptr);
+
+    PagedKVPoolBudget budget;
+    budget.remaining_budget_bytes = 2 * 1024 * 1024;
+    budget.frame_bytes = 4 * 1024;
+    budget.request_records = 4;
+    budget.max_pages_per_request = 64;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+        /*layers=*/pooled_fx.config.n_layers,
+        /*admitted_issuances=*/12, /*readers_per_bank=*/4);
+    auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+    ASSERT_TRUE(plan);
+    // Slightly larger table so the binding's tail grant and all banks seat.
+    PhysicalMemoryPlanBuilder mbuilder;
+    mbuilder.add({.world_rank=0, .device=device,
+        .total_bytes=plan->total_bytes,
+        .admission_available_bytes=plan->total_bytes},
+        PhysicalMemoryOwner::KVCache, plan->total_bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mbuilder.build()), 0);
+    auto created = PagedKVInstance::create(authority, *plan, device);
+    ASSERT_TRUE(created);
+    PagedKVInstance instance = std::move(*created);
+
+    std::unique_ptr<DeviceGraphOrchestrator> pooled_owner;
+    PreparedWeightStore pooled_store;
+    std::shared_ptr<QwenStandardGraph> pooled_builder;
+    make_runner(pooled_fx, pooled_owner, pooled_store, pooled_builder);
+    auto &pooled = *pooled_owner;
+    // persistent_tail=true enables the in-place private tail extension.
+    PooledKVDecodeBinding binding(&instance.pool(), &instance.table(),
+        /*request_id=*/88, /*slot=*/0,
+        pooled_fx.config.n_kv_heads, pooled_fx.config.head_dim,
+        /*page_tokens=*/8, pooled_fx.config.n_layers,
+        /*admitted_issuances=*/12, /*persistent_tail=*/true);
+    ASSERT_TRUE(binding.hasTailGrant());
+    pooled.setPooledDecodeBinding(&binding);
+
+    ASSERT_OK("pooled prefill (in-place tail)", pooled.forward(prompt.data(), 3, 1) != nullptr);
+    const std::size_t vocab = static_cast<std::size_t>(pooled_fx.config.vocab_size);
+    for (int step = 0; step < decode_steps; ++step)
+    {
+        const auto *control_next = control.forward(&decode[step], 1, 1);
+        const auto *pooled_next = pooled.forward(&decode[step], 1, 1);
+        ASSERT_NE(control_next, nullptr);
+        ASSERT_NE(pooled_next, nullptr);
+        EXPECT_EQ(std::memcmp(pooled_next, control_next, vocab * sizeof(float)), 0)
+            << "in-place pooled decode diverged from the control at step " << step;
+        auto *prior = binding.priorFor(0);
+        ASSERT_NE(prior, nullptr) << "prior lost after step " << step;
+        // Rows grow exactly like the COW caller (the in-place path appends in
+        // the same frame; row arithmetic is unchanged).
+        EXPECT_EQ(prior->snapshot.view().rows(), 3 + step + 1);
+        EXPECT_FALSE(binding.stepPrepared());
+    }
+    // The in-place tail grant must still be live (the request owns its tail).
+    EXPECT_TRUE(binding.hasTailGrant());
+    // Rows pass the page boundary: 3 prefill + 9 decode = 12 rows, crossing the
+    // 8-row page at step 4 — the in-place extension filled the first page and
+    // a rolled fresh tail frame took the next partial page.
+    EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 12);
+}

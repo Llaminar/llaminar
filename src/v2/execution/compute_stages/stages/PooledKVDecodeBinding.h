@@ -61,11 +61,13 @@ public:
     /** @brief Bind one admitted pooled instance for one decode request. */
     PooledKVDecodeBinding(PhysicalPagePool *pool, CPUFP32PagedKVTable *table,
         std::uint64_t request_id, int slot, int kv_heads, int head_dim,
-        int page_tokens, int layers, std::size_t admitted_issuances)
+        int page_tokens, int layers, std::size_t admitted_issuances,
+        bool persistent_tail = false)
         : pool_(pool), table_(table), request_id_(request_id), slot_(slot),
           kv_heads_(kv_heads), head_dim_(head_dim), page_tokens_(page_tokens),
           admitted_issuances_(admitted_issuances),
-          cells_(static_cast<std::size_t>(layers))
+          cells_(static_cast<std::size_t>(layers)),
+          persistent_tail_(persistent_tail)
     {
         if (!pool_ || !table_)
             throw std::invalid_argument("Pooled decode binding requires the admitted pool and table");
@@ -84,6 +86,35 @@ public:
         reservation_ = table_->reserveAcceptedWork(seatedVersionDemand());
         if (!reservation_)
             throw std::invalid_argument("Pooled table cannot reserve the admitted request version envelope");
+        // In-place private tail (P2 economy): ONE persistent frame per layer is
+        // admitted from the pool ONCE at binding time. It is the request's
+        // exclusive tail storage; every step extends it in place while it
+        // remains private and exclusively owned (design: "every writer owns an
+        // exclusive tail or COW destination"). A pool that cannot seat the
+        // request's tail frames refuses at binding time — persistent storage
+        // is sized from admitted membership, never allocated in the hot path.
+        if (persistent_tail_)
+        {
+            // The request's peak is its admitted per-request page bound; only
+            // its tail frames (one per layer) are protected NOW. Further
+            // growth is witnessed (extendWithWitness) inside prepareStep, so
+            // a small live request never pre-reserves its whole window.
+            const auto peak = pool_->geometry().max_pages_per_request;
+            tail_grant_ = pool_->tryAdmitTail(static_cast<std::size_t>(layers), peak);
+            if (!tail_grant_)
+                throw std::invalid_argument("Pooled request tail frames cannot be admitted from the envelope");
+            tail_frames_.assign(static_cast<std::size_t>(layers), std::nullopt);
+            fresh_tail_frames_.assign(static_cast<std::size_t>(layers), std::nullopt);
+            for (int layer = 0; layer < layers; ++layer)
+            {
+                try { tail_frames_[static_cast<std::size_t>(layer)] = tail_grant_->assignFrame(); }
+                catch (const std::exception &e)
+                {
+                    throw std::invalid_argument(
+                        std::string("Pooled request tail frame assignment refused: ") + e.what());
+                }
+            }
+        }
     }
 
     /**
@@ -129,6 +160,98 @@ public:
     std::size_t remainingIssuances() const noexcept
     {
         return reservation_ ? reservation_->remaining() : 0;
+    }
+
+    /**
+     * @brief Whether this request still holds a live exclusive tail grant.
+     *
+     * The tail grant is this request's PERSISTENT private storage: one frame
+     * per layer, admitted ONCE at binding construction from the admitted
+     * envelope (never a hot-path admission), owned for the full request
+     * lifetime. The partial tail page is extended in place through it; only
+     * full pages become shared history.
+     */
+    bool hasTailGrant() const noexcept { return static_cast<bool>(tail_grant_); }
+    /** @return The persistent exclusive-tail grant (frames owned per layer). */
+    PhysicalPagePool::Grant *tailGrant() noexcept
+    {
+        return tail_grant_ ? &*tail_grant_ : nullptr;
+    }
+    /** @return The persistent exclusive-tail frame of layer @p layer (or null). */
+    PhysicalPagePool::FrameHandle *tailFrame(int layer) noexcept
+    {
+        if (layer < 0 || static_cast<std::size_t>(layer) >= tail_frames_.size())
+            return nullptr;
+        auto &frame = tail_frames_[static_cast<std::size_t>(layer)];
+        return frame ? &*frame : nullptr;
+    }
+    /**
+     * @return The FRESH tail frame rolled for this step's final partial page
+     * (null when none was rolled; the stage then uses @ref tailFrame).
+     */
+    PhysicalPagePool::FrameHandle *freshTailFrame(int layer) noexcept
+    {
+        if (layer < 0 || static_cast<std::size_t>(layer) >= fresh_tail_frames_.size())
+            return nullptr;
+        auto &frame = fresh_tail_frames_[static_cast<std::size_t>(layer)];
+        return frame ? &*frame : nullptr;
+    }
+    /**
+     * @brief Whether layer @p layer's persistent tail frame is an EMPTY
+     * private frame (the next partial tail page should be written there).
+     */
+    bool tailFrameReady(int layer) noexcept
+    {
+        if (!pool_ || !tail_grant_) return false;
+        auto *frame = tailFrame(layer);
+        return frame && pool_->tailFrameEmpty(*tail_grant_, *frame);
+    }
+    /**
+     * @brief Whether layer @p layer's persistent tail frame holds the CURRENT
+     * private publication of the prior tail page (in-place extension legal).
+     */
+    bool tailHeldByFrame(int layer) noexcept
+    {
+        if (!pool_ || !tail_grant_) return false;
+        auto *frame = tailFrame(layer);
+        return frame && pool_->tailFrameExclusive(*tail_grant_, *frame);
+    }
+    /**
+     * @brief Roll one layer's tail frame over to a FRESH empty frame for this
+     * step's final partial page (recorded in @p fresh_tail_frames_).
+     *
+     * When the pre-assigned tail frame is still EMPTY (fresh start) no roll is
+     * needed and @p fresh_tail_frames_ stays empty; the stage uses the
+     * pre-assigned @ref tailFrame. When it holds a full/shared publication
+     * (in-place tail filled, or a full page rolled into history), a new frame
+     * is grown through the all-resource witness and recorded as the fresh
+     * destination. The frame holding the CURRENT prior tail is left untouched
+     * for the in-place extension.
+     * @return True when a fresh empty tail destination exists; false on
+     * refusal (the caller then falls back to the COW/fresh-page path).
+     */
+    bool rollTailFrame(int layer)
+    {
+        if (!pool_ || !tail_grant_) return false;
+        if (layer < 0 || static_cast<std::size_t>(layer) >= tail_frames_.size())
+            return false;
+        if (tailFrameReady(layer))
+            return true; // Pre-assigned empty frame is the destination (no roll).
+        auto &fresh = fresh_tail_frames_[static_cast<std::size_t>(layer)];
+        if (fresh && pool_->tailFrameEmpty(*tail_grant_, *fresh))
+            return true; // Already rolled for this step.
+        try
+        {
+            if (!pool_->extendWithWitness(*tail_grant_, 1))
+                return false;
+            auto handle = tail_grant_->assignFrame();
+            fresh = handle;
+            return true;
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
     }
 
     /**
@@ -204,6 +327,109 @@ public:
         return 1 + (rows_after_tail > 0 ? (rows_after_tail + page_tokens_ - 1) / page_tokens_ : 0);
     }
 
+    /**
+     * @brief Per-layer tail mode of the step the orchestrator is about to run.
+     */
+    enum class StepTailMode : std::uint8_t { None, InPlace, FinalFresh };
+    /**
+     * @return Whether the prior tail page is EXACTLY this layer's tail frame
+     * (in-place extension legal) and the step may extend it.
+     */
+    StepTailMode stepTailMode(int layer, int rows) noexcept
+    {
+        if (!persistent_tail_ || !tail_grant_ || rows <= 0)
+            return StepTailMode::None;
+        if (layer < 0 || static_cast<std::size_t>(layer) >= cells_.size())
+            return StepTailMode::None;
+        const auto &prior = cells_[static_cast<std::size_t>(layer)].cells[0];
+        if (!prior.live())
+        {
+            // Fresh start: a partial final page lands on the (empty) tail frame.
+            return (rows % page_tokens_ != 0) && tailHeldByFrame(layer)
+                ? StepTailMode::FinalFresh : StepTailMode::None;
+        }
+        const auto pages = prior.snapshot.view().pages();
+        if (pages.empty()) return StepTailMode::None;
+        const int tail_rows = pages.back().rows();
+        if (tail_rows < page_tokens_)
+            return tailHeldByFrame(layer) ? StepTailMode::InPlace : StepTailMode::None;
+        // The prior tail is FULL: its private page is shared into the new bank
+        // (frame.converts to shared) and a fresh tail frame takes the final
+        // partial page of this step (rolled at prepareStep).
+        return (rows % page_tokens_ != 0) ? StepTailMode::FinalFresh : StepTailMode::None;
+    }
+    /**
+     * @return Whether the step's LAST page (partial) must be written into the
+     * persistent tail frame (FinalFresh, or an InPlace step whose remainder
+     * ends in a partial page after the in-place fill).
+     */
+    bool stepFinishesOnTailFrame(int layer, int rows) noexcept
+    {
+        const auto mode = stepTailMode(layer, rows);
+        if (mode == StepTailMode::FinalFresh) return true;
+        if (mode == StepTailMode::InPlace)
+        {
+            const auto &prior = cells_[static_cast<std::size_t>(layer)].cells[0];
+            if (!prior.live()) return false;
+            const auto pages = prior.snapshot.view().pages();
+            if (pages.empty()) return false;
+            const int tail_rows = pages.back().rows();
+            const int tail_room = page_tokens_ - tail_rows;
+            const int remaining = rows - tail_room;
+            return remaining > 0 && (remaining % page_tokens_) != 0;
+        }
+        return false;
+    }
+    /**
+     * @brief Prepare the step's tail plan: roll tail frames for FinalFresh and
+     * admit only the fresh pages NOT covered by the exclusive tail extension.
+     * @param rows Live rows this step appends.
+     * @return Fresh page count for the step grant, or -1 when the tail plan
+     * cannot be completed (the caller then uses the COW fallback page count).
+     */
+    int freshPagesWithTail(int rows)
+    {
+        if (!persistent_tail_ || !tail_grant_ || rows <= 0)
+            return pagesForStep(rows);
+        // Decide per layer; all layers advance symmetrically in this caller,
+        // so consult layer 0 and apply the plan to every layer.
+        const auto mode = stepTailMode(0, rows);
+        if (mode == StepTailMode::InPlace)
+        {
+            const int tail_rows = cells_.front().cells[0].live()
+                ? cells_.front().cells[0].snapshot.view().pages().back().rows() : 0;
+            const int tail_room = page_tokens_ - tail_rows;
+            const int remaining = rows - tail_room;
+            if (remaining <= 0)
+                return 0; // Extension covers everything; no fresh page admitted.
+            // The final partial page must be written into a fresh tail frame.
+            const bool final_partial = (remaining % page_tokens_ != 0);
+            const int pages = (remaining + page_tokens_ - 1) / page_tokens_;
+            if (final_partial)
+            {
+                for (std::size_t layer = 0; layer < tail_frames_.size(); ++layer)
+                    if (!rollTailFrame(static_cast<int>(layer)))
+                        return pagesForStep(rows); // Fallback: full COW with admission.
+                return pages - 1;
+            }
+            return pages;
+        }
+        if (mode == StepTailMode::FinalFresh)
+        {
+            const bool final_partial = (rows % page_tokens_ != 0);
+            const int pages = (rows + page_tokens_ - 1) / page_tokens_;
+            if (final_partial)
+            {
+                for (std::size_t layer = 0; layer < tail_frames_.size(); ++layer)
+                    if (!rollTailFrame(static_cast<int>(layer)))
+                        return pagesForStep(rows);
+                return pages - 1;
+            }
+            return pages;
+        }
+        return pagesForStep(rows);
+    }
+
     /** @brief RAII step ownership: cancels on unwind unless completed. */
     class StepGuard final
     {
@@ -270,16 +496,26 @@ public:
         const auto demand = table_->liveClassDemand();
         if (demand.occupied_banks + kRequiredBanksPerLayer * layers > table_->bankCount())
             return StepGuard{};
-        const int per_layer = pagesForStep(rows);
-        const int total = per_layer * static_cast<int>(layers);
-        step_grant_ = pool_->tryAdmit(static_cast<std::size_t>(total));
-        if (!step_grant_ || step_grant_->remainingCommitment() <
-            static_cast<std::size_t>(total))
+        // Page demand: fresh pages only. The exclusive tail extends the
+        // request's PERSISTENT tail frames (already admitted at binding); a
+        // step fully covered by the tail admits NO step grant. A step with a
+        // fresh remainder admits exactly the fresh page count (M6: the
+        // complete fresh demand before the graph runs).
+        const int fresh = freshPagesWithTail(rows);
+        if (fresh > 0)
         {
-            step_grant_.reset();
-            return StepGuard{};
+            step_grant_ = pool_->tryAdmit(static_cast<std::size_t>(fresh));
+            if (!step_grant_ || step_grant_->remainingCommitment() <
+                static_cast<std::size_t>(fresh))
+            {
+                step_grant_.reset();
+                return StepGuard{};
+            }
         }
+        else
+            step_grant_.reset(); // Tail-only step: no fresh frames needed.
         step_rows_ = rows;
+        step_prepared_ = true;
         return StepGuard(this);
     }
     /** @return The pre-admitted step grant (null until prepareStep succeeds). */
@@ -287,7 +523,7 @@ public:
     {
         return step_grant_ ? &*step_grant_ : nullptr;
     }
-    bool stepPrepared() const noexcept { return static_cast<bool>(step_grant_); }
+    bool stepPrepared() const noexcept { return step_prepared_; }
     /** @return The accepted-work issuance reservation consumed per layer per step. */
     CPUFP32PagedKVTable::IssuanceReservation *issuance() noexcept
     {
@@ -299,7 +535,7 @@ public:
      */
     bool stepComplete() const noexcept
     {
-        if (!step_grant_ || step_rows_ <= 0) return false;
+        if (!step_prepared_ || step_rows_ <= 0) return false;
         for (std::size_t layer = 0; layer < cells_.size(); ++layer)
         {
             const auto &next = cells_[layer].cells[1];
@@ -325,8 +561,20 @@ public:
     {
         for (auto &pair : cells_)
             pair.cells[0] = std::move(pair.cells[1]);
+        // Promote each rolled fresh tail frame to the persistent tail frame
+        // (the step's final partial page is now the live tail). Frames that
+        // were NOT rolled (in-place or empty-start) keep their position.
+        for (std::size_t layer = 0; layer < fresh_tail_frames_.size(); ++layer)
+        {
+            if (fresh_tail_frames_[layer])
+            {
+                tail_frames_[layer] = fresh_tail_frames_[layer];
+                fresh_tail_frames_[layer].reset();
+            }
+        }
         step_grant_.reset();
         step_rows_ = 0;
+        step_prepared_ = false;
     }
 
     /**
@@ -338,8 +586,14 @@ public:
     {
         for (auto &pair : cells_)
             pair.cells[1] = {};
+        // Rolled fresh frames were never written: return them to the tail
+        // grant's owned frames as empty spares (they stay eligible for the
+        // next roll; nothing was published on them).
+        for (auto &fresh : fresh_tail_frames_)
+            fresh.reset();
         step_grant_.reset();
         step_rows_ = 0;
+        step_prepared_ = false;
     }
 
     /**
@@ -385,5 +639,11 @@ private:
     std::optional<CPUFP32PagedKVTable::IssuanceReservation> reservation_;
     std::optional<PhysicalPagePool::Grant> step_grant_;
     int step_rows_ = 0;
+    bool step_prepared_ = false;
+    /** Persistent exclusive-tail grant (one frame per layer), admitted at binding. */
+    std::optional<PhysicalPagePool::Grant> tail_grant_;
+    std::vector<std::optional<PhysicalPagePool::FrameHandle>> tail_frames_;
+    std::vector<std::optional<PhysicalPagePool::FrameHandle>> fresh_tail_frames_;
+    bool persistent_tail_ = false;
 };
 } // namespace llaminar2

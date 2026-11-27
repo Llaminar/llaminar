@@ -82,6 +82,16 @@ public:
         Snapshot &operator=(const Snapshot &) = delete;
         /** @return Native view borrowing this exact retained bank and page publications. */
         CPUFP32PagedKVView view() const;
+        /**
+         * @return Pointer to one retained bank page metadata entry.
+         *
+         * Single CPU runner-thread metadata authority: the caller may replace
+         * the entry's publication (relinquishPrivatePin) when it owns the
+         * frame. Never exposes live KV payload ownership.
+         */
+        CPUFP32KVPage *pageAt(std::size_t index) const;
+        /** @return Number of retained pages of this bank. */
+        std::size_t pageCount() const;
         /** @return A new bounded borrower, or empty when the declared reader envelope is exhausted. */
         std::optional<Snapshot> tryBorrow() const;
         /** @return Non-reused bank incarnation for identity checks and evidence. */

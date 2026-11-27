@@ -128,6 +128,8 @@ public:
         SharedPage share() const;
         /** @return The immutable content version; aborted write versions are never reused. */
         std::uint64_t version() const noexcept { return version_; }
+        /** @return Exact valid byte extent of this publication. */
+        std::size_t bytes() const noexcept { return bytes_; }
     private:
         friend class PhysicalPagePool;
         CommittedPage(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle,
@@ -230,7 +232,8 @@ public:
     private:
         friend class PhysicalPagePool;
         AppendPlan(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle,
-            std::uint64_t version, std::size_t start, std::size_t count);
+            std::uint64_t version, std::size_t start, std::size_t count,
+            bool inherits_pin = false);
         void release() noexcept;
         std::shared_ptr<PhysicalPagePool> pool_;
         FrameHandle handle_;
@@ -238,6 +241,7 @@ public:
         std::size_t start_ = 0;
         std::size_t count_ = 0;
         std::size_t copied_ = 0; ///< Completed sequential bytes, never a readiness guess.
+        bool inherits_pin_ = false;
     };
 
     /** @brief Move-only unpublished request commitment; destruction rolls it back. */
@@ -264,6 +268,25 @@ public:
         FramePin pinFrame(FrameHandle handle);
         /** @brief Prepare an exact private append, or defer while an existing borrower pins the frame. */
         std::optional<AppendPlan> prepareAppend(FrameHandle handle, std::size_t bytes);
+        /**
+         * @brief Extend ONE exclusively owned tail publication in place.
+         *
+         * The writer's OWN previous tail `CommittedPage` may be the only pin.
+         * The prior publication is revoked (its `read()`/`share()` refuse after
+         * this succeeds) and its pin transfers to the new destination: no
+         * unpinned interval exists. The prior cell must be replaced by this
+         * plan's `commit()` in the same step; holding the old page after the
+         * extension reads only the ORIGINAL extent (its cached rows never
+         * grow).
+         * @param handle Frame already owned by THIS request record.
+         * @param prior The caller's own previous committed tail.
+         * @param bytes Fresh bytes appended after the prior extent.
+         * @return A plan appending after `prior.bytes()`, or empty when the
+         * frame is shared, retiring, foreign, not exclusively pinned by
+         * @p prior, or the new extent exceeds the frame.
+         */
+        std::optional<AppendPlan> prepareExclusiveTail(FrameHandle handle,
+            const CommittedPage &prior, std::size_t bytes);
         /** @brief Prepare bytes only in an empty original private frame; never reinterpret older codec data. */
         std::optional<AppendPlan> prepareFreshWrite(FrameHandle handle, std::size_t bytes);
         /** @return Original physical issuer identity, not another capacity ledger. */
@@ -311,6 +334,22 @@ public:
      */
     std::optional<Grant> tryAdmit(std::size_t pages);
     /**
+     * @brief Admit `pages` protected growth under an explicit larger peak.
+     *
+     * The declared peak is the request's admitted lifetime ceiling (its own
+     * page bound), while only `pages` frames are protected immediately. The
+     * rest is grown through `extendWithWitness` under the all-resource proof —
+     * never an unprotected hot-path allocation. This is the persistent-tail
+     * admission path: a request owns one small tail grant and proves each
+     * frame growth at the moment it is needed.
+     * @param pages Frames protected NOW (positive, <= declared_peak).
+     * @param declared_peak Request lifetime peak (<= max_pages_per_request).
+     * @return A grant, or empty with no mutation on pressure.
+     * @throws std::invalid_argument For zero pages, declared_peak < pages,
+     * declared_peak > max_pages_per_request, or an unrepresentable peak.
+     */
+    std::optional<Grant> tryAdmitTail(std::size_t pages, std::size_t declared_peak);
+    /**
      * @brief Try to admit under a bounded completion-order witness.
      * @param declared_peak Maximum pages the request may reach (design §5.3).
      * @param initial_grant Finite-operation pages granted immediately (G).
@@ -343,6 +382,45 @@ public:
     const PhysicalPagePoolGeometry &geometry() const noexcept { return geometry_; }
     /** @return Original PMA instance identity for same-authority admission checks. */
     const PhysicalMemoryAuthority *issuerForAdmission() const noexcept { return authority_.get(); }
+    /**
+     * @brief Whether one frame of a live grant is this request's exclusive
+     * private tail (not shared, not retiring, no foreign pins).
+     */
+    bool tailFrameExclusive(const Grant &grant, const FrameHandle &handle) noexcept
+    {
+        try
+        {
+            (void)require(grant);
+            const auto &frame = requireFrame(handle);
+            return frame.owned && !frame.shared && !frame.retiring && !frame.writer &&
+                frame.record == grant.record_ && frame.request_generation == grant.generation_ &&
+                frame.pins == (frame.valid_bytes ? 1u : 0u) &&
+                frame.valid_bytes < geometry_.frame_bytes;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+    /**
+     * @brief Whether one frame of a live grant is this request's EMPTY private
+     * tail (never written: rolled over for a new partial page).
+     */
+    bool tailFrameEmpty(const Grant &grant, const FrameHandle &handle) noexcept
+    {
+        try
+        {
+            (void)require(grant);
+            const auto &frame = requireFrame(handle);
+            return frame.owned && !frame.shared && !frame.retiring && !frame.writer &&
+                frame.record == grant.record_ && frame.request_generation == grant.generation_ &&
+                frame.valid_bytes == 0 && frame.pins == 0;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
 
 private:
     friend class PhysicalMemoryAuthority;
@@ -380,6 +458,8 @@ private:
     {
         return !frame.owned && !frame.shared && !frame.retiring && !frame.pins && !frame.writer;
     }
+    /** @brief Shared admission tail for tryAdmit and tryAdmitTail. */
+    std::optional<Grant> admitLocked(std::size_t pages, std::size_t declared_peak);
     /** @brief Validate one original grant incarnation before observing its metadata. */
     const Request &require(const Grant &grant) const;
     /** @brief Retire only unpublished private ownership; no native access API exists yet. */
@@ -391,6 +471,8 @@ private:
     void reclaim(Frame &frame) noexcept;
     void discard(const Grant &grant, FrameHandle handle);
     std::optional<AppendPlan> prepareAppend(const Grant &grant, FrameHandle handle, std::size_t bytes);
+    std::optional<AppendPlan> prepareExclusiveTail(const Grant &grant, FrameHandle handle,
+        const CommittedPage &prior, std::size_t bytes);
     Frame &requireFrame(FrameHandle handle);
     ReadAccess registerRead(const CommittedPage &page);
     SharedPage share(const CommittedPage &page);

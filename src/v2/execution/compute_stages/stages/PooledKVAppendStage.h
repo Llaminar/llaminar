@@ -33,6 +33,8 @@
 
 namespace llaminar2
 {
+class PooledKVDecodeBinding; ///< Live binding authority (forward declaration; defined
+                             ///< in PooledKVDecodeBinding.h which includes this file).
 /**
  * @brief Caller-owned live pooled publication (ref + retained Snapshot).
  *
@@ -84,6 +86,39 @@ public:
          * `tryAdmit`. Null or an exhausted grant refuses before mutation.
          */
         PhysicalPagePool::Grant *grant = nullptr;
+        /**
+         * @brief Per-stage direct-test override of the exclusive tail (ignored
+         * when @p binding is non-null; production wire passes the binding).
+         */
+        bool exclusive_tail = false;
+        /**
+         * @brief Per-stage direct-test override of the final-partial-page
+         * destination (ignored when @p binding is non-null).
+         */
+        bool tail_finishes_last_page = false;
+        /**
+         * @brief Live pooled binding (production caller).
+         *
+         * When non-null the stage reads the CURRENT tail mode, tail grant and
+         * tail frames AT EXECUTE TIME, because CPU forward graphs are rebuilt
+         * per forward but the builder bakes pointers into the cached stage:
+         * for a one-shot per-forward graph the addresses are stable while the
+         * VALUES change between steps. Baking the mode as a bool would replay
+         * a stale plan. The binding is the single authority.
+         */
+        PooledKVDecodeBinding *binding = nullptr;
+        /**
+         * @brief Per-stage direct-test override of the persistent tail grant.
+         */
+        PhysicalPagePool::Grant *tail_grant = nullptr;
+        /**
+         * @brief Per-stage direct-test override of this layer's tail frame.
+         */
+        const PhysicalPagePool::FrameHandle *tail_frame = nullptr;
+        /**
+         * @brief Per-stage direct-test override of the rolled fresh tail frame.
+         */
+        const PhysicalPagePool::FrameHandle *fresh_tail_frame = nullptr;
         /**
          * @brief Accepted-work issuance reservation of this request (N2).
          *

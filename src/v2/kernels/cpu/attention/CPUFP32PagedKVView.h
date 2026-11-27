@@ -76,6 +76,15 @@ public:
     /** @return Whether this entry backs an immutable shared page rather than a private publication. */
     bool sharedBacked() const noexcept { return kind_ == Kind::Shared; }
     /**
+     * @return The PRIVATE publication backing this entry, or null when the
+     * entry is shared or empty. The caller must own the frame to extend it in
+     * place; the returned page is its prior committed tail publication.
+     */
+    const PhysicalPagePool::CommittedPage *privatePublication() const noexcept
+    {
+        return kind_ == Kind::Private ? &publication_ : nullptr;
+    }
+    /**
      * @brief Borrow this page's immutable content as a shared reference.
      * @return A new logical reference; the caller retains it as long as needed.
      * @throws std::logic_error For a moved-from page.

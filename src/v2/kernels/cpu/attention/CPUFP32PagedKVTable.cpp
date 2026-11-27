@@ -419,6 +419,20 @@ CPUFP32PagedKVView CPUFP32PagedKVTable::Snapshot::view() const
     const auto &state = table_->require(bank_, version_, Phase::Published);
     return CPUFP32PagedKVView({table_->pages_ + bank_ * table_->geometry_.page_capacity, state.pages}, table_->geometry_.page_tokens);
 }
+CPUFP32KVPage *CPUFP32PagedKVTable::Snapshot::pageAt(std::size_t index) const
+{
+    if (!table_) throw std::logic_error("CPU page-table page access uses an empty snapshot");
+    const auto &state = table_->require(bank_, version_, Phase::Published);
+    if (index >= state.pages)
+        throw std::out_of_range("CPU page-table page index exceeds the retained bank extent");
+    return table_->pages_ + bank_ * table_->geometry_.page_capacity + index;
+}
+std::size_t CPUFP32PagedKVTable::Snapshot::pageCount() const
+{
+    if (!table_) throw std::logic_error("CPU page-table page count uses an empty snapshot");
+    const auto &state = table_->require(bank_, version_, Phase::Published);
+    return state.pages;
+}
 bool CPUFP32PagedKVTable::bindPublication(Snapshot &snapshot,
     std::uint64_t request_id, int slot)
 {

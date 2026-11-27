@@ -4948,6 +4948,11 @@ namespace llaminar2
             auto *cell = pooled->nextCell(layer_idx);
             if (!cell)
                 throw std::invalid_argument("Pooled decode binding has no next cell for the layer");
+            // P2 exclusive tail: the append stage reads the LIVE tail plan
+            // from the binding at execute time (the binding is the single
+            // authority; per-forward graphs rebuild with stable pointers but
+            // the tail mode, rolled frames and row counts change between
+            // steps). Only the binding pointer is baked here.
             // M1: the prior is the binding's CURRENT cell, a DISTINCT object
             // from the next cell; the stage reads it at execute and never
             // clears it. M6: all page frames come from the pre-admitted step
@@ -4962,6 +4967,7 @@ namespace llaminar2
                               .ref_out = cell,
                               .prior = pooled->priorFor(layer_idx),
                               .grant = pooled->stepGrant(),
+                              .binding = pooled,
                               .issuance = pooled->issuance(),
                               .request_id = pooled->requestId(),
                               .slot = pooled->slot(),
