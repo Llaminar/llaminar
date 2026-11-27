@@ -67,3 +67,10 @@ shared authority after review; do not duplicate its grammar, substitute C++20,
 rewrite the dependency target to `probe`, or treat old b1.json as authority.
 The actual target remains the exact ISA1 lambda from the proposal, final
 `0x4d6f70`, size `0x110`; the second reached lambda needs its own proof.
+
+Scratch scope is now canonical artifact-directory containment for **all three**
+B1 outputs (object, dependency file, assembly), resolving symlinks. The original
+production dependency filename is retained even when absent and explicitly
+forbidden, as are `.ninja_deps`, production output and every link input. Distinct
+scratch outputs are required. Compiler-free negatives cover absent P, database,
+outside-root and symlink escapes; native fixtures use per-attempt artifact roots.

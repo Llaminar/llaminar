@@ -47,6 +47,27 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
             C._static_alias_extent(image._replace(symbols=[first, second, second._replace(name="third")]),
                                    "body", assembly)
 
+    def test_b1_scratch_scope_rejects_absent_production_dep_database_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            production_dep = root / "absent-P.d"
+            recipe = dict(files={}, production_dependency=str(production_dep), output=str(root / "app"))
+            replay = C.StaticB1Replay([], str(root), "source", {}, artifacts / "b1.o",
+                                      artifacts / "b1.d", artifacts / "production.s")
+            C._static_b1_scratch_paths(replay, artifacts, root, recipe)
+            self.assertFalse(production_dep.exists())
+            for field in ("obj", "dependencies", "assembly"):
+                for forbidden in (production_dep, root / ".ninja_deps", root / "app", root / "outside"):
+                    with self.subTest(field=field, path=forbidden), self.assertRaises(ValueError):
+                        C._static_b1_scratch_paths(replay._replace(**{field: forbidden}), artifacts, root, recipe)
+            (artifacts / "escape").symlink_to(root, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                C._static_b1_scratch_paths(replay._replace(dependencies=artifacts / "escape" / "absent-P.d"),
+                                           artifacts, root, recipe)
+            self.assertFalse(production_dep.exists())
+
     def test_manifest_and_enum_cannot_construct_authority(self):
         for key in (None, {}, "static-executable", "0" * 64):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "native verifier"):
@@ -204,14 +225,18 @@ class StaticSelectionNativeTest(unittest.TestCase):
         image = C.read_object(obj)
         unit = C.make_unit("winner", image, C.normalize_disassembly(listing, image))
         target, alias = "_ZN6ChosenILi7EEC2Ev", "_ZN6ChosenILi7EEC1Ev"
-        scratch = C.executed_command([compiler], str(root / "f.cpp"), root / "b1.o", root / "b1.d")
-        subprocess.run(scratch, cwd=root, check=True)
-        self.assertEqual((root / "b1.o").read_bytes(), obj)
-        paths = C.JobPaths(str(root / "f.cpp"), str(root / "b1.o"), str(root / "b1.d"), str(root), None)
         identity = C.compiler_identity(subprocess.check_output([compiler, "--version"], text=True))
-        plan = C.driver_plan(scratch, str(root), identity, paths)
-        replay = C.StaticB1Replay(scratch, str(root), paths.source, plan,
-                                  root / "b1.o", root / "b1.d", root / "replayed.s")
+        def prepare_replay(label):
+            directory = root / label
+            directory.mkdir(exist_ok=True)
+            scratch = C.executed_command([compiler], str(root / "f.cpp"), directory / "b1.o", directory / "b1.d")
+            subprocess.run(scratch, cwd=root, check=True)
+            self.assertEqual((directory / "b1.o").read_bytes(), obj)
+            paths = C.JobPaths(str(root / "f.cpp"), str(directory / "b1.o"), str(directory / "b1.d"), str(root), None)
+            plan = C.driver_plan(scratch, str(root), identity, paths)
+            return C.StaticB1Replay(scratch, str(root), paths.source, plan,
+                                    directory / "b1.o", directory / "b1.d", directory / "replayed.s")
+        replay = prepare_replay("valid")
         with self.assertRaisesRegex(ValueError, "without B1"):
             C.verify_static_executable_selection(args, root, root / "app", root / "no-plan", unit, obj, obj, target)
         authority = C.verify_static_executable_selection(args, root, root / "app", root / "valid", unit, obj, obj,
@@ -250,7 +275,7 @@ class StaticSelectionNativeTest(unittest.TestCase):
             try:
                 with mock.patch.object(C, "capture_static_link", captured), self.assertRaises(ValueError):
                     C.verify_static_executable_selection(args, root, root / "app", root / label,
-                                                        unit, obj, obj, target, b1=replay)
+                                                        unit, obj, obj, target, b1=prepare_replay(label))
             finally:
                 (root / "app").write_bytes(original_app)
         for label, field, value in (("alias-size", "size", 4), ("alias-address", "address", 4),
@@ -265,7 +290,7 @@ class StaticSelectionNativeTest(unittest.TestCase):
             return files
         with mock.patch.object(C, "_static_replay_b1", mutated_after_replay), self.assertRaisesRegex(ValueError, "artifact changed"):
             C.verify_static_executable_selection(args, root, root / "app", root / "changed-after-replay",
-                                                unit, obj, obj, target, b1=replay)
+                                                unit, obj, obj, target, b1=prepare_replay("changed-after-replay"))
         with self.assertRaisesRegex(ValueError, "overlap production"):
             C.verify_static_executable_selection(args, root, root / "app", root / "production-path",
                                                 unit, obj, obj, target, b1=replay._replace(obj=root / "f.o"))
@@ -275,7 +300,7 @@ class StaticSelectionNativeTest(unittest.TestCase):
                         original_symbol._replace(kind="other"), original_symbol._replace(binding="global")):
             changed_image = image._replace(symbols=[changed if s.name == alias else s for s in image.symbols])
             with self.assertRaises(ValueError):
-                C._static_alias_extent(changed_image, target, (root / "replayed.s").read_text())
+                C._static_alias_extent(changed_image, target, replay.assembly.read_text())
         with self.assertRaisesRegex(ValueError, "multiple static authorities"):
             C.CallModel({"winner": unit}, {target: authority, alias: {"copy": "winner"}})
         retained = root / "valid" / "production.s"
@@ -283,11 +308,11 @@ class StaticSelectionNativeTest(unittest.TestCase):
         self.assertEqual(model.resolve(unit, alias)[0], "fail")
         with self.assertRaisesRegex(ValueError, "differs from selected"):
             C._static_replay_b1(replay, obj + b"changed", root / "valid")
-        stale = dict(plan, jobs=[list(job) for job in plan["jobs"]])
+        stale = dict(replay.plan, jobs=[list(job) for job in replay.plan["jobs"]])
         stale["jobs"][0].append("-unknown-option")
         with self.assertRaises(ValueError):
             C._static_replay_b1(replay._replace(plan=stale), obj, root / "valid")
-        assembly = (root / "replayed.s").read_text()
+        assembly = replay.assembly.read_text()
         for changed in (assembly.replace(f".set\t{alias},{target}", f".set\t{alias},wrong"),
                         assembly + f"\n.set {alias},{target}\n"):
             with self.assertRaises(ValueError):

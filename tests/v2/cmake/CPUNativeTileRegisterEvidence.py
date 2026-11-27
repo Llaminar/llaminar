@@ -1969,6 +1969,22 @@ class StaticB1Replay(NamedTuple):
     assembly: Path
 
 
+def _static_b1_scratch_paths(replay: StaticB1Replay, artifacts: Path, cwd: Path, recipe: dict) -> None:
+    """Reject any B1 write outside its canonical artifact root or into production state."""
+    root = artifacts.resolve(strict=True)
+    forbidden = {Path(path).resolve() for path in recipe["files"]}
+    forbidden.update({Path(recipe["production_dependency"]).resolve(), (cwd / ".ninja_deps").resolve(),
+                      Path(recipe["output"]).resolve()})
+    paths = [path.resolve() for path in (replay.obj, replay.dependencies, replay.assembly)]
+    if len(set(paths)) != 3:
+        raise ValueError("static B1 scratch outputs alias each other")
+    for path in paths:
+        if path in forbidden:
+            raise ValueError("static B1 replay paths overlap production link inputs/outputs")
+        if path == root or not path.is_relative_to(root):
+            raise ValueError("static B1 scratch outputs must be under the artifact directory")
+
+
 def _static_replay_b1(replay: StaticB1Replay, selected: bytes, artifacts: Path) -> dict[str, str]:
     """Bind the actual assembler input to whole selected-object bytes and tool/source closure."""
     if type(replay) is not StaticB1Replay:
@@ -2616,7 +2632,8 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
             if str(p) in files and files[str(p)] != actual:
                 raise ValueError(f"static retained artifact changed: {p}")
             files[str(p)] = actual
-    recipe = dict(schema=1, argv=list(original_argv), cwd=str(cwd), output=str(output), env=env, files=files)
+    recipe = dict(schema=1, argv=list(original_argv), cwd=str(cwd), output=str(output),
+                  production_dependency=str(production_dep), env=env, files=files)
     proof.write_text(json.dumps(recipe, indent=2))
     return recipe
 
@@ -2666,9 +2683,7 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
     if overlaps or input_overlap:
         if b1 is None:
             raise ValueError("static final function has overlapping aliases without B1 authority")
-        if any(str(path.resolve()) in recipe["files"] for path in
-               (b1.obj, b1.dependencies, b1.assembly)):
-            raise ValueError("static B1 replay paths overlap production link inputs/outputs")
+        _static_b1_scratch_paths(b1, artifacts, cwd, recipe)
         b1_files = _static_replay_b1(b1, object_bytes, artifacts)
         canonical, aliases = _static_alias_extent(image, target, (artifacts / "production.s").read_text())
         for name in aliases:
