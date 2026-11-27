@@ -1332,6 +1332,90 @@ class TLSLocalExecPairTest(unittest.TestCase):
             CHECKER.tlsle_groups(code, image, {"f": (".text.f", 0, 4), "g": (".text.f", 4, 12)})
 
 
+def tlsie_sequence(base: str = "x1", dest: str = "x2") -> str:
+    """Exact native GOT page/load shape with relocation placeholders."""
+    return (f"\tadrp\t{base}, 0 <{TLS}> !{CHECKER.TLSIE_PAIR[0]}:{TLS}\n"
+            f"\tldr\t{dest}, [{base}] !{CHECKER.TLSIE_PAIR[1]}:{TLS}\n")
+
+
+class TLSInitialExecPairTest(unittest.TestCase):
+    """Only the consecutive 541/542 pair defines non-stack data without traffic credit."""
+
+    def test_exact_pair_aliasing_and_register_boundaries(self) -> None:
+        for base, dest in (("x0", "x0"), ("x1", "x2"), ("x30", "x30"), ("x0", "x30")):
+            with self.subTest(base=base, dest=dest):
+                functions = [("f", tlsie_sequence(base, dest) + "\tret\n")]
+                image = CHECKER.read_object(witness_object(functions))
+                bodies = CHECKER.normalize_disassembly(disassembly(functions), image)
+                self.assertIn(f":gottprel:{TLS}", str(bodies))
+                self.assertIn(f":gottprel_lo12:{TLS}", str(bodies))
+
+    def test_load_is_not_stack_or_call_or_invariant_credit(self) -> None:
+        body = ("\tmrs\tx3, tpidr_el0\n.Lk:\n" + tlsie_sequence() +
+                "\tsub\tx5, x5, #1\n\tcbnz\tx5, .Lk\n\tret\n")
+        counts, _, errors = traffic(body)
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not value for value in counts.values()), counts)
+
+    def test_stack_derived_load_operand_fails_even_when_page_is_skipped(self) -> None:
+        pair = tlsie_sequence().replace("\tldr", ".Lload:\n\tldr")
+        _, _, errors = traffic("\tadd\tx1, sp, #0\n\tb\t.Lload\n" + pair + "\tret\n")
+        self.assertTrue(any("stack-derived" in error for error in errors), errors)
+
+    def test_load_does_not_seed_stack_or_erase_other_stack_facts(self) -> None:
+        body = ("\tstp\tx29, x30, [sp, #-32]!\n\tmov\tx29, sp\n"
+                "\tadd\tx9, sp, #16\n" + tlsie_sequence() +
+                "\tstr\tq0, [x9]\n\tldr\tx3, [x2]\n"
+                "\tldp\tx29, x30, [sp], #32\n\tret\n")
+        counts, _, errors = traffic(body)
+        self.assertEqual(errors, [])
+        self.assertEqual(counts["fp"], {"0": 1})
+        self.assertFalse(counts["tls_call"])
+
+    def test_orphans_mixed_symbols_and_instruction_variants_fail(self) -> None:
+        pair = tlsie_sequence()
+        cases = [pair.splitlines()[0] + "\n", pair.splitlines()[1] + "\n",
+                 pair.replace(CHECKER.TLSIE_PAIR[1] + ":" + TLS, CHECKER.TLSIE_PAIR[1] + ":other"),
+                 pair.replace("[x1]", "[x3]"), pair.replace("ldr\tx2", "ldr\tw2"),
+                 pair.replace("x1", "sp"), pair.replace("x1", "xzr"),
+                 pair.replace("x2", "xzr"), pair.replace("x1", "x31"),
+                 pair.replace("[x1]", "[x1, x3]"), pair.replace("[x1]", "[x1, #8]"),
+                 pair.replace("[x1]", "[x1]!"), pair.replace("[x1]", "[x1], #8"),
+                 pair.replace("\n", "\n\tnop\n", 1)]
+        for body in cases:
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, "TLS initial-exec"):
+                traffic(body + "\tret\n")
+
+    def test_addends_and_function_boundary_fail(self) -> None:
+        functions = [("f", tlsie_sequence() + "\tret\n")]
+        original = witness_object(functions)
+        header = elf_header_offset(original, ".rela.text.f")
+        offset = int.from_bytes(original[header + 24:header + 32], "little")
+        for record in (0, 1):
+            for addend in (1, -1):
+                data = bytearray(original)
+                data[offset + record * 24 + 16:offset + record * 24 + 24] = addend.to_bytes(8, "little", signed=True)
+                image = CHECKER.read_object(bytes(data))
+                code, _ = CHECKER.parse_disassembly(disassembly(functions), False)
+                with self.subTest(record=record, addend=addend), self.assertRaisesRegex(ValueError, "addend"):
+                    CHECKER.tlsie_groups(code, image, CHECKER.function_extents(image))
+        image = CHECKER.read_object(original)
+        code, _ = CHECKER.parse_disassembly(disassembly(functions), False)
+        with self.assertRaisesRegex(ValueError, "function boundary"):
+            CHECKER.tlsie_groups(code, image, {"f": (".text.f", 0, 4), "g": (".text.f", 4, 12)})
+
+    def test_other_tls_relocations_remain_rejected(self) -> None:
+        functions = [("f", tlsie_sequence() + "\tret\n")]
+        original = witness_object(functions)
+        header = elf_header_offset(original, ".rela.text.f")
+        offset = int.from_bytes(original[header + 24:header + 32], "little")
+        for kind in (512, 513, 539, 543, 544, 545, 546, 547, 548, 550, 552):
+            data = bytearray(original)
+            data[offset + 8:offset + 12] = kind.to_bytes(4, "little")
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "not admitted in code"):
+                CHECKER.read_object(bytes(data))
+
+
 class TLSDescriptorTest(unittest.TestCase):
     """The only admitted indirect call: an exact TLS descriptor sequence. It clobbers x0/x30 only, is counted
     per loop, and every perturbation (reorder, mixed symbol, stray relocation, CALL on a non-blr, register

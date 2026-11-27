@@ -93,3 +93,14 @@ Additional retained remote file SHA256:
 Static acquisition implementation and any TLSIE extension need their own
 reviewed slices. The present work closes neither native whole-object admission
 nor Q5 qualification.
+
+## Initial-exec slice — UNVERIFIED, review required before qualification
+
+The separate initial-exec slice admits only consecutive 541/542 relocations,
+zero addends and the same symbol/function, on exact 64-bit ADRP/LDR operands.
+The symbolic GOT load is non-stack data, not a call or traffic credit. No new
+MRS/ADD/indexed-load forms, production budgets or static authority are added.
+Focused synthetic coverage is explicitly registered in ProductionTestPreflight.
+Original whole-object 549 and pre-slice 541 rejections remain the native controls.
+This implementation is committed before developer verification as directed;
+no T-a or Q5 qualification is claimed.
