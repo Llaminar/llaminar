@@ -552,7 +552,9 @@ TEST(PooledDenseDecode, RunnerTruncateExportImportRoundTrip)
     EXPECT_EQ(static_cast<int>(exported->meta().rows), 6);
     EXPECT_TRUE(target.truncateLayer(0, truncated_rows));
     EXPECT_EQ(target.priorFor(0)->snapshot.view().rows(), truncated_rows);
-    target_owner->setPooledDecodeStartPosition(truncated_rows);
+    // Typed cursor lifecycle: no host setter — the DGO adopts the publication
+    // row count because the binding's cursor epoch advanced.
+    EXPECT_EQ(target.cursorEpoch(), 1u);
     for (const auto token : decode_after)
         ASSERT_OK("target decode after truncate", target_owner->forward(&token, 1, 1) != nullptr);
     EXPECT_EQ(target.priorFor(0)->snapshot.view().rows(),

@@ -709,6 +709,12 @@ namespace llaminar2
         PooledKVDecodeBinding::StepGuard pooled_step_guard_;
         /** N1 (grouped): one guard per member; all advance or all cancel. */
         std::vector<PooledKVDecodeBinding::StepGuard> pooled_step_guards_;
+        /** Typed cursor lifecycle: last publication-epoch adopted per binding.
+         * When a binding's epoch advances (truncate/import changed the row
+         * counts) the orchestrator adopts the publication's authoritative
+         * position instead of requiring a host-side cursor setter. */
+        std::uint64_t pooled_cursor_epoch_seen_single_ = 0;
+        std::vector<std::uint64_t> pooled_cursor_epochs_seen_group_;
     private:
         // Only the original Rank can order these phases across every participant.
         /** @brief Join original prior producers and publish this grouped channel's reset close before any TP peer awaits. */

@@ -18018,6 +18018,42 @@ namespace llaminar2
                 : InferencePhase::PREFILL;
         transitionToPhase(new_phase);
 
+        // Typed cursor lifecycle (adopted EARLY, before any position/RoPE row
+        // is derived from state_.positions): when a pooled binding's
+        // publication epoch advanced (truncate/import changed the row counts
+        // OUTSIDE a forward), the orchestrator re-seats the host cursor to the
+        // publication's authoritative row count. The publication is the single
+        // position authority (M1); the host cursor is a mirror, never an
+        // independent one, and never a test-only raw setter.
+        if (pooled_kv_binding_)
+        {
+            const std::uint64_t epoch = pooled_kv_binding_->cursorEpoch();
+            if (epoch != pooled_cursor_epoch_seen_single_)
+            {
+                pooled_cursor_epoch_seen_single_ = epoch;
+                if (!state_.positions.empty())
+                    state_.positions[0] = pooled_kv_binding_->nextPosition();
+            }
+        }
+        if (!pooled_kv_binding_group_.empty())
+        {
+            if (pooled_cursor_epochs_seen_group_.size() !=
+                pooled_kv_binding_group_.size())
+                pooled_cursor_epochs_seen_group_.assign(
+                    pooled_kv_binding_group_.size(), 0);
+            for (std::size_t r = 0; r < pooled_kv_binding_group_.size(); ++r)
+            {
+                auto *member = pooled_kv_binding_group_[r];
+                const std::uint64_t epoch = member->cursorEpoch();
+                if (epoch != pooled_cursor_epochs_seen_group_[r])
+                {
+                    pooled_cursor_epochs_seen_group_[r] = epoch;
+                    if (r < state_.positions.size())
+                        state_.positions[r] = member->nextPosition();
+                }
+            }
+        }
+
         /*
          * A GPU grouped verifier executes after accepted-state publication has
          * updated the canonical KV count entirely on device. The legacy

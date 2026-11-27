@@ -642,6 +642,18 @@ public:
     }
 
     /**
+     * @brief Typed cursor lifecycle: generation of the publication row counts.
+     *
+     * Truncate/import change the live row counts OUTSIDE a forward step; the
+     * host cursor must be re-seated to the publication's new count. The
+     * binding owns that change and exposes it as a monotonic epoch so the
+     * orchestrator can ADOPT the authoritative position instead of a
+     * test-only direct setter. Epoch 0 = never changed since construction.
+     * @return Current cursor generation.
+     */
+    std::uint64_t cursorEpoch() const noexcept { return cursor_epoch_; }
+
+    /**
      * @brief Export one layer's complete live pooled history as an archive.
      * @param layer Attended layer.
      * @return The exact archive of that layer's publication (provenance is
@@ -728,6 +740,9 @@ public:
         auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
         cell.ref = ref;
         cell.snapshot = std::move(snapshot);
+        // Typed cursor lifecycle: the row counts changed outside a forward;
+        // the orchestrator adopts the authoritative position via cursorEpoch.
+        ++cursor_epoch_;
         return true;
     }
 
@@ -761,6 +776,11 @@ private:
     std::vector<PooledPublicationCellPair> cells_;
     std::optional<CPUFP32PagedKVTable::IssuanceReservation> reservation_;
     bool cancelled_ = false;
+    /** Monotonic cursor-generation counter: bumped on every authority
+     * operation that changes the publication row counts (truncate/import).
+     * The DGO adopts the binding's authoritative position when it observes
+     * a new epoch — a typed cursor lifecycle, never a raw host setter. */
+    std::uint64_t cursor_epoch_ = 0;
     std::optional<PhysicalPagePool::Grant> step_grant_;
     /** Grant owning the frames of the LAST truncation/import bank (private
      * materialized pages must stay owned for the bank's lifetime). */
