@@ -4192,6 +4192,8 @@ def row_decomposition_keys(root: Path | None = None) -> dict[tuple, tuple[tuple,
                        ((2, DOTS[pair], *suffix), (rows - 2, DOTS[tail], *suffix)))
     if not result:
         raise ValueError("empty NEON row-decomposition table")
+    if any(leaf in result for leaves in result.values() for leaf in leaves):
+        raise ValueError("NEON row routing chains through another retired source key")
     return result
 
 

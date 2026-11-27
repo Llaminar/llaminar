@@ -445,10 +445,10 @@ namespace llaminar2::cpu::native_quantised
                     return run<PairOps, Policy, Physical, Map, Minimum, Strips>();
                 else
                 {
-                using FirstMap = typename CPUNativeNEONProjectionTile<2>::NibbleMap;
-                using LastMap = typename CPUNativeNEONProjectionTile<Rows - 2>::NibbleMap;
-                rowSlice<2, 0>().template run<PairOps, Policy, Physical, FirstMap(Map), Minimum, Strips>();
-                rowSlice<Rows - 2, 2>().template run<LastOps, Policy, Physical, LastMap(Map), Minimum, Strips>();
+                    using FirstMap = typename CPUNativeNEONProjectionTile<(Rows > 2 ? 2 : Rows)>::NibbleMap;
+                    using LastMap = typename CPUNativeNEONProjectionTile<Rows - 2>::NibbleMap;
+                    rowSlice<2, 0>().template run<PairOps, Policy, Physical, FirstMap(Map), Minimum, Strips>();
+                    rowSlice<Rows - 2, 2>().template run<LastOps, Policy, Physical, LastMap(Map), Minimum, Strips>();
                 }
             }
             else
@@ -1518,14 +1518,14 @@ namespace llaminar2::cpu::native_quantised
          * measured per program with the GCC 14 tile register and stack-traffic witness.
          */
         static constexpr std::string_view kUnscheduledPrograms[] = {
-            "1:0:1:3:11:0", "1:1:0:1:0:0", "1:1:0:2:0:0", "1:1:1:2:0:0", "1:1:1:3:11:0", "2:0:1:3:11:0",
-            "2:1:0:2:0:0", "2:1:1:3:11:0", "2:2:0:3:11:0", "2:2:0:4:2:0", "2:2:1:3:11:0", "2:2:1:4:2:0",
-            "2:2:1:7:0:0", "2:2:1:7:1:1", "3:0:0:2:0:0", "3:0:0:3:11:0", "3:0:1:3:7:1", "3:0:1:3:11:0",
-            "3:1:0:2:0:0", "3:1:0:3:11:0", "3:1:1:3:7:1", "3:1:1:3:11:0", "3:2:0:2:0:0", "3:2:0:3:11:0",
+            "1:0:1:3:11:0", "1:1:0:1:0:0", "1:1:0:2:0:0", "1:1:1:2:0:0", "2:0:1:3:11:0",
+            "2:1:0:2:0:0", "2:1:1:3:11:0", "2:2:0:3:11:0", "2:2:0:4:2:0", "2:2:1:4:2:0",
+            "2:2:1:7:0:0", "2:2:1:7:1:1", "3:0:0:2:0:0", "3:0:0:3:11:0", "3:0:1:3:7:1",
+            "3:1:0:2:0:0", "3:1:0:3:11:0", "3:2:0:2:0:0", "3:2:0:3:11:0",
             "3:2:0:4:2:0", "3:2:1:2:0:0", "3:2:1:3:11:0", "3:2:1:4:2:0", "3:2:1:6:1:1", "4:0:0:2:0:0",
-            "4:0:0:3:11:0", "4:0:0:6:1:1", "4:0:1:3:7:1", "4:0:1:3:11:0", "4:1:0:3:11:0", "4:1:0:4:2:0",
-            "4:1:0:7:0:0", "4:1:0:7:1:1", "4:1:1:3:7:1", "4:1:1:3:11:0", "4:1:1:6:1:1", "4:1:1:7:1:1",
-            "4:2:0:3:11:0", "4:2:0:4:2:0", "4:2:1:3:11:0", "4:2:1:4:2:0", "4:2:1:6:1:1",
+            "4:0:0:3:11:0", "4:0:0:6:1:1", "4:1:0:3:11:0", "4:1:0:4:2:0",
+            "4:1:0:7:0:0", "4:1:0:7:1:1", "4:1:1:7:1:1",
+            "4:2:0:3:11:0", "4:2:0:4:2:0", "4:2:1:4:2:0", "4:2:1:6:1:1",
         };
 
         /**
@@ -1538,9 +1538,9 @@ namespace llaminar2::cpu::native_quantised
          */
         static constexpr std::string_view kUnthreadedPrograms[] = {
             "1:1:0:0:1:1", "1:1:0:1:0:0", "1:1:0:2:0:0", "2:0:0:4:2:0", "2:1:0:2:0:0", "2:1:0:4:2:0",
-            "2:2:1:4:2:0", "3:0:0:4:2:0", "3:0:0:7:0:0", "3:1:0:4:2:0", "3:1:0:7:0:0", "3:1:1:4:2:0",
+            "2:2:1:4:2:0", "3:0:0:4:2:0", "3:0:0:7:0:0", "3:1:0:4:2:0", "3:1:0:7:0:0",
             "3:2:1:4:2:0", "4:0:0:4:2:0", "4:0:0:6:1:1", "4:0:0:7:0:0", "4:0:1:4:2:0", "4:1:0:4:2:0",
-            "4:1:0:7:0:0", "4:1:1:4:2:0", "4:1:1:6:1:1", "4:2:1:6:1:1",
+            "4:1:0:7:0:0", "4:1:1:4:2:0", "4:2:1:6:1:1",
         };
 
         /**
@@ -1553,9 +1553,9 @@ namespace llaminar2::cpu::native_quantised
          * and stack-traffic witness.
          */
         static constexpr std::string_view kOpaqueStorePrograms[] = {
-            "2:0:1:3:11:0", "2:1:1:3:11:0", "3:0:0:4:2:0", "3:0:1:3:7:1", "3:0:1:3:11:0", "3:0:1:4:2:0",
-            "3:1:0:4:2:0", "3:1:1:3:11:0", "3:1:1:4:2:0", "3:2:1:3:11:0", "4:0:0:3:11:0", "4:0:1:3:7:1",
-            "4:0:1:3:11:0", "4:1:0:3:11:0", "4:1:1:3:7:1", "4:1:1:4:2:0",
+            "2:0:1:3:11:0", "2:1:1:3:11:0", "3:0:0:4:2:0", "3:0:1:3:7:1",
+            "3:1:0:4:2:0", "3:2:1:3:11:0", "4:0:0:3:11:0",
+            "4:1:0:3:11:0", "4:1:1:4:2:0",
         };
 
         /** @brief Program-key fields rows:family:policy:encoding:map:minimum of one listed key; -1 if malformed. */

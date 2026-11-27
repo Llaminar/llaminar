@@ -53,6 +53,21 @@ namespace llaminar2::cpu::native_quantised
         {2, NEONRowDot::I8MM, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
     };
 
+    static_assert([] {
+        for (const auto &source : kNEONRowDecompositions)
+            for (const auto &other : kNEONRowDecompositions)
+                if (source.policy == other.policy && source.encoding == other.encoding &&
+                    source.map == other.map && source.minimum == other.minimum)
+                {
+                    const int first = source.rows <= 2 ? source.rows : 2;
+                    if (other.rows == first && other.family == source.pair_family)
+                        return false;
+                    if (source.rows > 2 && other.rows == source.rows - 2 && other.family == source.tail_family)
+                        return false;
+                }
+        return true;
+    }(), "NEON row routing must select terminal physical leaves without chaining");
+
     /** @brief Compile-time exact-key selection; unlisted arithmetic programs retain their physical tile. */
     template <int Rows, NEONRowDot Family, CPUProjectionNumericalPolicy Policy,
               NEONRowEncoding Encoding, int Map, bool Minimum>
