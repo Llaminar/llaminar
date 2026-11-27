@@ -870,15 +870,20 @@ namespace llaminar2::cpu::native_quantised
         /**
          * @brief Whether a coded tile walks its K blocks flat, widening the header factors per block.
          * @tparam Coded Coded source codebook (Q5_K 7 or IQ3_S 11).
-         * @return True for Q5_K; IQ3_S widens once per superblock intersection because
-         *         its decode leaves no register to widen the header again in every block.
+         * @tparam Ops Admitted integer instruction family.
+         * @tparam Ordered Whether the tile runs the GPU-aligned partition tree.
+         * @return True for Q5_K except the backend-native four-row SMMLA tile; IQ3_S and that tile widen once
+         *         per superblock intersection because their decode leaves no register to widen
+         *         the header again in every block.
          */
-        template <int Coded> static constexpr bool flatCodedWalk() noexcept { return Coded == 7; }
+        template <int Coded, typename Ops, bool Ordered> static constexpr bool flatCodedWalk() noexcept
+        { return Coded == 7 && !(multi_scale::usesRowPairs<Ops> && Rows == 4 && !Ordered); }
 
         /** @brief Visit increasing-K blocks without recomputing addresses or header factors in the K loop.
          * @tparam Physical Prepared encoding.
          * @tparam Coded Codebook of a coded source, or zero for the generic per-block tile.
          * @tparam Ops Admitted SIMD family.
+         * @tparam Ordered Whether the tile runs the GPU-aligned partition tree (flatCodedWalk()).
          * @param first First block of the current ordered partition.
          * @param last Exclusive end of the current ordered partition.
          * @param column First lane of the four-column strip.
@@ -891,7 +896,7 @@ namespace llaminar2::cpu::native_quantised
          * empty-partition exit into a second cycle of the walk, which the stack
          * witness's loop roles read as a nested partition loop.
          */
-        template <Encoding Physical, int Coded, typename Ops, typename Visit>
+        template <Encoding Physical, int Coded, typename Ops, bool Ordered = false, typename Visit>
         [[gnu::always_inline]] void forPartitionBlocks(int first, int last, [[maybe_unused]] int column, Visit &&visit) const noexcept
         {
             if constexpr (Coded == 0 && hoistsSourceHeader<Ops, Physical>())
@@ -939,7 +944,7 @@ namespace llaminar2::cpu::native_quantised
                 // Tile binding already admitted the resident geometry. A wire
                 // intersection is never passed directly to this execution ABI.
                 const auto *root = weights_.interleavedBase() + std::size_t(chunk_) * geometry.rowBytes();
-                if constexpr (flatCodedWalk<Coded>())
+                if constexpr (flatCodedWalk<Coded, Ops, Ordered>())
                 {
                     // Q5_K: one flat, branch-free increasing-K walk. Each block
                     // addresses its unit and source superblock header from the
@@ -1451,7 +1456,7 @@ namespace llaminar2::cpu::native_quantised
             if constexpr (Coded == 11)
                 return !((Rows == 1 && sdot && ordered) || (pairs && !ordered && (Rows == 2 || Rows == 3)));
             else if constexpr (Coded == 7)
-                return !(ordered && ((Rows == 1 && sdot) || (Rows == 2 && pairs) || (Rows == 3 && sdot))) && !(pairs && Rows == 4 && !ordered);
+                return !(ordered && ((Rows == 1 && sdot) || (Rows == 2 && pairs) || (Rows == 3 && sdot)));
             else if constexpr (Physical == Encoding::NibbleLUT)
                 return (Map == NibbleMap::Unsigned && (Rows == 2 || (Rows == 3 && pairs))) || (pairs && Rows == 4 && ordered);
             else if constexpr (Physical == Encoding::SignedInt8SingleScale)
@@ -1537,7 +1542,7 @@ namespace llaminar2::cpu::native_quantised
                         const int first = ordered || Coded == 0 ? partition * blocks_per_partition_ : 0;
                         const int last = ordered || Coded == 0 ? std::min(first + blocks_per_partition_, weights_.blocks_per_row)
                             : weights_.blocks_per_row;
-                        forPartitionBlocks<Physical, Coded, Ops>(first, last, column, [&](int block, const std::uint8_t *unit,
+                        forPartitionBlocks<Physical, Coded, Ops, ordered>(first, last, column, [&](int block, const std::uint8_t *unit,
                             [[maybe_unused]] const auto &base) __attribute__((always_inline)) {
                             // Re-derive this strip's column offsets in every block where that
                             // frees registers (opaqueStripColumn()); otherwise GCC hoists them.
@@ -1674,14 +1679,14 @@ namespace llaminar2::cpu::native_quantised
                                 [[maybe_unused]] auto factor_base = base;
                                 if constexpr (Rows == 1 && Ops::instruction == Dot::DotProd)
                                 {
-                                    if constexpr (flatCodedWalk<Coded>())
+                                    if constexpr (flatCodedWalk<Coded, Ops, ordered>())
                                         asm("" : "+r"(factor_unit), "+r"(factor_base) : "w"(low[0]));
                                     else
                                         asm("" : "+r"(factor_unit) : "w"(low[0]));
                                 }
                                 const auto factors = [&]() __attribute__((always_inline)) {
                                     // A flat walk passes the header; the grouped IQ3_S walk the widened base.
-                                    if constexpr (flatCodedWalk<Coded>())
+                                    if constexpr (flatCodedWalk<Coded, Ops, ordered>())
                                         return codedFactors<Coded, Ops>(factor_unit, codedBase<Coded, Ops>(factor_base, strip), strip);
                                     else
                                         return codedFactors<Coded, Ops>(factor_unit, base, strip);
