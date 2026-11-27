@@ -32,3 +32,19 @@ The live TLS slice is committed UNVERIFIED before tests, per owner direction.
 Review is mandatory before native controls or using it to admit Q5. Static
 transaction authority is not implemented by this TLS slice; static default/weak
 binding remains rejecting. Auto-merge remains OFF; parent owns pushes.
+
+## Post-push developer validation
+
+Parent confirmed all three commits pushed before verification: a618058a2
+(relocation), f51fc475b (dormant tools retirement), e3164760e (live TLS).
+
+- `python3 -B tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py TLSLocalExecPairTest TLSDescriptorTest CallModelTest CallProvenanceTest RelocationTest -v`: 37 passed.
+- Real `cmake -S tests/v2/portability -B /tmp/pr73-tlsle-portability -G Ninja -DCMAKE_BUILD_TYPE=Release` with resolved Homebrew Ninja and explicit Homebrew OpenMP flags/library/include configured successfully (AppleClang21, native NEON). The redundant `CPU_INSTRUCTION_SET` input was unused; native architecture detection selected NEON.
+- `ctest --test-dir /tmp/pr73-tlsle-portability -N -R '^V2_Integration_CPUNativeTileTLSLocalExecPair$'`: one registered test.
+- Same CTest selection with `--output-on-failure`: passed; ProductionTestPreflight label present.
+- `git diff --check`: passed.
+
+These are developer checks only, not the complete Unit/preflight gate, native
+production T-a, static verifier coverage or Q5 qualification. The approved static
+acquisition scope and observed provenance gaps are in STATIC-ACQUISITION.md;
+no static authority has been implemented or minted.
