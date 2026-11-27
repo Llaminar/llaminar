@@ -6929,12 +6929,17 @@
      },
      {
       "call": "visit(block, unit, base);",
-      "when": "E == 3 and (C == 11 or (L == 2 and R == 4 and G == 0))"
+      "when": "E == 3 and ((C == 11 and not (R == 3 and G == 1 and L != 2)) or (L == 2 and R == 4 and G == 0))"
      },
      {
       "call": "visit(block, root + geometry.blockOffset(0, block), root + geometry.headerOffset(0, block));",
       "when": "E == 3 and C == 7 and not (L == 2 and R == 4 and G == 0)",
       "source": "forPartitionBlocks branch: Coded != 0"
+     },
+     {
+      "call": "visit(block, root + geometry.blockOffset(0, block), base);",
+      "when": "E == 3 and C == 11 and R == 3 and G == 1 and L != 2",
+      "source": "forPartitionBlocks ordered three-row IQ3_S flat walk"
      }
     ],
     "via": "forPartitionBlocks<Physical, Coded, Ops, ordered>(first, last, column, [&]"
@@ -6954,12 +6959,17 @@
      },
      {
       "call": "visit(block, unit, base);",
-      "when": "E == 3 and (C == 11 or (L == 2 and R == 4 and G == 0))"
+      "when": "E == 3 and ((C == 11 and not (R == 3 and G == 1 and L != 2)) or (L == 2 and R == 4 and G == 0))"
      },
      {
       "call": "visit(block, root + geometry.blockOffset(0, block), root + geometry.headerOffset(0, block));",
       "when": "E == 3 and C == 7 and not (L == 2 and R == 4 and G == 0)",
       "source": "forPartitionBlocks branch: Coded != 0"
+     },
+     {
+      "call": "visit(block, root + geometry.blockOffset(0, block), base);",
+      "when": "E == 3 and C == 11 and R == 3 and G == 1 and L != 2",
+      "source": "forPartitionBlocks ordered three-row IQ3_S flat walk"
      }
     ],
     "via": "forPartitionBlocks<Physical, 0, Ops>(first, last, column0, [&]"
