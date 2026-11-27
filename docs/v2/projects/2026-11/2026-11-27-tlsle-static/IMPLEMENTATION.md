@@ -142,3 +142,48 @@ normalized text now fail closed without those markers.
 This is developer evidence only. Whole-object T-a is still BLOCKED, not PASS;
 there is no traffic, static-binding or Q5 qualification. Independent review is
 required before qualification effect. Scratch evidence is not staged.
+
+### Bounded local-exec addend developer check
+
+Implementation 07f2f3553 was committed on `codex/tls-le-addend` from fetched
+956e96308, preserving `codex/tls-ie-pair`. It admits only identical addends
+A with 0 <= A < 2^24 on the existing exact consecutive 549/551 pair and
+preserves the full symbolic target in both normalized ADD operands. Initial-exec
+zero-addend admission, register/placeholder/function constraints, budgets and
+static authority are unchanged. Existing explicit preflight registration of
+`TLSLocalExecPairTest` includes the new boundary and negative regressions.
+
+The implementation SHA was handed to the parent immediately after commit,
+before tests. Developer verification nevertheless began before parent push
+confirmation; the parent subsequently reported transplant/push as ced96e8ec.
+This ordering does not satisfy the owner's push-before-verification requirement.
+
+Developer results (not qualification):
+- Focused TLSLocalExecPairTest, TLSInitialExecPairTest, TLSDescriptorTest,
+  CallModelTest, CallProvenanceTest and RelocationTest: 47 passed.
+- Existing real portability build `/tmp/pr73-tlsie-portability`, CTest regex
+  `^V2_Integration_CPUNativeTileTLS(Local|Initial)ExecPair$`: both passed,
+  ProductionTestPreflight labelled. CMake was unchanged; no reconfigure needed.
+- Full compiler-free `--shard analysis`: 204 tests, one failure in
+  `ParseCacheTest.test_mutating_a_result_never_reaches_the_cache`: cached
+  ObjectImage has a populated object_sha256 while `_read_elf(data)` has b''.
+  This is a PR-introduced cache interface/test defect assigned to the static
+  owner, not waived or repaired by this slice; its assertion remains unchanged.
+- `/tmp/pr73-tlsle-native-inspection/check_ie.py` used the complete retained
+  native production object, rechecked SHA256
+  2e4caad3baaa10cd948e53c696be499df93c65948d0f9f3a1ed49104c16d14f0,
+  and native unfiltered `WeightManager.no-raw.objdump`. Original checker still
+  rejects 549; pre-IE checker still rejects 541. Current complete-object
+  relocation reading and normalization completed with 3060 bodies. Output:
+  `le-addend-result.txt` in that scratch directory.
+- An additional exact assertion through the same checker confirmed section
+  `.text._ZN9llaminar214KernelProfiler6recordENS_10KernelTypeEm` offsets
+  0x3b0/0x3b4 normalize to `add x4, x20, :tprel_hi12:sym+0x10` and
+  `add x4, x4, :tprel_lo12_nc:sym+0x10`, respectively, where sym is the
+  previously recorded local `current_device_key` symbol. The addend was not
+  discarded or folded into a numeric placeholder.
+
+No slicing, bypass, object edits, traffic budgets or table changes were used.
+No further unknown normalization form was encountered. Whole-object traffic,
+static binding and Q5 qualification remain unproven; independent review is
+required before qualification use. Auto-merge remains OFF; parent owns pushes.
