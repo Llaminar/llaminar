@@ -6877,8 +6877,8 @@
    }
   }
  },
- "pr73-neon-stack-iq4-unit-column": {
-  "file_sha256": "f94d908bfcffd1cf173f7679c6582c0c3abf21e1473bd64669133193c8c118e3",
+ "pr73-neon-stack-iq4-ordered-schedule": {
+  "file_sha256": "45cb42e08c32edb98d6e708c176a8f83e14f4fce6a29d2d607d41e28581d24fc",
   "kernel_functions": [
    {
     "signature": "inline void executeBlockProgram() const noexcept"
@@ -7136,43 +7136,43 @@
     "trip": "P if (G or E != 3) else 1",
     "source": "executeBlockProgram: partitions_ when ordered or Coded == 0 (E != 3), else 1"
    },
-   "1809": {
+   "1805": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: low groups 0..3"
    },
-   "1812": {
+   "1808": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: high groups 4..7"
    },
-   "1822": {
+   "1818": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q5: Q5NativePayload::groups == 4"
    },
-   "1871": {
+   "1867": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run IQ4_XS grouped: group < 4 (two nibble groups each)"
    },
-   "1881": {
+   "1877": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run nibble: group < 4 (two nibble groups each)"
    },
-   "2094": {
+   "2090": {
     "role": "partition",
     "variable": "partition",
     "trip": "P",
     "source": "panel: partitions_"
    },
-   "2107": {
+   "2103": {
     "role": "group",
     "variable": "group",
     "trip": "8",
