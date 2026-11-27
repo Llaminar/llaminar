@@ -115,9 +115,8 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
         // Packet compaction may expose every routed entry as a physical row.
         // Keep one admitted transform arena across all width changes, just as
         // the owning graph does, and retire the stage before that arena.
-        CPUProjectionTestWorkspace invocation_workspace(rows * routes, std::max(d_model, intermediate));
         MoELocalExpertStage stage(params);
-        stage.bindWorkspace(invocation_workspace.get());
+        CPUStageTestWorkspace invocation_workspace(stage, rows * routes);
         CPUDeviceContext context(DeviceId::cpu());
 
         // Movement changes local route count without rebuilding the executor.
