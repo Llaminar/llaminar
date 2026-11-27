@@ -29,6 +29,34 @@
 #include <span>
 #include <vector>
 
+namespace llaminar2::cpu::native_quantised
+{
+/** @brief Test-only access to retired wide programs; never linked into the production probe. */
+struct CPUNativeNEONProjectionWideOracle
+{
+    /** @brief Execute the original physical tile on the same admitted row spans and K tree. */
+    template <typename Ops, CPUProjectionNumericalPolicy Policy, std::size_t Rows>
+    static void execute(const CPUNativeNEONProjectionTile<Rows> &tile)
+    {
+        using Tile = CPUNativeNEONProjectionTile<Rows>;
+        using E = CPUNativeQuantisedEncoding;
+        using M = typename Tile::NibbleMap;
+        switch (tile.weights_.encoding)
+        {
+        case E::CompactMultiScale:
+            if (tile.weights_.codebook_id == 7)
+                return tile.template runCoded<Ops, Policy, 7, 0>();
+            return tile.template runCoded<Ops, Policy, 11, 0>();
+        case E::NibbleLUTSourceScale:
+            return tile.template run<Ops, Policy, E::NibbleLUTSourceScale, M::NonLinear, false, 0>();
+        case E::Q4KSuperblockCoded:
+            return tile.template run<Ops, Policy, E::Q4KSuperblockCoded, M::Unsigned, true, 0>();
+        default: throw std::invalid_argument("wide oracle requires a row-decomposition source");
+        }
+    }
+};
+}
+
 namespace llaminar2::test
 {
 namespace
@@ -784,6 +812,79 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
 }
 } // namespace
 #endif
+
+/** @brief Compare installed decomposition with the original wide arithmetic on exact live spans. */
+template <typename Ops, std::size_t Rows, CPUProjectionNumericalPolicy Policy>
+void verifyRowDecomposition()
+{
+    using namespace cpu::native_quantised;
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
+    {
+        const auto encoding = preparedEncodingForSource(*source.metadata);
+        if (!(encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+              encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded ||
+              (encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
+               (source.metadata->codebook_id == 7 || source.metadata->codebook_id == 11))))
+            continue;
+        for (const int n : {1, 3, 4, 63, 64, 65})
+            for (const int blocks : {1, 2, 7, 16, 17, 33})
+            {
+                NativeQuantisedPreparedByteFixture fixture(*source.metadata, n, blocks * 32);
+                fixture.descriptor.numerical_policy = Policy;
+                fixture.seedPayloadAndMetadata();
+                const auto packed = fixture.view();
+                const auto activation = activationRows(blocks, Rows);
+                const int stride = n + 3;
+                const float dirty = std::bit_cast<float>(0x7fc12345u);
+                std::vector<float> installed(Rows * stride, dirty), wide(Rows * stride, dirty);
+                std::array<std::span<const Q8_1Block>, Rows> input;
+                std::array<std::span<float>, Rows> output, reference;
+                for (int repeat = 0; repeat < 2; ++repeat)
+                {
+                    std::fill(installed.begin(), installed.end(), dirty);
+                    std::fill(wide.begin(), wide.end(), dirty);
+                    for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
+                    {
+                        const int columns = std::min(64, n - chunk * 64);
+                        for (std::size_t row = 0; row < Rows; ++row)
+                        {
+                            input[row] = {activation.data() + row * blocks, std::size_t(blocks)};
+                            output[row] = {installed.data() + row * stride + chunk * 64, std::size_t(columns)};
+                            reference[row] = {wide.data() + row * stride + chunk * 64, std::size_t(columns)};
+                        }
+                        CPUNativeNEONProjectionTile<Rows>::bind(packed, input, output, chunk)
+                            .template execute<Ops::instruction>();
+                        CPUNativeNEONProjectionWideOracle::execute<Ops, Policy>(
+                            CPUNativeNEONProjectionTile<Rows>::bind(packed, input, reference, chunk));
+                    }
+                    ASSERT_EQ(std::memcmp(installed.data(), wide.data(), installed.size() * sizeof(float)), 0)
+                        << "rows=" << Rows << " n=" << n << " blocks=" << blocks;
+                }
+            }
+    }
+}
+
+/** @brief Exercise both numerical policies and every decomposed physical width. */
+template <typename Ops> void verifyRowDecompositionPolicies()
+{
+    using P = CPUProjectionNumericalPolicy;
+    verifyRowDecomposition<Ops, 3, P::GPUAlignedExpert>();
+    verifyRowDecomposition<Ops, 4, P::GPUAlignedExpert>();
+    verifyRowDecomposition<Ops, 3, P::BackendNative>();
+    verifyRowDecomposition<Ops, 4, P::BackendNative>();
+}
+
+/** @test Original wide and installed row-pair programs have identical output and guard bytes. */
+TEST_F(CPUNativeNEONPreparedProjection, RowDecompositionMatchesOriginalWideProgram)
+{
+    verifyRowDecompositionPolicies<ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>>();
+#if defined(__ARM_FEATURE_DOTPROD)
+    verifyRowDecompositionPolicies<ms::NEONMultiScaleOps<ms::NEONByteDot::DotProd>>();
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    verifyRowDecompositionPolicies<ms::NEONMultiScaleOps<ms::NEONByteDot::I8MM>>();
+#endif
+}
 
 /** @test ASIMD directly certifies compact ordered trees independently of numerical policy. */
 TEST_F(CPUNativeNEONPreparedProjection, ASIMDCompactOrderedTreesRespectNumericalPolicy)

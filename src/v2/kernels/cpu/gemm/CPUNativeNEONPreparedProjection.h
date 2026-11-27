@@ -12,6 +12,7 @@
 #pragma once
 
 #include "CPUNativeQuantisedMultiScaleKernels.h"
+#include "CPUNativeNEONRowDecomposition.h"
 #include "CPUNativeQuantisedWeightView.h"
 #include "tensors/MXFP4Format.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
@@ -267,6 +268,8 @@ namespace llaminar2::cpu::native_quantised
         // Only the batch binding, which admits CPU features, publication,
         // policy, K tree and every task's spans before forming a team, may build
         // and run tiles without per-task checks.
+        template <std::size_t> friend class CPUNativeNEONProjectionTile;
+        friend struct CPUNativeNEONProjectionWideOracle;
         friend class CPUNativeNEONProjectionBatch;
         friend class CPUNativeNEONPackedPrefill;
 
@@ -364,43 +367,96 @@ namespace llaminar2::cpu::native_quantised
          * @tparam Policy Immutable complete projection arithmetic identity.
          * @pre requireExecutable() admitted the publication.
          */
-        template <typename Ops, CPUProjectionNumericalPolicy Policy, int Strips = 0> void dispatch() const noexcept
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, int Strips = 0>
+        [[gnu::always_inline]] inline void dispatch() const noexcept
         {
             switch (weights_.encoding)
             {
             case Encoding::SignedInt8SingleScale:
-                return run<Ops, Policy, Encoding::SignedInt8SingleScale, NibbleMap::Centered, false, Strips>();
+                return dispatchRows<Ops, Policy, Encoding::SignedInt8SingleScale, NibbleMap::Centered, false, Strips>();
             case Encoding::Q5NativeSingleScale:
                 if (weights_.is_asymmetric)
-                    return run<Ops, Policy, Encoding::Q5NativeSingleScale, NibbleMap::Unsigned, true, Strips>();
-                return run<Ops, Policy, Encoding::Q5NativeSingleScale, NibbleMap::Centered, false, Strips>();
+                    return dispatchRows<Ops, Policy, Encoding::Q5NativeSingleScale, NibbleMap::Unsigned, true, Strips>();
+                return dispatchRows<Ops, Policy, Encoding::Q5NativeSingleScale, NibbleMap::Centered, false, Strips>();
             case Encoding::Q6KNativeDualScale:
-                return run<Ops, Policy, Encoding::Q6KNativeDualScale, NibbleMap::Centered, false, Strips>();
+                return dispatchRows<Ops, Policy, Encoding::Q6KNativeDualScale, NibbleMap::Centered, false, Strips>();
             case Encoding::Q4KSuperblockCoded:
-                return run<Ops, Policy, Encoding::Q4KSuperblockCoded, NibbleMap::Unsigned, true, Strips>();
+                return dispatchRows<Ops, Policy, Encoding::Q4KSuperblockCoded, NibbleMap::Unsigned, true, Strips>();
             case Encoding::NibbleLUTSourceScale:
-                return run<Ops, Policy, Encoding::NibbleLUTSourceScale, NibbleMap::NonLinear, false, Strips>();
+                return dispatchRows<Ops, Policy, Encoding::NibbleLUTSourceScale, NibbleMap::NonLinear, false, Strips>();
             case Encoding::NibbleLUT:
                 switch (weights_.codebook_id)
                 {
-                case 0: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Centered, false, Strips>();
-                case 4: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::NonLinear, false, Strips>();
-                case 5: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Unsigned, true, Strips>();
+                case 0: return dispatchRows<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Centered, false, Strips>();
+                case 4: return dispatchRows<Ops, Policy, Encoding::NibbleLUT, NibbleMap::NonLinear, false, Strips>();
+                case 5: return dispatchRows<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Unsigned, true, Strips>();
                 case kNativeQuantisedMXFP4Codebook:
                     if (weights_.scaleEncoding() != ScaleWords::E8M0)
                         break;
-                    return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::MXFP4, false, Strips>();
+                    return dispatchRows<Ops, Policy, Encoding::NibbleLUT, NibbleMap::MXFP4, false, Strips>();
                 }
                 break;
             case Encoding::CompactMultiScale:
                 if (weights_.codebook_id == 7)
-                    return runCoded<Ops, Policy, 7, Strips>();
+                    return dispatchCodedRows<Ops, Policy, 7, Strips>();
                 if (weights_.codebook_id == 11)
-                    return runCoded<Ops, Policy, 11, Strips>();
+                    return dispatchCodedRows<Ops, Policy, 11, Strips>();
                 break; // The shared compact implementation was selected before this switch.
             }
             // requireExecutable() rejected every other tuple before the team.
             __builtin_unreachable();
+        }
+
+        /**
+         * @brief Borrow exactly one contiguous live row slice for a physical subprogram.
+         * @tparam Count Number of rows consumed, never padded.
+         * @tparam Offset First logical row of the slice.
+         * @return A smaller tile with the identical column and K-partition identity.
+         */
+        template <std::size_t Count, std::size_t Offset>
+        [[gnu::always_inline]] inline auto rowSlice() const noexcept
+        {
+            static_assert(Offset + Count <= Rows);
+            std::array<std::span<const Q8_1Block>, Count> activation;
+            std::array<std::span<float>, Count> output;
+            for (std::size_t row = 0; row < Count; ++row)
+            {
+                activation[row] = activation_[Offset + row];
+                output[row] = output_[Offset + row];
+            }
+            return CPUNativeNEONProjectionTile<Count>::admitted(weights_, activation, output, chunk_);
+        }
+
+        /** @brief Select a first-class row decomposition before instantiating a non-coded K program. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical, NibbleMap Map,
+                  bool Minimum, int Strips>
+        [[gnu::always_inline]] inline void dispatchRows() const noexcept
+        {
+            if constexpr (decomposeNEONRows<Rows, Ops::instruction, Policy, Physical, int(Map), Minimum>())
+            {
+                rowSlice<2, 0>().template dispatch<Ops, Policy, Strips>();
+                rowSlice<Rows - 2, 2>().template dispatch<Ops, Policy, Strips>();
+            }
+            else
+                run<Ops, Policy, Physical, Map, Minimum, Strips>();
+        }
+
+        /** @brief Select existing coded row pairs, with SDOT pairs for ordered four-row I8MM IQ3. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, int Codebook, int Strips>
+        [[gnu::always_inline]] inline void dispatchCodedRows() const noexcept
+        {
+            if constexpr (decomposeNEONRows<Rows, Ops::instruction, Policy,
+                          Encoding::CompactMultiScale, Codebook, Codebook == 7>())
+            {
+                // I8MM's two-row IQ3 program is not admitted by the stack gate;
+                // SDOT computes the identical per-row integer dot and FP program.
+                using PairOps = std::conditional_t<Ops::instruction == Dot::I8MM,
+                    multi_scale::NEONMultiScaleOps<Dot::DotProd>, Ops>;
+                rowSlice<2, 0>().template dispatch<PairOps, Policy, Strips>();
+                rowSlice<Rows - 2, 2>().template dispatch<PairOps, Policy, Strips>();
+            }
+            else
+                runCoded<Ops, Policy, Codebook, Strips>();
         }
 
         /** @brief Decode four columns' source nibbles entirely in native registers.
