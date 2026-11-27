@@ -6150,6 +6150,29 @@ endforeach()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUAllocationAccountingSourcePolicy)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUAllocationAccountingSourcePolicyNegativeControls)
 
+# Per-function code generation in src/v2 may only pin exact FP (fp-contract=off,
+# no-associative-math) and arithmetic-preserving register-pressure options; no
+# target attributes, optimization pragmas or FP-semantic options.
+foreach(cpu_codegen_gate IN ITEMS Unit Integration)
+    add_test(NAME V2_${cpu_codegen_gate}_CPUCodegenAttributeSourcePolicy
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_cpu_codegen_attribute_policy.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..)
+    add_test(NAME V2_${cpu_codegen_gate}_CPUCodegenAttributeSourcePolicyNegativeControls
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_codegen_attribute_policy.py)
+    set(cpu_codegen_labels "V2;${cpu_codegen_gate};CPU;DeviceFree;NativeQuantised;SourcePolicy;Regression")
+    if(cpu_codegen_gate STREQUAL "Integration")
+        list(APPEND cpu_codegen_labels "ProductionTestPreflight")
+    endif()
+    set_tests_properties(
+        V2_${cpu_codegen_gate}_CPUCodegenAttributeSourcePolicy
+        V2_${cpu_codegen_gate}_CPUCodegenAttributeSourcePolicyNegativeControls
+        PROPERTIES LABELS "${cpu_codegen_labels}" TIMEOUT 60)
+endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodegenAttributeSourcePolicy)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodegenAttributeSourcePolicyNegativeControls)
+
 # Prepared CPU NativeQuantised bytes are mutated only by named publication
 # producers; the runtime generation/seal tests own the lifecycle proof.
 foreach(native_publication_gate IN ITEMS Unit Integration)
