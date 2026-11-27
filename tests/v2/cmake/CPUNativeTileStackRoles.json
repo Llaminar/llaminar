@@ -6877,8 +6877,8 @@
    }
   }
  },
- "pr73-neon-stack-iq4-row-lanes": {
-  "file_sha256": "b5237bd16c56d2a2926049bddf2f7b66845cd2424b4b5ca816dd1bdb8a988117",
+ "pr73-neon-stack-iq4-chunk-origin": {
+  "file_sha256": "6db686def197de4904bf3350aa1312cc2cb2b24944d9db984376519acd70fb76",
   "kernel_functions": [
    {
     "signature": "inline void executeBlockProgram() const noexcept"
@@ -7058,121 +7058,121 @@
     "trip": "(K / P) / (ceil((K / P - 1) / 8) + 1)",
     "source": "forPartitionBlocks IQ4_XS: blocks of one superblock (partition blocks / superblock bound)"
    },
-   "944": {
+   "950": {
     "role": "block",
     "variable": "block",
     "trip": "K / P",
     "source": "forPartitionBlocks Coded == 0: [first, last)"
    },
-   "969": {
+   "980": {
     "role": "block",
     "variable": "block",
     "trip": "K / P if G else K",
     "source": "forPartitionBlocks Q5_K: flat [first, last) walk; last = K when not ordered"
    },
-   "977": {
+   "988": {
     "role": "superblock",
     "variable": "block",
     "trip": "ceil(((K / P if G else K) - 1) / 8) + 1",
     "source": "forPartitionBlocks coded: superblocks met by [first, last) (upper bound); last = K when not ordered"
    },
-   "982": {
+   "993": {
     "role": "block",
     "variable": "block",
     "trip": "(K / P if G else K) / (ceil(((K / P if G else K) - 1) / 8) + 1)",
     "source": "forPartitionBlocks coded: blocks of one superblock"
    },
-   "1207": {
+   "1218": {
     "role": "column",
     "variable": "column0",
     "trip": "C / (4 * S)",
     "source": "runQ4K: column0 += 4 * S"
    },
-   "1222": {
+   "1233": {
     "role": "partition",
     "variable": "partition",
     "trip": "P if G else 1",
     "source": "runQ4K: partitions_ when ordered (GPU-aligned), else 1"
    },
-   "1228": {
+   "1239": {
     "role": "superblock",
     "variable": "block",
     "trip": "ceil(((K / P if G else K) - 1) / 8) + 1",
     "source": "runQ4K: superblocks met by [first, last) (upper bound, 8 blocks each); last = K when not ordered"
    },
-   "1237": {
+   "1248": {
     "role": "block",
     "variable": "block",
     "trip": "(K / P if G else K) / (ceil(((K / P if G else K) - 1) / 8) + 1)",
     "source": "runQ4K: blocks of one superblock"
    },
-   "1278": {
+   "1289": {
     "role": "group",
     "variable": "group",
     "trip": "8",
     "source": "runQ4K (ASIMD/DotProd strips): group < 8"
    },
-   "1288": {
+   "1299": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "runQ4K: group < 4 (two nibble groups each)"
    },
-   "1691": {
+   "1702": {
     "role": "column",
     "variable": "column",
     "trip": "C / (4 * S)",
     "source": "executeBlockProgram: panel walk"
    },
-   "1710": {
+   "1721": {
     "role": "column",
     "variable": "column",
     "trip": "C / 4",
     "source": "executeBlockProgram: strip walk"
    },
-   "1730": {
+   "1741": {
     "role": "partition",
     "variable": "partition",
     "trip": "P if (G or E != 3) else 1",
     "source": "executeBlockProgram: partitions_ when ordered or Coded == 0 (E != 3), else 1"
    },
-   "1790": {
+   "1801": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: low groups 0..3"
    },
-   "1793": {
+   "1804": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: high groups 4..7"
    },
-   "1803": {
+   "1814": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q5: Q5NativePayload::groups == 4"
    },
-   "1857": {
+   "1863": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run IQ4_XS grouped: group < 4 (two nibble groups each)"
    },
-   "1867": {
+   "1873": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run nibble: group < 4 (two nibble groups each)"
    },
-   "2078": {
+   "2084": {
     "role": "partition",
     "variable": "partition",
     "trip": "P",
     "source": "panel: partitions_"
    },
-   "2091": {
+   "2097": {
     "role": "group",
     "variable": "group",
     "trip": "8",
