@@ -2184,7 +2184,10 @@ def _static_ninja_record(text: str, target: str, mtime_ns: int, cwd: Path) -> se
             continue
         if not line.startswith("    ") or not line[4:] or line[4:].strip() != line[4:]:
             raise ValueError("unsupported native Ninja dependency record grammar")
-        entries.append((cwd / line[4:]).resolve(strict=True))
+        try:
+            entries.append((cwd / line[4:]).resolve(strict=True))
+        except (OSError, ValueError) as error:
+            raise ValueError("unresolved native Ninja dependency path") from error
     if not entries or len(entries) != int(header[1]):
         raise ValueError("empty or incomplete native Ninja dependency record")
     return set(entries)

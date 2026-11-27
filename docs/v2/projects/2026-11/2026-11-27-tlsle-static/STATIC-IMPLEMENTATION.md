@@ -92,12 +92,19 @@ The retained real candidate edge in
 `/home/factory/pr73-arm-stack-q5/economy16/static-candidate-I8MM/final-link.txt`
 contains exactly one dependency-output option and no explicit linker script.
 Its production dependency output
-`numtree/build/CMakeFiles/llaminar2.dir/link.d` is currently absent (the earlier
-diagnostic removed it); the 52,151,944-byte executable remains present. Native
-capture correctly requires that original dependency inventory. Do not synthesize
-it or waive the missing file. A separately reviewed exact-production relink
-preparation, anchored to unchanged executable bytes and retained inputs/env/tools,
-is required before this executable can establish a new capture baseline.
+`numtree/build/CMakeFiles/llaminar2.dir/link.d` is absent. This is ordinary Ninja
+`deps=gcc` behavior: Ninja consumes the linker depfile into `.ninja_deps`.
+Read-only observation in `economy16/static-ninja-observation/deps.txt` reports
+exact target `llaminar2`, 43 dependencies, VALID, mtime1795780850938300935.
+
+The reviewed explicit native-Ninja admission requires that link cwd be the Ninja
+build root owning `.ninja_deps`; a mismatched cwd or missing/stale/foreign/empty
+record fails closed. Supply the actual Ninja executable explicitly only when the
+original depfile is absent. Its realpath/ELF/version/hash, native database hash,
+exact-target query/environment/raw record and output mtime are bound. Every
+redirected native relink depfile must match that record's input set; database,
+tool, output bytes and mtime must remain unchanged. No synthetic inventory,
+in-place production relink, automatic alternative or depfile recreation occurs.
 
 No WeightManager/Q5 admission, budget/table change, native traffic/spill result,
 no-offset economy verdict or baseline58d77 comparison is certified here.
