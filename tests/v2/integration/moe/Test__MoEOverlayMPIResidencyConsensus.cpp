@@ -13,6 +13,9 @@
  * all-rank retirement fence; current-epoch inference remains admitted meanwhile.
  * Completed remote telemetry must retain exact ordered changing coordinates
  * without retaining a separate string-keyed metric for each lifetime epoch.
+ * Expected wire and root extents derive from the Q4_0 file-density block
+ * (16 nibble bytes plus one FP16 scale per column and K block), never from
+ * a retired prepared-unit plane.
  */
 
 #include "../../utils/RecordedMigrationEvidence.h"
@@ -34,6 +37,7 @@
 #include "utils/MPIContext.h"
 #include "utils/PerfStatsCollector.h"
 #include "execution/moe/ExpertTierTransferMeasurement.h"
+#include "tensors/BlockStructures.h"
 #include "../../utils/ObservedExpertDemandFixture.h"
 #include "../../utils/ActiveProgressContinuationReplayFixture.h"
 
@@ -1059,6 +1063,51 @@ namespace llaminar2::test
             return true;
         }
 
+        /**
+         * Live encoded bytes of one remoteCpuProjection() fixture: 32 live
+         * output columns by two 32-value K blocks, each at Q4_0 file density
+         * (16 nibble payload bytes plus one FP16 scale). Resident N padding
+         * and any retired per-column plane must never reach the wire.
+         */
+        constexpr std::size_t kRemoteCpuProjectionLiveWireBytes = 32u * 2u * sizeof(Q4_0Block);
+        static_assert(kRemoteCpuProjectionLiveWireBytes == 1152u);
+        /** Complete resident root: one 64-column tile by two K blocks at the same density. */
+        constexpr std::size_t kRemoteCpuProjectionRootBytes = 64u * 2u * sizeof(Q4_0Block);
+        static_assert(kRemoteCpuProjectionRootBytes == 2304u);
+
+        /**
+         * Independent payload oracle: a 97-byte lane holds five 18-byte Q4_0
+         * columns. Each 32-column K block needs seven chunks; its two-column
+         * tail cannot share a chunk with the next K block. Protocol messages
+         * are not payload chunks. No production layout participates in this oracle.
+         */
+        constexpr std::size_t kRemoteCpuProjectionColumnsPerChunk = 97u / 18u;
+        static_assert(kRemoteCpuProjectionColumnsPerChunk == 5u);
+        constexpr std::size_t kRemoteCpuProjectionChunksPerKBlock =
+            (32u + kRemoteCpuProjectionColumnsPerChunk - 1u) /
+            kRemoteCpuProjectionColumnsPerChunk;
+        static_assert(kRemoteCpuProjectionChunksPerKBlock == 7u);
+        constexpr std::uint64_t kRemoteCpuProjectionPayloadChunks =
+            kRemoteCpuProjectionChunksPerKBlock * 2u;
+        static_assert(kRemoteCpuProjectionPayloadChunks == 14u);
+
+        /**
+         * @brief Check production geometry against the independent fixture oracle.
+         * @param manifest Live projection admitted to the 97-byte staging lane.
+         */
+        void expectRemoteCpuProjectionStorageLayout(
+            const MoEOverlayRemoteProjectionManifest& manifest)
+        {
+            for (const auto endpoint : {MoEOverlayRemoteCPUStorageEndpoint::Source,
+                                        MoEOverlayRemoteCPUStorageEndpoint::Destination})
+            {
+                const auto layout = remoteCpuProjectionStorageLayout(manifest, endpoint);
+                EXPECT_EQ(layout.unit_count, 14u) << "Q4_0 layout must retain seven units per K block";
+                EXPECT_EQ(layout.maximum_units_per_chunk, 1u) << "97-byte lane must fit exactly one wire unit";
+                EXPECT_EQ(layout.wire_columns_per_unit, 5u) << "Q4_0 wire unit must hold five 18-byte columns";
+            }
+        }
+
         /** @brief Build deterministic final CPU projection bytes for MPI traffic. */
         cpu::native_quantised::CPUNativeQuantisedPackedWeights remoteCpuProjection(
             std::uint8_t seed)
@@ -1826,8 +1875,8 @@ namespace llaminar2::test
             0xa5u);
         const auto initial_recipient=received_from_peer;
         const auto zero_wire=cpuLiveWireOracle(rank_zero_source),one_wire=cpuLiveWireOracle(rank_one_source);
-        ASSERT_EQ(zero_wire.size(),1280u);ASSERT_EQ(one_wire.size(),1280u);
-        ASSERT_EQ(rank_zero_source.native_interleaved.size(),2560u);
+        ASSERT_EQ(zero_wire.size(),kRemoteCpuProjectionLiveWireBytes);ASSERT_EQ(one_wire.size(),kRemoteCpuProjectionLiveWireBytes);
+        ASSERT_EQ(rank_zero_source.native_interleaved.size(),kRemoteCpuProjectionRootBytes);
         EXPECT_EQ(zero_manifest.total_bytes,zero_wire.size());EXPECT_EQ(one_manifest.total_bytes,one_wire.size());
         const auto source_lifetime = std::make_shared<int>(41);
         const auto destination_lifetime = std::make_shared<int>(73);
@@ -2065,10 +2114,13 @@ namespace llaminar2::test
             context->rank() == 0 ? 1u : 2u);
         EXPECT_EQ(stats.operations_completed, 2u);
         EXPECT_EQ(stats.operations_aborted, 1u);
-        //97-byte lane fits one4-column Q4_0 unit (80 bytes);16 units
-        // must each finish the existing send/ACK before the staging slice is reused.
-        EXPECT_EQ(stats.chunks_sent,16u);
-        EXPECT_EQ(stats.chunks_received,16u);
+        // A 97-byte lane fits five Q4_0 columns (90 bytes), not four
+        // retired 20-byte prepared columns. Each K block retains its partial
+        // two-column tail; manifest/ACK messages are not payload chunks.
+        expectRemoteCpuProjectionStorageLayout(zero_manifest);
+        expectRemoteCpuProjectionStorageLayout(one_manifest);
+        EXPECT_EQ(stats.chunks_sent, kRemoteCpuProjectionPayloadChunks);
+        EXPECT_EQ(stats.chunks_received, kRemoteCpuProjectionPayloadChunks);
         EXPECT_EQ(stats.bytes_sent,sent_wire.size());
         EXPECT_EQ(stats.bytes_received,received_wire.size());
         EXPECT_EQ(stats.mpi_failures, 0u);
@@ -2328,8 +2380,8 @@ namespace llaminar2::test
         for (const auto &group : seen) for (const bool present : group) EXPECT_TRUE(present);
         const auto stats = transport.stats();
         EXPECT_EQ(stats.operations_completed, epochs);
-        EXPECT_EQ(stats.bytes_sent, epochs / 2u * 1280u);
-        EXPECT_EQ(stats.bytes_received, epochs / 2u * 1280u);
+        EXPECT_EQ(stats.bytes_sent, epochs / 2u * kRemoteCpuProjectionLiveWireBytes);
+        EXPECT_EQ(stats.bytes_received, epochs / 2u * kRemoteCpuProjectionLiveWireBytes);
         EXPECT_EQ(stats.protocol_failures, 0u);
         EXPECT_EQ(stats.mpi_failures, 0u);
         EXPECT_EQ(stats.inference_stream_waits, 0u);
@@ -2366,7 +2418,7 @@ namespace llaminar2::test
             source_projection.native_interleaved.size(), 0xa5u);
         const auto initial_recipient=destination_bytes;
         const auto source_wire=cpuLiveWireOracle(source_projection);
-        ASSERT_EQ(source_wire.size(),1280u);
+        ASSERT_EQ(source_wire.size(),kRemoteCpuProjectionLiveWireBytes);
         EXPECT_EQ(manifest.total_bytes,source_wire.size());
         const auto source_lifetime = std::make_shared<int>(19);
         const auto destination_lifetime = std::make_shared<int>(23);
@@ -2413,8 +2465,9 @@ namespace llaminar2::test
         const auto stats = transport.stats();
         EXPECT_EQ(stats.bytes_sent,context->rank()==0?source_wire.size():0u);
         EXPECT_EQ(stats.bytes_received,context->rank()==1?source_wire.size():0u);
-        EXPECT_EQ(stats.chunks_sent,context->rank()==0?16u:0u);
-        EXPECT_EQ(stats.chunks_received,context->rank()==1?16u:0u);
+        expectRemoteCpuProjectionStorageLayout(manifest);
+        EXPECT_EQ(stats.chunks_sent,context->rank()==0?kRemoteCpuProjectionPayloadChunks:0u);
+        EXPECT_EQ(stats.chunks_received,context->rank()==1?kRemoteCpuProjectionPayloadChunks:0u);
         EXPECT_EQ(stats.wave_reservations_started, 1u);
         EXPECT_EQ(stats.wave_reservations_failed, 0u);
         EXPECT_EQ(stats.operations_completed, 1u);
@@ -2777,7 +2830,8 @@ namespace llaminar2::test
             const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
             live_expert_bytes+=cpuLiveWireOracle(*packed).size();
         }
-        EXPECT_EQ(live_expert_bytes,3840u); //1280 live bytes per Gate/Up/Down projection.
+        // Gate/Up are 32x64 and Down is 64x32: each carries 64 live Q4_0 blocks.
+        EXPECT_EQ(live_expert_bytes,3u*64u*sizeof(Q4_0Block));
         EXPECT_EQ(projection_stats.bytes_sent,live_expert_bytes);
         EXPECT_EQ(
             projection_stats.bytes_sent,
