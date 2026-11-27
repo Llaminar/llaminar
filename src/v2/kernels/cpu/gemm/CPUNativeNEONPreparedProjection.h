@@ -978,17 +978,23 @@ namespace llaminar2::cpu::native_quantised
          * `n | 0xF0` is exactly `n - 16` as a signed byte, and a set fifth bit
          * leaves `n = (n + 16) - 16`. Q5_1 inserts bit 4 with one bitwise
          * select. Both produce the original signed source bytes.
+         * @tparam GroupFifth Load the fifth bits from this group's byte, so one lane
+         *         table serves every group (q5GroupFifth()); otherwise load group 0's
+         *         bytes and add the group to the lane table. Same selected bits.
          */
-        template <bool Centered> [[gnu::always_inline]] static inline std::array<int8x16_t, 2>
+        template <bool Centered, bool GroupFifth = false> [[gnu::always_inline]] static inline std::array<int8x16_t, 2>
         ordinaryQ5Groups(const std::uint8_t *unit, int column, int group) noexcept
         {
             const auto raw = vld1q_u8(unit + Q5NativePayload::nibbleOffset(group, column));
-            auto fifth = vld1q_u8(unit + Q5NativePayload::fifthOffset(0, column));
+            // The 16-byte read from a group's fifth-bit byte stays inside the sealed
+            // unit: the per-block scales follow the payload.
+            auto fifth = vld1q_u8(unit + Q5NativePayload::fifthOffset(GroupFifth ? group : 0, column));
             if constexpr (Centered)
                 fifth = vmvnq_u8(fifth);
             const uint8x16_t lane{0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12};
             const uint8x16_t positions{1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8};
-            const auto bits = vqtbl1q_u8(fifth, vaddq_u8(lane, vdupq_n_u8(static_cast<std::uint8_t>(group))));
+            const auto bits = GroupFifth ? vqtbl1q_u8(fifth, lane)
+                : vqtbl1q_u8(fifth, vaddq_u8(lane, vdupq_n_u8(static_cast<std::uint8_t>(group))));
             const auto low_selected = vtstq_u8(bits, positions);
             const auto high_selected = vtstq_u8(bits, vshlq_n_u8(positions, 4));
             if constexpr (Centered)
@@ -1007,6 +1013,25 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
+         * @brief Whether a Q5 program reads each group's fifth bits from that group's byte.
+         * @tparam Ops Admitted integer instruction family.
+         * @tparam Ordered Whether the tile runs the GPU-aligned partition tree.
+         * @tparam WithMinimum Whether the source is Q5_1 (additive minimum).
+         * @return The addressing measured to need fewer live constants for this program
+         *         with the GCC 14 tile witness; both select the same bits.
+         */
+        template <typename Ops, bool Ordered, bool WithMinimum> static constexpr bool q5GroupFifth() noexcept
+        {
+            constexpr bool pairs = multi_scale::usesRowPairs<Ops>;
+            if constexpr (Rows == 4)
+                return !(pairs && !Ordered && !WithMinimum);
+            else if constexpr (Rows == 3)
+                return Ordered && WithMinimum && !pairs;
+            else
+                return Rows == 2 && pairs && !Ordered && WithMinimum;
+        }
+
+        /**
          * @brief Compute one block's exact INT32 dots for every row with row-pair SMMLA.
          * @tparam Ops Admitted I8MM operation set.
          * @tparam Physical Non-compact execution encoding.
@@ -1020,7 +1045,7 @@ namespace llaminar2::cpu::native_quantised
          * walk and consumed as adjacent pairs that never straddle a scale half.
          * The FP32 block program that follows is shared and unchanged.
          */
-        template <typename Ops, Encoding Physical, NibbleMap Map>
+        template <typename Ops, Encoding Physical, NibbleMap Map, bool Ordered = false>
         void pairBlock(const std::uint8_t *unit, int column, int block,
             typename Ops::I (&low)[Rows], typename Ops::I (&high)[Rows]) const noexcept
         {
@@ -1046,8 +1071,9 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 1
                 for (int group = 0; group < 4; group += 2)
                 {
-                    const auto first = ordinaryQ5Groups<Map == NibbleMap::Centered>(unit, column, group);
-                    const auto second = ordinaryQ5Groups<Map == NibbleMap::Centered>(unit, column, group + 1);
+                    constexpr bool fifth = q5GroupFifth<Ops, Ordered, Map == NibbleMap::Unsigned>();
+                    const auto first = ordinaryQ5Groups<Map == NibbleMap::Centered, fifth>(unit, column, group);
+                    const auto second = ordinaryQ5Groups<Map == NibbleMap::Centered, fifth>(unit, column, group + 1);
                     consumePair<Ops>(first[0], second[0], block, group, low01, low23, low);
                     consumePair<Ops>(first[1], second[1], block, group + 4, low01, low23, low);
                 }
@@ -1526,7 +1552,7 @@ namespace llaminar2::cpu::native_quantised
                             else if constexpr (Coded == 11)
                                 iq3sBlock<Ops>(unit, strip, block, low);
                             else if constexpr (multi_scale::usesRowPairs<Ops>)
-                                pairBlock<Ops, Physical, Map>(unit, strip, block, low, high);
+                                pairBlock<Ops, Physical, Map, ordered>(unit, strip, block, low, high);
                             else if constexpr (Physical == Encoding::Q6KNativeDualScale)
                             {
                                 // Keep one decoded group live at a time. Fully
@@ -1567,7 +1593,8 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 1
                                 for (int group = 0; group < Q5NativePayload::groups; ++group)
                                 {
-                                    const auto weights = ordinaryQ5Groups<Map == NibbleMap::Centered>(unit, strip, group);
+                                    const auto weights = ordinaryQ5Groups<Map == NibbleMap::Centered,
+                                        q5GroupFifth<Ops, ordered, WithMinimum>()>(unit, strip, group);
                                     consume<Ops>(weights[0], block, group, low);
                                     consume<Ops>(weights[1], block, group + 4, low);
                                 }
