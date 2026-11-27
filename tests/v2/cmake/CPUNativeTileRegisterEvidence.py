@@ -2170,6 +2170,12 @@ def _static_emulation(tokens: list[str], supported: str) -> str:
     return selected[0]
 
 
+def _static_ninja_version(data: bytes) -> bool:
+    """Recognize native releases and the exact observed builder-owned Ninja stamp."""
+    return bool(re.fullmatch(rb"[0-9]+\.[0-9]+(?:\.[0-9]+)?\n?", data) or
+                data == b"1.13.0.git.kitware.jobserver-pipe-1\n")
+
+
 def _static_ninja_record(text: str, target: str, mtime_ns: int, cwd: Path) -> set[Path]:
     """Read one exact native Ninja deps record; stale/partial/foreign records fail."""
     lines = text.splitlines()
@@ -2270,7 +2276,7 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
             retain(f"ninja-{label}.stderr", result.stderr)
             if result.returncode or result.stderr:
                 raise ValueError(f"native Ninja {label} query failed")
-            if label == "version" and not re.fullmatch(rb"[0-9]+\.[0-9]+(?:\.[0-9]+)?\n?", result.stdout):
+            if label == "version" and not _static_ninja_version(result.stdout):
                 raise ValueError("unsupported native Ninja version")
         original_dependencies = _static_ninja_record(result.stdout.decode(), args[oi], original_mtime, cwd)
         retain("ninja-record.json", json.dumps(dict(observed=str(observed_ninja), resolved=str(ninja),
