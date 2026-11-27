@@ -1763,7 +1763,11 @@ namespace llaminar2::cpu::native_quantised
                             {
                                 // IQ4_XS ties the barrier to the block, so GCC cannot hoist it
                                 // (and every offset derived from it) out of the K walk.
-                                if constexpr (Physical == Encoding::NibbleLUTSourceScale)
+                                if constexpr (Physical == Encoding::NibbleLUTSourceScale && Rows == 3 && ordered)
+                                    // The unit already advances with K: retain the loop dependency
+                                    // without extending the logical block's lifetime into addressing.
+                                    asm("" : "+r"(strip) : "r"(unit));
+                                else if constexpr (Physical == Encoding::NibbleLUTSourceScale)
                                     asm("" : "+r"(strip) : "r"(block));
                                 else
                                     asm("" : "+r"(strip));
