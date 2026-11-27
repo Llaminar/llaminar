@@ -1457,6 +1457,21 @@ namespace llaminar2::cpu::native_quantised
             "4:1:0:7:0:0", "4:1:1:4:2:0", "4:1:1:6:1:1", "4:2:1:6:1:1",
         };
 
+        /**
+         * @brief Strip-walk programs that re-derive the stored column after the partition walk.
+         * @details Same key format as kUnscheduledPrograms. GCC otherwise keeps the column's
+         * output offset and tail bound as separate induction variables, live through every
+         * partition and block, where they spill. An empty register barrier on the column
+         * before the stores makes GCC compute both from the column there. The stores write
+         * the same bytes. Each entry was measured per program with the GCC 14 tile register
+         * and stack-traffic witness.
+         */
+        static constexpr std::string_view kOpaqueStorePrograms[] = {
+            "2:0:1:3:11:0", "2:1:1:3:11:0", "3:0:0:4:2:0", "3:0:1:3:7:1", "3:0:1:3:11:0", "3:0:1:4:2:0",
+            "3:1:0:4:2:0", "3:1:1:3:11:0", "3:1:1:4:2:0", "3:2:1:3:11:0", "4:0:0:3:11:0", "4:0:1:3:7:1",
+            "4:0:1:3:11:0", "4:1:0:3:11:0", "4:1:1:3:7:1", "4:1:1:4:2:0",
+        };
+
         /** @brief Program-key fields rows:family:policy:encoding:map:minimum of one listed key; -1 if malformed. */
         static consteval std::array<int, 6> programKeyFields(std::string_view key) noexcept
         {
@@ -1504,6 +1519,7 @@ namespace llaminar2::cpu::native_quantised
         }
         static_assert(wellFormedProgramList<kUnscheduledPrograms>(), "kUnscheduledPrograms holds a malformed key");
         static_assert(wellFormedProgramList<kUnthreadedPrograms>(), "kUnthreadedPrograms holds a malformed key");
+        static_assert(wellFormedProgramList<kOpaqueStorePrograms>(), "kOpaqueStorePrograms holds a malformed key");
         static_assert([] {
             for (const std::string_view key : kUnthreadedPrograms)
                 if (programKeyFields(key)[3] == static_cast<int>(Encoding::CompactMultiScale))
@@ -1611,7 +1627,9 @@ namespace llaminar2::cpu::native_quantised
          * every column-derived offset (payload, bit planes, codes, header words)
          * out of the K walk, where each would occupy a register through every
          * nested loop and evict the column and partition state to the stack. Where
-         * the decode keeps few offsets, hoisting is cheaper. The choice was measured
+         * the decode keeps few offsets, hoisting is cheaper. An empty barrier whose
+         * inputs do not change in the K walk can itself be hoisted out of it; the
+         * IQ4_XS programs therefore tie it to the block. The choice was measured
          * per program with the GCC 14 tile register and stack-traffic witness, and
          * changes no arithmetic: the same offsets address the same bytes.
          */
@@ -1634,7 +1652,7 @@ namespace llaminar2::cpu::native_quantised
             else if constexpr (Physical == Encoding::Q6KNativeDualScale)
                 return !(pairs && Rows == 3 && ordered);
             else if constexpr (Physical == Encoding::NibbleLUTSourceScale)
-                return Rows == 1 || (Rows == 2 && asimd && !ordered) || (Rows >= 3 && !(asimd && ordered) && !(pairs && Rows == 3));
+                return true;
             else if constexpr (Physical == Encoding::Q5NativeSingleScale)
                 return Rows == 4 && WithMinimum && !ordered;
             else
@@ -1718,7 +1736,14 @@ namespace llaminar2::cpu::native_quantised
                             // frees registers (opaqueStripColumn()); otherwise GCC hoists them.
                             int strip = column;
                             if constexpr (opaqueStripColumn<Ops, Policy, Physical, Map, WithMinimum, Coded>())
-                                asm("" : "+r"(strip));
+                            {
+                                // IQ4_XS ties the barrier to the block, so GCC cannot hoist it
+                                // (and every offset derived from it) out of the K walk.
+                                if constexpr (Physical == Encoding::NibbleLUTSourceScale)
+                                    asm("" : "+r"(strip) : "r"(block));
+                                else
+                                    asm("" : "+r"(strip));
+                            }
                             I low[Rows]{}, high[Rows]{};
                             if constexpr (Coded == 7)
                             {
@@ -1942,21 +1967,28 @@ namespace llaminar2::cpu::native_quantised
                         for (std::size_t row = 0; row < Rows; ++row)
                             reduced[row] = carried[row];
                     }
+                    // Re-derive the stored column after the partition walk where that frees
+                    // registers (kOpaqueStorePrograms); otherwise GCC keeps its own
+                    // induction copies of the column's store offsets live across the walk.
+                    int stored = column;
+                    if constexpr (listedProgram<kOpaqueStorePrograms, Ops, Policy, Physical,
+                                      Coded != 0 ? Coded : static_cast<int>(Map), WithMinimum>())
+                        asm("" : "+r"(stored));
 #pragma GCC unroll 4
                     for (std::size_t row = 0; row < Rows; ++row)
                     {
-                        if (column + 4 <= columns_)
-                            vst1q_f32(output_[row].data() + column, reduced[row]);
+                        if (stored + 4 <= columns_)
+                            vst1q_f32(output_[row].data() + stored, reduced[row]);
                         else
                         {
                             // Scalar lane stores are the bounded final-column tail,
                             // not a row replay. Never expose the accumulator array's
                             // address to memcpy: that forces all full-column partials
                             // into stack slots even when the tail branch is unused.
-                            auto *destination = output_[row].data() + column;
+                            auto *destination = output_[row].data() + stored;
                             vst1q_lane_f32(destination, reduced[row], 0);
-                            if (columns_ - column >= 2) vst1q_lane_f32(destination + 1, reduced[row], 1);
-                            if (columns_ - column == 3) vst1q_lane_f32(destination + 2, reduced[row], 2);
+                            if (columns_ - stored >= 2) vst1q_lane_f32(destination + 1, reduced[row], 1);
+                            if (columns_ - stored == 3) vst1q_lane_f32(destination + 2, reduced[row], 2);
                         }
                     }
                 }

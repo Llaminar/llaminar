@@ -3306,7 +3306,8 @@ class PolicyTest(unittest.TestCase):
                 self.assertTrue(all(not key.startswith("1:") and value >= 0 for key, value in limits.items()))
 
     def test_codegen_profile_lists_name_audited_programs(self) -> None:
-        """kUnscheduledPrograms/kUnthreadedPrograms: well-formed unique keys of programs the witness audits."""
+        """kUnscheduledPrograms/kUnthreadedPrograms/kOpaqueStorePrograms: well-formed unique keys of programs the
+        witness audits."""
         source = (REPO / "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h").read_text()
         audited = set()
         for mode, entries in CHECKER.ENVELOPE_PROGRAMS.items():
@@ -3318,7 +3319,7 @@ class PolicyTest(unittest.TestCase):
                         audited.add(f"{rows}:{leaf}:{policy}:{encoding}:{nibble_map}:{minimum}")
                     for codebook, minimum in CHECKER.CODED_DISPATCH:
                         audited.add(f"{rows}:{leaf}:{policy}:{CHECKER.CODED_ENCODING}:{codebook}:{minimum}")
-        for name in ("kUnscheduledPrograms", "kUnthreadedPrograms"):
+        for name in ("kUnscheduledPrograms", "kUnthreadedPrograms", "kOpaqueStorePrograms"):
             with self.subTest(name=name):
                 match = re.search(name + r"\[\] = \{(.*?)\};", source, re.S)
                 self.assertIsNotNone(match)

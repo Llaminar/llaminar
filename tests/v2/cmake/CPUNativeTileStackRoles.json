@@ -5372,5 +5372,381 @@
     "OrderedPartitions": 1
    }
   }
+ },
+ "pr73-neon-stack-12": {
+  "file_sha256": "d27f05201283e38043047f12eacee7fd9dc0fa0f19cbd933557ebe5f5eb13ff4",
+  "kernel_functions": [
+   {
+    "signature": "inline void executeBlockProgram() const noexcept"
+   },
+   {
+    "signature": "inline void runQ4K() const noexcept",
+    "calls": [
+     {
+      "call": "return runQ4K<Ops, Policy, multi_scale::usesRowPairs<Ops> ? 1 : S>();",
+      "when": "E == 6"
+     }
+    ]
+   },
+   {
+    "signature": "inline void panel(int column0)",
+    "calls": [
+     {
+      "call": "panel<Ops, Policy, Physical, Map, WithMinimum, S>(column);",
+      "when": "S > 1 and L != 2 and E != 6"
+     }
+    ]
+   },
+   {
+    "signature": "void forPartitionBlocks(int first, int last",
+    "calls": [
+     {
+      "call": "forPartitionBlocks<Physical, Coded, Ops, ordered>(first, last, column, [&]",
+      "when": "not (S > 1 and L != 2) and E != 6"
+     },
+     {
+      "call": "forPartitionBlocks<Physical, 0, Ops>(first, last, column0, [&]",
+      "when": "True"
+     }
+    ]
+   },
+   {
+    "signature": "column, [&](int block, const std::uint8_t *unit,",
+    "calls": [
+     {
+      "call": "visit(block, unit, header);",
+      "when": "E == 4 and L == 1 and R == 1",
+      "source": "forPartitionBlocks branch: hoistsSourceHeader (NibbleLUTSourceScale, single-row SDOT)"
+     },
+     {
+      "call": "visit(block, unit, nullptr);",
+      "when": "E != 3 and not (E == 4 and L == 1 and R == 1)",
+      "source": "forPartitionBlocks branch: Coded == 0 without hoisted header"
+     },
+     {
+      "call": "visit(block, unit, base);",
+      "when": "E == 3 and (C == 11 or (L == 2 and R == 4 and G == 0))"
+     },
+     {
+      "call": "visit(block, root + geometry.blockOffset(0, block), root + geometry.headerOffset(0, block));",
+      "when": "E == 3 and C == 7 and not (L == 2 and R == 4 and G == 0)",
+      "source": "forPartitionBlocks branch: Coded != 0"
+     }
+    ],
+    "via": "forPartitionBlocks<Physical, Coded, Ops, ordered>(first, last, column, [&]"
+   },
+   {
+    "signature": "column0, [&](int block, const std::uint8_t *unit,",
+    "calls": [
+     {
+      "call": "visit(block, unit, header);",
+      "when": "E == 4 and L == 1 and R == 1",
+      "source": "forPartitionBlocks branch: hoistsSourceHeader (NibbleLUTSourceScale, single-row SDOT)"
+     },
+     {
+      "call": "visit(block, unit, nullptr);",
+      "when": "E != 3 and not (E == 4 and L == 1 and R == 1)",
+      "source": "forPartitionBlocks branch: Coded == 0 without hoisted header"
+     },
+     {
+      "call": "visit(block, unit, base);",
+      "when": "E == 3 and (C == 11 or (L == 2 and R == 4 and G == 0))"
+     },
+     {
+      "call": "visit(block, root + geometry.blockOffset(0, block), root + geometry.headerOffset(0, block));",
+      "when": "E == 3 and C == 7 and not (L == 2 and R == 4 and G == 0)",
+      "source": "forPartitionBlocks branch: Coded != 0"
+     }
+    ],
+    "via": "forPartitionBlocks<Physical, 0, Ops>(first, last, column0, [&]"
+   },
+   {
+    "signature": "void q5KBlock(const std::uint8_t *unit, int column, int block,",
+    "calls": [
+     {
+      "call": "q5KBlock<Ops>(unit, strip, block, low);",
+      "when": "E == 3 and C == 7"
+     }
+    ]
+   },
+   {
+    "signature": "void iq3sBlock(const std::uint8_t *unit, int column, int block,",
+    "calls": [
+     {
+      "call": "iq3sBlock<Ops>(unit, strip, block, low);",
+      "when": "E == 3 and C == 11"
+     }
+    ]
+   }
+  ],
+  "panel_strips": [
+   {
+    "when": "E == 3",
+    "S": 1,
+    "source": "executeBlockProgram: Coded != 0 ? 1 (coded strip walk)"
+   },
+   {
+    "when": "L == 2",
+    "S": 1,
+    "source": "usesRowPairs<Ops> (SMMLA row-pair tiles)"
+   },
+   {
+    "when": "R != 1 or L == 0",
+    "S": 1,
+    "source": "Rows != 1 || ASIMD"
+   },
+   {
+    "when": "E == 1",
+    "S": 4,
+    "source": "SignedInt8SingleScale"
+   },
+   {
+    "when": "E in (4, 6, 7)",
+    "S": 1,
+    "source": "Q5NativeSingleScale, NibbleLUTSourceScale, Q4KSuperblockCoded"
+   },
+   {
+    "when": "True",
+    "S": 2,
+    "source": "otherwise"
+   }
+  ],
+  "loops": {
+   "580": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "q5KBlock pairs: group += 2 over 8"
+   },
+   "615": {
+    "role": "group",
+    "variable": "group",
+    "trip": "8",
+    "source": "q5KBlock: group < 8"
+   },
+   "625": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "q5KBlock: group < 4 (two groups each)"
+   },
+   "722": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "iq3sBlock pairs: group += 2 over 8"
+   },
+   "761": {
+    "role": "group",
+    "variable": "group",
+    "trip": "8",
+    "source": "iq3sBlock: group < 8"
+   },
+   "928": {
+    "role": "superblock",
+    "variable": "block",
+    "trip": "ceil((K / P - 1) / 8) + 1",
+    "source": "forPartitionBlocks IQ4_XS: superblocks met by one partition (upper bound, 8 blocks each)"
+   },
+   "933": {
+    "role": "block",
+    "variable": "block",
+    "trip": "(K / P) / (ceil((K / P - 1) / 8) + 1)",
+    "source": "forPartitionBlocks IQ4_XS: blocks of one superblock (partition blocks / superblock bound)"
+   },
+   "939": {
+    "role": "block",
+    "variable": "block",
+    "trip": "K / P",
+    "source": "forPartitionBlocks Coded == 0: [first, last)"
+   },
+   "964": {
+    "role": "block",
+    "variable": "block",
+    "trip": "K / P if G else K",
+    "source": "forPartitionBlocks Q5_K: flat [first, last) walk; last = K when not ordered"
+   },
+   "972": {
+    "role": "superblock",
+    "variable": "block",
+    "trip": "ceil(((K / P if G else K) - 1) / 8) + 1",
+    "source": "forPartitionBlocks coded: superblocks met by [first, last) (upper bound); last = K when not ordered"
+   },
+   "977": {
+    "role": "block",
+    "variable": "block",
+    "trip": "(K / P if G else K) / (ceil(((K / P if G else K) - 1) / 8) + 1)",
+    "source": "forPartitionBlocks coded: blocks of one superblock"
+   },
+   "1202": {
+    "role": "column",
+    "variable": "column0",
+    "trip": "C / (4 * S)",
+    "source": "runQ4K: column0 += 4 * S"
+   },
+   "1217": {
+    "role": "partition",
+    "variable": "partition",
+    "trip": "P if G else 1",
+    "source": "runQ4K: partitions_ when ordered (GPU-aligned), else 1"
+   },
+   "1223": {
+    "role": "superblock",
+    "variable": "block",
+    "trip": "ceil(((K / P if G else K) - 1) / 8) + 1",
+    "source": "runQ4K: superblocks met by [first, last) (upper bound, 8 blocks each); last = K when not ordered"
+   },
+   "1232": {
+    "role": "block",
+    "variable": "block",
+    "trip": "(K / P if G else K) / (ceil(((K / P if G else K) - 1) / 8) + 1)",
+    "source": "runQ4K: blocks of one superblock"
+   },
+   "1273": {
+    "role": "group",
+    "variable": "group",
+    "trip": "8",
+    "source": "runQ4K (ASIMD/DotProd strips): group < 8"
+   },
+   "1283": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "runQ4K: group < 4 (two nibble groups each)"
+   },
+   "1686": {
+    "role": "column",
+    "variable": "column",
+    "trip": "C / (4 * S)",
+    "source": "executeBlockProgram: panel walk"
+   },
+   "1701": {
+    "role": "column",
+    "variable": "column",
+    "trip": "C / 4",
+    "source": "executeBlockProgram: strip walk"
+   },
+   "1721": {
+    "role": "partition",
+    "variable": "partition",
+    "trip": "P if (G or E != 3) else 1",
+    "source": "executeBlockProgram: partitions_ when ordered or Coded == 0 (E != 3), else 1"
+   },
+   "1781": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "run Q6_K: low groups 0..3"
+   },
+   "1784": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "run Q6_K: high groups 4..7"
+   },
+   "1794": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "run Q5: Q5NativePayload::groups == 4"
+   },
+   "1843": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "run IQ4_XS grouped: group < 4 (two nibble groups each)"
+   },
+   "1853": {
+    "role": "group",
+    "variable": "group",
+    "trip": "4",
+    "source": "run nibble: group < 4 (two nibble groups each)"
+   },
+   "2064": {
+    "role": "partition",
+    "variable": "partition",
+    "trip": "P",
+    "source": "panel: partitions_"
+   },
+   "2077": {
+    "role": "group",
+    "variable": "group",
+    "trip": "8",
+    "source": "panel: group < 8"
+   }
+  },
+  "compact": {
+   "source": "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h",
+   "file_sha256": "44a46bf7b36830996a9b93ec0961bb08d3d862babd9194c6353a34eba62485ed",
+   "kernel_functions": [
+    {
+     "signature": "inline void rowsProgram("
+    }
+   ],
+   "loops": {
+    "1093": {
+     "role": "column",
+     "variable": "column",
+     "trip": "ceil(C / W)",
+     "header": "int column = 0; column < columns; column += Lanes",
+     "definitions": {}
+    },
+    "1097": {
+     "role": "partition",
+     "variable": "partition",
+     "trip": "P if T == 1 else 1",
+     "header": "int partition = 0; partition < partition_count; ++partition",
+     "definitions": {
+      "partition_count": "Tree == Reduction::OrderedPartitions ? partitions : 1"
+     }
+    },
+    "1101": {
+     "role": "row",
+     "variable": "row",
+     "trip": "R",
+     "header": "size_t row = 0; row < Rows; ++row",
+     "definitions": {},
+     "unrolled": "True"
+    },
+    "1117": {
+     "role": "block",
+     "variable": "kb",
+     "trip": "K / P if T == 1 else K",
+     "header": "int kb = first; kb < last; ++kb",
+     "definitions": {
+      "first": "Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin",
+      "last": "Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end"
+     }
+    },
+    "1185": {
+     "role": "row",
+     "variable": "row",
+     "trip": "R",
+     "header": "size_t row = 0; row < Rows; ++row",
+     "definitions": {},
+     "unrolled": "True"
+    },
+    "1315": {
+     "role": "row",
+     "variable": "row",
+     "trip": "R",
+     "header": "size_t row = 0; row < Rows; ++row",
+     "definitions": {},
+     "unrolled": "True"
+    },
+    "1349": {
+     "role": "row",
+     "variable": "row",
+     "trip": "R",
+     "header": "size_t row = 0; row < Rows; ++row",
+     "definitions": {},
+     "unrolled": "True"
+    }
+   },
+   "reduction": {
+    "Contiguous": 0,
+    "OrderedPartitions": 1
+   }
+  }
  }
 }

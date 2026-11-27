@@ -127,6 +127,8 @@ GCC 14 witness in the pinned toolchain:
 
 - `opaqueStripColumn()`: whether an empty register barrier re-derives the strip
   column in every K block;
+- `kOpaqueStorePrograms`: whether an empty register barrier re-derives the
+  stored column after the partition walk;
 - `q5GroupFifth()`: which fifth-bit addressing a Q5 program uses;
 - `hoistsSourceHeader()`: which IQ4_XS tile (single-row SDOT) walks one
   superblock at a time instead of one flat block loop;
