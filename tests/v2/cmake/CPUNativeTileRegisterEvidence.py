@@ -1967,6 +1967,7 @@ class StaticB1Replay(NamedTuple):
     obj: Path
     dependencies: Path
     assembly: Path
+    production: dict | None = None
 
 
 def _static_b1_scratch_paths(replay: StaticB1Replay, artifacts: Path, cwd: Path, recipe: dict) -> None:
@@ -1993,7 +1994,13 @@ def _static_replay_b1(replay: StaticB1Replay, selected: bytes, artifacts: Path) 
         [replay.command[0], "--version"], cwd=replay.directory, text=True))
     closure = read_depfile(replay.dependencies, replay.directory)
     before = bind_inputs(closure)
-    paths = JobPaths(replay.source, str(replay.obj), str(replay.dependencies), replay.directory, frozenset(before))
+    if replay.production is None:
+        paths = JobPaths(replay.source, str(replay.obj), str(replay.dependencies), replay.directory, frozenset(before))
+    else:
+        paths = production_job_paths(replay.production, replay.command, frozenset(before))
+        if (paths.source, paths.obj, paths.deps, paths.directory) != (
+                replay.source, str(replay.obj), str(replay.dependencies), replay.directory):
+            raise ValueError("static B1 paths differ from production compile authority")
     validate_plan(replay.plan["jobs"], identity, paths)
     programs = program_identities(replay.plan, replay.command)
     observed = driver_plan(replay.command, replay.directory, identity, paths)
@@ -2006,11 +2013,14 @@ def _static_replay_b1(replay: StaticB1Replay, selected: bytes, artifacts: Path) 
             program_identities(replay.plan, replay.command) != programs or \
             plan_shape(driver_plan(replay.command, replay.directory, identity, paths)) != plan_shape(replay.plan):
         raise ValueError("static B1 replay inputs/programs/object changed")
+    if replay.production is not None:
+        require_production_authority(replay.production)
     retained = artifacts / "production.s"
     retained.write_bytes(replay.assembly.read_bytes())
     plan_file = artifacts / "b1-plan.json"
     plan_file.write_text(json.dumps(dict(command=replay.command, directory=replay.directory,
-                                       plan=replay.plan, programs=programs, inputs=before), sort_keys=True))
+                                       plan=replay.plan, programs=programs, inputs=before,
+                                       production=replay.production), sort_keys=True))
     files = {str(retained.resolve()): _static_hash(retained.read_bytes()),
              str(plan_file.resolve()): _static_hash(plan_file.read_bytes())}
     for path in [*closure, str(replay.obj), str(replay.dependencies), str(replay.assembly)]:
@@ -5577,6 +5587,305 @@ def require_line_witness_delta(executed: list[str], witness: list[str], renamed:
                          f"{sorted(set(witness) ^ set(executed))[:6]}")
 
 
+def production_compile_relation(database: list[str], edge: list[str], output: str,
+                                launcher: str | None) -> list[str]:
+    """Corroborate a Ninja edge against the DB, allowing only CMake dependency insertion and its launcher."""
+    direct = edge[1:] if launcher else edge
+    if launcher and (not edge or edge[0] != launcher):
+        raise ValueError("configured launcher is absent or changed")
+    if database.count("-o") != 1 or database[database.index("-o") + 1] != output:
+        raise ValueError("compileDB output operand differs from selected output")
+    if any(arg in database for arg in ("-MD", "-MMD", "-MT", "-MQ", "-MF")):
+        raise ValueError("compileDB already contains dependency metadata")
+    positions = [i for i, arg in enumerate(direct) if arg in ("-MD", "-MMD", "-MT", "-MQ", "-MF")]
+    if len(positions) != 3:
+        raise ValueError("edge needs exactly one dependency mode, target and file")
+    start = positions[0]
+    metadata = direct[start:start + 5]
+    if len(metadata) != 5 or metadata[0] not in ("-MD", "-MMD") or metadata[1] not in ("-MT", "-MQ") or \
+            metadata[2:] != [output, "-MF", output + ".d"] or \
+            direct[:start] + direct[start + 5:] != database:
+        raise ValueError("Ninja edge is not compileDB argv plus only dependency metadata")
+    return direct
+
+
+PRODUCTION_CCACHE_BLOCK = '''find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    message(STATUS "V2: Found ccache: ${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")'''
+
+
+def production_cmake_inputs(directory: Path) -> list[Path]:
+    """Read CMake's exact RERUN_CMAKE implicit read-list from its hashed Ninja manifest.
+
+    Only literal Ninja escapes are accepted. Variables, multiple rerun edges,
+    order-only inputs and missing implicit read lists fail closed.
+    """
+    text = (directory / "build.ninja").read_text().replace("$\n", "")
+    lines = [line for line in text.splitlines() if ": RERUN_CMAKE " in line]
+    if len(lines) != 1:
+        raise ValueError("missing or ambiguous CMake RERUN_CMAKE read-list")
+    tail = lines[0].split(": RERUN_CMAKE ", 1)[1]
+    tokens, token, position = [], "", 0
+    while position < len(tail):
+        char = tail[position]
+        if char == "$":
+            position += 1
+            if position == len(tail) or tail[position] not in " $:":
+                raise ValueError("unsupported Ninja variable in CMake read-list")
+            token += tail[position]
+        elif char == " ":
+            if token:
+                tokens.append(token)
+                token = ""
+        else:
+            token += char
+        position += 1
+    if token:
+        tokens.append(token)
+    if tokens.count("|") != 1 or "||" in tokens:
+        raise ValueError("unsupported CMake implicit dependency boundary")
+    paths = [(directory / value).resolve(strict=True) for value in tokens[tokens.index("|") + 1:]]
+    if not paths or len(paths) != len(set(paths)):
+        raise ValueError("empty or duplicate CMake read-list")
+    return paths
+
+
+def production_cmake_assignments(text: str) -> list[tuple[str, list[str]]]:
+    """Lex CMake commands, including nested parentheses, quotes and bracket arguments/comments.
+
+    Assignment destinations, not oneDNN's -D value passthrough or HIP variables,
+    determine whether a command may alter the project CXX launcher.
+    """
+    pattern = re.compile(r'#[=]*\[|\[(=*)\[|"|#[^\n]*|[A-Za-z_][A-Za-z_0-9]*\s*\(')
+    assignments = []
+    position = 0
+    while position < len(text):
+        match = pattern.search(text, position)
+        if not match:
+            break
+        item = match[0]
+        if item.startswith("#"):
+            # Bracket comments start '#[=[' (the ordinary comment alternative also matches them).
+            bracket = re.match(r'#\[(=*)\[', text[match.start():])
+            if bracket:
+                end = text.find("]" + bracket[1] + "]", match.start() + len(bracket[0]))
+                if end < 0:
+                    raise ValueError("unterminated CMake bracket comment")
+                position = end + len(bracket[1]) + 2
+            else:
+                position = text.find("\n", match.start())
+                if position < 0:
+                    break
+            continue
+        if item == '"' or item.startswith("["):
+            raise ValueError("unscoped CMake literal in processed input")
+        command = item[:item.index("(")].strip().lower()
+        depth, cursor, body, quoted = 1, match.end(), "", False
+        while cursor < len(text) and depth:
+            char = text[cursor]
+            if char == "\\":
+                body += text[cursor:cursor + 2]
+                cursor += 2
+                continue
+            if not quoted and char == "#":
+                bracket = re.match(r'#\[(=*)\[', text[cursor:])
+                if bracket:
+                    end = text.find("]" + bracket[1] + "]", cursor + len(bracket[0]))
+                    if end < 0:
+                        raise ValueError("unterminated CMake bracket comment")
+                    cursor = end + len(bracket[1]) + 2
+                else:
+                    end = text.find("\n", cursor)
+                    cursor = len(text) if end < 0 else end
+                body += " "
+                continue
+            if not quoted and char == "[":
+                bracket = re.match(r'\[(=*)\[', text[cursor:])
+                if bracket:
+                    end = text.find("]" + bracket[1] + "]", cursor + len(bracket[0]))
+                    if end < 0:
+                        raise ValueError("unterminated CMake bracket argument")
+                    literal = text[cursor + len(bracket[0]):end]
+                    body += shlex.quote(literal)
+                    cursor = end + len(bracket[1]) + 2
+                    continue
+            if char == '"':
+                quoted = not quoted
+            if not quoted and char in "()":
+                depth += 1 if char == "(" else -1
+            if depth:
+                body += char
+            cursor += 1
+        if depth or quoted:
+            raise ValueError("incomplete processed CMake command")
+        position = cursor
+        if command not in ("set", "set_property", "set_target_properties", "define_property"):
+            continue
+        tokens = shlex.split(body)
+        assigned = command == "set" and tokens and "CMAKE_CXX_COMPILER_LAUNCHER" in tokens[0]
+        assigned |= command != "set" and any("CXX_COMPILER_LAUNCHER" in token for token in tokens)
+        if assigned:
+            assignments.append((command, tokens))
+    return assignments
+
+
+def production_source_launcher(directory: Path, cache_text: str, source_commit: str | None) -> dict:
+    """Authenticate the reviewed normal-variable launcher assignment against the build source commit.
+
+    The CMake-owned processed read-list selects scope; build-generated and installed
+    module inputs are hashed separately from commit-owned source inputs. Only assignment
+    destinations are scanned: oneDNN -D passthrough and HIP variables are not CXX assignments.
+    """
+    homes = re.findall(r"^CMAKE_HOME_DIRECTORY:INTERNAL=(.*)$", cache_text, re.MULTILINE)
+    values = re.findall(r"^CCACHE_PROGRAM:FILEPATH=(.*)$", cache_text, re.MULTILINE)
+    if len(homes) != 1 or len(values) != 1 or not source_commit or not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ValueError("normal-variable launcher requires exact build source commit, home and cache path")
+    home = Path(homes[0]).resolve()
+    if not Path(homes[0]).is_absolute() or home.parts[-2:] != ("src", "v2") or values[0].endswith("-NOTFOUND"):
+        raise ValueError("invalid build source home or missing configured ccache")
+    root = home.parent.parent
+
+    def git(*arguments: str) -> bytes:
+        """Read source identities without modifying the checkout or manufacturing a build selection."""
+        return subprocess.check_output(["git", "-C", str(root), *arguments])
+    if git("rev-parse", "HEAD").decode().strip() != source_commit:
+        raise ValueError("build source commit differs from selected source checkout")
+    blob = git("show", source_commit + ":src/v2/CMakeLists.txt")
+    main = home / "CMakeLists.txt"
+    if main.read_bytes() != blob or blob.decode().count(PRODUCTION_CCACHE_BLOCK) != 1:
+        raise ValueError("reviewed source launcher block changed")
+    records = {}
+    assignments = []
+    processed = production_cmake_inputs(directory)
+    if main.resolve() not in processed:
+        raise ValueError("reviewed launcher source is absent from CMake processed read-list")
+    for path in processed:
+        content = path.read_bytes()
+        if path.is_relative_to(root) and not path.is_relative_to(directory.resolve()):
+            relative = path.relative_to(root).as_posix()
+            try:
+                committed = git("show", source_commit + ":" + relative)
+            except subprocess.CalledProcessError as error:
+                raise ValueError("untracked processed source CMake input") from error
+            if content != committed:
+                raise ValueError("processed source input differs from audited commit blob")
+        else:
+            relative = str(path)
+        records[relative] = hashlib.sha256(content).hexdigest()
+        if path.name == "CMakeLists.txt" or ".cmake" in path.name:
+            for command, tokens in production_cmake_assignments(content.decode()):
+                assignments.append((relative, command, tokens))
+    if assignments != [("src/v2/CMakeLists.txt", "set", ["CMAKE_CXX_COMPILER_LAUNCHER", "${CCACHE_PROGRAM}"])]:
+        raise ValueError("extra or changed project CXX launcher assignment")
+    return {"path": values[0], "source_commit": source_commit, "home": str(home),
+            "source_blob": hashlib.sha1(b"blob " + str(len(blob)).encode() + b"\0" + blob).hexdigest(),
+            "cmake_sources": records, "assignments": assignments}
+
+
+def production_compile_authority(database: Path, database_sha256: str, source: str, output: str,
+                                 ninja: Path, source_commit: str | None = None) -> dict:
+    """Observe the exact single-object Ninja command, its manifests, DB and configured launcher.
+
+    Literal CMake include/subninja paths are the bounded manifest grammar. Shell wrappers,
+    response files, variable-expanded includes and multiple command lines fail closed.
+    """
+    database = database.resolve()
+    if envelope.digest(database) != database_sha256:
+        raise ValueError("stale compileDB hash")
+    entries = [entry for entry in json.loads(database.read_text())
+               if entry.get("file") == source and entry.get("output") == output]
+    if len(entries) != 1:
+        raise ValueError("compileDB FILE+OUTPUT selection is absent or ambiguous")
+    entry = entries[0]
+    directory = Path(entry["directory"])
+    if not directory.is_absolute() or database.parent != directory.resolve():
+        raise ValueError("compileDB is not from the selected build directory")
+    command = entry.get("arguments") or shlex.split(entry["command"])
+    if not command or not all(isinstance(arg, str) for arg in command) or \
+            command.count("-c") != 1 or command[command.index("-c") + 1] != source:
+        raise ValueError("compileDB source operand differs from selected FILE")
+    manifests = {}
+
+    def manifest(path: Path) -> None:
+        """Hash every literal included manifest, rejecting cycles and unsupported path expressions."""
+        path = path.resolve()
+        if str(path) in manifests:
+            raise ValueError("duplicate or cyclic Ninja include")
+        manifests[str(path)] = envelope.digest(path)
+        for line in path.read_text().splitlines():
+            match = re.match(r"^(?:include|subninja)\s+(.+)$", line)
+            if match:
+                value = match[1]
+                if "$" in value or len(shlex.split(value)) != 1:
+                    raise ValueError("unsupported Ninja include expression")
+                manifest(directory / value)
+    manifest(directory / "build.ninja")
+    cache = directory / "CMakeCache.txt"
+    cache_hash = envelope.digest(cache)
+    configured = re.findall(r"^CMAKE_CXX_COMPILER_LAUNCHER:[^=]+=(.*)$", cache.read_text(), re.MULTILINE)
+    if len(configured) > 1:
+        raise ValueError("ambiguous configured launcher")
+    launcher = configured[0] if configured and configured[0] else None
+    launcher_source = None
+    if not configured and re.search(r"^CCACHE_PROGRAM:FILEPATH=", cache.read_text(), re.MULTILINE):
+        launcher_source = production_source_launcher(directory, cache.read_text(), source_commit)
+        launcher = launcher_source["path"]
+    launcher_record = None
+    if launcher:
+        if not os.path.isabs(launcher) or any(c in launcher for c in "; \t\n"):
+            raise ValueError("launcher must be one absolute executable without arguments")
+        launcher_record = driver_identity([launcher])
+        if Path(launcher_record["resolved"]).read_bytes()[:4] != b"\x7fELF":
+            raise ValueError("launcher is not an ELF executable")
+        launcher_record["version"] = observe([launcher, "--version"], str(directory))
+        launcher_record["environment"] = {k: v for k, v in os.environ.items() if k.startswith("CCACHE_")}
+    ninja_record = driver_identity([str(ninja)])
+    query = [str(ninja), "-t", "commands", "-s", output]
+    result = subprocess.run(query, cwd=directory, capture_output=True, text=True, check=True)
+    lines = result.stdout.splitlines()
+    if len(lines) != 1 or result.stderr or any(token in lines[0] for token in ("&&", ";", "|", "`", "$")):
+        raise ValueError("selected Ninja edge is not exactly one direct command")
+    edge = shlex.split(lines[0])
+    direct = production_compile_relation(command, edge, output, launcher)
+    compiler = driver_identity(direct)
+    if any(envelope.digest(Path(path)) != digest for path, digest in manifests.items()) or \
+            envelope.digest(database) != database_sha256 or envelope.digest(cache) != cache_hash:
+        raise ValueError("build authority changed during observation")
+    return {"database": str(database), "database_sha256": database_sha256, "entry": entry,
+            "source": source, "output": output, "directory": str(directory), "ninja": ninja_record,
+            "query": query, "edge_text": lines[0], "edge": edge, "direct": direct,
+            "manifests": manifests, "cache_sha256": cache_hash, "launcher": launcher_record,
+            "compiler": compiler, "launcher_source": launcher_source, "source_commit": source_commit}
+
+
+def require_production_authority(authority: dict) -> None:
+    """Reobserve every selected build input and command; no caller-supplied argv is execution authority."""
+    current = production_compile_authority(Path(authority["database"]), authority["database_sha256"],
+                                           authority["source"], authority["output"],
+                                           Path(authority["ninja"]["selected"]), authority.get("source_commit"))
+    if current != authority:
+        raise ValueError("production build authority changed")
+
+
+def production_witness_command(authority: dict, obj: Path, deps: Path) -> list[str]:
+    """Remove only the authenticated launcher; redirect -o/-MF, preserve -MT, append reviewed -g."""
+    require_production_authority(authority)
+    build = Path(authority["directory"]).resolve()
+    if obj.resolve() == deps.resolve() or any(not p.is_absolute() or p.resolve().is_relative_to(build)
+                                             for p in (obj, deps)):
+        raise ValueError("production witness outputs must be distinct artifacts outside the build tree")
+    command = list(authority["direct"])
+    if not line_witness_needed(command):
+        raise ValueError("production argv already has line information")
+    for option, path in (("-o", obj), ("-MF", deps)):
+        if command.count(option) != 1:
+            raise ValueError("production output operand is absent or duplicated")
+        command[command.index(option) + 1] = str(path)
+    return command + [LINE_WITNESS_FLAG]
+
+
 def allocated_image(data: bytes) -> dict:
     """L-2: every SHF_ALLOC section of an ELF relocatable object and the relocations applied to it, by name."""
     if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
@@ -5903,7 +6212,8 @@ GNU_CC1PLUS = {
     "-fasynchronous-unwind-tables": "flag", "-fstack-protector-strong": "flag", "-fstack-clash-protection": "flag",
     "-H": "flag", "-imultiarch": r"aarch64-linux-gnu", "-mcpu=": "generic", "-march=": r"armv8-a(?:\+\w+)*",
     "-mabi=": "lp64", "-std=": r"(?:gnu|c)\+\+(?:20|23)", "-fno-sanitize=": "all", "-D": r"[A-Za-z_]\w*(?:=[\w.+-]*)?",
-    "-MT": "probe", "-MD": "md", "-MF": "deps", "-I": "search", "-dumpdir": "dumpdir",
+    "-MT": "target", "-MQ": "target", "-MD": "md", "-MMD": "md", "-MF": "deps",
+    "-I": "search", "-isystem": "search", "-iquote": "search", "-dumpdir": "dumpdir",
     "-dumpbase": r"[\w.+-]+", "-dumpbase-ext": r"\.cpp", "-o": "assembly",
 }
 GNU_AS = {"-EL": "flag", "--gdwarf-5": "flag", "-march=": r"armv8-a(?:\+\w+)*", "-mabi=": "lp64", "-I": "search",
@@ -5917,6 +6227,7 @@ class JobPaths(NamedTuple):
     deps: str
     directory: str
     closure: frozenset | None  # None while the closure is not yet observed; validated again once it is.
+    production: dict | None = None
 
 
 def admit_job(job: list[str], table: dict[str, str], paths: JobPaths, positional: str) -> dict[str, list[str]]:
@@ -5948,6 +6259,12 @@ def admit_job(job: list[str], table: dict[str, str], paths: JobPaths, positional
                     continue
                 raise ValueError(f"job argument not admitted: {argument}")
             option, kind, value, position = joined, table[joined], argument[len(joined):], position + 1
+        if kind == "target":
+            expected = paths.production["output"] if paths.production else "probe"
+            if value != expected:
+                raise ValueError("job dependency target differs from bound output")
+            named.setdefault(kind, []).append(value)
+            continue
         if kind in ("search", "closure", "deps", "md", "object", "assembly", "dumpdir", "directory", "main-file-name"):
             named.setdefault(kind, []).append(value)
             if kind == "search" and not os.path.isabs(value):
@@ -5985,10 +6302,13 @@ def validate_plan(jobs: list[list[str]], identity: str, paths: JobPaths) -> None
     # GCC retains earlier dialect switches in -### even when the witness's
     # final -std=c++20 overrides the production target's C++23 dialect.
     standards = [arg for arg in jobs[0] if arg.startswith("-std=")]
-    if not standards or standards[-1] != "-std=c++20":
+    expected_standard = ([arg for arg in paths.production["direct"] if arg.startswith("-std=")]
+                         if paths.production else ["-std=c++20"])
+    if not standards or not expected_standard or standards[-1] != expected_standard[-1]:
         raise ValueError("GNU witness requires final effective -std=c++20")
     # GNU passes -MD the object-derived name; -MF selects the file actually written.
-    if compiler.get("deps") != [paths.deps] or len(compiler.get("md", [])) != 1 or \
+    if compiler.get("target") != [paths.production["output"] if paths.production else "probe"] or \
+            compiler.get("deps") != [paths.deps] or len(compiler.get("md", [])) != 1 or \
             compiler["md"][0] not in (paths.deps, os.path.splitext(paths.obj)[0] + ".d") or \
             len(compiler.get("assembly", [])) != 1 or \
             len(compiler.get("dumpdir", [])) > 1:
@@ -6203,6 +6523,121 @@ def build_line_witness(args: argparse.Namespace, command: list[str], directory: 
             "object_file": lines_obj.name, "object_sha256": envelope.digest(lines_obj),
             "assembly_sha256": envelope.digest(lines_assembly), "release_object_sha256": envelope.digest(obj),
             "allocated_image_sha256": image}
+
+
+def production_job_paths(authority: dict, command: list[str], closure: frozenset | None) -> JobPaths:
+    """Shared B1/line-witness adapter: exact compiler argv with only -o/-MF and optional trailing -g deltas.
+
+    The dialect remains the exact bound DB token (including production -std=gnu++23).
+    No codegen flag is introduced or normalized by this adapter.
+    """
+    require_production_authority(authority)
+    direct = authority["direct"]
+    candidate = list(command)
+    if len(candidate) == len(direct) + 1 and candidate[-1] == LINE_WITNESS_FLAG:
+        if not line_witness_needed(direct):
+            raise ValueError("line information is already selected")
+        candidate.pop()
+    if len(candidate) != len(direct):
+        raise ValueError("extra production witness argv")
+    expected = list(direct)
+    outputs = []
+    for option in ("-o", "-MF"):
+        if direct.count(option) != 1 or candidate.count(option) != 1:
+            raise ValueError("duplicate or absent production output option")
+        index = direct.index(option) + 1
+        outputs.append(candidate[index])
+        if candidate[index] != direct[index]:
+            path = Path(candidate[index])
+            if not path.is_absolute() or path.resolve().is_relative_to(Path(authority["directory"]).resolve()):
+                raise ValueError("redirected production output is in the build tree")
+        expected[index] = candidate[index]
+    if candidate != expected or outputs[0] == outputs[1]:
+        raise ValueError("production command changed beyond output-only redirection")
+    return JobPaths(authority["source"], outputs[0], outputs[1], authority["directory"], closure, authority)
+
+
+def production_driver_plan(authority: dict, command: list[str], identity: str,
+                           closure: frozenset | None) -> dict:
+    """Observe the shared validated production plan, compatible with plan_shape and replay_plan."""
+    paths = production_job_paths(authority, command, closure)
+    return driver_plan(command, authority["directory"], identity, paths)
+
+
+def production_location_table(assembly: str, inputs: dict, directory: str) -> dict:
+    """Bind every numbered .file and .loc to the actual dependency closure before installing context."""
+    files = {}
+    sources = closure_sources(inputs)
+    for raw in assembly.splitlines():
+        text = raw.strip()
+        if text.startswith(".file"):
+            match = ASM_FILE.match(text)
+            if not match:
+                if re.fullmatch(r'\.file\s+"[^"\\]+"', text):
+                    continue  # GNU's unnumbered main-file annotation is not a .loc table entry.
+                raise ValueError("incomplete production location file table")
+            number, first, second = match.groups()
+            path = Path(first) / second if second is not None else Path(first)
+            path = Path(os.path.normpath(str(Path(directory) / path)))
+            if number in files or str(path) not in inputs or source_name(str(path)) not in sources:
+                raise ValueError("duplicate or foreign production location file")
+            files[number] = str(path)
+        elif text.startswith(".loc"):
+            match = ASM_LOC.match(text)
+            if not match or match[1] not in files or int(match[2]) > len(Path(files[match[1]]).read_text().splitlines()):
+                raise ValueError("incomplete or foreign production location table")
+    if not files:
+        raise ValueError("production witness has no location file table")
+    return files
+
+
+def build_production_line_witness(authority: dict, production_object: Path, proof: Path,
+                                  inputs: dict) -> dict:
+    """Retain production line tables only after exact allocated code/data identity and closure checks.
+
+    This API never rewrites the build object or dependency output. All commands and
+    native job forms remain in the returned record for independent review.
+    """
+    directory = authority["directory"]
+    original = Path(directory) / authority["output"]
+    if original.resolve() != production_object.resolve():
+        raise ValueError("production object is not the selected Ninja output")
+    release = production_object.read_bytes()
+    if bind_inputs(sorted(inputs)) != inputs:
+        raise ValueError("production source closure changed")
+    obj, deps, assembly = line_witness_paths(proof)
+    command = production_witness_command(authority, obj, deps)
+    identity = compiler_identity(observe([authority["direct"][0], "--version"], directory))
+    original_plan = production_driver_plan(authority, authority["direct"], identity, frozenset(inputs))
+    plan = production_driver_plan(authority, command, identity, frozenset(inputs))
+    programs = program_identities(plan, authority["direct"])
+    if program_identities(original_plan, authority["direct"]) != programs:
+        raise ValueError("production witness selects different native programs")
+    result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
+    if result.returncode or precompiled_headers(result.stderr):
+        raise ValueError("production witness compilation failed or used precompiled headers")
+    if read_depfile(deps, directory) != sorted(inputs):
+        raise ValueError("production witness read a foreign or incomplete source closure")
+    replay_plan(plan, directory, obj, deps, assembly)
+    image = require_code_identity(release, obj.read_bytes())
+    if bind_inputs(sorted(inputs)) != inputs or production_object.read_bytes() != release:
+        raise ValueError("production object or source closure changed")
+    require_production_authority(authority)
+    if program_identities(plan, authority["direct"]) != programs:
+        raise ValueError("production native programs changed")
+    # No source location can authorize context before the allocated-image proof.
+    file_table = production_location_table(assembly.read_text(), inputs, directory)
+    data = read_object(release)
+    locations = {}
+    assembly_functions(assembly.read_text(), {name for name in function_extents(data)}, data.macho, locations)
+    sources = closure_sources(inputs)
+    install_bounded_context(locations, sources)
+    return {"authority": authority, "command": command, "original_plan": original_plan, "driver_plan": plan,
+            "programs": programs, "allocated_image_sha256": image, "inputs": inputs,
+            "assembly_sha256": envelope.digest(assembly), "object_sha256": envelope.digest(obj),
+            "release_object_sha256": hashlib.sha256(release).hexdigest(), "locations": locations,
+            "file_table": file_table,
+            "location_table_sha256": hashlib.sha256(canonical_image(file_table).encode()).hexdigest()}
 
 
 def bind_line_witness(args: argparse.Namespace, document: dict, document_path: Path, command: list[str],

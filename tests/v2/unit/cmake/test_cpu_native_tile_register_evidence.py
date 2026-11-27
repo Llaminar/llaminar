@@ -31,12 +31,14 @@ import random
 import re
 import signal
 import stat
+import shlex
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 CHECKER_PATH = Path(__file__).resolve().parents[2] / "cmake" / "CPUNativeTileRegisterEvidence.py"
 REPO = Path(__file__).resolve().parents[4]
@@ -4468,6 +4470,227 @@ def shard_suite(shard: str) -> unittest.TestSuite:
     names = sorted(loader.getTestCaseNames(ProofBindingTest))
     return unittest.TestSuite(ProofBindingTest(name) for position, name in enumerate(names)
                               if position % BINDING_SHARDS == index)
+
+
+class ProductionCompileLineWitnessTests(unittest.TestCase):
+    """Production argv comes from a corroborated Ninja edge, not a fabricated DB identity."""
+
+    def test_normal_variable_launcher_requires_exact_source_block_and_unique_assignment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "src/v2"
+            home.mkdir(parents=True)
+            (root / "cmake").mkdir()
+            main = home / "CMakeLists.txt"
+            main.write_text(CHECKER.PRODUCTION_CCACHE_BLOCK + "\nendif()\n")
+            extra = root / "cmake/Extra.cmake"
+            extra.write_text("# no launcher override\n")
+            standalone = root / "tests/standalone/CMakeLists.txt"
+            standalone.parent.mkdir(parents=True)
+            standalone.write_text('set(CMAKE_CXX_COMPILER_LAUNCHER "/standalone-only")\n')
+            def git(*args):
+                return subprocess.check_output(["git", "-C", directory, *args])
+            git("init", "-q")
+            git("add", ".")
+            git("-c", "user.name=Evidence Test", "-c", "user.email=evidence@example.invalid",
+                "-c", "core.hooksPath=/dev/null", "commit", "-q", "--no-verify", "-m", "source")
+            commit = git("rev-parse", "HEAD").decode().strip()
+            cache = f"CMAKE_HOME_DIRECTORY:INTERNAL={home}\nCCACHE_PROGRAM:FILEPATH=/usr/bin/ccache\n"
+            build = root / "build"
+            build.mkdir()
+            (build / "build.ninja").write_text(f"build build.ninja: RERUN_CMAKE | {main} {extra}\n")
+            record = CHECKER.production_source_launcher(build, cache, commit)
+            self.assertEqual(record["path"], "/usr/bin/ccache")
+            manifest = build / "build.ninja"
+            original_manifest = manifest.read_text()
+            generated = build / "Generated.cmake"
+            generated.write_text("# generated CMake module\n")
+            manifest.write_text(original_manifest.rstrip() + f" {generated}\n")
+            generated_record = CHECKER.production_source_launcher(build, cache, commit)
+            self.assertIn(str(generated.resolve()), generated_record["cmake_sources"])
+            generated.write_text('define_property(TARGET PROPERTY CXX_COMPILER_LAUNCHER BRIEF_DOCS "x" FULL_DOCS "x")\n')
+            with self.assertRaisesRegex(ValueError, "extra or changed"):
+                CHECKER.production_source_launcher(build, cache, commit)
+            untracked = root / "ProcessedTest.cmake"
+            untracked.write_text("# not tracked\n")
+            manifest.write_text(original_manifest.rstrip() + f" {untracked}\n")
+            with self.assertRaisesRegex(ValueError, "untracked processed"):
+                CHECKER.production_source_launcher(build, cache, commit)
+            untracked.unlink()
+            manifest.write_text(original_manifest.rstrip() + f" {standalone}\n")
+            with self.assertRaisesRegex(ValueError, "extra or changed"):
+                CHECKER.production_source_launcher(build, cache, commit)
+            manifest.write_text(original_manifest)
+            for changed_cache, changed_commit in ((cache, None), (cache, "0" * 40),
+                                                   (cache.replace("/usr/bin/ccache", "CCACHE_PROGRAM-NOTFOUND"), commit)):
+                with self.subTest(cache=changed_cache), self.assertRaises(ValueError):
+                    CHECKER.production_source_launcher(build, changed_cache, changed_commit)
+            main.write_text(main.read_text().replace("find_program(CCACHE_PROGRAM ccache)",
+                                                     "find_program(CCACHE_PROGRAM other)"))
+            with self.assertRaisesRegex(ValueError, "block changed"):
+                CHECKER.production_source_launcher(build, cache, commit)
+            git("checkout", "--", "src/v2/CMakeLists.txt")
+            extra.write_text('set_property(TARGET core PROPERTY CXX_COMPILER_LAUNCHER "/other")\n')
+            git("add", ".")
+            git("-c", "user.name=Evidence Test", "-c", "user.email=evidence@example.invalid",
+                "-c", "core.hooksPath=/dev/null", "commit", "-q", "--no-verify", "-m", "extra launcher")
+            commit = git("rev-parse", "HEAD").decode().strip()
+            with self.assertRaisesRegex(ValueError, "extra or changed"):
+                CHECKER.production_source_launcher(build, cache, commit)
+
+    def test_processed_cmake_assignment_lexer_covers_property_and_genex_forms(self):
+        for text in ('set_property(TARGET core PROPERTY CXX_COMPILER_LAUNCHER "$<1:/other>")',
+                     'set_target_properties(core PROPERTIES CXX_COMPILER_LAUNCHER /other)',
+                     'define_property(TARGET PROPERTY CXX_COMPILER_LAUNCHER BRIEF_DOCS "x" FULL_DOCS "x")',
+                     'set(CMAKE_CXX_COMPILER_LAUNCHER [=[/other]=])'):
+            with self.subTest(text=text):
+                self.assertEqual(len(CHECKER.production_cmake_assignments(text)), 1)
+        for text in ('#[=[set(CMAKE_CXX_COMPILER_LAUNCHER ignored)]=]',
+                     'set(CMAKE_HIP_COMPILER_LAUNCHER /hip)',
+                     'set(args "-DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}")'):
+            self.assertEqual(CHECKER.production_cmake_assignments(text), [])
+
+    def test_witness_redirects_only_output_operands_and_never_target(self):
+        authority = {"directory": "/num/build", "direct": ["/usr/bin/c++", "-O3", "-MD", "-MT", "a.o",
+                                                           "-MF", "a.o.d", "-o", "a.o", "-c", "/src/a.cpp"]}
+        with mock.patch.object(CHECKER, "require_production_authority"):
+            command = CHECKER.production_witness_command(authority, Path("/art/lines.o"), Path("/art/lines.d"))
+            self.assertEqual(command, ["/usr/bin/c++", "-O3", "-MD", "-MT", "a.o", "-MF", "/art/lines.d",
+                                       "-o", "/art/lines.o", "-c", "/src/a.cpp", "-g"])
+            for obj, deps in (("/num/build/lines.o", "/art/lines.d"),
+                              ("/art/lines.o", "/num/build/lines.d"), ("/art/x", "/art/x")):
+                with self.subTest(obj=obj, deps=deps), self.assertRaises(ValueError):
+                    CHECKER.production_witness_command(authority, Path(obj), Path(deps))
+
+    def test_location_table_rejects_foreign_missing_and_duplicate_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "a.cpp"
+            source.write_text("int a;\n")
+            inputs = {str(source): {}}
+            table = f'.file 1 "{source}"\n.loc 1 1 0\n'
+            self.assertEqual(CHECKER.production_location_table(table, inputs, directory), {"1": str(source)})
+            for changed in (table + table, '.loc 1 1 0', table.replace(str(source), "/foreign/a.cpp"),
+                            table.replace('.loc 1 1', '.loc 2 1'), table.replace('.loc 1 1', '.loc 1 9')):
+                with self.subTest(changed=changed), self.assertRaises(ValueError):
+                    CHECKER.production_location_table(changed, inputs, directory)
+
+    def test_same_build_database_and_manifest_binding(self):
+        with tempfile.TemporaryDirectory() as root:
+            build = Path(root)
+            database = build / "compile_commands.json"
+            source, output = "/num/src/v2/loaders/WeightManager.cpp", "CMakeFiles/core.dir/WeightManager.cpp.o"
+            command = ["/usr/bin/c++", "-O3", "-std=gnu++23", "-o", output, "-c", source]
+            entry = {"file": source, "output": output, "directory": root, "arguments": command}
+            database.write_text(json.dumps([entry]))
+            (build / "build.ninja").write_text("include CMakeFiles/rules.ninja\n")
+            (build / "CMakeFiles").mkdir()
+            (build / "CMakeFiles/rules.ninja").write_text("# native rule\n")
+            (build / "CMakeCache.txt").write_text("# no configured launcher\n")
+            edge = command[:-4] + ["-MD", "-MT", output, "-MF", output + ".d"] + command[-4:]
+            result = subprocess.CompletedProcess([], 0, shlex.join(edge) + "\n", "")
+            digest = CHECKER.envelope.digest(database)
+            identity = lambda argv: {"selected": argv[0], "sha256": "native-tool"}
+            with mock.patch.object(CHECKER, "driver_identity", side_effect=identity), \
+                    mock.patch.object(CHECKER.subprocess, "run", return_value=result):
+                authority = CHECKER.production_compile_authority(database, digest, source, output, Path("/bin/ninja"))
+                CHECKER.require_production_authority(authority)
+                for key in ("file", "output"):
+                    with self.subTest(key=key), self.assertRaises(ValueError):
+                        CHECKER.production_compile_authority(database, digest, source if key != "file" else "/wrong.cpp",
+                                                             output if key != "output" else "wrong.o", Path("/bin/ninja"))
+                (build / "CMakeFiles/rules.ninja").write_text("# changed rule\n")
+                with self.assertRaisesRegex(ValueError, "authority changed"):
+                    CHECKER.require_production_authority(authority)
+                database.write_text(json.dumps([entry, entry]))
+                with self.assertRaisesRegex(ValueError, "stale"):
+                    CHECKER.production_compile_authority(database, digest, source, output, Path("/bin/ninja"))
+                with self.assertRaisesRegex(ValueError, "ambiguous"):
+                    CHECKER.production_compile_authority(database, CHECKER.envelope.digest(database), source, output,
+                                                         Path("/bin/ninja"))
+
+    def test_configured_launcher_is_exact_single_elf_and_rechecked(self):
+        with tempfile.TemporaryDirectory() as root:
+            build = Path(root)
+            launcher = build / "ccache"
+            launcher.write_bytes(b"\x7fELFtest-launcher")
+            database = build / "compile_commands.json"
+            cache = build / "CMakeCache.txt"
+            source, output = "/num/src/v2/loaders/WeightManager.cpp", "WeightManager.cpp.o"
+            command = ["/usr/bin/c++", "-O3", "-std=gnu++23", "-o", output, "-c", source]
+            database.write_text(json.dumps([{"file": source, "output": output,
+                                             "directory": root, "arguments": command}]))
+            (build / "build.ninja").write_text("# selected build\n")
+            cache.write_text(f"CMAKE_CXX_COMPILER_LAUNCHER:FILEPATH={launcher}\n")
+            edge = [str(launcher)] + command[:-4] + ["-MD", "-MT", output, "-MF", output + ".d"] + command[-4:]
+            result = subprocess.CompletedProcess([], 0, shlex.join(edge) + "\n", "")
+            digest = CHECKER.envelope.digest(database)
+            def identity(argv):
+                return {"selected": argv[0], "resolved": argv[0],
+                        "sha256": CHECKER.envelope.digest(launcher) if argv[0] == str(launcher) else "native"}
+            with mock.patch.object(CHECKER, "driver_identity", side_effect=identity), \
+                    mock.patch.object(CHECKER, "observe", return_value="ccache 4.test"), \
+                    mock.patch.object(CHECKER.subprocess, "run", return_value=result):
+                authority = CHECKER.production_compile_authority(database, digest, source, output, Path("/bin/ninja"))
+                self.assertEqual(authority["direct"], edge[1:])
+                launcher.write_bytes(b"\x7fELFchanged-launcher")
+                with self.assertRaisesRegex(ValueError, "authority changed"):
+                    CHECKER.require_production_authority(authority)
+                for configured in (str(launcher) + ";--args", str(launcher) + " --args", "/other/ccache", ""):
+                    cache.write_text(f"CMAKE_CXX_COMPILER_LAUNCHER:FILEPATH={configured}\n")
+                    with self.subTest(configured=configured), self.assertRaises((ValueError, FileNotFoundError)):
+                        CHECKER.production_compile_authority(database, digest, source, output, Path("/bin/ninja"))
+
+    def test_shared_adapter_binds_production_dialect_target_and_output_only_deltas(self):
+        output = "CMakeFiles/core.dir/WeightManager.cpp.o"
+        direct = ["/usr/bin/c++", "-O3", "-std=gnu++23", "-MD", "-MT", output, "-MF", output + ".d",
+                  "-o", output, "-c", "/num/src/v2/loaders/WeightManager.cpp"]
+        authority = {"directory": "/num/build", "output": output, "source": direct[-1], "direct": direct}
+        command = list(direct)
+        command[command.index("-o") + 1] = "/art/production.o"
+        command[command.index("-MF") + 1] = "/art/production.d"
+        with mock.patch.object(CHECKER, "require_production_authority"):
+            paths = CHECKER.production_job_paths(authority, command, None)
+            self.assertEqual(paths.production, authority)
+            self.assertEqual(CHECKER.production_job_paths(authority, command + ["-g"], None), paths)
+            for changed in (command + ["-funknown"], ["/usr/bin/ccache"] + command,
+                            [arg.replace("gnu++23", "c++20") for arg in command], command + ["-MT", output]):
+                with self.subTest(command=changed), self.assertRaises(ValueError):
+                    CHECKER.production_job_paths(authority, changed, None)
+        jobs = [["/usr/libexec/gcc/cc1plus", "-quiet", "-I", "/num/src/v2", "-isystem", "/sdk/include",
+                 "-iquote", "/num/generated", "-D", "NDEBUG", "-MD", "/art/production.d", "-MF",
+                 "/art/production.d", "-MT", output, direct[-1], "-march=armv8-a+i8mm", "-O3",
+                 "-std=gnu++23", "-o", "/tmp/ccAb12Cd.s"],
+                ["as", "-EL", "-march=armv8-a", "-mabi=lp64", "-o", "/art/production.o", "/tmp/ccAb12Cd.s"]]
+        CHECKER.validate_plan(jobs, "GNU-14", paths)
+        for changed in ([arg.replace("gnu++23", "c++20") for arg in jobs[0]],
+                        jobs[0] + ["-funknown"], jobs[0] + ["-MT", output]):
+            with self.subTest(job=changed), self.assertRaises(ValueError):
+                CHECKER.validate_plan([changed, jobs[1]], "GNU-14", paths)
+        with self.assertRaises(ValueError):
+            CHECKER.validate_plan(jobs, "GNU-14", paths._replace(production=None))
+
+    def test_native_cmake_metadata_relation_preserves_codegen_order(self):
+        database = ["/usr/bin/c++", "-DNDEBUG", "-I/num/src/v2", "-isystem", "/sdk/include",
+                    "-mcpu=generic", "-march=armv8-a+simd+dotprod+i8mm+fp16fml", "-O3",
+                    "-std=gnu++23", "-fopenmp", "-o", "CMakeFiles/core.dir/WeightManager.cpp.o",
+                    "-c", "/num/src/v2/loaders/WeightManager.cpp"]
+        output = database[database.index("-o") + 1]
+        metadata = ["-MD", "-MT", output, "-MF", output + ".d"]
+        edge = database[:-4] + metadata + database[-4:]
+        self.assertEqual(CHECKER.production_compile_relation(database, edge, output, None), edge)
+        self.assertEqual(CHECKER.production_compile_relation(database, ["/usr/bin/ccache"] + edge,
+                                                             output, "/usr/bin/ccache"), edge)
+        mutations = [edge + ["-funknown"], edge + ["-O2"], edge + ["-MT", output],
+                     [arg for arg in edge if arg != "-MD"],
+                     ["wrong.o" if arg == output else arg for arg in edge],
+                     ["wrong.d" if arg == output + ".d" else arg for arg in edge],
+                     ["/usr/bin/ccache"] + edge, ["/usr/bin/ccache", "--args"] + edge]
+        for changed in mutations:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                CHECKER.production_compile_relation(database, changed, output, None)
+        for changed in (edge, ["/other/ccache"] + edge, ["/usr/bin/ccache"] * 2 + edge):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                CHECKER.production_compile_relation(database, changed, output, "/usr/bin/ccache")
 
 
 if __name__ == "__main__":

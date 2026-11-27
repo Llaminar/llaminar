@@ -1,8 +1,45 @@
-# Separate production line-witness plan proposal / handoff
+# Production line-witness adapter checkpoint / handoff
 
-**No plan grammar, memcpy table, budget, role or kernel change is implemented
-here.** Static selection tooling is complete; production economy qualification
-requires this separate reviewed source-owned extension and the alias proposal.
+This checkpoint composes the production compile-plan adapter with the existing
+native alias API on `20f7bb2dd`. It changes tooling only, not kernels, memcpy
+tables, budgets or roles. Actual native integration and production economy are
+**not qualified**. Auto-merge remains off; independent net-range review is required.
+
+## Source-owned implementation checkpoint (not production qualification)
+
+The sole checker now exports `production_compile_authority`,
+`production_job_paths`, `production_driver_plan` and
+`build_production_line_witness`. B1 and line-table witnesses use the same typed
+native-job grammar. `production_job_paths` binds the exact compiler-direct
+Ninja edge with only artifact `-o`/`-MF` redirection and optional reviewed `-g`;
+it never substitutes a dialect or dependency target. `StaticB1Replay.production`
+passes that same authority into the alias replay's existing native-plan validation;
+its scratch-output confinement and native-epoch protection remain unchanged.
+The integrated checkpoint contains the net result of all eight original commits,
+not their obsolete intermediate CMake scan policies. Only CMake's processed
+input closure authorizes the source-launcher scan. The original chain is retained
+at `codex/pr73-line-plan-original`; native execution remains review-gated.
+
+Read-only inspection confirmed the actual cache contains
+`CCACHE_PROGRAM:FILEPATH=/usr/bin/ccache`, not a cached
+`CMAKE_CXX_COMPILER_LAUNCHER`. The normal-variable branch therefore requires an
+explicit full build-source commit, the exact reviewed source assignment block,
+source/blob equality and a bound project CMake assignment scan. The cache and
+Ninja manifest observations were:
+
+| Actual build input | SHA256 |
+|---|---|
+| `/num/build/CMakeCache.txt` | `850c9b2a3c74e51aed9068f645d71ef74414f7e4451c03b45f51a47be710a3b1` |
+| `/num/build/build.ninja` | `4756cd45b24fc74a8f7a4b3fc2367e6d348059bb7e189f69f051405e7ad59e55` |
+| `/num/build/CMakeFiles/rules.ninja` | `61f334a63b10371c757395aafaf2cf66b6ba7c55fc7ba2dd69110f31d0f086c9` |
+
+Historical checks on the original branch passed 247 tests: the 211-test
+analysis shard, four binding shards (9/9/9/8), and one separately selected test.
+Those results do not certify this composed checkpoint. No verification was run
+before committing it for immediate parent push. Existing CMake registrations
+own the device-free tests; no new test or qualification framework was added.
+No production object, kernel, budget, memcpy table or qualification result was
+changed by this lane.
 
 ## Reproducible actual boundary
 
@@ -41,9 +78,9 @@ without substituting flags. It stopped **before compiling**:
 ValueError: job value -MT CMakeFiles/llaminar2_core.dir/loaders/WeightManager.cpp.o not admitted
 ```
 
-The existing GNU plan grammar is probe-specific (`-MT probe`) and also lacks the
-actual production `-isystem` form. Do not fix one flag at a time or rerun an ad-hoc
-`-g` compilation. Inspect the complete retained jobs once.
+That historical rejection used the probe-specific GNU plan grammar (`-MT probe`),
+which lacked the production `-isystem` form. The adapter now binds these forms
+to the production authority; the actual native rerun remains unqualified.
 
 ## Same-build compileDB discrepancy to settle explicitly
 
