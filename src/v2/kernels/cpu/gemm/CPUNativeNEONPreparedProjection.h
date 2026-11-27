@@ -1490,9 +1490,24 @@ namespace llaminar2::cpu::native_quantised
                         for (std::size_t row = 0; row < Rows; ++row)
                             reduced[row] = orderedPartitionSeedNEON();
                     }
+                    // A backend-native tile has exactly one partition (partitionsFor()), so its
+                    // reduction is its single interval's accumulator. The decode-heavy row-pair
+                    // walks (Q5, Q6_K, IQ4_XS) carry that chain instead of keeping a second
+                    // live copy for an ordered fold that cannot occur.
+                    constexpr bool carry = !ordered && Coded == 0 && multi_scale::usesRowPairs<Ops> &&
+                        ((Physical == Encoding::Q5NativeSingleScale && (Rows != 4 || WithMinimum)) ||
+                         Physical == Encoding::Q6KNativeDualScale ||
+                         Physical == Encoding::NibbleLUTSourceScale);
+                    [[maybe_unused]] float32x4_t carried[Rows]{};
                     for (int partition = 0; partition < (ordered || Coded == 0 ? partitions_ : 1); ++partition)
                     {
                         float32x4_t accumulator[Rows]{};
+                        if constexpr (carry)
+                        {
+#pragma GCC unroll 4
+                            for (std::size_t row = 0; row < Rows; ++row)
+                                accumulator[row] = carried[row];
+                        }
                         const int first = ordered || Coded == 0 ? partition * blocks_per_partition_ : 0;
                         const int last = ordered || Coded == 0 ? std::min(first + blocks_per_partition_, weights_.blocks_per_row)
                             : weights_.blocks_per_row;
@@ -1705,10 +1720,25 @@ namespace llaminar2::cpu::native_quantised
                                         std::bit_cast<int32x4_t>(low[row]), std::bit_cast<float32x4_t>(scale0), activation_scale, Policy);
                             }
                         });
+                        if constexpr (carry)
+                        {
+#pragma GCC unroll 4
+                            for (std::size_t row = 0; row < Rows; ++row)
+                                carried[row] = accumulator[row];
+                        }
+                        else
+                        {
+#pragma GCC unroll 4
+                            for (std::size_t row = 0; row < Rows; ++row)
+                                reduced[row] = !seeded && ((!ordered && Coded != 0) || partition == 0)
+                                    ? accumulator[row] : foldNEON<Policy>(reduced[row], accumulator[row]);
+                        }
+                    }
+                    if constexpr (carry)
+                    {
 #pragma GCC unroll 4
                         for (std::size_t row = 0; row < Rows; ++row)
-                            reduced[row] = !seeded && ((!ordered && Coded != 0) || partition == 0)
-                                ? accumulator[row] : foldNEON<Policy>(reduced[row], accumulator[row]);
+                            reduced[row] = carried[row];
                     }
 #pragma GCC unroll 4
                     for (std::size_t row = 0; row < Rows; ++row)
