@@ -9,6 +9,8 @@
  * never migrate, replace, or discard already filled execution storage.
  * Registry-only consumers drop references on departure without releasing shared
  * weights or mutating the canonical registry and prepared-store ownership.
+ * Initial GPU pool plans retain the source operand's coded metadata declaration
+ * so physical allocation and expert admission describe the same native planes.
  */
 
 #include "MoEExpertWeightService.h"
@@ -24,6 +26,7 @@
 #include "../../kernels/cpu/gemm/CPUPackedWeights.h"
 #include "../../kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "../../loaders/MmapRegion.h"
+#include "../../loaders/BoundedGPUExpertSource.h"
 #include "../../loaders/ExpertGemmRegistry.h"
 #include "../../loaders/GPUVramPreflight.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
@@ -2404,7 +2407,10 @@ namespace llaminar2
                                          vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                                          vnni->has_emins,
                                          nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
-                                         raw_bytes);
+                                         raw_bytes, {0},
+                                         gpuPreparedWeightCodedDeclaration(
+                                             *view, GPUPreparedWeightPoolLayout::SourceNative,
+                                             ctx.device_id));
                 max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
                 ++total_planned;
             }
