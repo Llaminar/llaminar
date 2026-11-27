@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 namespace llaminar2
 {
@@ -349,6 +350,25 @@ namespace llaminar2
         }
 
         /**
+         * @brief Check the device tuple against compile-time catalog entries without device host-table reads.
+         * @return Whether original provenance and every physical GPU plane match one catalog source.
+         */
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr bool gpuFormatMatchesSource() const noexcept
+        {
+            return [this]<std::size_t... Index>(std::index_sequence<Index...>) {
+                return (([this] {
+                    constexpr auto source = *native_quantised_formats::kAllSourceFormats[Index].metadata;
+                    constexpr auto physical = canonicalDeviceVnniFormat(source);
+                    return gpu_source_codebook_id == source.codebook_id &&
+                        gpu_source_is_superblock == source.is_superblock &&
+                        gpu_codebook_id == physical.codebook_id &&
+                        gpu_payload_bytes_per_block == physical.payload_bytes_per_block &&
+                        gpu_is_asymmetric == physical.is_asymmetric && gpu_has_emins == physical.has_emins;
+                }()) || ...);
+            }(std::make_index_sequence<native_quantised_formats::kAllSourceFormats.size()>{});
+        }
+
+        /**
          * @brief Validate all scalar geometry and format relationships.
          * @return Whether the layout can safely drive a device kernel.
          */
@@ -404,11 +424,8 @@ namespace llaminar2
                 cpu_encoding != cpu::native_quantised::preparedEncodingForSource(*source))
                 return false;
 
-            const auto physical = canonicalDeviceVnniFormat(*source);
             const auto cpu = cpuStorage();
-            if (!cpu.valid() || gpu_codebook_id != physical.codebook_id ||
-                gpu_payload_bytes_per_block != physical.payload_bytes_per_block ||
-                gpu_is_asymmetric != physical.is_asymmetric || gpu_has_emins != physical.has_emins)
+            if (!cpu.valid() || !gpuFormatMatchesSource())
                 return false;
             if (!cpu.coded())
                 return gpu_superblock_phase == 0 && gpu_code_bit_shift == 0;

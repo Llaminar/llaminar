@@ -318,8 +318,10 @@ namespace llaminar2
                     units > layout.unit_count - description.first_unit ||
                     units > layout.maximum_units_per_chunk)
                     return MappedTransferProgressError::InvalidPackedPopulation;
-                // This is dispatch totality, not a second footprint authority.
-                // Never acknowledge bytes for a codebook with no device branch.
+                // Authenticate physical dispatch against the same catalog as host admission.
+                // Complements alone cannot reject a consistently malformed device command.
+                if (!layout.gpuFormatMatchesSource())
+                    return MappedTransferProgressError::InvalidPackedDispatch;
                 if (coded)
                     return nativeQuantisedSuperblockCodable(layout.gpu_codebook_id) && layout.gpu_superblock_phase < 8 &&
                         layout.gpu_code_bit_shift < 8 ? MappedTransferProgressError::None : MappedTransferProgressError::InvalidPackedDispatch;

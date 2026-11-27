@@ -1561,7 +1561,7 @@ namespace
                     .load(std::memory_order_acquire), generation);
                 constexpr std::array expected_errors{
                     MappedTransferProgressError::InvalidWork,
-                    MappedTransferProgressError::InvalidWork,
+                    MappedTransferProgressError::InvalidPackedDispatch,
                     MappedTransferProgressError::InvalidIdentity,
                     MappedTransferProgressError::InvalidPackedPointers,
                     MappedTransferProgressError::InvalidPackedGeometry,
