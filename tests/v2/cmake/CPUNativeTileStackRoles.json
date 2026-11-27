@@ -6878,7 +6878,7 @@
   }
  },
  "pr73-neon-stack-iq4-original-q5": {
-  "file_sha256": "3d536d7c9484cd4cc2631e48cc58ab21128cd619593d6cfbe8c3e29b226d4d51",
+  "file_sha256": "8a7f8700d4df58457e689f61b908235120204ed16786c3c2240b859cf21e7a26",
   "kernel_functions": [
    {
     "signature": "inline void executeBlockProgram() const noexcept"
@@ -7118,61 +7118,61 @@
     "trip": "4",
     "source": "runQ4K: group < 4 (two nibble groups each)"
    },
-   "1691": {
+   "1693": {
     "role": "column",
     "variable": "column",
     "trip": "C / (4 * S)",
     "source": "executeBlockProgram: panel walk"
    },
-   "1710": {
+   "1712": {
     "role": "column",
     "variable": "column",
     "trip": "C / 4",
     "source": "executeBlockProgram: strip walk"
    },
-   "1730": {
+   "1732": {
     "role": "partition",
     "variable": "partition",
     "trip": "P if (G or E != 3) else 1",
     "source": "executeBlockProgram: partitions_ when ordered or Coded == 0 (E != 3), else 1"
    },
-   "1790": {
+   "1792": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: low groups 0..3"
    },
-   "1793": {
+   "1795": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: high groups 4..7"
    },
-   "1803": {
+   "1805": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q5: Q5NativePayload::groups == 4"
    },
-   "1852": {
+   "1854": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run IQ4_XS grouped: group < 4 (two nibble groups each)"
    },
-   "1862": {
+   "1864": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run nibble: group < 4 (two nibble groups each)"
    },
-   "2073": {
+   "2075": {
     "role": "partition",
     "variable": "partition",
     "trip": "P",
     "source": "panel: partitions_"
    },
-   "2086": {
+   "2088": {
     "role": "group",
     "variable": "group",
     "trip": "8",
