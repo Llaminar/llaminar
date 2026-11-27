@@ -280,6 +280,90 @@ template <typename Ops> void verifyAllCompact()
             }
     }
 }
+/**
+ * @brief Exercise compact ordered trees independently of the numerical policy.
+ * @tparam Codebook Exact compact source identity.
+ * @tparam Rows Physical rows sharing the K walk.
+ * @tparam Ops Explicitly admitted integer instruction family.
+ * @param policy Select ordinary additions or the GPU-aligned ordered-NaN program.
+ * @details BackendNative plus OrderedPartitions is intentionally called directly:
+ * the ordinary projection tile selects a contiguous tree for BackendNative and
+ * therefore does not certify this independently supported compact entry.
+ */
+template <int Codebook, std::size_t Rows, typename Ops>
+void verifyCompactOrderedPolicy(CPUProjectionNumericalPolicy policy)
+{
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
+    {
+        if (source.metadata->codebook_id != Codebook)
+            continue;
+        for (const int n : {1, 3, 4, 5, 63, 64, 65})
+            for (const int blocks : {1, 2, 7, 16, 17, 33})
+            {
+                SCOPED_TRACE(::testing::Message() << "codebook=" << Codebook << " rows=" << Rows
+                    << " n=" << n << " blocks=" << blocks << " policy=" << int(policy));
+                NativeQuantisedPreparedByteFixture fixture(*source.metadata, n, blocks * 32);
+                fixture.descriptor.numerical_policy = policy;
+                fixture.seedPayloadAndMetadata();
+                const auto packed = fixture.view();
+                const auto activation = activationRows(blocks, Rows);
+                const int stride = n + 3;
+                const float guard = -123.0f;
+                std::vector<float> grouped(Rows * stride, guard), serial(Rows * stride, guard);
+                std::array<const Q8_1Block *, Rows> inputs{};
+                for (std::size_t row = 0; row < Rows; ++row)
+                    inputs[row] = activation.data() + row * blocks;
+                const int partitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(blocks * 32);
+                const int span = (blocks + partitions - 1) / partitions;
+                for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
+                {
+                    const int columns = std::min(64, n - chunk * 64);
+                    std::array<float *, Rows> outputs{};
+                    for (std::size_t row = 0; row < Rows; ++row)
+                        outputs[row] = grouped.data() + row * stride + chunk * 64;
+                    ms::dispatchOrdered<4, Rows, Ops>(packed, inputs, outputs, chunk, blocks, partitions, span, columns);
+                    for (std::size_t row = 0; row < Rows; ++row)
+                    {
+                        const std::array<const Q8_1Block *, 1> input{inputs[row]};
+                        const std::array<float *, 1> output{serial.data() + row * stride + chunk * 64};
+                        ms::dispatchOrdered<4, 1, Ops>(packed, input, output, chunk, blocks, partitions, span, columns);
+                    }
+                }
+                for (std::size_t row = 0; row < Rows; ++row)
+                {
+                    for (int column = 0; column < n; ++column)
+                    {
+                        float expected = 0.0f;
+                        for (int partition = 0; partition < partitions; ++partition)
+                        {
+                            float partial = 0.0f;
+                            for (int block = partition * span; block < std::min((partition + 1) * span, blocks); ++block)
+                                partial = appendPreparedReference(packed, inputs[row][block], column, block, partial);
+                            expected = partition == 0 ? partial : memoryRoundedAdd(expected, partial);
+                        }
+                        ASSERT_EQ(std::bit_cast<std::uint32_t>(grouped[row * stride + column]),
+                            std::bit_cast<std::uint32_t>(serial[row * stride + column]));
+                        ASSERT_EQ(std::bit_cast<std::uint32_t>(grouped[row * stride + column]),
+                            std::bit_cast<std::uint32_t>(expected));
+                    }
+                    for (int column = n; column < stride; ++column)
+                    {
+                        ASSERT_EQ(grouped[row * stride + column], guard);
+                        ASSERT_EQ(serial[row * stride + column], guard);
+                    }
+                }
+            }
+    }
+}
+
+/** @brief Cover the independently selected compact K tree on both numerical policies. */
+template <typename Ops> void verifyCompactOrderedPolicies()
+{
+    verifyCompactOrderedPolicy<12, 4, Ops>(CPUProjectionNumericalPolicy::BackendNative);
+    verifyCompactOrderedPolicy<17, 2, Ops>(CPUProjectionNumericalPolicy::BackendNative);
+    verifyCompactOrderedPolicy<17, 2, Ops>(CPUProjectionNumericalPolicy::GPUAlignedExpert);
+}
+
 /** @brief Cover all registered sources and physical encodings on both arithmetic policies. */
 template <typename Ops> void verifyAllPrepared()
 {
@@ -691,7 +775,21 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
 } // namespace
 #endif
 
+/** @test ASIMD directly certifies compact ordered trees independently of numerical policy. */
+TEST_F(CPUNativeNEONPreparedProjection, ASIMDCompactOrderedTreesRespectNumericalPolicy)
+{ verifyCompactOrderedPolicies<ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>>(); }
+
+#if defined(__ARM_FEATURE_DOTPROD)
+/** @test SDOT certifies both IQ1_M policy helpers and the IQ3_XXS ordinary-add ordered tree. */
+TEST_F(CPUNativeNEONPreparedProjection, DotProdCompactOrderedTreesRespectNumericalPolicy)
+{ verifyCompactOrderedPolicies<ms::NEONMultiScaleOps<ms::NEONByteDot::DotProd>>(); }
+#endif
+
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+/** @test I8MM certifies IQ3_XXS four-row ordinary-add ordered trees against serial and source bytes. */
+TEST_F(CPUNativeNEONPreparedProjection, I8MMCompactOrderedTreesRespectNumericalPolicy)
+{ verifyCompactOrderedPolicies<I8MMOps>(); }
+
 /** @test Every source's row-pair SMMLA projection retains the complete serial program. */
 TEST_F(CPUNativeNEONPreparedProjection, I8MMEverySourceAndEncodingMatchesSerialAndSourceOrder)
 { verifyAllPrepared<I8MMOps>(); }
