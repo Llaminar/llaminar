@@ -434,8 +434,14 @@ namespace llaminar2::cpu::native_quantised
         {
             if constexpr (decomposeNEONRows<Rows, Ops::instruction, Policy, Physical, int(Map), Minimum>())
             {
-                rowSlice<2, 0>().template dispatch<Ops, Policy, Strips>();
-                rowSlice<Rows - 2, 2>().template dispatch<Ops, Policy, Strips>();
+                constexpr auto family = decomposedNEONPairFamily<Rows, Ops::instruction, Policy,
+                    Physical, int(Map), Minimum>();
+                using PairOps = std::conditional_t<family == Ops::instruction, Ops,
+                    multi_scale::NEONMultiScaleOps<family>>;
+                using FirstMap = typename CPUNativeNEONProjectionTile<2>::NibbleMap;
+                using LastMap = typename CPUNativeNEONProjectionTile<Rows - 2>::NibbleMap;
+                rowSlice<2, 0>().template run<PairOps, Policy, Physical, FirstMap(Map), Minimum, Strips>();
+                rowSlice<Rows - 2, 2>().template run<PairOps, Policy, Physical, LastMap(Map), Minimum, Strips>();
             }
             else
                 run<Ops, Policy, Physical, Map, Minimum, Strips>();
@@ -450,10 +456,12 @@ namespace llaminar2::cpu::native_quantised
             {
                 // I8MM's two-row IQ3 program is not admitted by the stack gate;
                 // SDOT computes the identical per-row integer dot and FP program.
-                using PairOps = std::conditional_t<Ops::instruction == Dot::I8MM,
-                    multi_scale::NEONMultiScaleOps<Dot::DotProd>, Ops>;
-                rowSlice<2, 0>().template dispatch<PairOps, Policy, Strips>();
-                rowSlice<Rows - 2, 2>().template dispatch<PairOps, Policy, Strips>();
+                constexpr auto family = decomposedNEONPairFamily<Rows, Ops::instruction, Policy,
+                    Encoding::CompactMultiScale, Codebook, Codebook == 7>();
+                using PairOps = std::conditional_t<family == Ops::instruction, Ops,
+                    multi_scale::NEONMultiScaleOps<family>>;
+                rowSlice<2, 0>().template runCoded<PairOps, Policy, Codebook, Strips>();
+                rowSlice<Rows - 2, 2>().template runCoded<PairOps, Policy, Codebook, Strips>();
             }
             else
                 runCoded<Ops, Policy, Codebook, Strips>();

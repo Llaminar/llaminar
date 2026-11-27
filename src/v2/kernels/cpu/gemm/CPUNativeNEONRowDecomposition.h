@@ -56,4 +56,17 @@ namespace llaminar2::cpu::native_quantised
                     return true;
         return false;
     }
+    /** @brief Resolve the pair instruction family from the same exact routing authority. */
+    template <int Rows, NEONRowDot Family, CPUProjectionNumericalPolicy Policy,
+              NEONRowEncoding Encoding, int Map, bool Minimum>
+    consteval NEONRowDot decomposedNEONPairFamily()
+    {
+        static_assert(decomposeNEONRows<Rows, Family, Policy, Encoding, Map, Minimum>());
+        for (const auto &key : kNEONRowDecompositions)
+            if (key.rows == Rows && key.family == Family && key.encoding == Encoding &&
+                key.map == Map && key.minimum == Minimum)
+                return key.pair_family;
+        throw "missing exact NEON row decomposition";
+    }
+
 }
