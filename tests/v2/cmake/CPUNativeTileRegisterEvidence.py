@@ -2170,7 +2170,28 @@ def _static_emulation(tokens: list[str], supported: str) -> str:
     return selected[0]
 
 
-def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Path) -> dict:
+def _static_ninja_record(text: str, target: str, mtime_ns: int, cwd: Path) -> set[Path]:
+    """Read one exact native Ninja deps record; stale/partial/foreign records fail."""
+    lines = text.splitlines()
+    if not lines:
+        raise ValueError("missing native Ninja dependency record")
+    header = re.fullmatch(re.escape(target) + r": #deps ([0-9]+), deps mtime ([0-9]+) \(VALID\)", lines[0])
+    if header is None or int(header[2]) != mtime_ns:
+        raise ValueError("stale or wrong-output native Ninja dependency record")
+    entries = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        if not line.startswith("    ") or not line[4:] or line[4:].strip() != line[4:]:
+            raise ValueError("unsupported native Ninja dependency record grammar")
+        entries.append((cwd / line[4:]).resolve(strict=True))
+    if not entries or len(entries) != int(header[1]):
+        raise ValueError("empty or incomplete native Ninja dependency record")
+    return set(entries)
+
+
+def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Path,
+                        ninja: Path | None = None) -> dict:
     """Capture a bounded GNU14/ld.bfd production edge; diagnostics never mint authority.
 
     Caller supplies the exact ordered Ninja driver edge, not a shell command. Every
@@ -2209,10 +2230,8 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     if len(dep_tokens) != 1 or not dep_tokens[0].startswith("-Wl,--dependency-file="):
         raise ValueError("static edge requires exactly one -Wl,--dependency-file=PATH token")
     di = args.index(dep_tokens[0])
-    production_dep = (cwd / dep_tokens[0].split("=", 1)[1]).resolve(strict=True)
-    dep_bytes = production_dep.read_bytes()
-    files[str(production_dep)] = _static_hash(dep_bytes)
-    retain("original.d", dep_bytes)
+    production_dep = (cwd / dep_tokens[0].split("=", 1)[1]).resolve()
+    original_mtime = output.stat().st_mtime_ns
 
     def dependency_paths(data):
         text = data.decode().replace("\\\n", "")
@@ -2221,7 +2240,38 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
             raise ValueError("unsupported static dependency grammar")
         return {(cwd / p).resolve(strict=True) for p in first.split(":", 1)[1].split()}
 
-    original_dependencies = dependency_paths(dep_bytes)
+    if production_dep.exists():
+        if ninja is not None:
+            raise ValueError("native Ninja dependency admission is only valid when production .d is absent")
+        dep_bytes = production_dep.read_bytes()
+        files[str(production_dep)] = _static_hash(dep_bytes)
+        retain("original.d", dep_bytes)
+        original_dependencies = dependency_paths(dep_bytes)
+    else:
+        if ninja is None:
+            raise ValueError("missing production .d requires explicit native Ninja dependency admission")
+        observed_ninja = ninja
+        ninja = ninja.resolve(strict=True)
+        database = cwd / ".ninja_deps"
+        files[str(database)] = _static_hash(database.read_bytes())
+        native = ninja.read_bytes()
+        _static_elf(native)
+        if _field(native, 16, 2) not in (2, 3):
+            raise ValueError("native Ninja must be an ELF executable")
+        files[str(ninja)] = _static_hash(native)
+        for label, command in (("version", [str(ninja), "--version"]),
+                               ("deps", [str(ninja), "-t", "deps", args[oi]])):
+            retain(f"ninja-{label}.json", json.dumps(dict(argv=command, cwd=str(cwd), env=env)))
+            result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, timeout=30)
+            retain(f"ninja-{label}.stdout", result.stdout)
+            retain(f"ninja-{label}.stderr", result.stderr)
+            if result.returncode or result.stderr:
+                raise ValueError(f"native Ninja {label} query failed")
+            if label == "version" and not re.fullmatch(rb"[0-9]+\.[0-9]+(?:\.[0-9]+)?\n?", result.stdout):
+                raise ValueError("unsupported native Ninja version")
+        original_dependencies = _static_ninja_record(result.stdout.decode(), args[oi], original_mtime, cwd)
+        retain("ninja-record.json", json.dumps(dict(observed=str(observed_ninja), resolved=str(ninja),
+               database=str(database), target=args[oi], output_mtime_ns=original_mtime)))
     if not original_dependencies:
         raise ValueError("static production dependency inventory is empty")
     for p in original_dependencies:
@@ -2341,6 +2391,8 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
             if path in files and files[path] != digest:
                 raise ValueError(f"static input changed: {path}")
             files[path] = digest
+    if output.stat().st_mtime_ns != original_mtime:
+        raise ValueError("static production output mtime changed during capture")
     if tuple(argv) != original_argv:
         raise ValueError("static original argv changed during capture")
     if dict(os.environ) != env:
@@ -2364,9 +2416,9 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
 
 def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path, artifacts: Path,
                                        unit: "Unit", object_bytes: bytes, replay_bytes: bytes,
-                                       target: str) -> TypedStaticExecutableSelection:
+                                       target: str, ninja: Path | None = None) -> TypedStaticExecutableSelection:
     """Reconstruct native closure and prove the kept input owns the actual AArch64 callee."""
-    recipe = capture_static_link(argv, cwd, output, artifacts)
+    recipe = capture_static_link(argv, cwd, output, artifacts, ninja=ninja)
     # A capture recipe is never itself sufficient: the following proof uses bytes.
     image = read_object(object_bytes)
     if object_bytes != replay_bytes or unit.object_identity != image_fingerprint(image):
