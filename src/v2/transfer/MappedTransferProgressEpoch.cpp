@@ -173,26 +173,6 @@ namespace llaminar2
 
     namespace
     {
-        /** @return Stable human-readable completion error. */
-        const char *progressErrorName(
-            MappedTransferProgressError error) noexcept
-        {
-            switch (error)
-            {
-            case MappedTransferProgressError::None:
-                return "none";
-            case MappedTransferProgressError::InvalidIdentity:
-                return "invalid command identity";
-            case MappedTransferProgressError::InvalidAddress:
-                return "invalid source or destination address";
-            case MappedTransferProgressError::InvalidByteCount:
-                return "invalid byte count";
-            case MappedTransferProgressError::InvalidWork:
-                return "invalid transfer work description";
-            }
-            return "unknown transfer error";
-        }
-
         /** @return Stable diagnostic name for a permanent slot direction. */
         const char *directionName(MappedTransferDirection direction) noexcept
         {
@@ -1067,7 +1047,7 @@ namespace llaminar2
             {
                 *error = std::string(
                              "Mapped transfer-progress copy command failed: ") +
-                         progressErrorName(transfer_error);
+                         mappedTransferProgressErrorName(transfer_error);
             }
             return MappedTransferProgress::Failed;
         }

@@ -67,7 +67,43 @@ namespace llaminar2
         InvalidAddress = 2u,
         InvalidByteCount = 3u,
         InvalidWork = 4u,
+        InvalidPackedPointers = 5u, ///< Missing staging or native metadata planes.
+        InvalidPackedGeometry = 6u, ///< Invalid dimensions, block count or direction.
+        InvalidPackedExtent = 7u, ///< Bytes do not end on an admitted unit boundary.
+        InvalidPackedPopulation = 8u, ///< Chunk exceeds the admitted unit population.
+        InvalidPackedDispatch = 9u, ///< No converter for the immutable format tuple.
     };
+
+    /** @return Stable terminal-receipt diagnostic; unknown status values fail closed. */
+    inline constexpr const char *mappedTransferProgressErrorName(
+        MappedTransferProgressError error) noexcept
+    {
+        switch (error)
+        {
+        case MappedTransferProgressError::None:
+            return "none";
+        case MappedTransferProgressError::InvalidIdentity:
+            return "invalid command identity";
+        case MappedTransferProgressError::InvalidAddress:
+            return "invalid source or destination address";
+        case MappedTransferProgressError::InvalidByteCount:
+            return "invalid byte count";
+        case MappedTransferProgressError::InvalidWork:
+            return "invalid transfer work description";
+        case MappedTransferProgressError::InvalidPackedPointers:
+            return "invalid packed transfer staging or metadata pointers";
+        case MappedTransferProgressError::InvalidPackedGeometry:
+            return "invalid packed transfer dimensions, units or direction";
+        case MappedTransferProgressError::InvalidPackedExtent:
+            return "invalid packed transfer encoded byte boundary";
+        case MappedTransferProgressError::InvalidPackedPopulation:
+            return "invalid packed transfer chunk population";
+        case MappedTransferProgressError::InvalidPackedDispatch:
+            return "invalid packed transfer format dispatch";
+        }
+        return "unknown transfer error";
+    }
+
 
     /** Device-owned lifetime of one graph-bounded CUDA transfer service. */
     enum class MappedTransferWakeState : std::uint64_t

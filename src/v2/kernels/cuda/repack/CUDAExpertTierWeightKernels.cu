@@ -283,16 +283,16 @@ namespace llaminar2
             /**
              * @brief Reject malformed dispatch geometry before division or dereference.
              * @param command Complement-validated snapshot of one generation.
-             * @return Whether the operation has a complete supported device dispatch.
+             * @return Exact rejecting predicate, or None for supported device dispatch.
              */
-            __device__ static __forceinline__ bool valid(
+            __device__ static __forceinline__ MappedTransferProgressError validationError(
                 const MappedTransferProgressCommand &command)
             {
                 const auto &description = work(command);
-                if (description.kind == MappedTransferWorkKind::Bytes) return true;
+                if (description.kind == MappedTransferWorkKind::Bytes) return MappedTransferProgressError::None;
                 const bool to_cpu = description.kind == MappedTransferWorkKind::PackedGpuToCpu;
                 if (!to_cpu && description.kind != MappedTransferWorkKind::PackedCpuToGpu)
-                    return false;
+                    return MappedTransferProgressError::InvalidWork;
                 const auto &layout = description.layout;
                 // Full format/footprint validation belongs to the canonical
                 // host layout. These device checks protect the dynamic loop;
@@ -300,31 +300,33 @@ namespace llaminar2
                 const bool coded = layout.cpuStorage().coded();
                 if ((!description.device_staging && !coded) || !description.scales ||
                     ((coded || layout.gpu_is_asymmetric) && !description.mins) ||
-                    (!coded && layout.gpu_has_emins && !description.emins) ||
-                    layout.N <= 0 || layout.K <= 0 || layout.K % 32 != 0 ||
+                    (!coded && layout.gpu_has_emins && !description.emins))
+                    return MappedTransferProgressError::InvalidPackedPointers;
+                if (layout.N <= 0 || layout.K <= 0 || layout.K % 32 != 0 ||
                     layout.blocks_per_row != layout.K / 32 ||
                     !layout.cpu_block_stride || description.first_unit>=layout.unit_count ||
                     (to_cpu ? layout.direction != ExpertTierWeightConversionDirection::GpuToCpu
                             : layout.direction != ExpertTierWeightConversionDirection::CpuToGpu))
-                    return false;
+                    return MappedTransferProgressError::InvalidPackedGeometry;
                 const auto first_bytes=expertTierWirePrefix(layout,description.first_unit);
                 const auto complete_bytes=expertTierWirePrefix(layout,layout.unit_count);
-                if(command.bytes>complete_bytes-first_bytes)return false;
+                if(command.bytes>complete_bytes-first_bytes)return MappedTransferProgressError::InvalidPackedExtent;
                 const auto final_unit=expertTierWireUnitAt(layout,first_bytes+command.bytes);
-                if(expertTierWirePrefix(layout,final_unit)!=first_bytes+command.bytes)return false;
+                if(expertTierWirePrefix(layout,final_unit)!=first_bytes+command.bytes)return MappedTransferProgressError::InvalidPackedExtent;
                 const auto units=final_unit-description.first_unit;
                 if (!units || description.first_unit >= layout.unit_count ||
                     units > layout.unit_count - description.first_unit ||
                     units > layout.maximum_units_per_chunk)
-                    return false;
+                    return MappedTransferProgressError::InvalidPackedPopulation;
                 // This is dispatch totality, not a second footprint authority.
                 // Never acknowledge bytes for a codebook with no device branch.
                 if (coded)
                     return nativeQuantisedSuperblockCodable(layout.gpu_codebook_id) && layout.gpu_superblock_phase < 8 &&
-                        layout.gpu_code_bit_shift < 8;
+                        layout.gpu_code_bit_shift < 8 ? MappedTransferProgressError::None : MappedTransferProgressError::InvalidPackedDispatch;
                 // Scalar layout admission authenticated the exact native provenance and
                 // planes. Q6_K and IQ4_XS units are coded above; nothing else has a branch.
-                return expertTierPreservesNativeSingleScale(layout.cpu_encoding, layout.cpu_codebook_id);
+                return expertTierPreservesNativeSingleScale(layout.cpu_encoding, layout.cpu_codebook_id)
+                    ? MappedTransferProgressError::None : MappedTransferProgressError::InvalidPackedDispatch;
             }
 
             /**

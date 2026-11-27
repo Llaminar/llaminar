@@ -120,8 +120,8 @@ namespace llaminar2
                                 for (unsigned word = 0u; word < kMappedTransferWorkWords; ++word)
                                     if (command.work_complements[word] != ~command.work[word])
                                         error = static_cast<unsigned>(MappedTransferProgressError::InvalidIdentity);
-                                if (!error && !Payload::valid(command))
-                                    error = static_cast<unsigned>(MappedTransferProgressError::InvalidWork);
+                                if (!error)
+                                    error = static_cast<unsigned>(Payload::validationError(command));
                                 if (cursor.generation != generation)
                                 {
                                     cursor.generation = generation;
