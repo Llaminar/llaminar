@@ -58,6 +58,18 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "container state"):
             C._static_unit_fingerprint(unit._replace(bodies=UnknownBodies(bodies)))
 
+    def test_ninja_record_requires_exact_output_valid_mtime_and_complete_nonempty_count(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            (root / "input.o").write_bytes(b"object")
+            valid = "app: #deps 1, deps mtime 123 (VALID)\n    input.o\n\n"
+            self.assertEqual(C._static_ninja_record(valid, "app", 123, root), {root / "input.o"})
+            for text in ("", valid.replace("app:", "other:"), valid.replace("VALID", "STALE"),
+                         valid.replace("mtime 123", "mtime 124"), valid.replace("#deps 1", "#deps 2"),
+                         "app: #deps 0, deps mtime 123 (VALID)\n", valid + valid):
+                with self.subTest(record=text), self.assertRaises(ValueError):
+                    C._static_ninja_record(text, "app", 123, root)
+
     def test_rewriting_options_include_forwarded_forms(self):
         for option in ("-flto", "-flto=auto", "--gc-sections", "--icf=all", "-r", "--relocatable", "-shared", "-T", "-Tscript.ld", "--script=script.ld"):
             for arg in (option, "-Wl," + option):
@@ -457,6 +469,65 @@ class StaticSelectionNativeTest(unittest.TestCase):
         native_run(explicit_args, check=True)
         with self.assertRaisesRegex(ValueError, "unsupported static link option: -T"):
             C.capture_static_link(explicit_args, root, root / "explicit-script-app", root / "unsupported-explicit-script")
+
+
+    def test_native_ninja_consumed_dependency_record_controls(self):
+        compiler = shutil.which(os.environ.get("LLAMINAR_STATIC_TEST_GXX", "g++-14"))
+        ninja = shutil.which("ninja")
+        self.assertIsNotNone(compiler, "native Ninja fixture requires GNU14")
+        self.assertIsNotNone(ninja, "native Ninja fixture requires actual Ninja")
+        base = os.environ.get("LLAMINAR_STATIC_TEST_ARTIFACTS")
+        if base:
+            Path(base).mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="static-ninja-", dir=base))
+        print(f"Retained native Ninja controls: {root}", flush=True)
+        (root / "main.cpp").write_text("int main(){return 0;}\n")
+        subprocess.run([compiler, "-c", str(root / "main.cpp"), "-o", str(root / "main.o")], check=True)
+        args = [compiler, "main.o", "-Wl,--dependency-file=link.d", "-o", "app"]
+        (root / "build.ninja").write_text("rule link\n  command = " + " ".join(args) +
+                "\n  depfile = link.d\n  deps = gcc\nbuild app: link main.o\n")
+        subprocess.run([ninja, "app"], cwd=root, check=True)
+        self.assertFalse((root / "link.d").exists(), "Ninja deps=gcc must actually consume the side output")
+        with self.assertRaisesRegex(ValueError, "requires explicit native Ninja"):
+            C.capture_static_link(args, root, root / "app", root / "no-explicit-ninja")
+        C.capture_static_link(args, root, root / "app", root / "valid", ninja=Path(ninja))
+        output = root / "app"
+        mtime = output.stat().st_mtime_ns
+        os.utime(output, ns=(mtime+1, mtime+1))
+        with self.assertRaisesRegex(ValueError, "stale or wrong-output"):
+            C.capture_static_link(args, root, output, root / "stale", ninja=Path(ninja))
+        os.utime(output, ns=(mtime, mtime))
+        shutil.copy2(output, root / "wrong-app")
+        wrong = args.copy()
+        wrong[-1] = "wrong-app"
+        with self.assertRaisesRegex(ValueError, "native Ninja deps query failed"):
+            C.capture_static_link(wrong, root, root / "wrong-app", root / "wrong-target", ninja=Path(ninja))
+        native_run = subprocess.run
+        database = root / ".ninja_deps"
+        original_database = database.read_bytes()
+        copied_ninja = root / "ninja"
+        shutil.copy2(ninja, copied_ninja)
+        for label, path in (("mutated-database", database), ("mutated-ninja-tool", copied_ninja)):
+            def invoke(command, **kw):
+                result = native_run(command, **kw)
+                if "-o" in command and Path(command[command.index("-o")+1]).name == "map.elf":
+                    path.write_bytes(path.read_bytes() + b"changed")
+                return result
+            with mock.patch.object(C.subprocess, "run", invoke):
+                with self.assertRaisesRegex(ValueError, "static input changed:"):
+                    C.capture_static_link(args, root, output, root / label, ninja=copied_ninja)
+            (root / label / "injected-native-artifact").write_bytes(path.read_bytes())
+            database.write_bytes(original_database)
+            shutil.copy2(ninja, copied_ninja)
+        # Actual Ninja log with an incomplete producer side output: valid record
+        # status alone must not be mistaken for a complete native linker closure.
+        rule = (root / "build.ninja").read_text()
+        rule = rule.replace("\n  depfile", " && sed -i '/Scrt1.o/d' link.d\n  depfile")
+        (root / "build.ninja").write_text(rule)
+        native_run([ninja, "-t", "clean"], cwd=root, check=True)
+        native_run([ninja, "app"], cwd=root, check=True)
+        with self.assertRaisesRegex(ValueError, "debug dependency set differs from production"):
+            C.capture_static_link(args, root, output, root / "different-native-record-set", ninja=Path(ninja))
 
 
 if __name__ == "__main__":
