@@ -1972,7 +1972,7 @@ class StaticB1Replay(NamedTuple):
 def _static_b1_scratch_paths(replay: StaticB1Replay, artifacts: Path, cwd: Path, recipe: dict) -> None:
     """Reject any B1 write outside its canonical artifact root or into production state."""
     root = artifacts.resolve(strict=True)
-    forbidden = {Path(path).resolve() for path in recipe["files"]}
+    forbidden = {Path(path).resolve() for path in recipe["protected_files"]}
     forbidden.update({Path(recipe["production_dependency"]).resolve(), (cwd / ".ninja_deps").resolve(),
                       Path(recipe["output"]).resolve()})
     paths = [path.resolve() for path in (replay.obj, replay.dependencies, replay.assembly)]
@@ -2626,6 +2626,9 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     for path, digest in files.items():
         if _static_hash(Path(path).read_bytes()) != digest:
             raise ValueError(f"static input changed: {path}")
+    # Freeze the native epoch before inventorying caller-prepared B1 scratch
+    # files. Those are checked evidence, not production inputs or owned relinks.
+    protected_files = list(files)
     for p in artifacts.iterdir():
         if p.is_file() and p != proof:
             actual = _static_hash(p.read_bytes())
@@ -2633,7 +2636,7 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
                 raise ValueError(f"static retained artifact changed: {p}")
             files[str(p)] = actual
     recipe = dict(schema=1, argv=list(original_argv), cwd=str(cwd), output=str(output),
-                  production_dependency=str(production_dep), env=env, files=files)
+                  production_dependency=str(production_dep), protected_files=protected_files, env=env, files=files)
     proof.write_text(json.dumps(recipe, indent=2))
     return recipe
 

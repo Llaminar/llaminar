@@ -53,7 +53,7 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
             artifacts = root / "artifacts"
             artifacts.mkdir()
             production_dep = root / "absent-P.d"
-            recipe = dict(files={}, production_dependency=str(production_dep), output=str(root / "app"))
+            recipe = dict(files={}, protected_files=[], production_dependency=str(production_dep), output=str(root / "app"))
             replay = C.StaticB1Replay([], str(root), "source", {}, artifacts / "b1.o",
                                       artifacts / "b1.d", artifacts / "production.s")
             C._static_b1_scratch_paths(replay, artifacts, root, recipe)
