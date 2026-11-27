@@ -241,11 +241,13 @@ namespace
     }
 
     /**
-     * @brief Zero-imbalance 16-column Q8_0 projection for ssm_out (2 sub-tiles x kb partitions).
+     * @brief Single-wave coalesced Q8_0 projection for up to 16 columns using 2 lanes/col int4
+     *        (1 warp covers all cols_per_cta <= 16 of 1 K-partition in 1 pass, 1 shuffle/block).
      */
-    __device__ __forceinline__ void completeQ8Tile16(
+    __device__ __forceinline__ void completeQ8TileDynamic16(
         const CUDARetainedGDNProjection &proj,
         unsigned col_base,
+        unsigned col_count,
         const int8_t *act_codes,
         const float *act_scales,
         float (*partials)[16])
@@ -253,8 +255,8 @@ namespace
         const unsigned tid = threadIdx.x;
         const unsigned warp = tid >> 5;
         const unsigned lane = tid & 31u;
-        const unsigned col_in_sub = lane >> 2;
-        const unsigned q_part = lane & 3u;
+        const unsigned col_in_tile = lane >> 1; // 0..15
+        const unsigned half_part = lane & 1u;   // 0..1 (16B = int4 per lane)
 
         const auto &w = proj.weights;
         const unsigned n = static_cast<unsigned>(w.n);
@@ -262,22 +264,44 @@ namespace
         const unsigned kb = static_cast<unsigned>(proj.k_partitions);
         const unsigned bps = static_cast<unsigned>(proj.blocks_per_partition);
         const auto *w_scales = static_cast<const uint16_t *>(w.scales);
+        const unsigned col = col_base + col_in_tile;
+        const bool valid_col = (col_in_tile < col_count) && (col < n);
 
-        const unsigned total_warp_tasks = 2u * kb;
-        for (unsigned task = warp; task < total_warp_tasks; task += 8u)
+        for (unsigned p = warp; p < kb; p += 8u)
         {
-            const unsigned p = task >> 1;
-            const unsigned st = task & 1u;
             const unsigned blk_begin = p * bps;
             const unsigned blk_end = min(blocks, blk_begin + bps);
-            const float sum = accumulateQ8SubTile8(
-                w, w_scales, act_codes, act_scales, col_base + st * 8u, blk_begin, blk_end, lane);
-            if (q_part == 0u)
-                partials[p][st * 8u + col_in_sub] = sum;
+            float sum = 0.0f;
+            if (blk_begin < blk_end)
+            {
+                unsigned elem = blk_begin * n + col;
+#pragma unroll 1
+                for (unsigned b = blk_begin; b < blk_end; ++b)
+                {
+                    const int4 w4 = valid_col
+                        ? reinterpret_cast<const int4 *>(w.payload + static_cast<std::size_t>(elem) * 32u)[half_part]
+                        : make_int4(0, 0, 0, 0);
+                    const int4 a4 = reinterpret_cast<const int4 *>(act_codes + b * 32u)[half_part];
+                    int d = __dp4a(w4.x, a4.x, 0);
+                    d = __dp4a(w4.y, a4.y, d);
+                    d = __dp4a(w4.z, a4.z, d);
+                    d = __dp4a(w4.w, a4.w, d);
+                    d += __shfl_xor_sync(0xffffffffu, d, 1);
+                    if (half_part == 0u && valid_col)
+                    {
+                        const float ws = __half2float(__ushort_as_half(w_scales[elem]));
+                        sum = __fadd_rn(sum,
+                            device_native_quantised_contract::singleScaleBlock(d, ws, act_scales[b]));
+                    }
+                    elem += n;
+                }
+            }
+            if (half_part == 0u && col_in_tile < col_count)
+                partials[p][col_in_tile] = sum;
         }
         __syncthreads();
 
-        if (tid < 16u && (col_base + tid) < n)
+        if (tid < col_count && (col_base + tid) < n)
         {
             float total = 0.0f;
             for (unsigned p = 0u; p < kb; ++p)
@@ -488,10 +512,11 @@ namespace
         __syncthreads();
     }
 
-    /** @brief General all-18-codebook 16-column ssm_out projection tile. */
-    __device__ __forceinline__ void completeGeneralTile16(
+    /** @brief General all-18-codebook dynamic <=16-column ssm_out projection tile. */
+    __device__ __forceinline__ void completeGeneralTileDynamic16(
         const CUDARetainedGDNProjection &proj,
         unsigned col_base,
+        unsigned col_count,
         const int8_t *act_codes,
         const float *act_scales,
         float (*partials)[16])
@@ -509,7 +534,7 @@ namespace
         for (unsigned p = half_warp; p < kb; p += 16u)
         {
             float sum = 0.0f;
-            if (col < n)
+            if (col_in_tile < col_count && col < n)
             {
                 const unsigned blk_begin = p * bps;
                 const unsigned blk_end = min(blocks, blk_begin + bps);
@@ -521,11 +546,12 @@ namespace
                         w, linear, act_codes + b * 32u, act_scales[b]));
                 }
             }
-            partials[p][col_in_tile] = sum;
+            if (col_in_tile < col_count)
+                partials[p][col_in_tile] = sum;
         }
         __syncthreads();
 
-        if (tid < 16u && (col_base + tid) < n)
+        if (tid < col_count && (col_base + tid) < n)
         {
             float total = 0.0f;
             for (unsigned p = 0u; p < kb; ++p)
@@ -755,13 +781,17 @@ namespace
 
                 if constexpr (StateLayout == GDNRecurrenceStateLayout::ValueMajorKeyContiguous)
                 {
+                    // Dual-row zero-dot-shuffle ValueMajor recurrence using unused shared.p3.state_lo[warp]
+                    // (256 floats = transposed [16 r][2 rows x 8 splits]): lanes 0..7 (vi0) and 8..15 (vi1)
+                    // evaluate both exact 8-split x 16-elem ascending FMA rows simultaneously with zero
+                    // bank conflicts on dot reads, cutting shuffles from 82 -> 18 per warp.
                     const int vi0 = c * 16 + static_cast<int>(warp) * 2;
                     const int vi1 = vi0 + 1;
-                    const int sp = static_cast<int>(lane >> 2);
-                    const unsigned sub = lane & 3u;
-                    const int rbase = sp * 16;
+                    const unsigned w_sp = lane >> 2;  // 0..7
+                    const unsigned w_sub = lane & 3u; // 0..3
                     const bool aligned16 = (reinterpret_cast<std::uintptr_t>(S_head) & 15u) == 0u;
                     const float4 kv4 = *reinterpret_cast<const float4 *>(shared.p3.k_local + lane * 4u);
+                    float *wbuf = &shared.p3.state_lo[warp][0];
 
                     const auto load_row = [&](int vi) -> float4 {
                         const float *src = S_head + static_cast<std::size_t>(vi) * 128u + lane * 4u;
@@ -784,100 +814,88 @@ namespace
                     // Issue both 512-byte coalesced warp loads up front to hide GDDR6X latency.
                     float4 sv0 = load_row(vi0);
                     float4 sv1 = load_row(vi1);
+                    sv0.x *= decay; sv0.y *= decay; sv0.z *= decay; sv0.w *= decay;
+                    sv1.x *= decay; sv1.y *= decay; sv1.z *= decay; sv1.w *= decay;
 
-                    const auto finish_vi = [&](int vi, float4 sv) {
-                        sv.x *= decay;
-                        sv.y *= decay;
-                        sv.z *= decay;
-                        sv.w *= decay;
+                    const unsigned wr_base = w_sub * 4u;
+                    wbuf[(wr_base + 0u) * 16u + w_sp] = sv0.x;
+                    wbuf[(wr_base + 1u) * 16u + w_sp] = sv0.y;
+                    wbuf[(wr_base + 2u) * 16u + w_sp] = sv0.z;
+                    wbuf[(wr_base + 3u) * 16u + w_sp] = sv0.w;
+                    wbuf[(wr_base + 0u) * 16u + 8u + w_sp] = sv1.x;
+                    wbuf[(wr_base + 1u) * 16u + 8u + w_sp] = sv1.y;
+                    wbuf[(wr_base + 2u) * 16u + 8u + w_sp] = sv1.z;
+                    wbuf[(wr_base + 3u) * 16u + 8u + w_sp] = sv1.w;
+                    __syncwarp();
 
-                        float pkv = 0.0f;
-                        if (sub == 0u)
-                        {
-                            pkv += sv.x * shared.p3.k_local[rbase + 0];
-                            pkv += sv.y * shared.p3.k_local[rbase + 1];
-                            pkv += sv.z * shared.p3.k_local[rbase + 2];
-                            pkv += sv.w * shared.p3.k_local[rbase + 3];
-                        }
+                    const unsigned d_row = lane >> 3; // 0 for vi0 (lanes 0..7), 1 for vi1 (lanes 8..15)
+                    const unsigned d_sp = lane & 7u;  // 0..7
+                    const int d_rbase = static_cast<int>(d_sp) * 16;
+                    float pkv = 0.0f;
+                    if (lane < 16u)
+                    {
 #pragma unroll
-                        for (unsigned off = 1u; off < 4u; ++off)
-                        {
-                            const float tx = __shfl_down_sync(0xffffffffu, sv.x, off, 4);
-                            const float ty = __shfl_down_sync(0xffffffffu, sv.y, off, 4);
-                            const float tz = __shfl_down_sync(0xffffffffu, sv.z, off, 4);
-                            const float tw = __shfl_down_sync(0xffffffffu, sv.w, off, 4);
-                            if (sub == 0u)
-                            {
-                                const int kb = rbase + static_cast<int>(off) * 4;
-                                pkv += tx * shared.p3.k_local[kb + 0];
-                                pkv += ty * shared.p3.k_local[kb + 1];
-                                pkv += tz * shared.p3.k_local[kb + 2];
-                                pkv += tw * shared.p3.k_local[kb + 3];
-                            }
-                        }
-
-                        float kv = 0.0f;
+                        for (int r = 0; r < 16; ++r)
+                            pkv += wbuf[static_cast<unsigned>(r) * 16u + lane] * shared.p3.k_local[d_rbase + r];
+                    }
+                    const int fold_src_base = (lane < 8u) ? 0 : 8;
+                    float kv = 0.0f;
 #pragma unroll
-                        for (int s = 0; s < 8; ++s)
-                        {
-                            const float ps = __shfl_sync(0xffffffffu, pkv, s * 4);
-                            if (lane == 0u)
-                                kv += ps;
-                        }
-                        float delta = 0.0f;
-                        if (lane == 0u)
-                        {
-                            const float v_val =
-                                args.gdn_recurrence_in[2u * key_span + static_cast<std::size_t>(h) * 128u + vi];
-                            delta = (v_val - kv) * beta_h;
-                        }
-                        delta = __shfl_sync(0xffffffffu, delta, 0);
+                    for (int s = 0; s < 8; ++s)
+                    {
+                        const float ps = __shfl_sync(0xffffffffu, pkv, fold_src_base + s);
+                        if (lane == 0u || lane == 8u)
+                            kv += ps;
+                    }
+                    float my_delta = 0.0f;
+                    if (lane == 0u || lane == 8u)
+                    {
+                        const int my_vi = (lane == 0u) ? vi0 : vi1;
+                        const float v_val =
+                            args.gdn_recurrence_in[2u * key_span + static_cast<std::size_t>(h) * 128u + my_vi];
+                        my_delta = (v_val - kv) * beta_h;
+                    }
+                    const float delta0 = __shfl_sync(0xffffffffu, my_delta, 0);
+                    const float delta1 = __shfl_sync(0xffffffffu, my_delta, 8);
 
-                        sv.x = sv.x + kv4.x * delta;
-                        sv.y = sv.y + kv4.y * delta;
-                        sv.z = sv.z + kv4.z * delta;
-                        sv.w = sv.w + kv4.w * delta;
-                        store_row(vi, sv);
+                    sv0.x += kv4.x * delta0; sv0.y += kv4.y * delta0;
+                    sv0.z += kv4.z * delta0; sv0.w += kv4.w * delta0;
+                    sv1.x += kv4.x * delta1; sv1.y += kv4.y * delta1;
+                    sv1.z += kv4.z * delta1; sv1.w += kv4.w * delta1;
+                    store_row(vi0, sv0);
+                    store_row(vi1, sv1);
 
-                        float pout = 0.0f;
-                        if (sub == 0u)
-                        {
-                            pout += sv.x * shared.p3.q_local[rbase + 0];
-                            pout += sv.y * shared.p3.q_local[rbase + 1];
-                            pout += sv.z * shared.p3.q_local[rbase + 2];
-                            pout += sv.w * shared.p3.q_local[rbase + 3];
-                        }
+                    wbuf[(wr_base + 0u) * 16u + w_sp] = sv0.x;
+                    wbuf[(wr_base + 1u) * 16u + w_sp] = sv0.y;
+                    wbuf[(wr_base + 2u) * 16u + w_sp] = sv0.z;
+                    wbuf[(wr_base + 3u) * 16u + w_sp] = sv0.w;
+                    wbuf[(wr_base + 0u) * 16u + 8u + w_sp] = sv1.x;
+                    wbuf[(wr_base + 1u) * 16u + 8u + w_sp] = sv1.y;
+                    wbuf[(wr_base + 2u) * 16u + 8u + w_sp] = sv1.z;
+                    wbuf[(wr_base + 3u) * 16u + 8u + w_sp] = sv1.w;
+                    __syncwarp();
+
+                    float pout = 0.0f;
+                    if (lane < 16u)
+                    {
 #pragma unroll
-                        for (unsigned off = 1u; off < 4u; ++off)
-                        {
-                            const float tx = __shfl_down_sync(0xffffffffu, sv.x, off, 4);
-                            const float ty = __shfl_down_sync(0xffffffffu, sv.y, off, 4);
-                            const float tz = __shfl_down_sync(0xffffffffu, sv.z, off, 4);
-                            const float tw = __shfl_down_sync(0xffffffffu, sv.w, off, 4);
-                            if (sub == 0u)
-                            {
-                                const int qb = rbase + static_cast<int>(off) * 4;
-                                pout += tx * shared.p3.q_local[qb + 0];
-                                pout += ty * shared.p3.q_local[qb + 1];
-                                pout += tz * shared.p3.q_local[qb + 2];
-                                pout += tw * shared.p3.q_local[qb + 3];
-                            }
-                        }
-
-                        float out_vi = 0.0f;
+                        for (int r = 0; r < 16; ++r)
+                            pout += wbuf[static_cast<unsigned>(r) * 16u + lane] * shared.p3.q_local[d_rbase + r];
+                    }
+                    float out_vi = 0.0f;
 #pragma unroll
-                        for (int s = 0; s < 8; ++s)
-                        {
-                            const float ps = __shfl_sync(0xffffffffu, pout, s * 4);
-                            if (lane == 0u)
-                                out_vi += ps;
-                        }
-                        if (lane == 0u)
-                            args.attn_output[h * 128 + vi] = out_vi;
-                    };
-
-                    finish_vi(vi0, sv0);
-                    finish_vi(vi1, sv1);
+                    for (int s = 0; s < 8; ++s)
+                    {
+                        const float ps = __shfl_sync(0xffffffffu, pout, fold_src_base + s);
+                        if (lane == 0u || lane == 8u)
+                            out_vi += ps;
+                    }
+                    if (lane == 0u || lane == 8u)
+                    {
+                        const int my_vi = (lane == 0u) ? vi0 : vi1;
+                        args.attn_output[h * 128 + my_vi] = out_vi;
+                    }
+                    (void)d_row;
                 }
                 else
                 {
@@ -1026,17 +1044,24 @@ namespace
                 shared.p4.act_scales[b] = out_q8_scales[b];
             __syncthreads();
 
-            const unsigned ssm_tiles = (static_cast<unsigned>(args.ssm_out.weights.n) + 15u) >> 4;
+            // Dynamic single-wave ssm_out tile width: spreads all columns across gridDim.x
+            // (e.g. cols_per_cta=9 -> 285/296 = 96.3% active CTAs in ONE wave on SM86)
+            // while remaining 100% general for any output width and any GPU grid size.
+            const unsigned ssm_n = static_cast<unsigned>(args.ssm_out.weights.n);
+            const unsigned cols_per_cta = min(16u, max(1u, (ssm_n + gridDim.x - 1u) / gridDim.x));
+            const unsigned ssm_tiles = (ssm_n + cols_per_cta - 1u) / cols_per_cta;
             for (unsigned tile = blockIdx.x; tile < ssm_tiles; tile += gridDim.x)
             {
+                const unsigned col_base = tile * cols_per_cta;
+                const unsigned col_count = min(cols_per_cta, ssm_n - col_base);
                 if constexpr (GeneralCodebooks)
                 {
-                    completeGeneralTile16(args.ssm_out, tile << 4,
+                    completeGeneralTileDynamic16(args.ssm_out, col_base, col_count,
                         shared.p4.act_codes, shared.p4.act_scales, shared.p4.partials);
                 }
                 else
                 {
-                    completeQ8Tile16(args.ssm_out, tile << 4,
+                    completeQ8TileDynamic16(args.ssm_out, col_base, col_count,
                         shared.p4.act_codes, shared.p4.act_scales, shared.p4.partials);
                 }
             }

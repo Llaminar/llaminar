@@ -267,9 +267,18 @@ namespace llaminar2::rocm::mapped_follower_moe
         launch.grant->live_rows = static_cast<std::uint32_t>(descriptor.live_rows);
         launch.grant->live_entries = static_cast<std::uint32_t>(descriptor.live_entries);
         launch.grant->single_row_id = descriptor.live_rows == 1u ? burst->row_id0 : -1;
-        moe_activation_packet_device::publishSuccess(
-            control, launch.grant, endpoint, operation, launch.stage_ordinal, launch.model_layer_index,
-            timeline, /*consumed=*/true, /*published=*/false);
+        if (descriptor.live_rows == 1u && descriptor.live_entries > 0u)
+        {
+            moe_activation_packet_device::publishSuccess(
+                control, launch.grant, endpoint, operation, launch.stage_ordinal, launch.model_layer_index,
+                timeline, /*consumed=*/true, /*published=*/false);
+        }
+        else
+        {
+            // Empty stage immediately packs return metadata on the next line; update grant state
+            // locally and avoid a duplicate 15-field PCIe write to control->follower_status.
+            launch.grant->last_consumed_stage = static_cast<std::int32_t>(launch.stage_ordinal);
+        }
     }
 
     /** @brief Protocol-exact dispatch validation using the already-acquired follower grant. */
@@ -720,13 +729,26 @@ namespace llaminar2::rocm::mapped_follower_moe
             auto burst_lds = asLds<Phase0BurstLds>(dynamic_storage + hidden_q8_bytes);
 
             if (tid == 0u)
-                moe_activation_packet_device::waitSystemAcquire64(args.dispatch_launch.acquire);
+            {
+                std::uint64_t observed = 0u;
+                while (true)
+                {
+                    observed = moe_activation_packet_device::loadSystemAcquire64(args.dispatch_launch.acquire.signal);
+                    if (observed >= args.dispatch_launch.acquire.value)
+                        break;
+                    __builtin_amdgcn_s_sleep(1u);
+                }
+                burst_lds->dispatch_timeline = observed;
+            }
             workgroupJoin<WorkgroupJoinMemory::GlobalAndLDS>();
 
-            // True zero-divergence parallel PCIe burst: each metadata array gets its
-            // own dedicated wavefront (Waves 0..7) so all 8 metadata arrays issue
-            // concurrently without intra-wave serialization, while Waves 8..15
-            // simultaneously fetch & quantize hidden4 (512 threads -> 640 float4s).
+            // Two-stage zero-waste PCIe burst:
+            // Stage 0a reads ONLY descriptor + entry_offsets[0..1] (~72 B); dispatch_timeline was
+            // already acquired by tid==0 above (eliminating a duplicate buffer_invl2 roundtrip!).
+            // When live_rows == 0 (empty follower stage), Stage 0b is completely skipped — zero
+            // uncached PCIe reads of the 10 KB hidden_rows_fp32 buffer or unused route slots!
+            // When live_rows > 0, Waves 0..4 fetch ONLY live_entries route metadata while
+            // Waves 5..15 (704 threads >= 640 float4s) fetch & quantize hidden in ONE single pass!
             {
                 const unsigned wave = waveUniform(tid >> 6);
                 const unsigned lane = lane64();
@@ -746,61 +768,63 @@ namespace llaminar2::rocm::mapped_follower_moe
                 }
                 else if (wave == 1u)
                 {
-                    if (lane == 0u)
-                    {
-                        const std::uint32_t bank =
-                            waveUniform(moeOverlayActivationBufferIndex(args.dispatch_launch.packet.stage_ordinal));
-                        const auto *control = waveUniform(args.dispatch_launch.packet.control);
-                        burst_lds->dispatch_timeline =
-                            moe_activation_packet_device::loadSystemAcquire64(&control->buffers[bank].dispatch_signal.value);
-                    }
-                }
-                else if (wave == 2u)
-                {
-                    if (lane == 0u)
-                        burst_lds->row_id0 = moe_activation_packet_device::loadPeerPublished(pkt.row_ids);
-                }
-                else if (wave == 3u)
-                {
                     if (lane < 2u)
                         burst_lds->entry_offsets[lane] = moe_activation_packet_device::loadPeerPublished(pkt.entry_offsets + lane);
                 }
-                else if (wave == 4u)
+                workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+
+                constexpr unsigned kLiveRowsWord =
+                    offsetof(MoEOverlayActivationPayloadDescriptor, live_rows) / sizeof(std::uint64_t);
+                constexpr unsigned kLiveEntriesWord =
+                    offsetof(MoEOverlayActivationPayloadDescriptor, live_entries) / sizeof(std::uint64_t);
+                const std::uint64_t peek_live_rows = burst_lds->desc_words[kLiveRowsWord];
+                const std::uint64_t peek_live_entries = burst_lds->desc_words[kLiveEntriesWord];
+                const bool has_live_rows = waveUniform(peek_live_rows > 0u);
+                if (has_live_rows)
                 {
-                    if (lane < entry_cap)
-                        burst_lds->expert_ids[lane] = moe_activation_packet_device::loadPeerPublished(pkt.expert_ids + lane);
-                }
-                else if (wave == 5u)
-                {
-                    if (lane < entry_cap)
-                        burst_lds->route_weights[lane] = moe_activation_packet_device::loadPeerPublished(pkt.route_weights + lane);
-                }
-                else if (wave == 6u)
-                {
-                    if (lane < entry_cap)
-                        burst_lds->original_slots[lane] = moe_activation_packet_device::loadPeerPublished(pkt.original_route_slots + lane);
-                }
-                else if (wave == 7u)
-                {
-                    if (lane < entry_cap)
-                        burst_lds->compact_slots[lane] = moe_activation_packet_device::loadPeerPublished(pkt.compact_route_slots + lane);
-                }
-                else
-                {
-                    const auto *hidden4 = reinterpret_cast<const float4 *>(waveUniform(
-                        phaseKernargField<MappedFollowerMoEArgs, float *,
-                            offsetof(MappedFollowerMoEArgs, dispatch_launch) +
-                            offsetof(MoEOverlayActivationSingleRowDispatchConsumeLaunch, packet) +
-                            offsetof(MoEOverlayActivationDispatchConsumeLaunch, packet) +
-                            offsetof(MoEOverlayMappedDispatchDeviceView, hidden_rows_fp32)>()));
-                    for (unsigned quad = tid - 512u; quad < (H >> 2); quad += 512u)
+                    const unsigned live_cap = waveUniform(min(entry_cap, static_cast<unsigned>(peek_live_entries)));
+                    if (wave == 0u)
                     {
-                        const float4 val = moe_activation_packet_device::loadPeerPublishedFloat4(hidden4 + quad);
-                        fastQuantizeFourLds(val, quad, q8_lds);
+                        if (lane == 0u)
+                            burst_lds->row_id0 = moe_activation_packet_device::loadPeerPublished(pkt.row_ids);
                     }
+                    else if (wave == 1u)
+                    {
+                        if (lane < live_cap)
+                            burst_lds->expert_ids[lane] = moe_activation_packet_device::loadPeerPublished(pkt.expert_ids + lane);
+                    }
+                    else if (wave == 2u)
+                    {
+                        if (lane < live_cap)
+                            burst_lds->route_weights[lane] = moe_activation_packet_device::loadPeerPublished(pkt.route_weights + lane);
+                    }
+                    else if (wave == 3u)
+                    {
+                        if (lane < live_cap)
+                            burst_lds->original_slots[lane] = moe_activation_packet_device::loadPeerPublished(pkt.original_route_slots + lane);
+                    }
+                    else if (wave == 4u)
+                    {
+                        if (lane < live_cap)
+                            burst_lds->compact_slots[lane] = moe_activation_packet_device::loadPeerPublished(pkt.compact_route_slots + lane);
+                    }
+                    else
+                    {
+                        const auto *hidden4 = reinterpret_cast<const float4 *>(waveUniform(
+                            phaseKernargField<MappedFollowerMoEArgs, float *,
+                                offsetof(MappedFollowerMoEArgs, dispatch_launch) +
+                                offsetof(MoEOverlayActivationSingleRowDispatchConsumeLaunch, packet) +
+                                offsetof(MoEOverlayActivationDispatchConsumeLaunch, packet) +
+                                offsetof(MoEOverlayMappedDispatchDeviceView, hidden_rows_fp32)>()));
+                        for (unsigned quad = tid - 320u; quad < (H >> 2); quad += 704u)
+                        {
+                            const float4 val = moe_activation_packet_device::loadPeerPublishedFloat4(hidden4 + quad);
+                            fastQuantizeFourLds(val, quad, q8_lds);
+                        }
+                    }
+                    workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
                 }
             }
-            workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
 
             if (tid == 0u)
             {
@@ -817,7 +841,7 @@ namespace llaminar2::rocm::mapped_follower_moe
                 {
                     followerPackReturnMetadataGranted(args.return_launch.packet);
                     __threadfence_system();
-                    moe_activation_packet_device::storeSystemRelease64(args.return_launch.publication);
+                    moe_activation_packet_device::storeSystemRelaxed64(args.return_launch.publication);
                     auto *sample = LLAMINAR_FOLLOWER_FIELD(service_telemetry_sample);
                     if (sample && sample->magic != kDeviceMoEOverlayServiceTelemetryMagic)
                     {

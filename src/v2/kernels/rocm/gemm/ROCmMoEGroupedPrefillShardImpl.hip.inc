@@ -2012,9 +2012,13 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
         Traits::is_dual_scale_asym ? 2 :
         Traits::is_asymmetric ? 1 : 0;
 
-    __shared__ __align__(16) int32_t staged_A[2][TILE_M * 8];
-    __shared__ float staged_scales[2][TILE_M];
-    __shared__ int32_t staged_sum_a[2][kSumAStride > 0 ? TILE_M * kSumAStride : 1];
+    // K_BATCH=3 keeps 12x256 total LDS at 15.5 KB (<= 16 KB -> 4 WGs/CU = 16 waves/CU on MI50)
+    // while cutting workgroup barriers 3x versus single-block staging.
+    constexpr int K_BATCH = 3;
+    __shared__ __align__(16) int32_t staged_A[2][K_BATCH][TILE_M * 8];
+    __shared__ float staged_scales[2][K_BATCH][TILE_M];
+    __shared__ int32_t staged_sum_a[2][K_BATCH][kSumAStride > 0 ? TILE_M * kSumAStride : 1];
+    __shared__ float s_totals[TILE_M][TILE_N];
     __shared__ int source_rows[TILE_M];
 
     if (threadIdx.x < static_cast<unsigned int>(rows_in_tile))
@@ -2043,100 +2047,124 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
 
     const int u_rows = __builtin_amdgcn_readfirstlane(rows_in_tile);
 
-    // Zero-init inactive tail slots once so 2-row groups run branchlessly.
-    if (static_cast<int>(threadIdx.x) >= u_rows * 8 &&
-        static_cast<int>(threadIdx.x) < TILE_M * 8)
+    // Zero-init inactive tail slots once across all K_BATCH buffers so 2-row groups run branchlessly.
+    for (int kb = 0; kb < K_BATCH; ++kb)
     {
-        staged_A[0][threadIdx.x] = 0;
-        staged_A[1][threadIdx.x] = 0;
-    }
-    if (static_cast<int>(threadIdx.x) >= u_rows &&
-        static_cast<int>(threadIdx.x) < TILE_M)
-    {
-        staged_scales[0][threadIdx.x] = 0.0f;
-        staged_scales[1][threadIdx.x] = 0.0f;
-        if constexpr (kSumAStride > 0)
+        if (static_cast<int>(threadIdx.x) >= u_rows * 8 &&
+            static_cast<int>(threadIdx.x) < TILE_M * 8)
         {
-#pragma unroll
-            for (int s = 0; s < kSumAStride; ++s)
+            staged_A[0][kb][threadIdx.x] = 0;
+            staged_A[1][kb][threadIdx.x] = 0;
+        }
+        if (static_cast<int>(threadIdx.x) >= u_rows &&
+            static_cast<int>(threadIdx.x) < TILE_M)
+        {
+            staged_scales[0][kb][threadIdx.x] = 0.0f;
+            staged_scales[1][kb][threadIdx.x] = 0.0f;
+            if constexpr (kSumAStride > 0)
             {
-                staged_sum_a[0][static_cast<int>(threadIdx.x) * kSumAStride + s] = 0;
-                staged_sum_a[1][static_cast<int>(threadIdx.x) * kSumAStride + s] = 0;
+#pragma unroll
+                for (int s = 0; s < kSumAStride; ++s)
+                {
+                    staged_sum_a[0][kb][static_cast<int>(threadIdx.x) * kSumAStride + s] = 0;
+                    staged_sum_a[1][kb][static_cast<int>(threadIdx.x) * kSumAStride + s] = 0;
+                }
             }
         }
     }
 
-    const auto stage_k_block = [&](int block_idx, int buf) __attribute__((always_inline))
+    // Stage up to K_BATCH (4) consecutive K-blocks in parallel across K_BATCH * TILE_M <= 64 lanes,
+    // cutting workgroup barrier count 4x and hiding activation loads behind 4 K-blocks of weight decode.
+    const auto stage_k_batch = [&](int b_start, int b_count, int buf) __attribute__((always_inline))
     {
-        if (static_cast<int>(threadIdx.x) < u_rows)
+        const int tid = static_cast<int>(threadIdx.x);
+        if (tid < b_count * TILE_M)
         {
-            const int r = static_cast<int>(threadIdx.x);
-            const int input_row = source_rows[r];
-            const int4* in16 = reinterpret_cast<const int4*>(
-                A_int8 + static_cast<size_t>(input_row) * static_cast<size_t>(K) +
-                static_cast<size_t>(block_idx) * 32u);
-            const int4 lo = in16[0];
-            const int4 hi = in16[1];
-            int4* dst16 = reinterpret_cast<int4*>(staged_A[buf] + r * 8);
-            dst16[0] = lo;
-            dst16[1] = hi;
-            staged_scales[buf][r] = scales_A_blockwise[
-                static_cast<size_t>(input_row) * static_cast<size_t>(blocks_per_row) +
-                static_cast<size_t>(block_idx)];
-            if constexpr (kSumAStride > 0)
+            const int kb = tid / TILE_M;
+            const int r = tid - kb * TILE_M;
+            if (r < u_rows)
             {
-                constexpr int32_t ones = 0x01010101;
-                const int32_t s0 = ::llaminar2::rocm_integer_contract::signedDot4(
-                    lo.y, ones, ::llaminar2::rocm_integer_contract::signedDot4(lo.x, ones, 0));
-                const int32_t s1 = ::llaminar2::rocm_integer_contract::signedDot4(
-                    lo.w, ones, ::llaminar2::rocm_integer_contract::signedDot4(lo.z, ones, 0));
-                const int32_t s2 = ::llaminar2::rocm_integer_contract::signedDot4(
-                    hi.y, ones, ::llaminar2::rocm_integer_contract::signedDot4(hi.x, ones, 0));
-                const int32_t s3 = ::llaminar2::rocm_integer_contract::signedDot4(
-                    hi.w, ones, ::llaminar2::rocm_integer_contract::signedDot4(hi.z, ones, 0));
-                const int sb = r * kSumAStride;
-                if constexpr (FMT == NATIVE_QUANTISED_PF_IQ1_M)
+                const int block_idx = b_start + kb;
+                const int input_row = source_rows[r];
+                const int4* in16 = reinterpret_cast<const int4*>(
+                    A_int8 + static_cast<size_t>(input_row) * static_cast<size_t>(K) +
+                    static_cast<size_t>(block_idx) * 32u);
+                const int4 lo = in16[0];
+                const int4 hi = in16[1];
+                int4* dst16 = reinterpret_cast<int4*>(staged_A[buf][kb] + r * 8);
+                dst16[0] = lo;
+                dst16[1] = hi;
+                staged_scales[buf][kb][r] = scales_A_blockwise[
+                    static_cast<size_t>(input_row) * static_cast<size_t>(blocks_per_row) +
+                    static_cast<size_t>(block_idx)];
+                if constexpr (kSumAStride > 0)
                 {
-                    staged_sum_a[buf][sb + 0] = s0;
-                    staged_sum_a[buf][sb + 1] = s1;
-                    staged_sum_a[buf][sb + 2] = s2;
-                    staged_sum_a[buf][sb + 3] = s3;
-                }
-                else if constexpr (Traits::is_dual_scale_asym)
-                {
-                    staged_sum_a[buf][sb + 0] = s0 + s1;
-                    staged_sum_a[buf][sb + 1] = s2 + s3;
-                }
-                else
-                {
-                    staged_sum_a[buf][sb] = (s0 + s1) + (s2 + s3);
+                    constexpr int32_t ones = 0x01010101;
+                    const int32_t s0 = ::llaminar2::rocm_integer_contract::signedDot4(
+                        lo.y, ones, ::llaminar2::rocm_integer_contract::signedDot4(lo.x, ones, 0));
+                    const int32_t s1 = ::llaminar2::rocm_integer_contract::signedDot4(
+                        lo.w, ones, ::llaminar2::rocm_integer_contract::signedDot4(lo.z, ones, 0));
+                    const int32_t s2 = ::llaminar2::rocm_integer_contract::signedDot4(
+                        hi.y, ones, ::llaminar2::rocm_integer_contract::signedDot4(hi.x, ones, 0));
+                    const int32_t s3 = ::llaminar2::rocm_integer_contract::signedDot4(
+                        hi.w, ones, ::llaminar2::rocm_integer_contract::signedDot4(hi.z, ones, 0));
+                    const int sb = r * kSumAStride;
+                    if constexpr (FMT == NATIVE_QUANTISED_PF_IQ1_M)
+                    {
+                        staged_sum_a[buf][kb][sb + 0] = s0;
+                        staged_sum_a[buf][kb][sb + 1] = s1;
+                        staged_sum_a[buf][kb][sb + 2] = s2;
+                        staged_sum_a[buf][kb][sb + 3] = s3;
+                    }
+                    else if constexpr (Traits::is_dual_scale_asym)
+                    {
+                        staged_sum_a[buf][kb][sb + 0] = s0 + s1;
+                        staged_sum_a[buf][kb][sb + 1] = s2 + s3;
+                    }
+                    else
+                    {
+                        staged_sum_a[buf][kb][sb] = (s0 + s1) + (s2 + s3);
+                    }
                 }
             }
         }
     };
 
-    float totals[TILE_M] = {};
-    const int blocks_per_partition =
-        (blocks_per_row + k_partitions - 1) / k_partitions;
+#pragma unroll
+    for (int local_row = 0; local_row < TILE_M; ++local_row)
+        s_totals[local_row][threadIdx.x] = 0.0f;
 
-    if (blocks_per_row > 0)
+    const int u_k_partitions = __builtin_amdgcn_readfirstlane(k_partitions);
+    const int u_blocks_per_row = __builtin_amdgcn_readfirstlane(blocks_per_row);
+    const int blocks_per_partition =
+        (u_blocks_per_row + u_k_partitions - 1) / u_k_partitions;
+
+    if (u_blocks_per_row > 0)
     {
-        stage_k_block(0, 0);
+        stage_k_batch(0, min(K_BATCH, u_blocks_per_row), 0);
         moe_prefill_block_barrier<TILE_N>();
     }
     int cur_buf = 0;
+    int staged_batch_base = 0;
 
 #pragma unroll 1
-    for (int partition = 0; partition < k_partitions; ++partition)
+    for (int partition = 0; partition < u_k_partitions; ++partition)
     {
         float partials[TILE_M] = {};
         const int begin = partition * blocks_per_partition;
-        const int end = min(begin + blocks_per_partition, blocks_per_row);
+        const int end = min(begin + blocks_per_partition, u_blocks_per_row);
         for (int b = begin; b < end; ++b)
         {
-            const int next_buf = cur_buf ^ 1;
-            int32_t packed_groups[8] = {};
-            MoEPrefillDecodedBlockWeights<FMT> block_weights{};
+            const int local_kb = b - staged_batch_base;
+            // Issue the next K_BATCH activation preload BEFORE decoding packed_groups[8] and
+            // block_weights so activation staging registers and weight decode registers never
+            // overlap in live range (saves 12-16 VGPRs, unlocking 4 waves/SIMD on MI50).
+            if (local_kb == 0 && staged_batch_base + K_BATCH < u_blocks_per_row)
+            {
+                const int next_start = staged_batch_base + K_BATCH;
+                stage_k_batch(next_start, min(K_BATCH, u_blocks_per_row - next_start), cur_buf ^ 1);
+            }
+
             if (owns_column)
             {
                 constexpr int payload_bytes = Traits::payload_bytes;
@@ -2144,17 +2172,10 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
                     static_cast<size_t>(b) * static_cast<size_t>(N) +
                     static_cast<size_t>(n);
                 const uint8_t* payload = payload_base + linear * payload_bytes;
+                int32_t packed_groups[8];
                 moe_prefill_decode_groups<FMT>(payload, packed_groups);
-                block_weights = moe_prefill_decode_block_weights<FMT>(desc, linear, payload);
-            }
-
-            if (b + 1 < blocks_per_row)
-            {
-                stage_k_block(b + 1, next_buf);
-            }
-
-            if (owns_column)
-            {
+                const MoEPrefillDecodedBlockWeights<FMT> block_weights =
+                    moe_prefill_decode_block_weights<FMT>(desc, linear, payload);
 #pragma unroll
                 for (int rg = 0; rg < TILE_M; rg += 2)
                 {
@@ -2164,22 +2185,23 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
                         for (int ri = 0; ri < 2; ++ri)
                         {
                             const int local_row = rg + ri;
-                            const int32_t* a4 = staged_A[cur_buf] + local_row * 8;
+                            const int32_t* a4 = staged_A[cur_buf][local_kb] + local_row * 8;
                             const int32_t* sum_row =
-                                kSumAStride > 0 ? (staged_sum_a[cur_buf] + local_row * kSumAStride) : nullptr;
+                                kSumAStride > 0 ? (staged_sum_a[cur_buf][local_kb] + local_row * kSumAStride) : nullptr;
                             partials[local_row] = moe_prefill_accumulate_preloaded_block<FMT>(
                                 block_weights, packed_groups, a4,
                                 sum_row,
-                                staged_scales[cur_buf][local_row],
+                                staged_scales[cur_buf][local_kb][local_row],
                                 partials[local_row]);
                         }
                     }
                 }
             }
-            if (b + 1 < blocks_per_row)
+            if (b + 1 == staged_batch_base + K_BATCH && b + 1 < u_blocks_per_row)
             {
                 moe_prefill_block_barrier<TILE_N>();
-                cur_buf = next_buf;
+                cur_buf ^= 1;
+                staged_batch_base += K_BATCH;
             }
         }
 
@@ -2190,10 +2212,10 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
             {
                 if (local_row < u_rows)
                 {
-                    totals[local_row] = k_partitions == 1
+                    s_totals[local_row][threadIdx.x] = u_k_partitions == 1
                                             ? partials[local_row]
                                             : rocm_native_quantised_accumulate_rn(
-                                                  totals[local_row], partials[local_row]);
+                                                  s_totals[local_row][threadIdx.x], partials[local_row]);
                 }
             }
         }
@@ -2209,7 +2231,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
                 const int grouped_slot = first_grouped_slot + local_row;
                 projection_out[
                     static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
-                    static_cast<size_t>(n)] = totals[local_row];
+                    static_cast<size_t>(n)] = s_totals[local_row][threadIdx.x];
             }
         }
     }
@@ -2951,106 +2973,127 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
         Traits::is_dual_scale_asym ? 2 :
         Traits::is_asymmetric ? 1 : 0;
 
-    __shared__ __align__(16) int32_t staged_A[2][TILE_M * 8];
-    __shared__ float staged_scales[2][TILE_M];
-    __shared__ int32_t staged_sum_a[2][kSumAStride > 0 ? TILE_M * kSumAStride : 1];
+    constexpr int K_BATCH = 3;
+    __shared__ __align__(16) int32_t staged_A[2][K_BATCH][TILE_M * 8];
+    __shared__ float staged_scales[2][K_BATCH][TILE_M];
+    __shared__ int32_t staged_sum_a[2][K_BATCH][kSumAStride > 0 ? TILE_M * kSumAStride : 1];
+    __shared__ float s_totals[TILE_M][TILE_N];
 
     const int u_rows = __builtin_amdgcn_readfirstlane(rows_in_tile);
     const int u_first_slot = __builtin_amdgcn_readfirstlane(first_grouped_slot);
 
-    if (static_cast<int>(threadIdx.x) >= u_rows * 8 &&
-        static_cast<int>(threadIdx.x) < TILE_M * 8)
+    for (int kb = 0; kb < K_BATCH; ++kb)
     {
-        staged_A[0][threadIdx.x] = 0;
-        staged_A[1][threadIdx.x] = 0;
-    }
-    if (static_cast<int>(threadIdx.x) >= u_rows &&
-        static_cast<int>(threadIdx.x) < TILE_M)
-    {
-        staged_scales[0][threadIdx.x] = 0.0f;
-        staged_scales[1][threadIdx.x] = 0.0f;
-        if constexpr (kSumAStride > 0)
+        if (static_cast<int>(threadIdx.x) >= u_rows * 8 &&
+            static_cast<int>(threadIdx.x) < TILE_M * 8)
         {
-#pragma unroll
-            for (int s = 0; s < kSumAStride; ++s)
+            staged_A[0][kb][threadIdx.x] = 0;
+            staged_A[1][kb][threadIdx.x] = 0;
+        }
+        if (static_cast<int>(threadIdx.x) >= u_rows &&
+            static_cast<int>(threadIdx.x) < TILE_M)
+        {
+            staged_scales[0][kb][threadIdx.x] = 0.0f;
+            staged_scales[1][kb][threadIdx.x] = 0.0f;
+            if constexpr (kSumAStride > 0)
             {
-                staged_sum_a[0][static_cast<int>(threadIdx.x) * kSumAStride + s] = 0;
-                staged_sum_a[1][static_cast<int>(threadIdx.x) * kSumAStride + s] = 0;
+#pragma unroll
+                for (int s = 0; s < kSumAStride; ++s)
+                {
+                    staged_sum_a[0][kb][static_cast<int>(threadIdx.x) * kSumAStride + s] = 0;
+                    staged_sum_a[1][kb][static_cast<int>(threadIdx.x) * kSumAStride + s] = 0;
+                }
             }
         }
     }
 
-    const auto stage_k_block = [&](int block_idx, int buf) __attribute__((always_inline))
+    const auto stage_k_batch = [&](int b_start, int b_count, int buf) __attribute__((always_inline))
     {
-        if (static_cast<int>(threadIdx.x) < u_rows)
+        const int tid = static_cast<int>(threadIdx.x);
+        if (tid < b_count * TILE_M)
         {
-            const int r = static_cast<int>(threadIdx.x);
-            const int grouped_slot = u_first_slot + r;
-            const int4* in16 = reinterpret_cast<const int4*>(
-                A_int8 + static_cast<size_t>(grouped_slot) * static_cast<size_t>(K) +
-                static_cast<size_t>(block_idx) * 32u);
-            const int4 lo = in16[0];
-            const int4 hi = in16[1];
-            int4* dst16 = reinterpret_cast<int4*>(staged_A[buf] + r * 8);
-            dst16[0] = lo;
-            dst16[1] = hi;
-            staged_scales[buf][r] = scales_A_blockwise[
-                static_cast<size_t>(grouped_slot) * static_cast<size_t>(blocks_per_row) +
-                static_cast<size_t>(block_idx)];
-            if constexpr (kSumAStride > 0)
+            const int kb = tid / TILE_M;
+            const int r = tid - kb * TILE_M;
+            if (r < u_rows)
             {
-                constexpr int32_t ones = 0x01010101;
-                const int32_t s0 = ::llaminar2::rocm_integer_contract::signedDot4(
-                    lo.y, ones, ::llaminar2::rocm_integer_contract::signedDot4(lo.x, ones, 0));
-                const int32_t s1 = ::llaminar2::rocm_integer_contract::signedDot4(
-                    lo.w, ones, ::llaminar2::rocm_integer_contract::signedDot4(lo.z, ones, 0));
-                const int32_t s2 = ::llaminar2::rocm_integer_contract::signedDot4(
-                    hi.y, ones, ::llaminar2::rocm_integer_contract::signedDot4(hi.x, ones, 0));
-                const int32_t s3 = ::llaminar2::rocm_integer_contract::signedDot4(
-                    hi.w, ones, ::llaminar2::rocm_integer_contract::signedDot4(hi.z, ones, 0));
-                const int sb = r * kSumAStride;
-                if constexpr (FMT == NATIVE_QUANTISED_PF_IQ1_M)
+                const int block_idx = b_start + kb;
+                const int grouped_slot = u_first_slot + r;
+                const int4* in16 = reinterpret_cast<const int4*>(
+                    A_int8 + static_cast<size_t>(grouped_slot) * static_cast<size_t>(K) +
+                    static_cast<size_t>(block_idx) * 32u);
+                const int4 lo = in16[0];
+                const int4 hi = in16[1];
+                int4* dst16 = reinterpret_cast<int4*>(staged_A[buf][kb] + r * 8);
+                dst16[0] = lo;
+                dst16[1] = hi;
+                staged_scales[buf][kb][r] = scales_A_blockwise[
+                    static_cast<size_t>(grouped_slot) * static_cast<size_t>(blocks_per_row) +
+                    static_cast<size_t>(block_idx)];
+                if constexpr (kSumAStride > 0)
                 {
-                    staged_sum_a[buf][sb + 0] = s0;
-                    staged_sum_a[buf][sb + 1] = s1;
-                    staged_sum_a[buf][sb + 2] = s2;
-                    staged_sum_a[buf][sb + 3] = s3;
-                }
-                else if constexpr (Traits::is_dual_scale_asym)
-                {
-                    staged_sum_a[buf][sb + 0] = s0 + s1;
-                    staged_sum_a[buf][sb + 1] = s2 + s3;
-                }
-                else
-                {
-                    staged_sum_a[buf][sb] = (s0 + s1) + (s2 + s3);
+                    constexpr int32_t ones = 0x01010101;
+                    const int32_t s0 = ::llaminar2::rocm_integer_contract::signedDot4(
+                        lo.y, ones, ::llaminar2::rocm_integer_contract::signedDot4(lo.x, ones, 0));
+                    const int32_t s1 = ::llaminar2::rocm_integer_contract::signedDot4(
+                        lo.w, ones, ::llaminar2::rocm_integer_contract::signedDot4(lo.z, ones, 0));
+                    const int32_t s2 = ::llaminar2::rocm_integer_contract::signedDot4(
+                        hi.y, ones, ::llaminar2::rocm_integer_contract::signedDot4(hi.x, ones, 0));
+                    const int32_t s3 = ::llaminar2::rocm_integer_contract::signedDot4(
+                        hi.w, ones, ::llaminar2::rocm_integer_contract::signedDot4(hi.z, ones, 0));
+                    const int sb = r * kSumAStride;
+                    if constexpr (FMT == NATIVE_QUANTISED_PF_IQ1_M)
+                    {
+                        staged_sum_a[buf][kb][sb + 0] = s0;
+                        staged_sum_a[buf][kb][sb + 1] = s1;
+                        staged_sum_a[buf][kb][sb + 2] = s2;
+                        staged_sum_a[buf][kb][sb + 3] = s3;
+                    }
+                    else if constexpr (Traits::is_dual_scale_asym)
+                    {
+                        staged_sum_a[buf][kb][sb + 0] = s0 + s1;
+                        staged_sum_a[buf][kb][sb + 1] = s2 + s3;
+                    }
+                    else
+                    {
+                        staged_sum_a[buf][kb][sb] = (s0 + s1) + (s2 + s3);
+                    }
                 }
             }
         }
     };
 
-    float totals[TILE_M] = {};
-    const int blocks_per_partition =
-        (blocks_per_row + k_partitions - 1) / k_partitions;
+#pragma unroll
+    for (int local_row = 0; local_row < TILE_M; ++local_row)
+        s_totals[local_row][threadIdx.x] = 0.0f;
 
-    if (blocks_per_row > 0)
+    const int u_k_partitions = __builtin_amdgcn_readfirstlane(k_partitions);
+    const int u_blocks_per_row = __builtin_amdgcn_readfirstlane(blocks_per_row);
+    const int blocks_per_partition =
+        (u_blocks_per_row + u_k_partitions - 1) / u_k_partitions;
+
+    if (u_blocks_per_row > 0)
     {
-        stage_k_block(0, 0);
+        stage_k_batch(0, min(K_BATCH, u_blocks_per_row), 0);
         moe_prefill_block_barrier<TILE_N>();
     }
     int cur_buf = 0;
+    int staged_batch_base = 0;
 
 #pragma unroll 1
-    for (int partition = 0; partition < k_partitions; ++partition)
+    for (int partition = 0; partition < u_k_partitions; ++partition)
     {
         float partials[TILE_M] = {};
         const int begin = partition * blocks_per_partition;
-        const int end = min(begin + blocks_per_partition, blocks_per_row);
+        const int end = min(begin + blocks_per_partition, u_blocks_per_row);
         for (int b = begin; b < end; ++b)
         {
-            const int next_buf = cur_buf ^ 1;
-            int32_t packed_groups[8] = {};
-            MoEPrefillDecodedBlockWeights<FMT> block_weights{};
+            const int local_kb = b - staged_batch_base;
+            if (local_kb == 0 && staged_batch_base + K_BATCH < u_blocks_per_row)
+            {
+                const int next_start = staged_batch_base + K_BATCH;
+                stage_k_batch(next_start, min(K_BATCH, u_blocks_per_row - next_start), cur_buf ^ 1);
+            }
+
             if (owns_column)
             {
                 constexpr int payload_bytes = Traits::payload_bytes;
@@ -3058,17 +3101,10 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
                     static_cast<size_t>(b) * static_cast<size_t>(N) +
                     static_cast<size_t>(n);
                 const uint8_t* payload = payload_base + linear * payload_bytes;
+                int32_t packed_groups[8];
                 moe_prefill_decode_groups<FMT>(payload, packed_groups);
-                block_weights = moe_prefill_decode_block_weights<FMT>(desc, linear, payload);
-            }
-
-            if (b + 1 < blocks_per_row)
-            {
-                stage_k_block(b + 1, next_buf);
-            }
-
-            if (owns_column)
-            {
+                const MoEPrefillDecodedBlockWeights<FMT> block_weights =
+                    moe_prefill_decode_block_weights<FMT>(desc, linear, payload);
 #pragma unroll
                 for (int rg = 0; rg < TILE_M; rg += 2)
                 {
@@ -3078,22 +3114,23 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
                         for (int ri = 0; ri < 2; ++ri)
                         {
                             const int local_row = rg + ri;
-                            const int32_t* a4 = staged_A[cur_buf] + local_row * 8;
+                            const int32_t* a4 = staged_A[cur_buf][local_kb] + local_row * 8;
                             const int32_t* sum_row =
-                                kSumAStride > 0 ? (staged_sum_a[cur_buf] + local_row * kSumAStride) : nullptr;
+                                kSumAStride > 0 ? (staged_sum_a[cur_buf][local_kb] + local_row * kSumAStride) : nullptr;
                             partials[local_row] = moe_prefill_accumulate_preloaded_block<FMT>(
                                 block_weights, packed_groups, a4,
                                 sum_row,
-                                staged_scales[cur_buf][local_row],
+                                staged_scales[cur_buf][local_kb][local_row],
                                 partials[local_row]);
                         }
                     }
                 }
             }
-            if (b + 1 < blocks_per_row)
+            if (b + 1 == staged_batch_base + K_BATCH && b + 1 < u_blocks_per_row)
             {
                 moe_prefill_block_barrier<TILE_N>();
-                cur_buf = next_buf;
+                cur_buf ^= 1;
+                staged_batch_base += K_BATCH;
             }
         }
 
@@ -3104,10 +3141,10 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
             {
                 if (local_row < u_rows)
                 {
-                    totals[local_row] = k_partitions == 1
+                    s_totals[local_row][threadIdx.x] = u_k_partitions == 1
                                             ? partials[local_row]
                                             : rocm_native_quantised_accumulate_rn(
-                                                  totals[local_row], partials[local_row]);
+                                                  s_totals[local_row][threadIdx.x], partials[local_row]);
                 }
             }
         }
@@ -3123,7 +3160,7 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
                 const int grouped_slot = u_first_slot + local_row;
                 down_partials[
                     static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
-                    static_cast<size_t>(n)] = totals[local_row];
+                    static_cast<size_t>(n)] = s_totals[local_row][threadIdx.x];
             }
         }
     }
@@ -3821,30 +3858,20 @@ namespace
         }
         config.rows = generated.tile_m;
         config.columns = generated.tile_n;
-        // Measured gfx906 Wave64 zero-s_barrier (TILE_N=64) + int4 inline staged_sum_a
-        // tile policy across all codebooks: avoids CTA starvation at small M (<=128)
-        // and lane waste on narrow sharded expert widths (N<=256 / N<=640).
+        // Measured gfx906 K_BATCH=3 + hoisted stage_k_batch tile policy across all codebooks:
+        // avoids CTA starvation at small M (<=128) and maximizes activation-staging reuse &
+        // 4-WG/CU occupancy (15.5 KB LDS <= 16 KB) with TILE_M=12, TILE_N=256 at M>128.
         if (m <= 128)
         {
             config.rows = 4;
             config.columns =
                 (role == MoEPrefillProjectionRole::GateUp && n <= 640) ? 64 : 128;
         }
-        else if (role == MoEPrefillProjectionRole::GateUp && n <= 256)
-        {
-            config.rows = 12;
-            config.columns = 64;
-        }
-        else if (role == MoEPrefillProjectionRole::Down && k <= 256)
-        {
-            config.rows = 12;
-            config.columns = 64;
-        }
         else if ((role == MoEPrefillProjectionRole::GateUp && n <= 640) ||
                  (role == MoEPrefillProjectionRole::Down && k <= 640))
         {
             config.rows = 12;
-            config.columns = 128;
+            config.columns = 256;
         }
         moe_prefill_apply_tile_override(role, config);
         return config;

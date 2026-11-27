@@ -35,7 +35,7 @@ namespace
     constexpr unsigned kHidden = 2560u;
     constexpr unsigned kLowRank = 320u;
     constexpr unsigned kThreads = 256u;
-    constexpr unsigned kKPartChunk = 8u;
+    constexpr unsigned kMaxKPartitions = 32u;
     constexpr unsigned kMaxOutElems = kMaxCUDARetainedQSAQHeads * 256u; // 6144
     constexpr unsigned kMaxOutBlocks = kMaxCUDARetainedQSAQHeads * 8u;  // 192
 
@@ -52,10 +52,10 @@ namespace
         moe::RetainedHCPrefixShared<kHidden> hc;
         struct
         {
-            alignas(16) int8_t act_codes[kHidden];          // 2560 B
-            alignas(16) float act_scales[kHidden / 32u];    // 320 B
-            alignas(16) float partials[kKPartChunk][32];    // 1024 B (256 floats -> also floating-row reduce)
-        } proj;                                             // 3904 B
+            alignas(16) int8_t act_codes[kHidden];           // 2560 B
+            alignas(16) float act_scales[kHidden / 32u];     // 320 B
+            alignas(16) float partials[kMaxKPartitions][32]; // 4096 B
+        } proj;                                              // 6976 B
         struct
         {
             float warp_sums[32];                             // 128 B
@@ -81,10 +81,10 @@ namespace
         } fold;
         struct
         {
-            alignas(16) int8_t act_codes[kMaxOutElems];     // 6144 B
-            alignas(16) float act_scales[kMaxOutBlocks];    // 768 B
-            alignas(16) float partials[kKPartChunk][16];    // 512 B
-        } wo;                                               // 7424 B
+            alignas(16) int8_t act_codes[kMaxOutElems];      // 6144 B
+            alignas(16) float act_scales[kMaxOutBlocks];     // 768 B
+            alignas(16) float partials[kMaxKPartitions][16]; // 2048 B
+        } wo;                                                // 8960 B
     };
     static_assert(sizeof(CUDARetainedQSAPostShared) <= 12288u,
         "CUDARetainedQSAPostShared must fit 4 CTAs/SM inside default 48 KB SMEM");
@@ -106,7 +106,7 @@ namespace
         dst_codes[lane] = static_cast<int8_t>(q);
     }
 
-    /** @brief Coalesced 256B/warp 8-column Q8_0 sub-tile with 2-block software pipelining. */
+    /** @brief Coalesced 256B/warp 8-column Q8_0 sub-tile (4-CTA/SM low-register schedule). */
     __device__ __forceinline__ float qsaAccumulateQ8SubTile8(
         const DeviceNativeQuantisedMatrixDesc &w,
         const uint16_t *w_scales,
@@ -126,41 +126,24 @@ namespace
             return 0.0f;
 
         unsigned elem = blk_begin * n + col;
-        int2 w_cur = valid_col
-            ? reinterpret_cast<const int2 *>(w.payload + static_cast<std::size_t>(elem) * 32u)[q_part]
-            : make_int2(0, 0);
-        uint16_t sc_cur = (q_part == 0u && valid_col) ? w_scales[elem] : 0u;
-
         float sum = 0.0f;
 #pragma unroll 1
         for (unsigned b = blk_begin; b < blk_end; ++b)
         {
-            int2 w_next = make_int2(0, 0);
-            uint16_t sc_next = 0u;
-            if (b + 1u < blk_end)
-            {
-                const unsigned next_elem = elem + n;
-                if (valid_col)
-                {
-                    w_next = reinterpret_cast<const int2 *>(
-                        w.payload + static_cast<std::size_t>(next_elem) * 32u)[q_part];
-                    if (q_part == 0u)
-                        sc_next = w_scales[next_elem];
-                }
-            }
+            const int2 w2 = valid_col
+                ? reinterpret_cast<const int2 *>(w.payload + static_cast<std::size_t>(elem) * 32u)[q_part]
+                : make_int2(0, 0);
             const int2 a2 = reinterpret_cast<const int2 *>(act_codes + b * 32u)[q_part];
-            int d = __dp4a(w_cur.x, a2.x, 0);
-            d = __dp4a(w_cur.y, a2.y, d);
+            int d = __dp4a(w2.x, a2.x, 0);
+            d = __dp4a(w2.y, a2.y, d);
             d += __shfl_xor_sync(0xffffffffu, d, 1);
             d += __shfl_xor_sync(0xffffffffu, d, 2);
             if (q_part == 0u && valid_col)
             {
-                const float ws = __half2float(__ushort_as_half(sc_cur));
+                const float ws = __half2float(__ushort_as_half(w_scales[elem]));
                 sum = __fadd_rn(sum,
                     device_native_quantised_contract::singleScaleBlock(d, ws, act_scales[b]));
             }
-            w_cur = w_next;
-            sc_cur = sc_next;
             elem += n;
         }
         return sum;
@@ -189,15 +172,16 @@ namespace
 
         float total = 0.0f;
 #pragma unroll 1
-        for (unsigned p_base = 0u; p_base < kb; p_base += kKPartChunk)
+        for (unsigned p_base = 0u; p_base < kb; p_base += kMaxKPartitions)
         {
-            const unsigned chunk = min(kKPartChunk, kb - p_base);
+            const unsigned chunk = min(kMaxKPartitions, kb - p_base);
             if constexpr (!GeneralCodebooks)
             {
                 const unsigned col_in_sub = lane >> 2;
                 const unsigned q_part = lane & 3u;
                 const auto *w_scales = static_cast<const uint16_t *>(w.scales);
                 const unsigned total_warp_tasks = 4u * chunk;
+#pragma unroll 1
                 for (unsigned task = warp; task < total_warp_tasks; task += 8u)
                 {
                     const unsigned dp = task >> 2;
@@ -215,9 +199,10 @@ namespace
             {
                 const unsigned col = col_base + lane;
                 const bool valid_col = col < n;
-                if (warp < chunk)
+#pragma unroll 1
+                for (unsigned dp = warp; dp < chunk; dp += 8u)
                 {
-                    const unsigned p = p_base + warp;
+                    const unsigned p = p_base + dp;
                     const unsigned blk_begin = p * bps;
                     const unsigned blk_end = min(blocks, blk_begin + bps);
                     float sum = 0.0f;
@@ -231,13 +216,14 @@ namespace
                                 w, linear, act_codes + b * 32u, act_scales[b]));
                         }
                     }
-                    partials[warp][lane] = sum;
+                    partials[dp][lane] = sum;
                 }
             }
             __syncthreads();
 
             if (warp == 0u && (col_base + lane) < n)
             {
+#pragma unroll 1
                 for (unsigned dp = 0u; dp < chunk; ++dp)
                     total = __fadd_rn(total, partials[dp][lane]);
             }
@@ -266,11 +252,12 @@ namespace
         }
     }
 
-    /** @brief Complete 16-column Wo projection tile (Q8_0 fast path or all-18-codebook general path). */
+    /** @brief Dynamic <=16-column single-wave Wo projection tile (2 lanes/col int4 for Q8_0, general for all 18 codebooks). */
     template <bool GeneralCodebooks>
-    __device__ __forceinline__ void qsaCompleteTile16(
+    __device__ __forceinline__ void qsaCompleteTileDynamic16(
         const CUDARetainedQSAProjection &proj,
         unsigned col_base,
+        unsigned col_count,
         const int8_t *act_codes,
         const float *act_scales,
         float (*partials)[16])
@@ -286,35 +273,59 @@ namespace
 
         float total = 0.0f;
 #pragma unroll 1
-        for (unsigned p_base = 0u; p_base < kb; p_base += kKPartChunk)
+        for (unsigned p_base = 0u; p_base < kb; p_base += kMaxKPartitions)
         {
-            const unsigned chunk = min(kKPartChunk, kb - p_base);
+            const unsigned chunk = min(kMaxKPartitions, kb - p_base);
             if constexpr (!GeneralCodebooks)
             {
-                const unsigned col_in_sub = lane >> 2;
-                const unsigned q_part = lane & 3u;
+                const unsigned col_in_tile = lane >> 1; // 0..15
+                const unsigned half_part = lane & 1u;   // 0..1 (16B = int4 per lane)
                 const auto *w_scales = static_cast<const uint16_t *>(w.scales);
-                const unsigned total_warp_tasks = 2u * chunk;
-                for (unsigned task = warp; task < total_warp_tasks; task += 8u)
+                const unsigned col = col_base + col_in_tile;
+                const bool valid_col = (col_in_tile < col_count) && (col < n);
+#pragma unroll 1
+                for (unsigned dp = warp; dp < chunk; dp += 8u)
                 {
-                    const unsigned dp = task >> 1;
                     const unsigned p = p_base + dp;
-                    const unsigned st = task & 1u;
                     const unsigned blk_begin = p * bps;
                     const unsigned blk_end = min(blocks, blk_begin + bps);
-                    const float sum = qsaAccumulateQ8SubTile8(
-                        w, w_scales, act_codes, act_scales, col_base + st * 8u, blk_begin, blk_end, lane);
-                    if (q_part == 0u)
-                        partials[dp][st * 8u + col_in_sub] = sum;
+                    float sum = 0.0f;
+                    if (blk_begin < blk_end)
+                    {
+                        unsigned elem = blk_begin * n + col;
+#pragma unroll 1
+                        for (unsigned b = blk_begin; b < blk_end; ++b)
+                        {
+                            const int4 w4 = valid_col
+                                ? reinterpret_cast<const int4 *>(w.payload + static_cast<std::size_t>(elem) * 32u)[half_part]
+                                : make_int4(0, 0, 0, 0);
+                            const int4 a4 = reinterpret_cast<const int4 *>(act_codes + b * 32u)[half_part];
+                            int d = __dp4a(w4.x, a4.x, 0);
+                            d = __dp4a(w4.y, a4.y, d);
+                            d = __dp4a(w4.z, a4.z, d);
+                            d = __dp4a(w4.w, a4.w, d);
+                            d += __shfl_xor_sync(0xffffffffu, d, 1);
+                            if (half_part == 0u && valid_col)
+                            {
+                                const float ws = __half2float(__ushort_as_half(w_scales[elem]));
+                                sum = __fadd_rn(sum,
+                                    device_native_quantised_contract::singleScaleBlock(d, ws, act_scales[b]));
+                            }
+                            elem += n;
+                        }
+                    }
+                    if (half_part == 0u && col_in_tile < col_count)
+                        partials[dp][col_in_tile] = sum;
                 }
             }
             else
             {
                 const unsigned col = col_base + lane;
-                const bool valid_col = (lane < 16u) && (col < n);
-                if (warp < chunk)
+                const bool valid_col = (lane < col_count) && (col < n);
+#pragma unroll 1
+                for (unsigned dp = warp; dp < chunk; dp += 8u)
                 {
-                    const unsigned p = p_base + warp;
+                    const unsigned p = p_base + dp;
                     const unsigned blk_begin = p * bps;
                     const unsigned blk_end = min(blocks, blk_begin + bps);
                     float sum = 0.0f;
@@ -328,21 +339,22 @@ namespace
                                 w, linear, act_codes + b * 32u, act_scales[b]));
                         }
                     }
-                    if (lane < 16u)
-                        partials[warp][lane] = sum;
+                    if (lane < col_count)
+                        partials[dp][lane] = sum;
                 }
             }
             __syncthreads();
 
-            if (tid < 16u && (col_base + tid) < n)
+            if (tid < col_count && (col_base + tid) < n)
             {
+#pragma unroll 1
                 for (unsigned dp = 0u; dp < chunk; ++dp)
                     total = __fadd_rn(total, partials[dp][tid]);
             }
             __syncthreads();
         }
 
-        if (tid < 16u && (col_base + tid) < n)
+        if (tid < col_count && (col_base + tid) < n)
             proj.output[col_base + tid] = total;
     }
 
@@ -361,6 +373,7 @@ namespace
         if (format == CUDARetainedQSAIndexerFormat::BF16)
         {
             const auto *w = static_cast<const std::uint16_t *>(weights) + row_base;
+#pragma unroll 1
             for (unsigned j = tid; j < kHidden; j += kThreads)
             {
                 const float wv = __uint_as_float(static_cast<std::uint32_t>(w[j]) << 16);
@@ -370,6 +383,7 @@ namespace
         else if (format == CUDARetainedQSAIndexerFormat::FP16)
         {
             const auto *w = static_cast<const std::uint16_t *>(weights) + row_base;
+#pragma unroll 1
             for (unsigned j = tid; j < kHidden; j += kThreads)
             {
                 const float wv = __half2float(__ushort_as_half(w[j]));
@@ -379,6 +393,7 @@ namespace
         else
         {
             const auto *w = static_cast<const float *>(weights) + row_base;
+#pragma unroll 1
             for (unsigned j = tid; j < kHidden; j += kThreads)
                 sum += mixed[j] * w[j];
         }
@@ -430,7 +445,7 @@ namespace
 
     /** @brief Resident cooperative CUDA QSA Pre-Attention megakernel. */
     template <bool GeneralCodebooks>
-    __global__ __launch_bounds__(kThreads, GeneralCodebooks ? 2 : 3)
+    __global__ __launch_bounds__(kThreads, GeneralCodebooks ? 2 : 4)
     void cudaRetainedQSAPreAttentionKernel(const __grid_constant__ CUDARetainedQSAPreInvocation inv)
     {
         __shared__ CUDARetainedQSAPreShared shared;
@@ -464,8 +479,8 @@ namespace
         // =====================================================================
         // Phase 1: Shared blockwise Q8 staging + Wq(split)/Wk/Wv + qsa_key/query
         // =====================================================================
-        const float *mixed = inv.hc.mixed;
         {
+            const float *mixed = inv.hc.mixed;
             const unsigned warp = tid >> 5;
             const unsigned lane = tid & 31u;
 #pragma unroll 1
@@ -475,88 +490,88 @@ namespace
                 qsaQuantizeBlockwiseWarp32(
                     val, shared.proj.act_codes + b * 32u, shared.proj.act_scales + b, lane);
             }
-        }
-        __syncthreads();
+            __syncthreads();
 
-        const int prefix_tokens = inv.replay_out->prefix_tokens;
-        const bool run_qsa_query =
-            (inv.qsa_query.format != CUDARetainedQSAIndexerFormat::Absent) &&
-            (!inv.qsa_query.ranking_only_guard ||
-             prefix_tokens >= llaminar2::qwen4exp::QwenSparseFirstRankingLogicalRow);
+            const int prefix_tokens = inv.replay_out->prefix_tokens;
+            const bool run_qsa_query =
+                (inv.qsa_query.format != CUDARetainedQSAIndexerFormat::Absent) &&
+                (!inv.qsa_query.ranking_only_guard ||
+                 prefix_tokens >= llaminar2::qwen4exp::QwenSparseFirstRankingLogicalRow);
 
-        const unsigned wq_tiles = (static_cast<unsigned>(inv.wq.weights.n) + 31u) >> 5;
-        const unsigned wk_tiles = (static_cast<unsigned>(inv.wk.weights.n) + 31u) >> 5;
-        const unsigned wv_tiles = (static_cast<unsigned>(inv.wv.weights.n) + 31u) >> 5;
-        const unsigned key_q_tiles = (inv.qsa_key.format == CUDARetainedQSAIndexerFormat::NativeQuantised)
-            ? ((static_cast<unsigned>(inv.qsa_key.n) + 31u) >> 5) : 0u;
-        const unsigned qry_q_tiles = (run_qsa_query &&
-            inv.qsa_query.format == CUDARetainedQSAIndexerFormat::NativeQuantised)
-            ? ((static_cast<unsigned>(inv.qsa_query.n) + 31u) >> 5) : 0u;
-        const unsigned total_q_tiles = wq_tiles + wk_tiles + wv_tiles + key_q_tiles + qry_q_tiles;
+            const unsigned wq_tiles = (static_cast<unsigned>(inv.wq.weights.n) + 31u) >> 5;
+            const unsigned wk_tiles = (static_cast<unsigned>(inv.wk.weights.n) + 31u) >> 5;
+            const unsigned wv_tiles = (static_cast<unsigned>(inv.wv.weights.n) + 31u) >> 5;
+            const unsigned key_q_tiles = (inv.qsa_key.format == CUDARetainedQSAIndexerFormat::NativeQuantised)
+                ? ((static_cast<unsigned>(inv.qsa_key.n) + 31u) >> 5) : 0u;
+            const unsigned qry_q_tiles = (run_qsa_query &&
+                inv.qsa_query.format == CUDARetainedQSAIndexerFormat::NativeQuantised)
+                ? ((static_cast<unsigned>(inv.qsa_query.n) + 31u) >> 5) : 0u;
+            const unsigned total_q_tiles = wq_tiles + wk_tiles + wv_tiles + key_q_tiles + qry_q_tiles;
 
 #pragma unroll 1
-        for (unsigned tile = bid; tile < total_q_tiles; tile += num_ctas)
-        {
-            const CUDARetainedQSAProjection *proj = nullptr;
-            unsigned col_base = 0u;
-            bool split_q = false;
-            if (tile < wq_tiles)
+            for (unsigned tile = bid; tile < total_q_tiles; tile += num_ctas)
             {
-                proj = &inv.wq;
-                col_base = tile << 5;
-                split_q = true;
+                const CUDARetainedQSAProjection *proj = nullptr;
+                unsigned col_base = 0u;
+                bool split_q = false;
+                if (tile < wq_tiles)
+                {
+                    proj = &inv.wq;
+                    col_base = tile << 5;
+                    split_q = true;
+                }
+                else if (tile < wq_tiles + wk_tiles)
+                {
+                    proj = &inv.wk;
+                    col_base = (tile - wq_tiles) << 5;
+                }
+                else if (tile < wq_tiles + wk_tiles + wv_tiles)
+                {
+                    proj = &inv.wv;
+                    col_base = (tile - wq_tiles - wk_tiles) << 5;
+                }
+                else if (tile < wq_tiles + wk_tiles + wv_tiles + key_q_tiles)
+                {
+                    proj = &inv.qsa_key.quantised;
+                    col_base = (tile - wq_tiles - wk_tiles - wv_tiles) << 5;
+                }
+                else
+                {
+                    proj = &inv.qsa_query.quantised;
+                    col_base = (tile - wq_tiles - wk_tiles - wv_tiles - key_q_tiles) << 5;
+                }
+                qsaCompleteTile32<GeneralCodebooks>(
+                    *proj, col_base, shared.proj.act_codes, shared.proj.act_scales,
+                    shared.proj.partials, split_q, inv.Q, inv.fa_gate);
             }
-            else if (tile < wq_tiles + wk_tiles)
-            {
-                proj = &inv.wk;
-                col_base = (tile - wq_tiles) << 5;
-            }
-            else if (tile < wq_tiles + wk_tiles + wv_tiles)
-            {
-                proj = &inv.wv;
-                col_base = (tile - wq_tiles - wk_tiles) << 5;
-            }
-            else if (tile < wq_tiles + wk_tiles + wv_tiles + key_q_tiles)
-            {
-                proj = &inv.qsa_key.quantised;
-                col_base = (tile - wq_tiles - wk_tiles - wv_tiles) << 5;
-            }
-            else
-            {
-                proj = &inv.qsa_query.quantised;
-                col_base = (tile - wq_tiles - wk_tiles - wv_tiles - key_q_tiles) << 5;
-            }
-            qsaCompleteTile32<GeneralCodebooks>(
-                *proj, col_base, shared.proj.act_codes, shared.proj.act_scales,
-                shared.proj.partials, split_q, inv.Q, inv.fa_gate);
-        }
 
-        // Schedule floating BF16/FP16/FP32 indexer rows onto tail CTAs first so they
-        // run in the tail shadow of the quantized tiles.
-        const unsigned key_f_rows = (inv.qsa_key.format == CUDARetainedQSAIndexerFormat::FP32 ||
-                                     inv.qsa_key.format == CUDARetainedQSAIndexerFormat::FP16 ||
-                                     inv.qsa_key.format == CUDARetainedQSAIndexerFormat::BF16)
-            ? static_cast<unsigned>(inv.qsa_key.n) : 0u;
-        const unsigned qry_f_rows = (run_qsa_query &&
-                                     (inv.qsa_query.format == CUDARetainedQSAIndexerFormat::FP32 ||
-                                      inv.qsa_query.format == CUDARetainedQSAIndexerFormat::FP16 ||
-                                      inv.qsa_query.format == CUDARetainedQSAIndexerFormat::BF16))
-            ? static_cast<unsigned>(inv.qsa_query.n) : 0u;
-        const unsigned total_f_rows = key_f_rows + qry_f_rows;
-        if (total_f_rows > 0u)
-        {
-            const unsigned shift = total_q_tiles % num_ctas;
-            const unsigned shifted_bid = (bid + num_ctas - shift) % num_ctas;
-            float *partials_flat = &shared.proj.partials[0][0];
-#pragma unroll 1
-            for (unsigned r = shifted_bid; r < total_f_rows; r += num_ctas)
+            // Schedule floating BF16/FP16/FP32 indexer rows onto tail CTAs first so they
+            // run in the tail shadow of the quantized tiles.
+            const unsigned key_f_rows = (inv.qsa_key.format == CUDARetainedQSAIndexerFormat::FP32 ||
+                                         inv.qsa_key.format == CUDARetainedQSAIndexerFormat::FP16 ||
+                                         inv.qsa_key.format == CUDARetainedQSAIndexerFormat::BF16)
+                ? static_cast<unsigned>(inv.qsa_key.n) : 0u;
+            const unsigned qry_f_rows = (run_qsa_query &&
+                                         (inv.qsa_query.format == CUDARetainedQSAIndexerFormat::FP32 ||
+                                          inv.qsa_query.format == CUDARetainedQSAIndexerFormat::FP16 ||
+                                          inv.qsa_query.format == CUDARetainedQSAIndexerFormat::BF16))
+                ? static_cast<unsigned>(inv.qsa_query.n) : 0u;
+            const unsigned total_f_rows = key_f_rows + qry_f_rows;
+            if (total_f_rows > 0u)
             {
-                const bool is_key = r < key_f_rows;
-                const void *fw = is_key ? inv.qsa_key.floating_weights : inv.qsa_query.floating_weights;
-                const auto fmt = is_key ? inv.qsa_key.format : inv.qsa_query.format;
-                const unsigned row_idx = is_key ? r : (r - key_f_rows);
-                float *fout = is_key ? inv.qsa_key.floating_output : inv.qsa_query.floating_output;
-                qsaCompleteFloatingRow(mixed, fw, fmt, row_idx, fout, partials_flat);
+                const unsigned shift = total_q_tiles % num_ctas;
+                const unsigned shifted_bid = (bid + num_ctas - shift) % num_ctas;
+                float *partials_flat = &shared.proj.partials[0][0];
+#pragma unroll 1
+                for (unsigned r = shifted_bid; r < total_f_rows; r += num_ctas)
+                {
+                    const bool is_key = r < key_f_rows;
+                    const void *fw = is_key ? inv.qsa_key.floating_weights : inv.qsa_query.floating_weights;
+                    const auto fmt = is_key ? inv.qsa_key.format : inv.qsa_query.format;
+                    const unsigned row_idx = is_key ? r : (r - key_f_rows);
+                    float *fout = is_key ? inv.qsa_key.floating_output : inv.qsa_query.floating_output;
+                    qsaCompleteFloatingRow(mixed, fw, fmt, row_idx, fout, partials_flat);
+                }
             }
         }
 
@@ -566,6 +581,7 @@ namespace
         // Phase 2: Per-head Q/K RMSNorm + 64-dim partial RoPE + FP16 KV append
         //          + canonical device ring_head/cached_tokens advance
         // =====================================================================
+        const int prefix_tokens = inv.replay_out->prefix_tokens;
         const int pos = inv.position_ids_device[0];
         const int cap = inv.kv_token_capacity;
         const int old_head = (inv.row_params_out[0].ring_row_origin + prefix_tokens) % cap;
@@ -903,12 +919,19 @@ namespace
             shared.wo.act_scales[tid] = wo_scales_global[tid];
         __syncthreads();
 
-        const unsigned wo_tiles = (static_cast<unsigned>(inv.wo.weights.n) + 15u) >> 4;
+        // Dynamic single-wave Wo tile width: spreads all columns across num_ctas
+        // (e.g. cols_per_cta=9 -> 285/296 = 96.3% active CTAs in ONE wave on SM86)
+        // while remaining 100% general for any output width and any GPU grid size.
+        const unsigned wo_n = static_cast<unsigned>(inv.wo.weights.n);
+        const unsigned cols_per_cta = min(16u, max(1u, (wo_n + num_ctas - 1u) / num_ctas));
+        const unsigned wo_tiles = (wo_n + cols_per_cta - 1u) / cols_per_cta;
 #pragma unroll 1
         for (unsigned tile = bid; tile < wo_tiles; tile += num_ctas)
         {
-            qsaCompleteTile16<GeneralCodebooks>(
-                inv.wo, tile << 4, shared.wo.act_codes, shared.wo.act_scales, shared.wo.partials);
+            const unsigned col_base = tile * cols_per_cta;
+            const unsigned col_count = min(cols_per_cta, wo_n - col_base);
+            qsaCompleteTileDynamic16<GeneralCodebooks>(
+                inv.wo, col_base, col_count, shared.wo.act_codes, shared.wo.act_scales, shared.wo.partials);
         }
     }
 

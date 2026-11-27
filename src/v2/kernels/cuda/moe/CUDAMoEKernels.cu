@@ -2438,13 +2438,14 @@ namespace llaminar2::cuda::moe
                 record_ready();
             const unsigned shared_gate_up_tasks =
                 retained_suffix_gate_up_k_splits * static_cast<unsigned>(arguments.shared.gate.n / 32);
-            // Respect the exact 8-SM co-residency reservation on SuffixGateUp so outbound
-            // mapped dispatch (packSingleRowDispatchBatchKernel) and persistent service kernels
-            // launch immediately after TopKPlan without waiting for SuffixGateUp to drain.
-            const unsigned gate_up_grid = std::min(shared_gate_up_tasks, route_prefix_->availableProcessors());
+            // Size SuffixGateUp to exact guaranteed live shared-expert tasks (capped at 2 CTAs/SM
+            // of availableProcessors) and SuffixDown to hidden / 16 (160 CTAs x 10 half-warps =
+            // 10 warps/SM) while leaving >1,000 free threads/SM for instant co-resident dispatch.
+            const unsigned gate_up_grid =
+                std::min(shared_gate_up_tasks, route_prefix_->availableProcessors() * 2u);
             if (cudaLaunchKernel(suffix_gate_up_, dim3(gate_up_grid, 1),
                     dim3(retained_suffix_gate_up_threads), parameters, 0, native) != cudaSuccess ||
-                cudaLaunchKernel(suffix_down_, dim3(kQFNDecodeGateUpK / 32, 1),
+                cudaLaunchKernel(suffix_down_, dim3(kQFNDecodeGateUpK / 16, 1),
                     dim3(retained_suffix_down_threads), parameters, 0, native) != cudaSuccess)
                 throw std::runtime_error("CUDA retained QFN resident suffix launch failed");
             return;

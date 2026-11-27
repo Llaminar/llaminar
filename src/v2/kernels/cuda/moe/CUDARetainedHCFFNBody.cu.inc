@@ -282,7 +282,7 @@
         constexpr int width = kQFNDecodeGateUpK;
         constexpr int experts = 4;
         float sums[experts]{};
-#pragma unroll
+#pragma unroll 1
         for (unsigned i = threadIdx.x; i < width; i += kThreads)
         {
             const float value = __half2float(__float2half_rn(hidden[i]));
@@ -322,7 +322,7 @@
     {
         constexpr int width = kQFNDecodeGateUpK;
         float sum0 = 0.0f, sum1 = 0.0f;
-#pragma unroll 2
+#pragma unroll 1
         for (unsigned i = threadIdx.x; i < width; i += kThreads)
         {
             const float value = __half2float(__float2half_rn(hidden[i]));
@@ -374,7 +374,7 @@
      * registers with zero spills and launches 296 resident CTAs (4 CTAs/SM on SM86).
      */
     template<bool PublishHCActivated, bool PublishHCUp, bool GeneralCodebooks = false>
-    __global__ __launch_bounds__(kThreads, GeneralCodebooks ? 2 : 3) void retainedQFNM1HCRouterKernel(
+    __global__ __launch_bounds__(kThreads, GeneralCodebooks ? 2 : 4) void retainedQFNM1HCRouterKernel(
         const __grid_constant__ RetainedM1HCFFN args)
     {
         using namespace llaminar2::cuda::moe;
@@ -386,30 +386,29 @@
             float shared_factor[kThreads];
         } workspace;
 
-        const auto& router = args.router;
         constexpr int hidden = kQFNDecodeGateUpK;
-        const unsigned routed_packets = static_cast<unsigned>(args.routed_width) / 32u;
-        const unsigned shared_packets = static_cast<unsigned>(args.shared.gate.n) / 32u;
-        const unsigned lane = threadIdx.x % 32;
-        const unsigned warp = threadIdx.x / 32;
-
         if (args.profile_ns && blockIdx.x == 0 && threadIdx.x == 0)
             args.profile_ns[0] = retainedRouteClock();
-        const unsigned max_packets = static_cast<unsigned>(router.top_k) * routed_packets + shared_packets;
-        if (blockIdx.x == 0)
         {
-            for (unsigned i = threadIdx.x; i < max_packets; i += blockDim.x)
-                args.suffix_done[i] = 0u;
+            const unsigned max_packets =
+                static_cast<unsigned>(args.router.top_k) * (static_cast<unsigned>(args.routed_width) >> 5) +
+                (static_cast<unsigned>(args.shared.gate.n) >> 5);
+            if (blockIdx.x == 0)
+            {
+                for (unsigned i = threadIdx.x; i < max_packets; i += blockDim.x)
+                    args.suffix_done[i] = 0u;
+            }
+            uint32_t* hc_down_done = (args.suffix_done && max_packets >= static_cast<unsigned>(args.hc.down.n >> 5))
+                ? args.suffix_done : nullptr;
+            publishRetainedHCPrefix<PublishHCActivated, PublishHCUp, hidden, true, GeneralCodebooks>(
+                args.hc, workspace.hc, grid, args.profile_ns, hc_down_done);
         }
-
-        uint32_t* hc_down_done = (args.suffix_done && max_packets >= static_cast<unsigned>(args.hc.down.n / 32))
-            ? args.suffix_done : nullptr;
-        publishRetainedHCPrefix<PublishHCActivated, PublishHCUp, hidden, true, GeneralCodebooks>(
-            args.hc, workspace.hc, grid, args.profile_ns, hc_down_done);
         if (args.profile_ns && blockIdx.x == 0 && threadIdx.x == 0)
             args.profile_ns[4] = retainedRouteClock();
 
-        const auto* router_weights = reinterpret_cast<const __half*>(router.weights);
+        const unsigned lane = threadIdx.x & 31u;
+        const unsigned warp = threadIdx.x >> 5;
+        const auto* router_weights = reinterpret_cast<const __half*>(args.router.weights);
         if (gridDim.x >= 267u)
         {
             // Full-GPU single-wave overlapped Router (256 CTAs x 2 experts) + HiddenQ8 (10 CTAs) + SharedGate (1 CTA).
@@ -417,14 +416,14 @@
             {
                 const int first_expert = 2 * static_cast<int>(blockIdx.x);
                 retainedRouterTwo(args.hc.mixed, router_weights + first_expert * hidden,
-                    router.logits + first_expert, workspace.router_tiles);
+                    args.router.logits + first_expert, workspace.router_tiles);
             }
             else if (blockIdx.x < 266u)
             {
                 const unsigned packet = ((blockIdx.x - 256u) * 8u + warp) * 32u;
                 if (packet < static_cast<unsigned>(hidden))
                     retainedHiddenQ8(args.hc.mixed[packet + lane], args.hidden_codes + packet,
-                        args.hidden_scales + packet / 32u, lane);
+                        args.hidden_scales + (packet >> 5), lane);
             }
             else if (blockIdx.x == 266u && args.shared_publication == RetainedM1SharedPublication::GatedComplete)
             {
@@ -434,44 +433,22 @@
                     *args.shared_gate_factor = factor;
             }
         }
-        else if (gridDim.x >= 139u)
-        {
-            // Single-wave overlapped Router (128 CTAs x 4 experts) + HiddenQ8 (10 CTAs) + SharedGate (1 CTA).
-            if (blockIdx.x < 128u)
-            {
-                const int first_expert = 4 * static_cast<int>(blockIdx.x);
-                retainedRouterFour(args.hc.mixed, router_weights + first_expert * hidden,
-                    router.logits + first_expert, workspace.router_tiles);
-            }
-            else if (blockIdx.x < 138u)
-            {
-                const unsigned packet = ((blockIdx.x - 128u) * 8u + warp) * 32u;
-                if (packet < static_cast<unsigned>(hidden))
-                    retainedHiddenQ8(args.hc.mixed[packet + lane], args.hidden_codes + packet,
-                        args.hidden_scales + packet / 32u, lane);
-            }
-            else if (blockIdx.x == 138u && args.shared_publication == RetainedM1SharedPublication::GatedComplete)
-            {
-                const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,
-                    hidden, workspace.shared_factor);
-                if (threadIdx.x == 0)
-                    *args.shared_gate_factor = factor;
-            }
-        }
         else
         {
+#pragma unroll 1
             for (int tile = blockIdx.x; tile < kRetainedQFNExpertCount / 4; tile += gridDim.x)
             {
                 const int first_expert = 4 * tile;
                 retainedRouterFour(args.hc.mixed, router_weights + first_expert * hidden,
-                    router.logits + first_expert, workspace.router_tiles);
+                    args.router.logits + first_expert, workspace.router_tiles);
                 __syncthreads();
             }
             const unsigned first_thread = blockIdx.x * blockDim.x + threadIdx.x;
             const unsigned threads = gridDim.x * blockDim.x;
-            for (unsigned packet = first_thread / 32 * 32; packet < static_cast<unsigned>(hidden); packet += threads)
+#pragma unroll 1
+            for (unsigned packet = (first_thread >> 5) << 5; packet < static_cast<unsigned>(hidden); packet += threads)
                 retainedHiddenQ8(args.hc.mixed[packet + lane], args.hidden_codes + packet,
-                    args.hidden_scales + packet / 32, lane);
+                    args.hidden_scales + (packet >> 5), lane);
             if (blockIdx.x == 1 && args.shared_publication == RetainedM1SharedPublication::GatedComplete)
             {
                 const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,
@@ -544,8 +521,9 @@
         if constexpr (IndependentLocalShard)
         {
             __shared__ RetainedTopKShared tk;
-            __shared__ DeviceMoEExpertDescriptorView preloaded_desc[kMaxTopK];
+            __shared__ RetainedM1Expert preloaded_expert[kMaxTopK];
             __shared__ uint8_t preloaded_local[kMaxTopK];
+            __shared__ uint32_t shared_exec_bank;
             const unsigned tid = threadIdx.x;
             const float l0 = router.logits[tid];
             const float l1 = router.logits[tid + kThreads];
@@ -610,32 +588,35 @@
                 if (router.normalize && topk_sum > 0.0f)
                     for (int slot = 0; slot < router.top_k; ++slot)
                         tk.selected_weights[slot] = tk.selected_weights[slot] / topk_sum;
+                const uint32_t exec_bank = runtime_require_decode_execution_bank(runtime);
+                if (exec_bank > 1u)
+                    __trap();
+                shared_exec_bank = exec_bank;
             }
             __syncthreads();
             if (args.profile_ns && tid == 0)
                 args.profile_ns[11] = retainedRouteClock();
 
             {
-                const uint32_t exec_bank = runtime_require_decode_execution_bank(runtime);
-                if (exec_bank > 1u)
-                    __trap();
+                const uint32_t exec_bank = shared_exec_bank;
                 const auto& bank = runtime_placement_banks(runtime)[exec_bank];
-                const unsigned warp = tid / 32u;
-                const unsigned lane = tid % 32u;
-                static_assert(sizeof(DeviceMoEExpertDescriptorView) % sizeof(uint64_t) == 0);
-                constexpr unsigned desc_words = sizeof(DeviceMoEExpertDescriptorView) / sizeof(uint64_t);
+                const unsigned warp = tid >> 5;
+                const unsigned lane = tid & 31u;
+                static_assert(sizeof(DeviceNativeQuantisedMatrixDesc) % sizeof(uint64_t) == 0);
+                constexpr unsigned words_per_mat = sizeof(DeviceNativeQuantisedMatrixDesc) / sizeof(uint64_t);
                 for (int s = static_cast<int>(warp); s < router.top_k; s += 8)
                 {
                     const int e = tk.selected[s];
                     const bool maybe_local = e >= 0 && e < router.experts && bank.local_compute_mask[e] != 0u;
                     if (lane == 0u)
                         preloaded_local[s] = maybe_local ? 1u : 0u;
-                    if (maybe_local)
+                    if (maybe_local && lane < words_per_mat)
                     {
-                        const auto* src_words = reinterpret_cast<const uint64_t*>(&bank.experts[e]);
-                        auto* dst_words = reinterpret_cast<uint64_t*>(&preloaded_desc[s]);
-                        for (unsigned w = lane; w < desc_words; w += 32u)
-                            dst_words[w] = src_words[w];
+                        const auto& src = bank.experts[e];
+                        auto& dst = preloaded_expert[s];
+                        reinterpret_cast<uint64_t*>(&dst.gate)[lane] = reinterpret_cast<const uint64_t*>(&src.gate)[lane];
+                        reinterpret_cast<uint64_t*>(&dst.up)[lane] = reinterpret_cast<const uint64_t*>(&src.up)[lane];
+                        reinterpret_cast<uint64_t*>(&dst.down)[lane] = reinterpret_cast<const uint64_t*>(&src.down)[lane];
                     }
                 }
             }
@@ -644,9 +625,7 @@
             {
                 const int slot = static_cast<int>(tid);
                 const bool in_route = slot < router.top_k;
-                const uint32_t execution_bank = runtime_require_decode_execution_bank(runtime);
-                if (execution_bank > 1u)
-                    __trap();
+                const uint32_t execution_bank = shared_exec_bank;
                 const bool shape_ok = runtime_shape_ok(runtime, execution_bank, router.experts, router.top_k);
                 if (!runtime_route_assignment_ledger_ok(runtime, router.top_k))
                     __trap();
@@ -688,8 +667,8 @@
                 const int local_expert = (in_route && shape_ok && local_compute) ? expert_id : -1;
                 const unsigned present = __ballot_sync(0xffffffffu, local_expert >= 0);
                 const int local_count = __popc(present);
-                const DeviceMoEExpertDescriptorView* descriptor =
-                    (local_expert >= 0 && preloaded_local[slot]) ? &preloaded_desc[slot] : nullptr;
+                const RetainedM1Expert* descriptor =
+                    (local_expert >= 0 && preloaded_local[slot]) ? &preloaded_expert[slot] : nullptr;
                 unsigned promoted = 0;
                 if (can_promote_gate)
                     promoted = __ballot_sync(0xffffffffu, descriptor && descriptor->gate.codebook_id == gate_promoted);
@@ -727,13 +706,13 @@
             __syncthreads();
             {
                 const int n_copy = args.route_order[0];
-                const unsigned warp = tid / 32u;
-                const unsigned lane = tid % 32u;
+                const unsigned warp = tid >> 5;
+                const unsigned lane = tid & 31u;
                 static_assert(sizeof(DeviceNativeQuantisedMatrixDesc) % sizeof(uint64_t) == 0);
                 constexpr unsigned words_per_mat = sizeof(DeviceNativeQuantisedMatrixDesc) / sizeof(uint64_t);
                 for (int packed = static_cast<int>(warp); packed < n_copy; packed += 8)
                 {
-                    const auto& view = preloaded_desc[preloaded_local[packed]];
+                    const auto& view = preloaded_expert[preloaded_local[packed]];
                     auto& dst = args.selected[packed];
                     if (lane < words_per_mat)
                     {
@@ -758,7 +737,7 @@
                             dim3(retained_suffix_gate_up_k_splits, total_gate_up_packets)) != cudaSuccess ||
                         cudaGraphKernelNodeSetGridDim(
                             static_cast<cudaGraphDeviceNode_t>(args.suffix_down_node),
-                            dim3(static_cast<unsigned>(hidden / 32), local_active + 1u)) != cudaSuccess)
+                            dim3(static_cast<unsigned>(hidden / 16), local_active + 1u)) != cudaSuccess)
                         __trap();
                 }
 #endif
@@ -768,11 +747,12 @@
         {
             __shared__ RetainedTopKShared tk;
             __shared__ RuntimeDecodeDispatchScratch dispatch;
-            __shared__ DeviceMoEExpertDescriptorView preloaded_desc[kMaxTopK];
+            __shared__ RetainedM1Expert preloaded_expert[kMaxTopK];
             __shared__ uint8_t packed_slots[kMaxTopK];
             __shared__ float shared_topk_sum;
             __shared__ uint32_t shared_exec_bank;
             __shared__ uint32_t shared_shape_ok;
+            __shared__ uint32_t shared_has_multi_resident;
             const unsigned tid = threadIdx.x;
             const float l0 = router.logits[tid];
             const float l1 = router.logits[tid + kThreads];
@@ -831,6 +811,8 @@
 #endif
             if (tid == 0u)
             {
+                if (args.profile_ns)
+                    args.profile_ns[11] = retainedRouteClock();
                 runtime_require_decode_row_policy(runtime, router.local_policy);
                 const uint32_t execution_bank = runtime_require_decode_execution_bank(runtime);
                 if (execution_bank > 1u)
@@ -841,7 +823,13 @@
                 float topk_sum = 0.0f;
                 for (int k = 0; k < router.top_k; ++k)
                     topk_sum += tk.selected_weights[k];
-                if (shape_ok)
+                const auto& bank_view = runtime_placement_banks(runtime)[execution_bank];
+                const bool needs_serial_replicated =
+                    shape_ok &&
+                    router.local_policy != llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal &&
+                    router.local_policy != llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal &&
+                    runtime_multi_resident_expert_count(bank_view) != 0u;
+                if (needs_serial_replicated)
                 {
                     runtime_resolve_decode_dispatch(
                         runtime, execution_bank, tk.selected, router.experts, router.top_k,
@@ -851,17 +839,47 @@
                 shared_topk_sum = topk_sum;
                 shared_exec_bank = execution_bank;
                 shared_shape_ok = shape_ok ? 1u : 0u;
+                shared_has_multi_resident = needs_serial_replicated ? 1u : 0u;
             }
             __syncthreads();
 
             const uint32_t exec_bank = shared_exec_bank;
             const bool shape_ok = shared_shape_ok != 0u;
+            const bool used_serial_dispatch = shared_has_multi_resident != 0u;
             const auto& bank = runtime_placement_banks(runtime)[exec_bank];
             const unsigned warp = tid >> 5;
             const unsigned lane = tid & 31u;
 
+            // Parallel non-replicated dispatch resolution on warp 0 (overlaps all top_k global loads).
+            if (!used_serial_dispatch && tid < static_cast<unsigned>(router.top_k))
+            {
+                const int k = static_cast<int>(tid);
+                const int e = tk.selected[k];
+                bool local = false;
+                int owner = -1;
+                if (shape_ok && e >= 0 && e < router.experts)
+                {
+                    if (router.local_policy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
+                    {
+                        const auto sel = runtime_intermediate_shard_row(runtime, bank, e);
+                        local = sel.disposition == llaminar2::MoEIntermediateShardRowDisposition::Local;
+                        owner = sel.participant;
+                    }
+                    else
+                    {
+                        local = bank.local_compute_mask[e] != 0u;
+                        owner = (router.local_policy == llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal)
+                            ? static_cast<int>(runtime->participant_id)
+                            : runtime_expert_owner(bank, e);
+                    }
+                }
+                dispatch.local_compute_flags[k] = local;
+                dispatch.assigned_participants[k] = owner;
+            }
+            __syncthreads();
+
             // Publish all top_k route assignments and histogram atomics in parallel across warp 0,
-            // while warps 0..7 simultaneously preload local expert descriptors into shared memory.
+            // while warps 0..7 simultaneously preload only {gate, up, down} (168 B) into SMEM.
             if (tid < static_cast<unsigned>(router.top_k))
             {
                 const int k = static_cast<int>(tid);
@@ -892,19 +910,20 @@
             }
             if (shape_ok)
             {
-                static_assert(sizeof(DeviceMoEExpertDescriptorView) % sizeof(uint64_t) == 0);
-                constexpr unsigned desc_words = sizeof(DeviceMoEExpertDescriptorView) / sizeof(uint64_t);
+                static_assert(sizeof(DeviceNativeQuantisedMatrixDesc) % sizeof(uint64_t) == 0);
+                constexpr unsigned words_per_mat = sizeof(DeviceNativeQuantisedMatrixDesc) / sizeof(uint64_t);
                 for (int s = static_cast<int>(warp); s < router.top_k; s += 8)
                 {
                     if (dispatch.local_compute_flags[s])
                     {
                         const int e = tk.selected[s];
-                        if (e >= 0 && e < router.experts)
+                        if (e >= 0 && e < router.experts && lane < words_per_mat)
                         {
-                            const auto* src_words = reinterpret_cast<const uint64_t*>(&bank.experts[e]);
-                            auto* dst_words = reinterpret_cast<uint64_t*>(&preloaded_desc[s]);
-                            for (unsigned w = lane; w < desc_words; w += 32u)
-                                dst_words[w] = src_words[w];
+                            const auto& src = bank.experts[e];
+                            auto& dst = preloaded_expert[s];
+                            reinterpret_cast<uint64_t*>(&dst.gate)[lane] = reinterpret_cast<const uint64_t*>(&src.gate)[lane];
+                            reinterpret_cast<uint64_t*>(&dst.up)[lane] = reinterpret_cast<const uint64_t*>(&src.up)[lane];
+                            reinterpret_cast<uint64_t*>(&dst.down)[lane] = reinterpret_cast<const uint64_t*>(&src.down)[lane];
                         }
                     }
                 }
@@ -921,8 +940,8 @@
                     __trap();
                 const unsigned present = __ballot_sync(0xffffffffu, expert >= 0);
                 const int local_count = __popc(present);
-                const DeviceMoEExpertDescriptorView* descriptor =
-                    (expert >= 0) ? &preloaded_desc[slot] : nullptr;
+                const RetainedM1Expert* descriptor =
+                    (expert >= 0) ? &preloaded_expert[slot] : nullptr;
                 unsigned promoted = 0;
                 if (can_promote_gate)
                     promoted = __ballot_sync(0xffffffffu, descriptor && descriptor->gate.codebook_id == gate_promoted);
@@ -945,7 +964,7 @@
                                 dim3(retained_suffix_gate_up_k_splits, total_gate_up_packets)) != cudaSuccess ||
                             cudaGraphKernelNodeSetGridDim(
                                 static_cast<cudaGraphDeviceNode_t>(args.suffix_down_node),
-                                dim3(static_cast<unsigned>(hidden / 32), local_active + 1u)) != cudaSuccess)
+                                dim3(static_cast<unsigned>(hidden / 16), local_active + 1u)) != cudaSuccess)
                             __trap();
                     }
 #endif
@@ -978,7 +997,7 @@
                 constexpr unsigned words_per_mat = sizeof(DeviceNativeQuantisedMatrixDesc) / sizeof(uint64_t);
                 for (int packed = static_cast<int>(warp); packed < n_copy; packed += 8)
                 {
-                    const auto& view = preloaded_desc[packed_slots[packed]];
+                    const auto& view = preloaded_expert[packed_slots[packed]];
                     auto& dst = args.selected[packed];
                     if (lane < words_per_mat)
                     {
@@ -988,6 +1007,9 @@
                     }
                 }
             }
+            __syncthreads();
+            if (tid == 0u && args.profile_ns)
+                args.profile_ns[12] = retainedRouteClock();
         }
         if (args.profile_ns && threadIdx.x == 0)
             args.profile_ns[6] = retainedRouteClock();
@@ -1151,7 +1173,7 @@
                                         experts_active * static_cast<unsigned>(output_packets))) != cudaSuccess ||
                                 cudaGraphKernelNodeSetGridDim(
                                     static_cast<cudaGraphDeviceNode_t>(args.suffix_down_node),
-                                    dim3(static_cast<unsigned>(hidden / 32), experts_active)) != cudaSuccess)
+                                    dim3(static_cast<unsigned>(hidden / 16), experts_active)) != cudaSuccess)
                                 __trap();
                         }
 #endif

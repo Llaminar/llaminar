@@ -230,6 +230,97 @@ __device__ __forceinline__ void completeProjectionTile32(
     }
 }
 
+/**
+ * @brief 512-byte coalesced 16-column CTA tile Q8_0 projection (4 lanes/col, 2-block pipelined).
+ *
+ * Automatically selected over 32-column tiles whenever 16-column tiling strictly reduces the
+ * worst-CTA column count for the admitted gridDim.x (e.g. 2560 cols on 56 CUs: 48 vs 64 cols/CTA).
+ */
+template<bool InlineConv = false>
+__device__ __forceinline__ void completeProjectionTile16(
+    const ProbeProjection& projection, unsigned col_base,
+    const PreAttnQ8Block48* activated, unsigned width, float* lds_partials,
+    bool do_conv = false,
+    const float* conv_weight = nullptr, const float* conv_bias = nullptr,
+    float* conv_state = nullptr, float* gdn_recurrence_in = nullptr)
+{
+    namespace numeric = llaminar2::device_fp32_contract;
+    const unsigned tid = threadIdx.x;
+    const unsigned part = tid >> 6;           // 0..15 == 16 canonical K-partitions
+    const unsigned lane = tid & 63u;
+    const unsigned col_in_wave = lane >> 2;   // 0..15 (16 contiguous columns = 512B/wave!)
+    const unsigned quarter = lane & 3u;       // 0..3 (8B per lane -> 32B/col)
+    const unsigned blocks = width >> 5;
+    constexpr unsigned parts = 16u;
+    const unsigned step = (blocks + parts - 1u) / parts;
+    const unsigned b_begin = part * step;
+    const unsigned b_end = (b_begin + step < blocks) ? (b_begin + step) : blocks;
+    const unsigned n_cols = static_cast<unsigned>(projection.weights.n);
+    const unsigned col = col_base + col_in_wave;
+    const bool valid_col = col < n_cols;
+    const uint8_t* payload = projection.weights.payload;
+    const unsigned short* scales = static_cast<const unsigned short*>(projection.weights.scales);
+
+    float result = 0.0f;
+    if (valid_col && b_begin < b_end) {
+        std::size_t elem = static_cast<std::size_t>(b_begin) * n_cols + col;
+        int2 w_cur = native_global_weight_read<int2>(payload + elem * 32u + quarter * 8u);
+        unsigned short sc_cur = (quarter == 0u)
+            ? native_global_weight_read<unsigned short>(scales + elem) : 0u;
+#pragma unroll 1
+        for (unsigned b = b_begin; b < b_end; ++b) {
+            int2 w_next{};
+            unsigned short sc_next = 0u;
+            if (b + 1u < b_end) {
+                const std::size_t next_elem = elem + n_cols;
+                w_next = native_global_weight_read<int2>(payload + next_elem * 32u + quarter * 8u);
+                if (quarter == 0u)
+                    sc_next = native_global_weight_read<unsigned short>(scales + next_elem);
+            }
+            const int2 aq = reinterpret_cast<const int2*>(activated[b].qs)[quarter];
+            int d = llaminar2::rocm_integer_contract::signedDot4(aq.x, w_cur.x, 0);
+            d = llaminar2::rocm_integer_contract::signedDot4(aq.y, w_cur.y, d);
+            d += __shfl_xor(d, 1, 64);
+            d += __shfl_xor(d, 2, 64);
+            if (quarter == 0u) {
+                const float ws = __half2float(__ushort_as_half(sc_cur));
+                result = numeric::add(result,
+                    llaminar2::device_native_quantised_contract::singleScaleBlock(d, ws, activated[b].scale));
+            }
+            w_cur = w_next;
+            sc_cur = sc_next;
+            elem += n_cols;
+        }
+    }
+    if (quarter == 0u)
+        lds_partials[part * 16u + col_in_wave] = result;
+    __syncthreads();
+    if (tid < 16u && (col_base + tid) < n_cols) {
+        float total = 0.0f;
+#pragma unroll
+        for (unsigned p = 0u; p < parts; ++p)
+            total = numeric::add(total, lds_partials[p * 16u + tid]);
+        const unsigned column = col_base + tid;
+        projection.output[column] = total;
+        if constexpr (InlineConv) if (do_conv) {
+            const std::size_t s_base = static_cast<std::size_t>(column) * 3u;
+            const std::size_t w_base = static_cast<std::size_t>(column) * 4u;
+            float sum = 0.0f;
+            sum += conv_state[s_base + 0u] * conv_weight[w_base + 0u];
+            const float c1 = conv_state[s_base + 1u];
+            sum += c1 * conv_weight[w_base + 1u];
+            conv_state[s_base + 0u] = c1;
+            const float c2 = conv_state[s_base + 2u];
+            sum += c2 * conv_weight[w_base + 2u];
+            conv_state[s_base + 1u] = c2;
+            sum += total * conv_weight[w_base + 3u];
+            conv_state[s_base + 2u] = total;
+            if (conv_bias) sum += conv_bias[column];
+            gdn_recurrence_in[column] = sum / (1.0f + expf(-sum));
+        }
+    }
+}
+
 /** @brief Exact ordered four-segment quarter dot matching rocm_gdn_value_major_scalar_kernel. */
 __device__ __forceinline__ float gdnOrderedQuarterDot8Lds(
     const float (&state)[8], const float* lds_vec, unsigned key_begin, int segment, int quarter)
@@ -514,68 +605,151 @@ __device__ __forceinline__ void executeFullGDNRecurrenceAndNorm(
 /** @brief Exact all-18-codebook K32 block dot contribution for general ROCm GDN projections. */
 template<std::uint8_t CB>
 __device__ __forceinline__ float generalGDNBlockContribution(
-    llaminar2::rocm_q8_residual::NativeDecoder& decoder,
+    const llaminar2::NativeEmbeddingIQTables& iq_tables,
     const llaminar2::DeviceNativeQuantisedMatrixDesc& desc,
     std::size_t linear,
-    const PreAttnQ8Block48& act)
+    const PreAttnQ8Block48 __attribute__((opencl_local))* act)
 {
+    llaminar2::NativeEmbeddingIQTables single_iq{};
+    if constexpr (CB == 11u) single_iq.iq3s = iq_tables.iq3s;
+    else if constexpr (CB == 12u) single_iq.iq3xxs = iq_tables.iq3xxs;
+    else if constexpr (CB == 13u) single_iq.iq2s = iq_tables.iq2s;
+    else if constexpr (CB == 14u) single_iq.iq2xs = iq_tables.iq2xs;
+    else if constexpr (CB == 15u) single_iq.iq2xxs = iq_tables.iq2xxs;
+    else if constexpr (CB == 16u || CB == 17u) single_iq.iq1s = iq_tables.iq1s;
+    llaminar2::rocm_q8_residual::NativeDecoder decoder(single_iq);
     using Traits = llaminar2::rocm_q8_residual::NativeDecoder::CodebookTraits<CB>;
     constexpr unsigned bytes = static_cast<unsigned>(Traits::payload_bytes);
-    const std::uint8_t* pay_src = desc.payload + linear * bytes;
-    std::uint8_t pay_buf[32];
-#pragma unroll
-    for (unsigned i = 0u; i < bytes; ++i)
-        pay_buf[i] = native_global_weight_read<std::uint8_t>(pay_src + i);
-    std::int32_t w[8];
-    decoder.template decode_groups<CB>(pay_buf, w);
-    const int4 a0 = act.q0;
-    const int4 a1 = act.q1;
-    const std::int32_t a[8]{a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-    const std::uint16_t primary = native_global_weight_read<std::uint16_t>(
-        static_cast<const std::uint16_t*>(desc.scales) + linear);
-    const std::uint16_t secondary = Traits::requires_secondary_metadata
-        ? native_global_weight_read<std::uint16_t>(static_cast<const std::uint16_t*>(desc.mins) + linear) : 0u;
-    const std::uint32_t emin = Traits::is_dual_scale_asym
-        ? native_global_weight_read<std::uint32_t>(static_cast<const std::uint32_t*>(desc.emins) + linear) : 0u;
+    using RawLdsInt4 = int __attribute__((ext_vector_type(4)));
+    const auto* a128 = reinterpret_cast<const RawLdsInt4 __attribute__((opencl_local))*>(act->qs);
     constexpr std::int32_t ones = 0x01010101;
-    if constexpr (Traits::is_dual_scale) {
-        std::int32_t dot_lo = 0, dot_hi = 0, sum_lo = 0, sum_hi = 0;
-#pragma unroll
-        for (unsigned g = 0u; g < 4u; ++g) {
-            dot_lo = llaminar2::rocm_integer_contract::signedDot4(a[g], w[g], dot_lo);
-            dot_hi = llaminar2::rocm_integer_contract::signedDot4(a[g + 4u], w[g + 4u], dot_hi);
-            sum_lo = llaminar2::rocm_integer_contract::signedDot4(a[g], ones, sum_lo);
-            sum_hi = llaminar2::rocm_integer_contract::signedDot4(a[g + 4u], ones, sum_hi);
+
+    // Fast low-register direct path for 32-byte raw int8 codebooks (Q8_0 and ExpandedInt8Min)
+    // avoids materializing both pay_buf[32] and w[8] simultaneously (saves 12+ VGPRs).
+    if constexpr (CB == 19u || CB == llaminar2::kNativeQuantisedExpandedInt8MinCodebook) {
+        const std::uint8_t* pay_src = desc.payload + linear * 32u;
+        std::int32_t dot = 0, sum_a = 0;
+        {
+            const int4 w0 = native_global_weight_read<int4>(pay_src);
+            const RawLdsInt4 a0 = a128[0];
+            dot = llaminar2::rocm_integer_contract::signedDot4(a0[0], w0.x, dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a0[1], w0.y, dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a0[2], w0.z, dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a0[3], w0.w, dot);
+            if constexpr (Traits::is_asymmetric) {
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a0[0], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a0[1], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a0[2], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a0[3], ones, sum_a);
+            }
         }
-        std::uint16_t iq1m_qh = 0u;
-        std::int32_t sg0 = 0, sg1 = 0, sg2 = 0, sg3 = 0;
-        if constexpr (Traits::is_iq1_m) {
-            iq1m_qh = static_cast<std::uint16_t>(pay_buf[4]) | (static_cast<std::uint16_t>(pay_buf[5]) << 8u);
-            sg0 = llaminar2::rocm_integer_contract::signedDot4(a[1], ones, llaminar2::rocm_integer_contract::signedDot4(a[0], ones, 0));
-            sg1 = llaminar2::rocm_integer_contract::signedDot4(a[3], ones, llaminar2::rocm_integer_contract::signedDot4(a[2], ones, 0));
-            sg2 = llaminar2::rocm_integer_contract::signedDot4(a[5], ones, llaminar2::rocm_integer_contract::signedDot4(a[4], ones, 0));
-            sg3 = llaminar2::rocm_integer_contract::signedDot4(a[7], ones, llaminar2::rocm_integer_contract::signedDot4(a[6], ones, 0));
+        {
+            const int4 w1 = native_global_weight_read<int4>(pay_src + 16u);
+            const RawLdsInt4 a1 = a128[1];
+            dot = llaminar2::rocm_integer_contract::signedDot4(a1[0], w1.x, dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a1[1], w1.y, dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a1[2], w1.z, dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a1[3], w1.w, dot);
+            if constexpr (Traits::is_asymmetric) {
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a1[0], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a1[1], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a1[2], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a1[3], ones, sum_a);
+            }
         }
+        const std::uint16_t primary = native_global_weight_read<std::uint16_t>(
+            static_cast<const std::uint16_t*>(desc.scales) + linear);
+        const std::uint16_t secondary = Traits::requires_secondary_metadata
+            ? native_global_weight_read<std::uint16_t>(static_cast<const std::uint16_t*>(desc.mins) + linear) : 0u;
         return decoder.template native_quantised_block_contribution_from_reduced_terms_rn<CB>(
-            dot_lo, dot_hi, act.scale, primary, secondary, emin,
+            dot, 0, act->scale, primary, secondary, 0u, sum_a, 0, 0, 0u, 0, 0, 0, 0);
+    }
+
+    std::int32_t w[8];
+    const std::uint8_t* pay_src = desc.payload + linear * bytes;
+    decoder.template decode_groups<CB>(pay_src, w);
+    const std::uint16_t iq1m_qh = Traits::is_iq1_m
+        ? static_cast<std::uint16_t>(
+              static_cast<std::uint16_t>(native_global_weight_read<std::uint8_t>(pay_src + 4u)) |
+              (static_cast<std::uint16_t>(native_global_weight_read<std::uint8_t>(pay_src + 5u)) << 8u))
+        : 0u;
+    if constexpr (Traits::is_dual_scale) {
+        std::int32_t dot_lo = 0, dot_hi = 0;
+        std::int32_t sg0 = 0, sg1 = 0, sg2 = 0, sg3 = 0;
+        {
+            const RawLdsInt4 a0 = a128[0];
+            dot_lo = llaminar2::rocm_integer_contract::signedDot4(a0[0], w[0], dot_lo);
+            dot_lo = llaminar2::rocm_integer_contract::signedDot4(a0[1], w[1], dot_lo);
+            dot_lo = llaminar2::rocm_integer_contract::signedDot4(a0[2], w[2], dot_lo);
+            dot_lo = llaminar2::rocm_integer_contract::signedDot4(a0[3], w[3], dot_lo);
+            sg0 = llaminar2::rocm_integer_contract::signedDot4(a0[1], ones,
+                llaminar2::rocm_integer_contract::signedDot4(a0[0], ones, 0));
+            sg1 = llaminar2::rocm_integer_contract::signedDot4(a0[3], ones,
+                llaminar2::rocm_integer_contract::signedDot4(a0[2], ones, 0));
+        }
+        {
+            const RawLdsInt4 a1 = a128[1];
+            dot_hi = llaminar2::rocm_integer_contract::signedDot4(a1[0], w[4], dot_hi);
+            dot_hi = llaminar2::rocm_integer_contract::signedDot4(a1[1], w[5], dot_hi);
+            dot_hi = llaminar2::rocm_integer_contract::signedDot4(a1[2], w[6], dot_hi);
+            dot_hi = llaminar2::rocm_integer_contract::signedDot4(a1[3], w[7], dot_hi);
+            sg2 = llaminar2::rocm_integer_contract::signedDot4(a1[1], ones,
+                llaminar2::rocm_integer_contract::signedDot4(a1[0], ones, 0));
+            sg3 = llaminar2::rocm_integer_contract::signedDot4(a1[3], ones,
+                llaminar2::rocm_integer_contract::signedDot4(a1[2], ones, 0));
+        }
+        const std::int32_t sum_lo = sg0 + sg1;
+        const std::int32_t sum_hi = sg2 + sg3;
+        const std::uint16_t primary = native_global_weight_read<std::uint16_t>(
+            static_cast<const std::uint16_t*>(desc.scales) + linear);
+        const std::uint16_t secondary = Traits::requires_secondary_metadata
+            ? native_global_weight_read<std::uint16_t>(static_cast<const std::uint16_t*>(desc.mins) + linear) : 0u;
+        const std::uint32_t emin = Traits::is_dual_scale_asym
+            ? native_global_weight_read<std::uint32_t>(static_cast<const std::uint32_t*>(desc.emins) + linear) : 0u;
+        return decoder.template native_quantised_block_contribution_from_reduced_terms_rn<CB>(
+            dot_lo, dot_hi, act->scale, primary, secondary, emin,
             sum_lo + sum_hi, sum_lo, sum_hi, iq1m_qh, sg0, sg1, sg2, sg3);
     } else {
         std::int32_t dot = 0, sum_a = 0;
-#pragma unroll
-        for (unsigned g = 0u; g < 8u; ++g) {
-            dot = llaminar2::rocm_integer_contract::signedDot4(a[g], w[g], dot);
-            if constexpr (Traits::is_asymmetric)
-                sum_a = llaminar2::rocm_integer_contract::signedDot4(a[g], ones, sum_a);
+        {
+            const RawLdsInt4 a0 = a128[0];
+            dot = llaminar2::rocm_integer_contract::signedDot4(a0[0], w[0], dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a0[1], w[1], dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a0[2], w[2], dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a0[3], w[3], dot);
+            if constexpr (Traits::is_asymmetric) {
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a0[0], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a0[1], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a0[2], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a0[3], ones, sum_a);
+            }
         }
+        {
+            const RawLdsInt4 a1 = a128[1];
+            dot = llaminar2::rocm_integer_contract::signedDot4(a1[0], w[4], dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a1[1], w[5], dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a1[2], w[6], dot);
+            dot = llaminar2::rocm_integer_contract::signedDot4(a1[3], w[7], dot);
+            if constexpr (Traits::is_asymmetric) {
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a1[0], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a1[1], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a1[2], ones, sum_a);
+                sum_a = llaminar2::rocm_integer_contract::signedDot4(a1[3], ones, sum_a);
+            }
+        }
+        const std::uint16_t primary = native_global_weight_read<std::uint16_t>(
+            static_cast<const std::uint16_t*>(desc.scales) + linear);
+        const std::uint16_t secondary = Traits::requires_secondary_metadata
+            ? native_global_weight_read<std::uint16_t>(static_cast<const std::uint16_t*>(desc.mins) + linear) : 0u;
         return decoder.template native_quantised_block_contribution_from_reduced_terms_rn<CB>(
-            dot, 0, act.scale, primary, secondary, 0u, sum_a, 0, 0, 0u, 0, 0, 0, 0);
+            dot, 0, act->scale, primary, secondary, 0u, sum_a, 0, 0, 0u, 0, 0, 0, 0);
     }
 }
 
 /** @brief Runtime-dispatched all-18-codebook 32-column projection tile for non-Q8_0 GDN weights. */
 template<bool InlineConv = false>
 __device__ __forceinline__ void completeGeneralProjectionTile32(
-    llaminar2::rocm_q8_residual::NativeDecoder& decoder,
+    const llaminar2::NativeEmbeddingIQTables& iq_tables,
     const ProbeProjection& projection, unsigned col_base,
     const PreAttnQ8Block48* activated, unsigned width, float* lds_partials,
     bool do_conv = false,
@@ -584,47 +758,49 @@ __device__ __forceinline__ void completeGeneralProjectionTile32(
 {
     namespace numeric = llaminar2::device_fp32_contract;
     const unsigned tid = threadIdx.x;
-    const unsigned part = tid >> 6;
+    const unsigned part = __builtin_amdgcn_readfirstlane(tid >> 6);
     const unsigned lane = tid & 63u;
-    const unsigned blocks = width >> 5;
+    const unsigned blocks = __builtin_amdgcn_readfirstlane(width >> 5);
     constexpr unsigned parts = 16u;
-    const unsigned step = (blocks + parts - 1u) / parts;
-    const unsigned b_begin = part * step;
-    const unsigned b_end = (b_begin + step < blocks) ? (b_begin + step) : blocks;
-    const unsigned n_cols = static_cast<unsigned>(projection.weights.n);
-    const unsigned col = col_base + lane;
+    const unsigned step = __builtin_amdgcn_readfirstlane((blocks + parts - 1u) / parts);
+    const unsigned b_begin = __builtin_amdgcn_readfirstlane(part * step);
+    const unsigned b_end = __builtin_amdgcn_readfirstlane((b_begin + step < blocks) ? (b_begin + step) : blocks);
+    const unsigned n_cols = __builtin_amdgcn_readfirstlane(static_cast<unsigned>(projection.weights.n));
+    const unsigned col = __builtin_amdgcn_readfirstlane(col_base) + lane;
     const std::uint8_t cb = static_cast<std::uint8_t>(__builtin_amdgcn_readfirstlane(projection.weights.codebook_id));
+    const auto* act_lds = (const PreAttnQ8Block48 __attribute__((opencl_local))*)(
+        (const unsigned char __attribute__((opencl_local))*)activated);
 
     float result = 0.0f;
-    if (lane < 32u && col < n_cols && b_begin < b_end) {
+    if (b_begin < b_end && lane < 32u && col < n_cols) {
 #pragma unroll 1
         for (unsigned b = b_begin; b < b_end; ++b) {
             const std::size_t elem = static_cast<std::size_t>(b) * n_cols + col;
             float contrib = 0.0f;
             switch (cb) {
-            case 0u:  contrib = generalGDNBlockContribution<0u>(decoder, projection.weights, elem, activated[b]); break;
-            case 4u:  contrib = generalGDNBlockContribution<4u>(decoder, projection.weights, elem, activated[b]); break;
-            case 5u:  contrib = generalGDNBlockContribution<5u>(decoder, projection.weights, elem, activated[b]); break;
-            case 6u:  contrib = generalGDNBlockContribution<6u>(decoder, projection.weights, elem, activated[b]); break;
-            case 7u:  contrib = generalGDNBlockContribution<7u>(decoder, projection.weights, elem, activated[b]); break;
-            case 8u:  contrib = generalGDNBlockContribution<8u>(decoder, projection.weights, elem, activated[b]); break;
-            case 9u:  contrib = generalGDNBlockContribution<9u>(decoder, projection.weights, elem, activated[b]); break;
-            case 10u: contrib = generalGDNBlockContribution<10u>(decoder, projection.weights, elem, activated[b]); break;
-            case 11u: contrib = generalGDNBlockContribution<11u>(decoder, projection.weights, elem, activated[b]); break;
-            case 12u: contrib = generalGDNBlockContribution<12u>(decoder, projection.weights, elem, activated[b]); break;
-            case 13u: contrib = generalGDNBlockContribution<13u>(decoder, projection.weights, elem, activated[b]); break;
-            case 14u: contrib = generalGDNBlockContribution<14u>(decoder, projection.weights, elem, activated[b]); break;
-            case 15u: contrib = generalGDNBlockContribution<15u>(decoder, projection.weights, elem, activated[b]); break;
-            case 16u: contrib = generalGDNBlockContribution<16u>(decoder, projection.weights, elem, activated[b]); break;
-            case 17u: contrib = generalGDNBlockContribution<17u>(decoder, projection.weights, elem, activated[b]); break;
-            case 19u: contrib = generalGDNBlockContribution<19u>(decoder, projection.weights, elem, activated[b]); break;
+            case 0u:  contrib = generalGDNBlockContribution<0u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 4u:  contrib = generalGDNBlockContribution<4u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 5u:  contrib = generalGDNBlockContribution<5u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 6u:  contrib = generalGDNBlockContribution<6u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 7u:  contrib = generalGDNBlockContribution<7u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 8u:  contrib = generalGDNBlockContribution<8u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 9u:  contrib = generalGDNBlockContribution<9u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 10u: contrib = generalGDNBlockContribution<10u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 11u: contrib = generalGDNBlockContribution<11u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 12u: contrib = generalGDNBlockContribution<12u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 13u: contrib = generalGDNBlockContribution<13u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 14u: contrib = generalGDNBlockContribution<14u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 15u: contrib = generalGDNBlockContribution<15u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 16u: contrib = generalGDNBlockContribution<16u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 17u: contrib = generalGDNBlockContribution<17u>(iq_tables, projection.weights, elem, act_lds + b); break;
+            case 19u: contrib = generalGDNBlockContribution<19u>(iq_tables, projection.weights, elem, act_lds + b); break;
             case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
                 contrib = generalGDNBlockContribution<llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(
-                    decoder, projection.weights, elem, activated[b]);
+                    iq_tables, projection.weights, elem, act_lds + b);
                 break;
             case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
                 contrib = generalGDNBlockContribution<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
-                    decoder, projection.weights, elem, activated[b]);
+                    iq_tables, projection.weights, elem, act_lds + b);
                 break;
             default: __builtin_trap();
             }
@@ -713,27 +889,33 @@ __global__ __launch_bounds__(NT, 1) void preAttentionKernel(
                 reinterpret_cast<std::int8_t*>(q.qs), &q.scale, nullptr, lane);
         }
         __syncthreads();
-        const unsigned qkv_tiles = (static_cast<unsigned>(qkv.weights.n) + 31u) >> 5;
-        const unsigned z_tiles = (static_cast<unsigned>(z.weights.n) + 31u) >> 5;
-        const unsigned total_tiles = qkv_tiles + z_tiles;
+        const unsigned qkv_tiles32 = (static_cast<unsigned>(qkv.weights.n) + 31u) >> 5;
+        const unsigned z_tiles32 = (static_cast<unsigned>(z.weights.n) + 31u) >> 5;
+        const unsigned total_tiles32 = qkv_tiles32 + z_tiles32;
+        unsigned total_tiles = total_tiles32;
         unsigned buf_idx = 0u;
+        if constexpr (!GeneralCodebooks) {
 #pragma unroll 1
-        for (unsigned tile = blockIdx.x; tile < total_tiles; tile += gridDim.x) {
-            const bool is_qkv = tile < qkv_tiles;
-            const unsigned col_base = (is_qkv ? tile : (tile - qkv_tiles)) << 5;
-            if constexpr (GeneralCodebooks) {
-                llaminar2::rocm_q8_residual::NativeDecoder decoder(iq_tables);
-                completeGeneralProjectionTile32<FullGDN>(
-                    decoder, is_qkv ? qkv : z, col_base, shared.activation, E,
-                    tile_lds + (buf_idx & 1u) * 512u, is_qkv,
-                    full.conv_weight, full.conv_bias, full.conv_state, full.gdn_recurrence_in);
-            } else {
+            for (unsigned tile = blockIdx.x; tile < total_tiles32; tile += gridDim.x) {
+                const bool is_qkv = tile < qkv_tiles32;
+                const unsigned col_base = (is_qkv ? tile : (tile - qkv_tiles32)) << 5;
                 completeProjectionTile32<FullGDN>(
                     is_qkv ? qkv : z, col_base, shared.activation, E,
                     tile_lds + (buf_idx & 1u) * 512u, is_qkv,
                     full.conv_weight, full.conv_bias, full.conv_state, full.gdn_recurrence_in);
+                ++buf_idx;
             }
-            ++buf_idx;
+        } else {
+#pragma unroll 1
+            for (unsigned tile = blockIdx.x; tile < total_tiles32; tile += gridDim.x) {
+                const bool is_qkv = tile < qkv_tiles32;
+                const unsigned col_base = (is_qkv ? tile : (tile - qkv_tiles32)) << 5;
+                completeGeneralProjectionTile32<FullGDN>(
+                    iq_tables, is_qkv ? qkv : z, col_base, shared.activation, E,
+                    tile_lds + (buf_idx & 1u) * 512u, is_qkv,
+                    full.conv_weight, full.conv_bias, full.conv_state, full.gdn_recurrence_in);
+                ++buf_idx;
+            }
         }
         if constexpr (FusedHalf) {
             // Schedule ALL Alpha/Beta FP16 rows exclusively onto the tail CTAs that received
@@ -778,21 +960,24 @@ __global__ __launch_bounds__(NT, 1) void preAttentionKernel(
         __syncthreads();
 
         float* ssm_lds = reinterpret_cast<float*>(dynamic_storage);
-        const unsigned ssm_tiles = (static_cast<unsigned>(full.ssm_out.weights.n) + 31u) >> 5;
+        const unsigned ssm_tiles32 = (static_cast<unsigned>(full.ssm_out.weights.n) + 31u) >> 5;
         unsigned ssm_buf = 0u;
+        if constexpr (!GeneralCodebooks) {
 #pragma unroll 1
-        for (unsigned tile = blockIdx.x; tile < ssm_tiles; tile += gridDim.x) {
-            if constexpr (GeneralCodebooks) {
-                llaminar2::rocm_q8_residual::NativeDecoder decoder(iq_tables);
-                completeGeneralProjectionTile32<false>(
-                    decoder, full.ssm_out, tile << 5, shared.out_q8, value_dim,
-                    ssm_lds + (ssm_buf & 1u) * 512u);
-            } else {
+            for (unsigned tile = blockIdx.x; tile < ssm_tiles32; tile += gridDim.x) {
                 completeProjectionTile32<false>(
                     full.ssm_out, tile << 5, shared.out_q8, value_dim,
                     ssm_lds + (ssm_buf & 1u) * 512u);
+                ++ssm_buf;
             }
-            ++ssm_buf;
+        } else {
+#pragma unroll 1
+            for (unsigned tile = blockIdx.x; tile < ssm_tiles32; tile += gridDim.x) {
+                completeGeneralProjectionTile32<false>(
+                    iq_tables, full.ssm_out, tile << 5, shared.out_q8, value_dim,
+                    ssm_lds + (ssm_buf & 1u) * 512u);
+                ++ssm_buf;
+            }
         }
     }
 #else

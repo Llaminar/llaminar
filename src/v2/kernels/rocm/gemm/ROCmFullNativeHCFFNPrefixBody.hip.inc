@@ -15,8 +15,86 @@
 #include "kernels/common/GPUHCDownPublication.cuh"
 #include "kernels/common/GPUHCShortKBlockBody.cuh"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
+#include "kernels/rocm/common/ROCmWorkgroupJoin.h"
+#include "kernels/rocm/common/ROCmWaveAddress.h"
+#include "kernels/rocm/moe/ROCmMoEWaveReduction.h"
 #include "ROCmSmallNFP32ProjectionBody.hip.inc"
+#include <type_traits>
 namespace llaminar2::rocm::full_hc_native {
+#if defined(__HIP_DEVICE_COMPILE__)
+template<class T> using PrefixLdsPtr = T __attribute__((opencl_local))*;
+template<class T> using PrefixGlobalPtr = T __attribute__((address_space(1)))*;
+#else
+template<class T> using PrefixLdsPtr = T*;
+template<class T> using PrefixGlobalPtr = T*;
+#endif
+using PrefixRawFloat4 = float __attribute__((ext_vector_type(4)));
+using PrefixRawInt4 = int __attribute__((ext_vector_type(4)));
+template<class T, class U>
+__device__ __forceinline__ PrefixLdsPtr<T> prefixAsLds(U* ptr) {
+ return (PrefixLdsPtr<T>)((PrefixLdsPtr<unsigned char>)ptr);
+}
+template<class T>
+__device__ __forceinline__ PrefixGlobalPtr<T> prefixAsGlobal(T* ptr) {
+ return reinterpret_cast<PrefixGlobalPtr<T>>(reinterpret_cast<std::uintptr_t>(ptr));
+}
+template<class T>
+__device__ __forceinline__ T prefixWaveUniform(T value) {
+ if constexpr (std::is_pointer_v<T>)
+  return reinterpret_cast<T>(waveUniformAddress(reinterpret_cast<std::uintptr_t>(value)));
+ else if constexpr (std::is_same_v<T, float>)
+  return __builtin_bit_cast(float, static_cast<unsigned>(__builtin_amdgcn_readfirstlane(__builtin_bit_cast(unsigned, value))));
+ else
+  return static_cast<T>(__builtin_amdgcn_readfirstlane(static_cast<unsigned>(value)));
+}
+__device__ __forceinline__ unsigned prefixLane64() {
+#if defined(__HIP_DEVICE_COMPILE__)
+ unsigned lane;
+ asm volatile("v_mbcnt_lo_u32_b32 %0, -1, 0\n\t"
+              "v_mbcnt_hi_u32_b32 %0, -1, %0" : "=&v"(lane));
+ return lane;
+#else
+ return static_cast<unsigned>(threadIdx.x) & 63u;
+#endif
+}
+__device__ __forceinline__ float4 prefixLdsLoadFloat4(PrefixLdsPtr<const PrefixRawFloat4> ptr, unsigned idx) {
+ const PrefixRawFloat4 v = ptr[idx];
+ return make_float4(v[0], v[1], v[2], v[3]);
+}
+__device__ __forceinline__ void prefixLdsStoreFloat4(PrefixLdsPtr<PrefixRawFloat4> ptr, unsigned idx, float4 v) {
+ PrefixRawFloat4 raw;
+ raw[0] = v.x; raw[1] = v.y; raw[2] = v.z; raw[3] = v.w;
+ ptr[idx] = raw;
+}
+__device__ __forceinline__ int4 prefixLdsLoadInt4(PrefixLdsPtr<const PrefixRawInt4> ptr, unsigned idx) {
+ const PrefixRawInt4 v = ptr[idx];
+ return make_int4(v[0], v[1], v[2], v[3]);
+}
+struct PrefixFastDiv16 {
+ unsigned d, m;
+ __device__ __forceinline__ static PrefixFastDiv16 make(unsigned divisor) {
+  return {divisor, (divisor <= 1u) ? 65536u : ((65536u + divisor - 1u) / divisor)};
+ }
+ __device__ __forceinline__ unsigned div(unsigned n) const {
+  return (d <= 1u) ? n : ((n * m) >> 16);
+ }
+ __device__ __forceinline__ void divmod(unsigned n, unsigned& q, unsigned& r) const {
+  q = div(n);
+  r = n - q * d;
+ }
+};
+struct PrefixFastDiv32 {
+ unsigned d, magic;
+ __device__ __forceinline__ static PrefixFastDiv32 make(unsigned divisor) {
+  return {divisor, (divisor <= 1u) ? 0xFFFFFFFFu : (0xFFFFFFFFu / divisor)};
+ }
+ __device__ __forceinline__ void divmod(unsigned n, unsigned& q, unsigned& r) const {
+  if (d <= 1u) { q = n; r = 0u; return; }
+  q = __umulhi(n, magic);
+  r = n - q * d;
+  if (r >= d) { ++q; r -= d; }
+ }
+};
 /** @brief Borrow immutable prepared bytes through their admitted global address space.
  * @tparam T Exact existing packet operand, without numeric conversion.
  * @param pointer Real prepared payload/metadata bytes. @return Identical loaded bytes.
@@ -56,11 +134,17 @@ __device__ __forceinline__ Packet loadPacket(const DeviceNativeQuantisedMatrixDe
  * @param scale Original stored activation scale. @return Original K32 contribution.
  */
 __device__ __forceinline__ float consumePacket(const Packet& packet,const signed char* input,float scale) {
- const int w[8]{packet.low.x,packet.low.y,packet.low.z,packet.low.w,
-  packet.high.x,packet.high.y,packet.high.z,packet.high.w};
- const auto* x=reinterpret_cast<const int*>(input);int dot=0;
-#pragma unroll
- for(unsigned word=0;word<8;++word)dot=rocm_integer_contract::signedDot4(x[word],w[word],dot);
+ const int4 x0=weightRead<int4>(input);
+ const int4 x1=weightRead<int4>(input+16u);
+ int dot=0;
+ dot=rocm_integer_contract::signedDot4(x0.x,packet.low.x,dot);
+ dot=rocm_integer_contract::signedDot4(x0.y,packet.low.y,dot);
+ dot=rocm_integer_contract::signedDot4(x0.z,packet.low.z,dot);
+ dot=rocm_integer_contract::signedDot4(x0.w,packet.low.w,dot);
+ dot=rocm_integer_contract::signedDot4(x1.x,packet.high.x,dot);
+ dot=rocm_integer_contract::signedDot4(x1.y,packet.high.y,dot);
+ dot=rocm_integer_contract::signedDot4(x1.z,packet.high.z,dot);
+ dot=rocm_integer_contract::signedDot4(x1.w,packet.high.w,dot);
  const float ws=__half2float(__ushort_as_half(static_cast<unsigned short>(packet.scale_bits)));
  return device_native_quantised_contract::singleScaleBlock(dot,ws,scale);
 }
@@ -474,21 +558,17 @@ __device__ __forceinline__ void fastCoalescedUp(const PersistentHCReadArgs& a,
    const int4 wv=weightRead<int4>(a.up.weights.payload+rb*32u+lane*16u);
    unsigned short sv=0u;
    if(half_part==0u)sv=weightRead<unsigned short>(w_scales+rb+col_in_wave);
+   const int4 p0 = prefixLdsLoadInt4(prefixAsLds<const PrefixRawInt4>(p_codes4), blk*2u+half_part);
+   const int4 r0 = prefixLdsLoadInt4(prefixAsLds<const PrefixRawInt4>(r_codes4), blk*2u+half_part);
    int dp=0,dr=0;
-   {
-    const int4 pa=p_codes4[blk*2u+half_part];
-    dp=rocm_integer_contract::signedDot4(pa.x,wv.x,dp);
-    dp=rocm_integer_contract::signedDot4(pa.y,wv.y,dp);
-    dp=rocm_integer_contract::signedDot4(pa.z,wv.z,dp);
-    dp=rocm_integer_contract::signedDot4(pa.w,wv.w,dp);
-   }
-   {
-    const int4 ra=r_codes4[blk*2u+half_part];
-    dr=rocm_integer_contract::signedDot4(ra.x,wv.x,dr);
-    dr=rocm_integer_contract::signedDot4(ra.y,wv.y,dr);
-    dr=rocm_integer_contract::signedDot4(ra.z,wv.z,dr);
-    dr=rocm_integer_contract::signedDot4(ra.w,wv.w,dr);
-   }
+   dp=rocm_integer_contract::signedDot4(p0.x,wv.x,dp);
+   dr=rocm_integer_contract::signedDot4(r0.x,wv.x,dr);
+   dp=rocm_integer_contract::signedDot4(p0.y,wv.y,dp);
+   dr=rocm_integer_contract::signedDot4(r0.y,wv.y,dr);
+   dp=rocm_integer_contract::signedDot4(p0.z,wv.z,dp);
+   dr=rocm_integer_contract::signedDot4(r0.z,wv.z,dr);
+   dp=rocm_integer_contract::signedDot4(p0.w,wv.w,dp);
+   dr=rocm_integer_contract::signedDot4(r0.w,wv.w,dr);
    const int fp=dp+__shfl_xor(dp,1,64),fr=dr+__shfl_xor(dr,1,64);
    if(half_part==0u) {
     const float ws=__half2float(__ushort_as_half(sv));
@@ -507,9 +587,9 @@ __device__ __forceinline__ void fastCoalescedUp(const PersistentHCReadArgs& a,
    }
    const float value=device_fp32_contract::add(p,q);
    if(output_demand.contains(FullNativeHCFFNOutputRole::HCUp))
-    a.up.output[std::size_t(branch)*H+col_base+col]=value;
+    prefixAsGlobal(a.up.output)[std::size_t(branch)*H+col_base+col]=value;
    primary_lds[branch*32u+col]=1.0f/(1.0f+expf(-value));
-   residual_lds[branch*32u+col]=a.norm.output[std::size_t(branch)*H+col_base+col];
+   residual_lds[branch*32u+col]=weightRead<float>(a.norm.output+std::size_t(branch)*H+col_base+col);
   }
   __syncthreads();
   if(tid<32u) {
@@ -517,10 +597,180 @@ __device__ __forceinline__ void fastCoalescedUp(const PersistentHCReadArgs& a,
 #pragma unroll
    for(unsigned branch=0u;branch<4u;++branch)
     mixed=fmaf(primary_lds[branch*32u+tid],residual_lds[branch*32u+tid],mixed);
-   a.mixed[col_base+tid]=mixed*0.25f;
+   prefixAsGlobal(a.mixed)[col_base+tid]=mixed*0.25f;
   }
   ++buf;
  }
+}
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+__device__ __forceinline__ float prefixQuietMax32(float4 values) {
+ const auto qabs = [] __device__ (float x) {
+  float out;
+  asm("v_max_f32_e64 %0, |%1|, |%1|" : "=v"(out) : "v"(x));
+  return out;
+ };
+ const auto compRoot = [] __device__ (float c) {
+  float r;
+  asm volatile("s_nop 1\n"
+               "v_max_f32_dpp %0, %1, %1 row_shl:4 row_mask:0xf bank_mask:0x5\n"
+               "v_max_f32_dpp %0, %1, %1 row_shr:4 row_mask:0xf bank_mask:0xa\n"
+               "s_nop 1\n"
+               "v_max_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+               "s_nop 1\n"
+               "v_max_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"
+               : "=&v"(r) : "v"(c));
+  return r;
+ };
+ const float x = compRoot(qabs(values.x)), y = compRoot(qabs(values.y));
+ const float z = compRoot(qabs(values.z)), w = compRoot(qabs(values.w));
+ return fmaxf(fmaxf(x, z), fmaxf(y, w));
+}
+#endif
+__device__ __forceinline__ void prefixNormQ8Four(float4 value, signed char* output, float* scale_output, unsigned lane) {
+ float maximum;
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+ maximum = prefixQuietMax32(value);
+#else
+ float a=fabsf(value.x),b=fabsf(value.y),c=fabsf(value.z),d=fabsf(value.w);
+#pragma unroll
+ for(int offset=4;offset>0;offset>>=1) {
+  a=fmaxf(a,__shfl_down(a,offset,8));b=fmaxf(b,__shfl_down(b,offset,8));
+  c=fmaxf(c,__shfl_down(c,offset,8));d=fmaxf(d,__shfl_down(d,offset,8));
+ }
+ maximum=__shfl(fmaxf(fmaxf(a,c),fmaxf(b,d)),0,8);
+#endif
+ const float scale=device_q8_activation_contract::publishPositiveFiniteHalfScale(
+  device_q8_activation_contract::boundedScale(maximum));
+ const float inverse=1.0f/scale;
+ if(lane==0u)*scale_output=scale;
+ const unsigned q0=unsigned(decode_equivalent::quantizeQ8(value.x,inverse))&255u;
+ const unsigned q1=unsigned(decode_equivalent::quantizeQ8(value.y,inverse))&255u;
+ const unsigned q2=unsigned(decode_equivalent::quantizeQ8(value.z,inverse))&255u;
+ const unsigned q3=unsigned(decode_equivalent::quantizeQ8(value.w,inverse))&255u;
+ const unsigned packed=q0|(q1<<8)|(q2<<16)|(q3<<24);
+ __builtin_memcpy(output+4u*lane,&packed,sizeof(packed));
+}
+struct PrefixLdsBranchInput {
+ PrefixLdsPtr<const float> cached;
+ __device__ __forceinline__ float retained(unsigned ch) const { return cached[ch]; }
+ __device__ __forceinline__ float publish(unsigned ch) const { return cached[ch]; }
+};
+struct PrefixLdsRegisterNormQ8Output {
+ PrefixLdsPtr<const PrefixRawFloat4> post_lds4;
+ PrefixLdsPtr<const PrefixRawFloat4> gain_lds4;
+ signed char* codes;
+ float* scales;
+ template<class Input, class Output>
+ __device__ __forceinline__ void publish(
+  const Input&, const float*, Output output,
+  int hidden, float epsilon, std::uint64_t base, float,
+  const float* completed_total, unsigned lane, bool) const {
+  using namespace qwen4exp::branch_norm_native;
+  auto* out_g = prefixAsGlobal(output);
+  auto* codes_g = prefixAsGlobal(codes);
+  auto* scales_g = prefixAsGlobal(scales);
+  const float inverse = normalizationInverse(completed_total[0], hidden, epsilon);
+  for (unsigned quad = lane; quad < unsigned(hidden / 4); quad += 1024u) {
+   const float4 p4 = prefixLdsLoadFloat4(post_lds4, quad);
+   const float4 g4 = prefixLdsLoadFloat4(gain_lds4, quad);
+   float4 value;
+   value.x = normalizedElement(p4.x, inverse, g4.x, OriginalNormalizedProducts{});
+   value.y = normalizedElement(p4.y, inverse, g4.y, OriginalNormalizedProducts{});
+   value.z = normalizedElement(p4.z, inverse, g4.z, OriginalNormalizedProducts{});
+   value.w = normalizedElement(p4.w, inverse, g4.w, OriginalNormalizedProducts{});
+   PrefixRawFloat4 out4;
+   out4[0] = value.x; out4[1] = value.y; out4[2] = value.z; out4[3] = value.w;
+   reinterpret_cast<PrefixGlobalPtr<PrefixRawFloat4>>(out_g + base)[quad] = out4;
+   prefixNormQ8Four(value, reinterpret_cast<signed char*>(codes_g + (quad >> 3) * 32u),
+                    reinterpret_cast<float*>(scales_g + (quad >> 3)), quad & 7u);
+  }
+ }
+};
+__device__ __forceinline__ float prefixConsumeHCDownPacket(
+ const Packet& packet, const signed char* input, float scale) {
+ const int4 x0 = weightRead<int4>(input);
+ const int4 x1 = weightRead<int4>(input + 16u);
+ int dot = 0;
+ dot = rocm_integer_contract::signedDot4(x0.x, packet.low.x, dot);
+ dot = rocm_integer_contract::signedDot4(x0.y, packet.low.y, dot);
+ dot = rocm_integer_contract::signedDot4(x0.z, packet.low.z, dot);
+ dot = rocm_integer_contract::signedDot4(x0.w, packet.low.w, dot);
+ dot = rocm_integer_contract::signedDot4(x1.x, packet.high.x, dot);
+ dot = rocm_integer_contract::signedDot4(x1.y, packet.high.y, dot);
+ dot = rocm_integer_contract::signedDot4(x1.z, packet.high.z, dot);
+ dot = rocm_integer_contract::signedDot4(x1.w, packet.high.w, dot);
+ const float ws = __half2float(__ushort_as_half(static_cast<unsigned short>(packet.scale_bits)));
+ return device_native_quantised_contract::singleScaleBlock(dot, ws, scale);
+}
+__device__ __forceinline__ float prefixOrderedAppendLds(
+ float sum, PrefixLdsPtr<const float> values, unsigned stride, unsigned column, unsigned count) {
+ unsigned i = 0u;
+#pragma unroll 1
+ for (; i + 8u <= count; i += 8u) {
+  float a = values[(i + 0u) * stride + column], b = values[(i + 1u) * stride + column];
+  float c = values[(i + 2u) * stride + column], d = values[(i + 3u) * stride + column];
+  float e = values[(i + 4u) * stride + column], f = values[(i + 5u) * stride + column];
+  float g = values[(i + 6u) * stride + column], h = values[(i + 7u) * stride + column];
+#if defined(__HIP_DEVICE_COMPILE__)
+  asm volatile("" : "+v"(a), "+v"(b), "+v"(c), "+v"(d), "+v"(e), "+v"(f), "+v"(g), "+v"(h));
+#endif
+  sum = device_fp32_contract::add(sum, a); sum = device_fp32_contract::add(sum, b);
+  sum = device_fp32_contract::add(sum, c); sum = device_fp32_contract::add(sum, d);
+  sum = device_fp32_contract::add(sum, e); sum = device_fp32_contract::add(sum, f);
+  sum = device_fp32_contract::add(sum, g); sum = device_fp32_contract::add(sum, h);
+ }
+ if (i + 4u <= count) {
+  float a = values[(i + 0u) * stride + column], b = values[(i + 1u) * stride + column];
+  float c = values[(i + 2u) * stride + column], d = values[(i + 3u) * stride + column];
+#if defined(__HIP_DEVICE_COMPILE__)
+  asm volatile("" : "+v"(a), "+v"(b), "+v"(c), "+v"(d));
+#endif
+  sum = device_fp32_contract::add(sum, a); sum = device_fp32_contract::add(sum, b);
+  sum = device_fp32_contract::add(sum, c); sum = device_fp32_contract::add(sum, d);
+  i += 4u;
+ }
+ if (__builtin_expect(i < count, 0)) {
+#pragma unroll 1
+  for (; i < count; ++i)
+   sum = device_fp32_contract::add(sum, values[i * stride + column]);
+ }
+ return sum;
+}
+struct PrefixHCUpPacket { int4 lo, hi; std::uint16_t s_bits; };
+__device__ __forceinline__ PrefixHCUpPacket prefixHCUpLoadPacket(
+ const std::uint8_t* up_pay, const std::uint16_t* up_sc, unsigned up_n, unsigned column, unsigned block) {
+ const std::size_t linear = std::size_t(block) * up_n + column;
+ const std::uint8_t* pay = up_pay + linear * 32u;
+ return {weightRead<int4>(pay), weightRead<int4>(pay + 16u), weightRead<std::uint16_t>(up_sc + linear)};
+}
+__device__ __forceinline__ void prefixHCUpConsumePacket(
+ const PrefixHCUpPacket& pkt, unsigned block,
+ PrefixLdsPtr<const PrefixRawInt4> p_codes4, PrefixLdsPtr<const PrefixRawInt4> r_codes4,
+ float ps, float rs, float& p_out, float& q_out) {
+ const int4 pa0 = prefixLdsLoadInt4(p_codes4, block * 2u);
+ const int4 ra0 = prefixLdsLoadInt4(r_codes4, block * 2u);
+ int dp = 0, dq = 0;
+ dp = rocm_integer_contract::signedDot4(pa0.x, pkt.lo.x, dp);
+ dq = rocm_integer_contract::signedDot4(ra0.x, pkt.lo.x, dq);
+ dp = rocm_integer_contract::signedDot4(pa0.y, pkt.lo.y, dp);
+ dq = rocm_integer_contract::signedDot4(ra0.y, pkt.lo.y, dq);
+ dp = rocm_integer_contract::signedDot4(pa0.z, pkt.lo.z, dp);
+ dq = rocm_integer_contract::signedDot4(ra0.z, pkt.lo.z, dq);
+ dp = rocm_integer_contract::signedDot4(pa0.w, pkt.lo.w, dp);
+ dq = rocm_integer_contract::signedDot4(ra0.w, pkt.lo.w, dq);
+ const int4 pa1 = prefixLdsLoadInt4(p_codes4, block * 2u + 1u);
+ const int4 ra1 = prefixLdsLoadInt4(r_codes4, block * 2u + 1u);
+ dp = rocm_integer_contract::signedDot4(pa1.x, pkt.hi.x, dp);
+ dq = rocm_integer_contract::signedDot4(ra1.x, pkt.hi.x, dq);
+ dp = rocm_integer_contract::signedDot4(pa1.y, pkt.hi.y, dp);
+ dq = rocm_integer_contract::signedDot4(ra1.y, pkt.hi.y, dq);
+ dp = rocm_integer_contract::signedDot4(pa1.z, pkt.hi.z, dp);
+ dq = rocm_integer_contract::signedDot4(ra1.z, pkt.hi.z, dq);
+ dp = rocm_integer_contract::signedDot4(pa1.w, pkt.hi.w, dp);
+ dq = rocm_integer_contract::signedDot4(ra1.w, pkt.hi.w, dq);
+ const float ws = __half2float(__ushort_as_half(pkt.s_bits));
+ p_out = device_native_quantised_contract::singleScaleBlock(dp, ws, ps);
+ q_out = device_native_quantised_contract::singleScaleBlock(dq, ws, rs);
 }
 } // namespace llaminar2::rocm::full_hc_native
 namespace llaminar2::rocm {
@@ -533,102 +783,158 @@ namespace llaminar2::rocm {
  * @param dynamic_storage Borrowed aligned dynamic arena, overlaid with the suffix.
  * @param dynamic_bytes Original cold-derived prefix bound, sealed by the retained kernel node.
  * @pre Exactly1024 physical lanes; original norm/injection arithmetic uses256.
- * @details Counts remain device-owned and independent: inactive norm retains its
- * existing normalized bytes; inactive publication reads the already-bound Q8 bytes;
- * inactive up retains logits/mixed. Raw down is still authored exactly as in the
- * original operation. No host mirror, substitute source or geometry fallback is
- * introduced. Original public activation writes are delayed until the third edge
- * so exact raw/activated aliases cannot overwrite another CTA's raw input.
+ * @details Uses vectorized AS1/AS3 LDS BranchRMSNorm (WaveOwnsBothRoots + DPP max),
+ * FastDiv16 idle-CTA-prefetched single-pass HC Down (zero down_partials round-trip),
+ * and balanced 100% single-wave e0..e1 HC Up + Mix across arbitrary gridDim.x while
+ * preserving general continuations for large geometries and exact OutputDemand semantics.
  */
 template<class Grid>
 __device__ __forceinline__ void fullNativeHCFFNPrefix(const FullNativeHCFFNPrefixArgs& prefix,
  Grid& grid,FullNativeHCFFNPrefixScratch& local,unsigned char* dynamic_storage,std::size_t dynamic_bytes) {
  using namespace full_hc_native;
  const auto& a=prefix.hc;
- const unsigned tid=threadIdx.x,H=unsigned(a.norm.hidden),R=unsigned(a.down_weights.n);
- // Cold admission and capture validation derive this bound from these exact
- // immutable source dimensions. Do not repeat that host geometry program in
- // every resident CTA; active row counts and all tensor data stay device-owned.
+ const unsigned tid=threadIdx.x;
+ const unsigned bid=blockIdx.x;
+ const unsigned gdim=gridDim.x;
+ const unsigned H=prefixWaveUniform(unsigned(a.norm.hidden));
+ const unsigned R=prefixWaveUniform(unsigned(a.down_weights.n));
  if(blockDim.x!=1024||!dynamic_bytes||dynamic_bytes>32768||(dynamic_bytes&15u)||!dynamic_storage)__builtin_trap();
- float* arena=reinterpret_cast<float*>(dynamic_storage);const unsigned words=unsigned(dynamic_bytes/4);
- const unsigned down_blocks=unsigned(a.down_weights.k)>>5;
- const unsigned parts=unsigned(a.partitions);
- // Preserve idle-CTA early prefetch of HC-down packets during BranchRMSNorm
- // and avoid the redundant global down_partials write+reload round-trip.
+ float* arena=reinterpret_cast<float*>(dynamic_storage);
+ auto arena_lds=prefixAsLds<float>(dynamic_storage);
+ const unsigned words=prefixWaveUniform(unsigned(dynamic_bytes>>2));
+ const unsigned total_parts=prefixWaveUniform(unsigned(a.partitions));
+ const unsigned down_blocks=prefixWaveUniform(unsigned(a.down_weights.k)>>5);
+ (void)down_blocks;
+ // Preserve idle-CTA early prefetch of HC-down packets during vectorized fast_norm
+ // and avoid the global down_partials write+reload round-trip (saves ~12 us vs fastCoalescedDown).
  const bool fast_down=false;
- (void)down_blocks; (void)parts;
- const unsigned up_groups=unsigned(a.up.weights.blocks_per_row);
- const bool fast_up=(H&31u)==0u&&up_groups>0u&&words>=2u*4u*up_groups*32u*2u;
- const auto owner=fullHCDownOwnership(blockIdx.x,gridDim.x,R);
- DownPanel panel{};
- Packet first{},second{};
- const bool early=!fast_down&&gridDim.x>4&&blockIdx.x>=4;
- if(!fast_down&&owner.columns)panel=downPanel(a,owner.columns,words);
- if(early) {first=firstPacket(a,owner,panel,tid);second=firstPacket(a,owner,panel,tid+1024);}
- const int norm_rows=a.norm.extent.liveRows?*a.norm.extent.liveRows:1;
- if(norm_rows<0||norm_rows>1)__builtin_trap();
- for(unsigned task=blockIdx.x;task<4;task+=gridDim.x) {
-  signed char* codes=a.input_codes+std::size_t(task)*H;
-  float* scales=a.input_scales+std::size_t(task)*(H/32);
-  if(norm_rows) {
-   // The bounded cache is complete32-value cohorts; excess channels retain
-   // their original globally published POST/gain, with exactly the same math.
-   const unsigned cache=unsigned(fullHCMin(H,((words-256)/2)/32*32));
-   float* post_cache=arena+256;float* gain_cache=post_cache+cache;
-    const auto base=std::size_t(task)*H;
-    const float* published_post=nullptr;
-    if(prefix.write.residual) {
-     const float gate=qwen4exp::branch_norm_native::residualGate(prefix.write.gateLogits[task]);
-     const qwen4exp::branch_norm_native::ResidualBranchInput original{
-      prefix.write.residual+base,prefix.write.block,prefix.write.output+base,gate};
-     for(unsigned channel=tid;channel<H;channel+=1024) {
-      const float gain=a.norm.gain[base+channel],post=original.publish(channel);
-      if(channel<cache){post_cache[channel]=post;gain_cache[channel]=gain;}
+ {
+  const auto owner=fullHCDownOwnership(bid,gdim,R);
+  DownPanel panel{};
+  Packet first{},second{};
+  const bool early=!fast_down&&gdim>4u&&bid>=4u;
+  if(!fast_down&&owner.columns)panel=downPanel(a,owner.columns,words);
+  if(early) {first=firstPacket(a,owner,panel,tid);second=firstPacket(a,owner,panel,tid+1024u);}
+  const int norm_rows=prefixWaveUniform(a.norm.extent.liveRows?*prefixAsGlobal(a.norm.extent.liveRows):1);
+  if(norm_rows<0||norm_rows>1)__builtin_trap();
+  const bool fast_norm=prefixWaveUniform((H&3u)==0u&&words>=256u+2u*H);
+  if(fast_norm) {
+   auto post_lds=arena_lds+256u;
+   auto gain_lds=post_lds+H;
+   auto post_lds4=prefixAsLds<PrefixRawFloat4>(post_lds);
+   auto gain_lds4=prefixAsLds<PrefixRawFloat4>(gain_lds);
+   const bool has_res=prefixWaveUniform(prefix.write.residual!=nullptr);
+#pragma unroll 1
+   for(unsigned task=bid;task<4u;task+=gdim) {
+    signed char* codes=a.input_codes+std::size_t(task)*H;
+    float* scales=a.input_scales+std::size_t(task)*(H>>5);
+    if(__builtin_expect(norm_rows!=0,1)) {
+     const auto base=std::size_t(task)*H;
+     const float* gain_p=a.norm.gain+base;
+     const float gate=has_res?qwen4exp::branch_norm_native::residualGate(
+      weightRead<float>(prefix.write.gateLogits+task)):0.0f;
+     const float* src_p=(has_res?prefix.write.residual:a.norm.input)+base;
+     const float* blk_p=prefix.write.block;
+     float* out_p=prefix.write.output+base;
+     const unsigned quads=H>>2;
+#pragma unroll 1
+     for(unsigned q=tid;q<quads;q+=1024u) {
+      const float4 g4=weightRead<float4>(gain_p+4u*q);
+      float4 p4=weightRead<float4>(src_p+4u*q);
+      if(has_res) {
+       const float4 b4=weightRead<float4>(blk_p+4u*q);
+       p4.x=qwen4exp::branch_norm_native::residualValue(p4.x,gate,b4.x);
+       p4.y=qwen4exp::branch_norm_native::residualValue(p4.y,gate,b4.y);
+       p4.z=qwen4exp::branch_norm_native::residualValue(p4.z,gate,b4.z);
+       p4.w=qwen4exp::branch_norm_native::residualValue(p4.w,gate,b4.w);
+       PrefixRawFloat4 ro;
+       ro[0]=p4.x;ro[1]=p4.y;ro[2]=p4.z;ro[3]=p4.w;
+       reinterpret_cast<PrefixGlobalPtr<PrefixRawFloat4>>(prefixAsGlobal(out_p))[q]=ro;
+      }
+      prefixLdsStoreFloat4(post_lds4,q,p4);
+      prefixLdsStoreFloat4(gain_lds4,q,g4);
      }
-     published_post=prefix.write.output+base;
+     workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+     qwen4exp::branch_norm_native::taskFromBranchInput<
+      PrefixLdsBranchInput,float*,PrefixLdsRegisterNormQ8Output,
+      qwen4exp::branch_norm_native::SquareSumPublication::WaveOwnsBothRoots>(
+      PrefixLdsBranchInput{post_lds},gain_p,a.norm.output,H,a.norm.epsilon,task,
+      arena,tid,tid<256u,
+      PrefixLdsRegisterNormQ8Output{post_lds4,gain_lds4,codes,scales});
     } else {
-     for(unsigned channel=tid;channel<H;channel+=1024) {
-      const float gain=a.norm.gain[base+channel],post=a.norm.input[base+channel];
-      if(channel<cache){post_cache[channel]=post;gain_cache[channel]=gain;}
+     for(unsigned quad=tid;quad<(H>>2);quad+=1024u) {
+      const float4 val=weightRead<float4>(a.norm.output+std::size_t(task)*H+4u*quad);
+      prefixNormQ8Four(val,codes+(quad>>3)*32u,scales+(quad>>3),quad&7u);
      }
-     published_post=a.norm.input+base;
     }
-    __syncthreads();
-    const StagedBranchInput input{post_cache,published_post,cache};
-   qwen4exp::branch_norm_native::taskFromBranchInput(input,a.norm.gain+base,a.norm.output,
-    H,a.norm.epsilon,task,arena,tid,tid<256,
-    RegisterNormQ8Output{gain_cache,a.norm.gain+base,cache,codes,scales});
-   __syncthreads();
-  } else {
-   // Original count0 retains normalized FP32 data but still publishes its
-   // complete original SingleQ8 down operand, including every real block.
-   for(unsigned quad=tid;quad<H/4;quad+=1024) {
-    const auto first_value=std::size_t(task)*H+4*quad;
-    const float4 value{a.norm.output[first_value],a.norm.output[first_value+1],
-     a.norm.output[first_value+2],a.norm.output[first_value+3]};
-    normQ8Four(value,codes+(quad/8)*32,scales+quad/8,quad%8);
+    if(task+gdim<4u)workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
    }
-   __syncthreads();
+  } else {
+   for(unsigned task=bid;task<4u;task+=gdim) {
+    signed char* codes=a.input_codes+std::size_t(task)*H;
+    float* scales=a.input_scales+std::size_t(task)*(H/32);
+    if(norm_rows) {
+     const unsigned cache=unsigned(fullHCMin(H,((words-256)/2)/32*32));
+     float* post_cache=arena+256;float* gain_cache=post_cache+cache;
+     const auto base=std::size_t(task)*H;
+     const float* published_post=nullptr;
+     if(prefix.write.residual) {
+      const float gate=qwen4exp::branch_norm_native::residualGate(prefix.write.gateLogits[task]);
+      const qwen4exp::branch_norm_native::ResidualBranchInput original{
+       prefix.write.residual+base,prefix.write.block,prefix.write.output+base,gate};
+      for(unsigned channel=tid;channel<H;channel+=1024) {
+       const float gain=a.norm.gain[base+channel],post=original.publish(channel);
+       if(channel<cache){post_cache[channel]=post;gain_cache[channel]=gain;}
+      }
+      published_post=prefix.write.output+base;
+     } else {
+      for(unsigned channel=tid;channel<H;channel+=1024) {
+       const float gain=a.norm.gain[base+channel],post=a.norm.input[base+channel];
+       if(channel<cache){post_cache[channel]=post;gain_cache[channel]=gain;}
+      }
+      published_post=a.norm.input+base;
+     }
+     __syncthreads();
+     const StagedBranchInput input{post_cache,published_post,cache};
+     qwen4exp::branch_norm_native::taskFromBranchInput(input,a.norm.gain+base,a.norm.output,
+      H,a.norm.epsilon,task,arena,tid,tid<256,
+      RegisterNormQ8Output{gain_cache,a.norm.gain+base,cache,codes,scales});
+     __syncthreads();
+    } else {
+     for(unsigned quad=tid;quad<H/4;quad+=1024) {
+      const auto first_value=std::size_t(task)*H+4*quad;
+      const float4 value{a.norm.output[first_value],a.norm.output[first_value+1],
+       a.norm.output[first_value+2],a.norm.output[first_value+3]};
+      normQ8Four(value,codes+(quad/8)*32,scales+quad/8,quad%8);
+     }
+     __syncthreads();
+    }
+   }
   }
+  grid.sync(); // All public normalized/Q8 words; old incoming write gates retired.
+  if(__builtin_expect(bid<4u&&a.injection.weights&&a.injection.rows.activeRows(),0))
+   injection(a,arena);
+  if(fast_down)fastCoalescedDown(a,dynamic_storage,words);
+  else down(a,owner,panel,first,second,early,arena,words);
  }
- grid.sync(); // All public normalized/Q8 words; old incoming write gates retired.
- injection(a,arena);
- if(fast_down)fastCoalescedDown(a,dynamic_storage,words);
- else down(a,owner,panel,first,second,early,arena,words);
  grid.sync(); // All raw outputs; input_codes/scales may now become the shorter up banks.
- const bool publish=a.publication.rows.activeRows()!=0;
+ const bool publish=prefixWaveUniform(a.publication.rows.activeRows()!=0);
  if(tid<R) {
   float raw_val;
   if(fast_down) {
    const float* dp=a.down_partials+tid;
-   if(parts==1u)raw_val=dp[0];
+   if(total_parts==1u)raw_val=weightRead<float>(dp);
    else {
     raw_val=0.0f;
-    for(unsigned p=0u;p<parts;++p)raw_val=device_fp32_contract::add(raw_val,dp[std::size_t(p)*R]);
+#pragma unroll 1
+    for(unsigned p=0u;p<total_parts;++p)
+     raw_val=device_fp32_contract::add(raw_val,weightRead<float>(dp+std::size_t(p)*R));
    }
-   if(blockIdx.x==0u)a.raw_down[tid]=raw_val;
-  } else raw_val=a.raw_down[tid];
-  if(publish) {
+   if(bid==0u)prefixAsGlobal(a.raw_down)[tid]=raw_val;
+  } else {
+   raw_val=weightRead<float>(a.raw_down+tid);
+  }
+  if(__builtin_expect(publish,1)) {
    auto output=a.publication;
    output.activated=local.activated;output.primary=local.primary;output.residual=local.residual;
    output.primaryScales=local.primary_scales;output.residualScales=local.residual_scales;
@@ -636,25 +942,27 @@ __device__ __forceinline__ void fullNativeHCFFNPrefix(const FullNativeHCFFNPrefi
     hc_down_publication::NativePositiveHalfScalePublication{});
   } else {local.primary[tid]=a.up.primary[tid];local.residual[tid]=a.up.residual[tid];}
  }
- if(!publish&&tid<R/32) {
+ if(__builtin_expect(!publish&&tid<(R>>5),0)) {
   local.primary_scales[tid]=a.up.primaryScales[tid];
   local.residual_scales[tid]=a.up.residualScales[tid];
  }
- __syncthreads();
- if(publish&&blockIdx.x==0) {
-  if(tid<R){a.publication.primary[tid]=local.primary[tid];a.publication.residual[tid]=local.residual[tid];}
-  if(tid<R/32){a.publication.primaryScales[tid]=local.primary_scales[tid];
-   a.publication.residualScales[tid]=local.residual_scales[tid];}
+ workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+ if(__builtin_expect(publish&&bid==0u,0)) {
+  if(tid<R){prefixAsGlobal(a.publication.primary)[tid]=local.primary[tid];prefixAsGlobal(a.publication.residual)[tid]=local.residual[tid];}
+  if(tid<(R>>5)){prefixAsGlobal(a.publication.primaryScales)[tid]=local.primary_scales[tid];
+   prefixAsGlobal(a.publication.residualScales)[tid]=local.residual_scales[tid];}
  }
- if(a.up.rows.activeRows()) {
+ const bool up_active=prefixWaveUniform(
+  (a.up.rows.countOwner()==a.publication.rows.countOwner())?publish:(a.up.rows.activeRows()!=0));
+ if(__builtin_expect(up_active,1)) {
+  const unsigned up_groups=prefixWaveUniform(unsigned(a.up.weights.blocks_per_row));
+  const bool fast_up=prefixWaveUniform((H&31u)==0u&&up_groups>0u&&words>=2u*4u*up_groups*32u*2u);
   if(fast_up)fastCoalescedUp(a,local,arena,prefix.output_demand);
   else up(a,local,arena,words,prefix.output_demand);
  }
  grid.sync(); // Mixed/injection ready; all replicated raw readers and local up users retired.
- if(prefix.output_demand.contains(FullNativeHCFFNOutputRole::HCActivated)&&publish&&blockIdx.x==0&&tid<R)
-  a.publication.activated[tid]=local.activated[tid];
- // Static scratch is unioned with the suffix. Retire the final public copy
- // before this CTA can overwrite its activation source through that union.
- __syncthreads();
+ if(prefix.output_demand.contains(FullNativeHCFFNOutputRole::HCActivated)&&publish&&bid==0u&&tid<R)
+  prefixAsGlobal(a.publication.activated)[tid]=local.activated[tid];
+ workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
 }
 } // namespace llaminar2::rocm

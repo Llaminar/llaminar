@@ -129,11 +129,11 @@ namespace llaminar2::cuda::moe
     enum class RetainedM1PacketOrdering { CompleteProgram, NativeCompletion };
     /** @brief One always-live half-warp of shared Down columns for each legacy cooperative suffix CTA. */
     inline constexpr unsigned retained_shared_down_frontier_columns = 16;
-    /** @brief Non-cooperative device-sized Gate/Up suffix launch width (2 warps per CTA). */
-    inline constexpr unsigned retained_suffix_gate_up_threads = 64;
-    /** @brief Split-K CTAs per 32-column Gate/Up packet (16 partitions / 2 warps = 8 CTAs). */
+    /** @brief Non-cooperative device-sized Gate/Up suffix launch width (10 warps = 2 partitions x 5 K-blocks). */
+    inline constexpr unsigned retained_suffix_gate_up_threads = 320;
+    /** @brief Split-K CTAs per 32-column Gate/Up packet (16 partitions / 2 partitions per CTA = 8 CTAs). */
     inline constexpr unsigned retained_suffix_gate_up_k_splits = 8;
-    /** @brief Non-cooperative device-sized Down suffix launch width (5 warps, 2 K32 blocks each). */
+    /** @brief Non-cooperative device-sized Down suffix launch width (10 half-warps x 16 cols = 160 threads). */
     inline constexpr unsigned retained_suffix_down_threads = 160;
 
 

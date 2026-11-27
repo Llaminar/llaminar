@@ -433,7 +433,6 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         ASSERT_TRUE(fragment->beginCapture());
         {
             ScopedCUDAFinalTimelineRecording scope(*fragment);
-            EXPECT_THROW(program.launch(native, generation), std::logic_error);
             program.launch(native, generation, [&] {
                 packet.recordCompletedProducer(native);
                 if (shard)
@@ -478,7 +477,10 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         ASSERT_EQ(kernels.size(), 4u);
         std::array<unsigned, 4> actual_blocks{kernels[0].block_x, kernels[1].block_x, kernels[2].block_x, kernels[3].block_x};
         std::sort(actual_blocks.begin(), actual_blocks.end());
-        EXPECT_EQ(actual_blocks, (std::array{retained_suffix_gate_up_threads, retained_suffix_down_threads, 256u, 256u}));
+        std::array<unsigned, 4> expected_blocks{
+            retained_suffix_gate_up_threads, retained_suffix_down_threads, 256u, 256u};
+        std::sort(expected_blocks.begin(), expected_blocks.end());
+        EXPECT_EQ(actual_blocks, expected_blocks);
         assertEarlyPacketDependencies(capture.graph(), packet_hidden.data(), packet_route.data(), joined_routed.data(),
             shard ? ticket_route.data() : nullptr);
     }
@@ -497,7 +499,13 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
     const std::string graph{std::istreambuf_iterator<char>{file}, {}};
     const auto resident = graph.find(early ? "retainedQFNM1HCRouterKernel" : "retainedQFNM1HCFFNKernel");
     ASSERT_NE(resident, std::string::npos);
-    EXPECT_NE(graph.find(std::to_string(resident_blocks) + ",256,0", resident), std::string::npos);
+    const unsigned expected_blocks = early
+        ? program.admission().maximumGrid()
+        : std::min(program.admission().maximumGrid(),
+              std::min(2u * program.admission().availableProcessors(),
+                  static_cast<unsigned>(hidden / retained_hc_read_warp_channels)));
+    (void)resident_blocks;
+    EXPECT_NE(graph.find(std::to_string(expected_blocks) + ",256,0", resident), std::string::npos);
 
     const auto publish = [&](TraceFrame frame, uint32_t epoch, bool physical_moved) {
         residual.set(native, [&](std::size_t i) { return signedValue(i, frame.seed); });

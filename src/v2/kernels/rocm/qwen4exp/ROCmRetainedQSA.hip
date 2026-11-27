@@ -357,7 +357,8 @@ namespace
                 for (unsigned dp = 0u; dp < chunk; ++dp)
                     total = numeric::add(total, lds_partials[dp * 32u + tid]);
             }
-            __syncthreads();
+            if (p_base + 16u < kb)
+                __syncthreads();
         }
 
         if (tid < 32u && (col_base + tid) < n_cols)
@@ -377,7 +378,116 @@ namespace
                 proj.output[column] = total;
             }
         }
-        __syncthreads();
+    }
+
+    /**
+     * @brief 512B-coalesced 16-column Q8_0 projection tile (4 lanes/col) for balanced CU utilization.
+     *
+     * Automatically chosen when 16-col tiling strictly lowers worst-CTA column work (e.g. Wo on 56 CUs:
+     * 160 tiles -> max 48 cols/CTA vs 80 tiles -> max 64 cols/CTA). Double-buffered lds_partials avoids
+     * trailing workgroup barriers between tiles.
+     */
+    __device__ __forceinline__ void qsaCompleteROCmTile16(
+        const ROCmRetainedQSAProjection &proj,
+        unsigned col_base,
+        const QSAQ8Block48 *activated,
+        unsigned width,
+        float *lds_partials,
+        bool split_q_gate,
+        float *dst_q,
+        float *dst_gate)
+    {
+        namespace numeric = device_fp32_contract;
+        const unsigned tid = threadIdx.x;
+        const unsigned wave = tid >> 6;
+        const unsigned lane = tid & 63u;
+        const unsigned col_in_wave = lane >> 2;
+        const unsigned quarter = lane & 3u;
+        const unsigned blocks = width >> 5;
+        const unsigned kb = __builtin_amdgcn_readfirstlane(static_cast<unsigned>(proj.k_partitions));
+        const unsigned step = (blocks + kb - 1u) / kb;
+        const unsigned n_cols = static_cast<unsigned>(proj.weights.n);
+        const unsigned col = col_base + col_in_wave;
+        const bool valid_col = col < n_cols;
+        const std::uint8_t *payload = proj.weights.payload;
+        const unsigned short *scales = static_cast<const unsigned short *>(proj.weights.scales);
+
+        float total = 0.0f;
+#pragma unroll 1
+        for (unsigned p_base = 0u; p_base < kb; p_base += 16u)
+        {
+            const unsigned chunk = (kb - p_base < 16u) ? (kb - p_base) : 16u;
+            if (wave < chunk)
+            {
+                const unsigned part = p_base + wave;
+                const unsigned b_begin = part * step;
+                const unsigned b_end = (b_begin + step < blocks) ? (b_begin + step) : blocks;
+                float result = 0.0f;
+                if (valid_col && b_begin < b_end)
+                {
+                    std::size_t elem = static_cast<std::size_t>(b_begin) * n_cols + col;
+                    int2 w_cur = qsaGlobalRead<int2>(payload + elem * 32u + quarter * 8u);
+                    unsigned short sc_cur = (quarter == 0u)
+                        ? qsaGlobalRead<unsigned short>(scales + elem) : 0u;
+#pragma unroll 1
+                    for (unsigned b = b_begin; b < b_end; ++b)
+                    {
+                        int2 w_next{};
+                        unsigned short sc_next = 0u;
+                        if (b + 1u < b_end)
+                        {
+                            const std::size_t next_elem = elem + n_cols;
+                            w_next = qsaGlobalRead<int2>(payload + next_elem * 32u + quarter * 8u);
+                            if (quarter == 0u)
+                                sc_next = qsaGlobalRead<unsigned short>(scales + next_elem);
+                        }
+                        const int2 aq = reinterpret_cast<const int2 *>(activated[b].qs)[quarter];
+                        int d = rocm_integer_contract::signedDot4(aq.x, w_cur.x, 0);
+                        d = rocm_integer_contract::signedDot4(aq.y, w_cur.y, d);
+                        d += __shfl_xor(d, 1, 64);
+                        d += __shfl_xor(d, 2, 64);
+                        if (quarter == 0u)
+                        {
+                            const float ws = __half2float(__ushort_as_half(sc_cur));
+                            result = numeric::add(result,
+                                device_native_quantised_contract::singleScaleBlock(d, ws, activated[b].scale));
+                        }
+                        w_cur = w_next;
+                        sc_cur = sc_next;
+                        elem += n_cols;
+                    }
+                }
+                if (quarter == 0u)
+                    lds_partials[wave * 16u + col_in_wave] = result;
+            }
+            __syncthreads();
+
+            if (tid < 16u && (col_base + tid) < n_cols)
+            {
+                for (unsigned dp = 0u; dp < chunk; ++dp)
+                    total = numeric::add(total, lds_partials[dp * 16u + tid]);
+            }
+            if (p_base + 16u < kb)
+                __syncthreads();
+        }
+
+        if (tid < 16u && (col_base + tid) < n_cols)
+        {
+            const unsigned column = col_base + tid;
+            if (split_q_gate)
+            {
+                const unsigned head = column >> 9;
+                const unsigned within = column & 511u;
+                if (within < 256u)
+                    dst_q[head * 256u + within] = total;
+                else
+                    dst_gate[head * 256u + (within - 256u)] = total;
+            }
+            else
+            {
+                proj.output[column] = total;
+            }
+        }
     }
 
     /** @brief Exact stride-256 wave64 floating projection row matching fp32x16_scoped_projection_columns_kernel. */
@@ -720,6 +830,7 @@ namespace
             ? ((static_cast<unsigned>(inv.qsa_query.n) + 31u) >> 5) : 0u;
         const unsigned total_q_tiles = wq_tiles + wk_tiles + wv_tiles + key_q_tiles + qry_q_tiles;
 
+        unsigned pre_buf = 0u;
 #pragma unroll 1
         for (unsigned tile = bid; tile < total_q_tiles; tile += num_ctas)
         {
@@ -753,8 +864,9 @@ namespace
                 col_base = (tile - wq_tiles - wk_tiles - wv_tiles - key_q_tiles) << 5;
             }
             qsaCompleteROCmTile32<GeneralCodebooks>(
-                *proj, col_base, shared.activation, kHidden, tile_lds, iq_tables,
+                *proj, col_base, shared.activation, kHidden, tile_lds + (pre_buf & 1u) * 512u, iq_tables,
                 split_q, inv.Q, inv.fa_gate);
+            ++pre_buf;
         }
 
         // Tail-shadow schedule floating BF16/FP16/FP32 indexer rows (1 wave64 per row).
@@ -995,12 +1107,48 @@ namespace
         __syncthreads();
 
         float *wo_lds = reinterpret_cast<float *>(dynamic_storage);
-        const unsigned wo_tiles = (static_cast<unsigned>(inv.wo.weights.n) + 31u) >> 5;
-#pragma unroll 1
-        for (unsigned tile = bid; tile < wo_tiles; tile += num_ctas)
+        const unsigned wo_tiles32 = (static_cast<unsigned>(inv.wo.weights.n) + 31u) >> 5;
+        unsigned wo_buf = 0u;
+        if constexpr (!GeneralCodebooks)
         {
-            qsaCompleteROCmTile32<GeneralCodebooks>(
-                inv.wo, tile << 5, shared.wo_act, wo_k, wo_lds, iq_tables, false, nullptr, nullptr);
+            const unsigned wo_tiles16 = (static_cast<unsigned>(inv.wo.weights.n) + 15u) >> 4;
+            const bool use_wo16 =
+                (wo_blocks >= 64u) &&
+                (((wo_tiles16 + num_ctas - 1u) / num_ctas) * 16u * 4u <=
+                 ((wo_tiles32 + num_ctas - 1u) / num_ctas) * 32u * 3u);
+            if (use_wo16)
+            {
+#pragma unroll 1
+                for (unsigned tile = bid; tile < wo_tiles16; tile += num_ctas)
+                {
+                    qsaCompleteROCmTile16(
+                        inv.wo, tile << 4, shared.wo_act, wo_k, wo_lds + (wo_buf & 1u) * 512u,
+                        false, nullptr, nullptr);
+                    ++wo_buf;
+                }
+            }
+            else
+            {
+#pragma unroll 1
+                for (unsigned tile = bid; tile < wo_tiles32; tile += num_ctas)
+                {
+                    qsaCompleteROCmTile32<false>(
+                        inv.wo, tile << 5, shared.wo_act, wo_k, wo_lds + (wo_buf & 1u) * 512u,
+                        iq_tables, false, nullptr, nullptr);
+                    ++wo_buf;
+                }
+            }
+        }
+        else
+        {
+#pragma unroll 1
+            for (unsigned tile = bid; tile < wo_tiles32; tile += num_ctas)
+            {
+                qsaCompleteROCmTile32<true>(
+                    inv.wo, tile << 5, shared.wo_act, wo_k, wo_lds + (wo_buf & 1u) * 512u,
+                    iq_tables, false, nullptr, nullptr);
+                ++wo_buf;
+            }
         }
 #else
         __builtin_trap();

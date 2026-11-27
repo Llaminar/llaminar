@@ -27,7 +27,6 @@ namespace llaminar2::cuda::moe
     struct RetainedHCPrefixShared
     {
         float norm[256]; ///< Original fixed 256-lane square reduction.
-        uint32_t down_finished; ///< Atomic partition completion counter for fused HC Down fold.
         union
         {
             alignas(16) float post[Hidden]; ///< Rounded POST reused for the four-channel wave layout.
@@ -389,15 +388,13 @@ namespace llaminar2::cuda::moe
             }
         };
         using namespace ::llaminar2::qwen4exp::branch_norm_native;
-        const unsigned hidden = prefix.norm.hidden;
         const unsigned tid = threadIdx.x;
-        const unsigned lane = tid % 32;
-        const unsigned warp = tid / 32;
-        const unsigned global_thread = blockIdx.x * blockDim.x + tid;
-        const unsigned grid_threads = gridDim.x * blockDim.x;
+        const unsigned lane = tid & 31u;
+        const unsigned warp = tid >> 5;
 
         if (blockIdx.x < 4)
         {
+            const unsigned hidden = prefix.norm.hidden;
             const unsigned branch = blockIdx.x;
             const unsigned offset = branch * hidden;
             static_assert(Hidden % 128 == 0);
@@ -463,9 +460,35 @@ namespace llaminar2::cuda::moe
                 retainedHCNormQ8Quad(output, codes + first, scales + first / 32, tid % 8);
             }
         }
+        else if constexpr (!GeneralCodebooks)
+        {
+            // While CTAs 0..3 compute BranchRMSNorm (~8 us), idle CTAs 4..gridDim.x-1 warm
+            // the immutable HC Down weight matrix (3.48 MB) into the GPU's L2 cache so the
+            // immediately following HC Down phase reads directly from L2 at >2 TB/s with 0 spills.
+            const unsigned idle_ctas = gridDim.x - 4u;
+            const unsigned idle_tid = (blockIdx.x - 4u) * 256u + tid;
+            const unsigned idle_stride = idle_ctas * 256u;
+            const unsigned payload_lines =
+                (static_cast<unsigned>(prefix.down.blocks_per_row) * static_cast<unsigned>(prefix.down.n) * 32u) >> 7;
+            const uint8_t* pay = prefix.down.payload;
+#pragma unroll 1
+            for (unsigned line = idle_tid; line < payload_lines; line += idle_stride)
+            {
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(pay + (static_cast<std::size_t>(line) << 7)));
+            }
+            const unsigned scale_lines =
+                (static_cast<unsigned>(prefix.down.blocks_per_row) * static_cast<unsigned>(prefix.down.n) * 2u) >> 7;
+            const uint8_t* sc = static_cast<const uint8_t*>(prefix.down.scales);
+#pragma unroll 1
+            for (unsigned line = idle_tid; line < scale_lines; line += idle_stride)
+            {
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(sc + (static_cast<std::size_t>(line) << 7)));
+            }
+        }
         grid.sync();
         mark(1);
 
+        {
         const unsigned partitions = prefix.down_partitions.count;
         const unsigned columns = prefix.down.n;
         const bool ordered = prefix.down_fold == HCDownFold::OrderedPartitions;
@@ -475,20 +498,21 @@ namespace llaminar2::cuda::moe
             {
                 if (columns % 32 == 0 && prefix.down_partitions.blocks_per_partition <= 32)
                 {
-                    // 1-wave 160-CTA 100% coalesced warp-split HC Down: each CTA owns 32 contiguous columns
-                    // (two 16-column half-tiles) x 1 partition, loading 512 contiguous bytes per warp in one
-                    // int4 transaction. When hc_down_done is provided, the last partition CTA for each
-                    // 32-column tile immediately folds and publishes Q8, eliminating one full grid.sync().
-                    const unsigned col_tiles = columns / 32u;
+                    // Full-grid 100% coalesced warp-split HC Down: every CTA owns 32 contiguous
+                    // columns x 1 partition (<=7 blocks across 8 warps -> 1 single pass, zero
+                    // loop-carried dependency, parallel payload+scale loads, 1 barrier/task via
+                    // warp-0 shuffle broadcast of atomicAdd).
+                    const unsigned col_tiles = columns >> 5;
                     const unsigned cta_tasks = partitions * col_tiles;
                     const bool fuse_down_publish = (hc_down_done != nullptr && col_tiles <= 32u);
                     const unsigned total_down_tasks =
                         (SupportOptionalWriteAndInject && prefix.injection_weights != nullptr)
                             ? (cta_tasks + 4u) : cta_tasks;
-                    const auto& down = prefix.down;
-                    const auto* weight_scales = static_cast<const uint16_t*>(down.scales);
                     const unsigned half_lane = lane >> 1;
                     const unsigned half_part = lane & 1u;
+                    const unsigned bps = static_cast<unsigned>(prefix.down_partitions.blocks_per_partition);
+                    const unsigned total_blocks = static_cast<unsigned>(prefix.down.blocks_per_row);
+#pragma unroll 1
                     for (unsigned cta_task = blockIdx.x; cta_task < total_down_tasks; cta_task += gridDim.x)
                     {
                         if constexpr (SupportOptionalWriteAndInject)
@@ -500,21 +524,31 @@ namespace llaminar2::cuda::moe
                             }
                         }
                         const unsigned partition = cta_task / col_tiles;
-                        const unsigned col_tile = cta_task % col_tiles;
-                        const unsigned col_base = col_tile * 32u;
-                        const unsigned first = partition * prefix.down_partitions.blocks_per_partition;
-                        const unsigned last = min(static_cast<unsigned>(down.blocks_per_row),
-                            first + static_cast<unsigned>(prefix.down_partitions.blocks_per_partition));
-                        const unsigned count = last > first ? last - first : 0u;
+                        const unsigned col_tile = cta_task - partition * col_tiles;
+                        const unsigned col_base = col_tile << 5;
+                        const unsigned first = partition * bps;
+                        const unsigned last = min(total_blocks, first + bps);
+                        const unsigned count = (last > first) ? (last - first) : 0u;
+#pragma unroll 1
                         for (unsigned b = warp; b < count; b += 8u)
                         {
                             const unsigned group = first + b;
-                            const unsigned row_base = group * down.n + col_base;
+                            const unsigned row_base = group * columns + col_base;
                             const int4 a4 = reinterpret_cast<const int4*>(
                                 prefix.norm_codes + group * 32u)[half_part];
-                            const float act_scale = prefix.norm_scales[group];
-                            const int4 w0 = reinterpret_cast<const int4*>(down.payload + row_base * 32u)[lane];
-                            const int4 w1 = reinterpret_cast<const int4*>(down.payload + (row_base + 16u) * 32u)[lane];
+                            const int4 w0 = reinterpret_cast<const int4*>(
+                                prefix.down.payload + row_base * 32u)[lane];
+                            const int4 w1 = reinterpret_cast<const int4*>(
+                                prefix.down.payload + (row_base + 16u) * 32u)[lane];
+                            float act_scale = 0.0f;
+                            uint16_t raw_ws0 = 0u, raw_ws1 = 0u;
+                            if (half_part == 0u)
+                            {
+                                const auto* weight_scales = static_cast<const uint16_t*>(prefix.down.scales);
+                                act_scale = prefix.norm_scales[group];
+                                raw_ws0 = weight_scales[row_base + half_lane];
+                                raw_ws1 = weight_scales[row_base + 16u + half_lane];
+                            }
                             int d0 = __dp4a(w0.x, a4.x, 0);
                             int d1 = __dp4a(w1.x, a4.x, 0);
                             d0 = __dp4a(w0.y, a4.y, d0);
@@ -527,8 +561,8 @@ namespace llaminar2::cuda::moe
                             const int full1 = d1 + __shfl_xor_sync(0xffffffffu, d1, 1);
                             if (half_part == 0u)
                             {
-                                const float ws0 = __half2float(__ushort_as_half(weight_scales[row_base + half_lane]));
-                                const float ws1 = __half2float(__ushort_as_half(weight_scales[row_base + 16u + half_lane]));
+                                const float ws0 = __half2float(__ushort_as_half(raw_ws0));
+                                const float ws1 = __half2float(__ushort_as_half(raw_ws1));
                                 shared.down_blocks[b][half_lane] =
                                     device_native_quantised_contract::singleScaleBlock(full0, ws0, act_scale);
                                 shared.down_blocks[b][16u + half_lane] =
@@ -539,34 +573,36 @@ namespace llaminar2::cuda::moe
                         if (warp == 0u)
                         {
                             float sum = 0.0f;
-                            for (unsigned b = 0; b < count; ++b)
+#pragma unroll 1
+                            for (unsigned b = 0u; b < count; ++b)
                                 sum = __fadd_rn(sum, shared.down_blocks[b][lane]);
                             prefix.down_partials[partition * columns + col_base + lane] = sum;
                             if (fuse_down_publish)
-                                __threadfence();
-                        }
-                        __syncthreads();
-                        if (fuse_down_publish)
-                        {
-                            if (tid == 0u)
-                                shared.down_finished = atomicAdd(hc_down_done + col_tile, 1u) + 1u;
-                            __syncthreads();
-                            if (shared.down_finished == partitions && warp == 0u)
                             {
-                                const unsigned column = col_base + lane;
-                                float total = 0.0f;
-                                for (unsigned part = 0u; part < partitions; ++part)
-                                    total = __fadd_rn(total, __ldcg(prefix.down_partials + part * columns + column));
-                                prefix.raw_down[column] = total;
-                                hc_down_publication::publish<hc_down_publication::OriginalScalePublication, PublishActivated>(
-                                    total, prefix.down_publication, column);
+                                __threadfence();
+                                unsigned finished = (lane == 0u) ? (atomicAdd(hc_down_done + col_tile, 1u) + 1u) : 0u;
+                                finished = __shfl_sync(0xffffffffu, finished, 0);
+                                if (finished == partitions)
+                                {
+                                    const unsigned column = col_base + lane;
+                                    float total = 0.0f;
+#pragma unroll 1
+                                    for (unsigned part = 0u; part < partitions; ++part)
+                                        total = __fadd_rn(total, __ldcg(prefix.down_partials + part * columns + column));
+                                    prefix.raw_down[column] = total;
+                                    hc_down_publication::publish<hc_down_publication::OriginalScalePublication, PublishActivated>(
+                                        total, prefix.down_publication, column);
+                                }
                             }
-                            __syncthreads();
                         }
+                        if (cta_task + gridDim.x < total_down_tasks)
+                            __syncthreads();
                     }
                 }
                 else
                 {
+                    const unsigned global_thread = blockIdx.x * blockDim.x + tid;
+                    const unsigned grid_threads = gridDim.x * blockDim.x;
                     for (unsigned task = global_thread; task < partitions * columns; task += grid_threads)
                     {
                         const unsigned column = task % columns;
@@ -582,6 +618,8 @@ namespace llaminar2::cuda::moe
             }
             else
             {
+                const unsigned global_thread = blockIdx.x * blockDim.x + tid;
+                const unsigned grid_threads = gridDim.x * blockDim.x;
                 for (unsigned task = global_thread; task < partitions * columns; task += grid_threads)
                 {
                     const unsigned column = task % columns;
@@ -615,6 +653,8 @@ namespace llaminar2::cuda::moe
             // Every publishing warp owns a complete quantizer packet. It folds
             // the original partition bank in order, or computes the single admitted
             // direct partition without materializing a partial or joining the grid.
+            const unsigned global_thread = blockIdx.x * blockDim.x + tid;
+            const unsigned grid_threads = gridDim.x * blockDim.x;
             for (unsigned first = (global_thread / 32) * 32; first < columns; first += grid_threads)
             {
                 const unsigned column = first + lane;
@@ -637,25 +677,25 @@ namespace llaminar2::cuda::moe
             }
             grid.sync();
         }
+        }
         mark(3);
 
+        const unsigned hidden = prefix.norm.hidden;
         if constexpr (!GeneralCodebooks)
         {
         if (prefix.up.weights.blocks_per_row == 10 && hidden % 16 == 0)
         {
             // 100% coalesced warp-split 160-CTA HC Up: each CTA owns 16 contiguous channels
-            // across all 4 branches, distributing the 40 (branch, K32-group) pairs evenly
-            // across 8 warps (5 tasks/warp, zero imbalance) with single 512-byte warp loads.
-            const auto& up = prefix.up;
-            const auto& weight = up.weights;
-            const auto* weight_scales = static_cast<const uint16_t*>(weight.scales);
+            // across all 4 branches, issuing all 5 x 512-byte int4 warp loads in flight via
+            // full unroll (~89% of GDDR6X roofline on SM86).
             const unsigned half_lane = lane >> 1;
             const unsigned half_part = lane & 1u;
-            const unsigned channel_tiles = hidden / 16u;
+            const unsigned channel_tiles = hidden >> 4;
+#pragma unroll 1
             for (unsigned tile = blockIdx.x; tile < channel_tiles; tile += gridDim.x)
             {
-                const unsigned first_channel = tile * 16u;
-#pragma unroll
+                const unsigned first_channel = tile << 4;
+#pragma unroll 2
                 for (unsigned step = 0u; step < 5u; ++step)
                 {
                     const unsigned task = step * 8u + warp;
@@ -663,9 +703,9 @@ namespace llaminar2::cuda::moe
                     const unsigned group = task - branch * 10u;
                     const unsigned col_base = branch * hidden + first_channel;
                     const int4 w4 = reinterpret_cast<const int4*>(
-                        weight.payload + (group * weight.n + col_base) * 32u)[lane];
-                    const int4 p4 = reinterpret_cast<const int4*>(up.primary + group * 32u)[half_part];
-                    const int4 r4 = reinterpret_cast<const int4*>(up.residual + group * 32u)[half_part];
+                        prefix.up.weights.payload + (group * prefix.up.weights.n + col_base) * 32u)[lane];
+                    const int4 p4 = reinterpret_cast<const int4*>(prefix.up.primary + group * 32u)[half_part];
+                    const int4 r4 = reinterpret_cast<const int4*>(prefix.up.residual + group * 32u)[half_part];
                     int pd = __dp4a(w4.x, p4.x, 0);
                     int rd = __dp4a(w4.x, r4.x, 0);
                     pd = __dp4a(w4.y, p4.y, pd);
@@ -678,12 +718,13 @@ namespace llaminar2::cuda::moe
                     const int r_full = rd + __shfl_xor_sync(0xffffffffu, rd, 1);
                     if (half_part == 0u)
                     {
-                        const unsigned linear = group * weight.n + col_base + half_lane;
-                        const float ws = __half2float(__ushort_as_half(weight_scales[linear]));
+                        const unsigned linear = group * prefix.up.weights.n + col_base + half_lane;
+                        const float ws = __half2float(__ushort_as_half(
+                            static_cast<const uint16_t*>(prefix.up.weights.scales)[linear]));
                         shared.up.primary[branch][group][half_lane] =
-                            device_native_quantised_contract::singleScaleBlock(p_full, ws, up.primaryScales[group]);
+                            device_native_quantised_contract::singleScaleBlock(p_full, ws, prefix.up.primaryScales[group]);
                         shared.up.residual[branch][group][half_lane] =
-                            device_native_quantised_contract::singleScaleBlock(r_full, ws, up.residualScales[group]);
+                            device_native_quantised_contract::singleScaleBlock(r_full, ws, prefix.up.residualScales[group]);
                     }
                 }
                 __syncthreads();
@@ -693,14 +734,14 @@ namespace llaminar2::cuda::moe
                     const unsigned ch = tid & 15u;
                     float primary = 0.0f, residual = 0.0f;
 #pragma unroll
-                    for (unsigned group = 0; group < 10u; ++group)
+                    for (unsigned group = 0u; group < 10u; ++group)
                     {
                         primary = __fadd_rn(primary, shared.up.primary[branch][group][ch]);
                         residual = __fadd_rn(residual, shared.up.residual[branch][group][ch]);
                     }
                     const float logit = __fadd_rn(primary, residual);
                     if constexpr (PublishUp)
-                        up.output[branch * hidden + first_channel + ch] = logit;
+                        prefix.up.output[branch * hidden + first_channel + ch] = logit;
                     shared.up.logit[branch][ch] = logit;
                 }
                 __syncthreads();
@@ -708,12 +749,13 @@ namespace llaminar2::cuda::moe
                 {
                     float mixed = 0.0f;
 #pragma unroll
-                    for (unsigned branch = 0; branch < 4u; ++branch)
+                    for (unsigned branch = 0u; branch < 4u; ++branch)
                         mixed = appendReadBranch(mixed, shared.up.logit[branch][tid],
                             prefix.norm.output[branch * hidden + first_channel + tid]);
                     prefix.mixed[first_channel + tid] = mixed * 0.25f;
                 }
-                __syncthreads();
+                if (tile + gridDim.x < channel_tiles)
+                    __syncthreads();
             }
             grid.sync();
             return;
@@ -724,6 +766,7 @@ namespace llaminar2::cuda::moe
         constexpr unsigned branch_width = retained_hc_read_warp_channels;
         const unsigned branch = lane / branch_width;
         const unsigned read_warp = tid / 32 * gridDim.x + blockIdx.x;
+        const unsigned grid_threads = gridDim.x * blockDim.x;
         for (unsigned first = read_warp * branch_width; first < hidden;
              first += grid_threads / 32 * branch_width)
         {
