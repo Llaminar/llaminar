@@ -1024,12 +1024,14 @@ namespace llaminar2
                                                 bool transpose_B,
                                                 float alpha = 1.0f,
                                                 float beta = 0.0f,
-                                                const FloatingProjectionRows *selection = nullptr)
+                                                const FloatingProjectionRows *selection = nullptr,
+                                                bool decode_equivalent = false)
         {
             // Fast SIMD 4x4 register-blocked FP32xBF16 GEMM for non-verifier prefill (e.g. QFN
             // qsa_key_proj [512, 2560] x [128, 2560] BF16), eliminating the scalar K loop.
             const auto scoped_sel = cpuFloatingProjectionRows(M);
-            if (transpose_B && M >= 16 && N > 0 && K >= 16 && !selection && !scoped_sel &&
+            if (!decode_equivalent && transpose_B && M >= 16 && N > 0 && K >= 16 &&
+                !selection && !scoped_sel &&
                 !ITensorGemm::VerifierKernelModeScope::active())
             {
                 const ISALevel isa = activeISALevel();
@@ -4894,7 +4896,9 @@ namespace llaminar2
                                                  k,
                                                  /*transpose_B=*/true,
                                                  alpha,
-                                                 beta);
+                                                 beta,
+                                                 /*selection=*/nullptr,
+                                                 /*decode_equivalent=*/true);
                 }
 
                 if (!down_ok)
@@ -5556,7 +5560,8 @@ namespace llaminar2
                                               m,
                                               proj.n,
                                               k,
-                                              /*transpose_B=*/true,1.0f,0.0f,&selection))
+                                              /*transpose_B=*/true, 1.0f, 0.0f, &selection,
+                                              /*decode_equivalent=*/true))
                                  : run_bf16_skinny_matmul(
                                        input_bf16,
                                        weight_bf16->typed_data(),

@@ -442,8 +442,8 @@ public:
        <<",expert="<<int(ids_[1][slot])<<",gate="<<unsigned(row.gate.codebook_id)
        <<",up="<<unsigned(row.up.codebook_id)<<",down="<<unsigned(row.down.codebook_id)
        <<",F="<<row.gate.n<<",down_N="<<row.down.n<<",down_K="<<row.down.k<<'\n';
-     } else require(row.down.codebook_id==kNativeQuantisedExpandedInt8MinCodebook&&row.down.payload&&row.down.scales,
-      "genuine CPU arrival executes its actual prepared physical23 descriptor");
+     } else require(row.down.codebook_id==native_quantised_formats::Q5_1.codebook_id&&row.down.payload&&row.down.scales,
+      "genuine CPU Q5_1 arrival executes its compact five-bit physical7 descriptor");
      witnessed=true;
     }
     require(witnessed,"actual full selected packet includes genuine promoted expert");

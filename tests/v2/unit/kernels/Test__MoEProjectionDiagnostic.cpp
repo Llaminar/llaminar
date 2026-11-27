@@ -252,11 +252,10 @@ TEST(MoEProjectionDiagnostic, Promoted23RepresentationPreservesDefaultAndOrigina
     EXPECT_EQ(original.prepared_representation, MoEProjectionPreparedRepresentation::OriginalGpu);
     authored["prepared_representation"] = "original-gpu-prepared";
     EXPECT_EQ(parseMoEProjectionDiagnostic(authored, Json::object()).evidenceId(), original.evidenceId());
-    authored["prepared_representation"] = "cpu-prepared-promoted23";
-    authored["source"]["routed"]["gate"] = "IQ1_S";
-    authored["source"]["routed"]["up"] = "IQ1_S";
-    const auto original_iq1s = parseMoEProjectionDiagnostic(syntheticRequest("IQ1_S"), Json::object());
-    const auto promoted = parseMoEProjectionDiagnostic(authored, Json::object());
+    auto authored_iq1s = syntheticRequest("IQ1_S");
+    const auto original_iq1s = parseMoEProjectionDiagnostic(authored_iq1s, Json::object());
+    authored_iq1s["prepared_representation"] = "cpu-prepared-promoted23";
+    const auto promoted = parseMoEProjectionDiagnostic(authored_iq1s, Json::object());
     EXPECT_EQ(promoted.prepared_representation, MoEProjectionPreparedRepresentation::CpuPreparedPromoted23);
     EXPECT_EQ(promoted.source.evidenceId(), original_iq1s.source.evidenceId());
     EXPECT_EQ(promoted.source.routed.gate, "IQ1_S");

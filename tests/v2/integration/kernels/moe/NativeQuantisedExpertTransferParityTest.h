@@ -1874,7 +1874,7 @@ namespace llaminar2::test
         constexpr int kTopK = 2;
         constexpr int kMaxRows = 65;
         constexpr int kLayer = 0;
-        const auto &format = quantizedVerifierFormat("Q5_K");
+        const auto &format = quantizedVerifierFormat("IQ1_S");
 
         std::vector<std::unique_ptr<TensorBase>> weights;
         std::vector<GpuPreparedGemm> prepared;
@@ -1921,9 +1921,9 @@ namespace llaminar2::test
                 ModelContextId{model_base + 3u},
                 weights,
                 prepared);
-        ASSERT_EQ(compact_gate.codebook_id, 7u);
-        ASSERT_EQ(compact_up.codebook_id, 7u);
-        ASSERT_EQ(compact_down.codebook_id, 7u);
+        ASSERT_EQ(compact_gate.codebook_id, 16u);
+        ASSERT_EQ(compact_up.codebook_id, 16u);
+        ASSERT_EQ(compact_down.codebook_id, 16u);
 
         std::array<cpu::native_quantised::CPUNativeQuantisedPackedWeights, 3>
             cpu_weights;
@@ -1931,7 +1931,7 @@ namespace llaminar2::test
         {
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 weights[index].get(), cpu_weights[index]));
-            ASSERT_TRUE(cpu_weights[index].usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights[index].usesNibbleLUT());
             ASSERT_TRUE(cpu_weights[index].is_asymmetric);
         }
         auto promoted_gate = promoteCPUProjection(

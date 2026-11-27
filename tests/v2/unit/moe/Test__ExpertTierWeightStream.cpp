@@ -71,11 +71,11 @@ namespace llaminar2
             projection.N = 70;
             projection.K = 96;
             projection.blocks_per_row = 3;
-            // Codebook 23 is a normalized destination for a Q5_1-derived
+            // Codebook 23 is a normalized destination for an IQ1_S-derived
             // asymmetric expanded CPU representation, not a GGUF source id.
             projection.source_codebook_id =
                 codebook == kNativeQuantisedExpandedInt8MinCodebook
-                    ? static_cast<uint8_t>(7)
+                    ? static_cast<uint8_t>(16)
                     : codebook == kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook;
             projection.codebook_id = codebook;
             projection.payload_bytes_per_block = payload_bytes;
@@ -95,11 +95,15 @@ namespace llaminar2
                 {
                     uint8_t value = static_cast<uint8_t>(
                         (block * 37u + byte * 19u + 11u) & 0xffu);
-                    if (codebook == 19 ||
-                        codebook == kNativeQuantisedExpandedInt8MinCodebook)
+                    if (codebook == 19)
                     {
                         value = static_cast<uint8_t>(static_cast<int8_t>(
                             static_cast<int>((block * 13u + byte * 7u) % 127u) - 63));
+                    }
+                    else if (codebook == kNativeQuantisedExpandedInt8MinCodebook)
+                    {
+                        value = static_cast<uint8_t>(
+                            cpu::native_quantised::kIQ1SDecodeLUT[(block * 13u + byte * 7u) % 3u]);
                     }
                     projection.payload[block * payload_bytes + byte] = value;
                 }
@@ -406,13 +410,15 @@ namespace llaminar2
                 makeProjection(4, 16, false, false),
                 makeProjection(kNativeQuantisedIQ4XSSourceScaleCodebook, 16, true, true),
                 makeProjection(5, 16, true, true),
+                makeProjection(6, 20, false, false),
+                makeProjection(7, 20, true, false),
                 makeProjection(8, 24, true, true),
                 makeProjection(19, 32, false, false),
                 makeProjection(
                     kNativeQuantisedExpandedInt8MinCodebook,
                     32,
                     true,
-                    false)));
+                    true)));
 
         TEST(ExpertTierWeightStream, OrderedChunksWriteDirectlyToFinalBytes)
         {

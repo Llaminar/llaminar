@@ -9,6 +9,7 @@
 
 #include "execution/moe/MoEOverlayDeviceControllerProtocol.h"
 #include "execution/moe/MoEOverlayDeviceControllerDispatch.h"
+#include "execution/moe/MoEOverlayCycleSearch.h"
 #include "execution/moe/MoEOverlayWorkerDrainProtocol.h"
 
 #include <gtest/gtest.h>
@@ -465,5 +466,166 @@ namespace llaminar2::test
         EXPECT_EQ(fixture.protocol.error(),
                   MoEOverlayDeviceControllerError::InvalidGroup);
         EXPECT_EQ(fixture.header.error_group_id, 4u);
+    }
+
+    /**
+     * @brief Replay compressed minimum-edge cycle search + first_start cursor
+     *        against full findMoEOverlayPlacementCycle across dense cycles and
+     *        dead-end DAG components for 5-target and 8-target topologies.
+     */
+    TEST(Test__MoEOverlayDeviceControllerProtocol,
+         CycleSearchFirstStartAndCompressedGraphMatchOracleReplay)
+    {
+        constexpr std::uint16_t kNone = 0xffffu;
+        for (const std::uint32_t target_count : {5u, 8u})
+        {
+            constexpr std::uint32_t expert_count = 512u;
+            std::vector<std::int32_t> current(expert_count);
+            std::vector<std::int32_t> desired(expert_count);
+            // Deterministic unbalanced+balanced mix that produces both rich
+            // multi-length cycles and large dead-end DAG remainders after
+            // partial enumeration.
+            for (std::uint32_t e = 0u; e < expert_count; ++e)
+            {
+                current[e] = static_cast<std::int32_t>((e * 7u + 3u) % target_count);
+                desired[e] = static_cast<std::int32_t>(
+                    (e < 320u) ? ((e * 11u + 1u) % target_count)
+                               : ((current[e] + 1u) % (target_count - 1u)));
+            }
+
+            std::vector<std::uint8_t> enum_oracle(expert_count, 0u);
+            std::vector<std::uint8_t> enum_cursor(expert_count, 0u);
+            std::vector<std::uint8_t> enum_compressed(expert_count, 0u);
+
+            std::vector<std::uint8_t> visited(target_count, 0u);
+            std::vector<std::uint32_t> sources(target_count, 0u);
+            std::vector<std::uint32_t> next_edges(target_count, 0u);
+            std::vector<std::uint32_t> cycle_oracle(target_count, 0u);
+            std::vector<std::uint32_t> cycle_cursor(target_count, 0u);
+            std::vector<std::uint32_t> cycle_compressed(target_count, 0u);
+
+            std::vector<std::uint16_t> pair_head(target_count * target_count, kNone);
+            std::vector<std::uint16_t> pair_next(expert_count, kNone);
+            std::vector<std::uint8_t> dead_pair(target_count * target_count, 0u);
+            for (std::uint32_t rev = expert_count; rev != 0u; --rev)
+            {
+                const std::uint32_t e = rev - 1u;
+                if (current[e] == desired[e])
+                    continue;
+                const std::uint32_t slot =
+                    static_cast<std::uint32_t>(current[e]) * target_count +
+                    static_cast<std::uint32_t>(desired[e]);
+                pair_next[e] = pair_head[slot];
+                pair_head[slot] = static_cast<std::uint16_t>(e);
+            }
+
+            std::uint32_t search_first_cursor = 0u;
+            std::uint32_t search_first_compressed = 0u;
+            std::uint32_t cycles_found = 0u;
+
+            while (true)
+            {
+                const auto oracle_res = findMoEOverlayPlacementCycle(
+                    current.data(), desired.data(), enum_oracle,
+                    target_count, expert_count, visited.data(),
+                    sources.data(), next_edges.data(), cycle_oracle.data(), 0u);
+                const auto cursor_res = findMoEOverlayPlacementCycle(
+                    current.data(), desired.data(), enum_cursor,
+                    target_count, expert_count, visited.data(),
+                    sources.data(), next_edges.data(), cycle_cursor.data(),
+                    search_first_cursor);
+
+                // Compressed canonical DFS matching authorDynamicPolicy.
+                std::uint32_t comp_len = 0u;
+                std::vector<std::uint8_t> dfs_vis(target_count, 0u);
+                std::vector<std::uint8_t> dfs_src(target_count, 0u);
+                std::vector<std::uint16_t> dfs_min(target_count, 0u);
+                for (std::uint32_t first = search_first_compressed;
+                     first < expert_count;
+                     ++first)
+                {
+                    if (enum_compressed[first] != 0u)
+                        continue;
+                    const auto start = static_cast<std::uint32_t>(current[first]);
+                    const auto next = static_cast<std::uint32_t>(desired[first]);
+                    if (start == next || dead_pair[start * target_count + next] != 0u)
+                        continue;
+                    cycle_compressed[0] = first;
+                    std::fill(dfs_vis.begin(), dfs_vis.end(), 0u);
+                    dfs_vis[start] = 1u;
+                    dfs_vis[next] = 1u;
+                    std::uint32_t depth = 1u;
+                    dfs_src[1] = static_cast<std::uint8_t>(next);
+                    dfs_min[1] = 0u;
+                    while (true)
+                    {
+                        const std::uint32_t u = dfs_src[depth];
+                        const std::uint16_t min_e = dfs_min[depth];
+                        std::uint16_t best_e = kNone;
+                        std::uint32_t best_v = target_count;
+                        const std::uint32_t row_base = u * target_count;
+                        for (std::uint32_t v = 0u; v < target_count; ++v)
+                        {
+                            if (v == u)
+                                continue;
+                            std::uint16_t h = pair_head[row_base + v];
+                            while (h != kNone && enum_compressed[h] != 0u)
+                                h = pair_next[h];
+                            pair_head[row_base + v] = h;
+                            if (h != kNone && h >= min_e && h < best_e)
+                            {
+                                best_e = h;
+                                best_v = v;
+                            }
+                        }
+                        if (best_e == kNone)
+                        {
+                            if (depth == 1u)
+                                break;
+                            --depth;
+                            continue;
+                        }
+                        dfs_min[depth] = static_cast<std::uint16_t>(best_e + 1u);
+                        if (best_v == start)
+                        {
+                            cycle_compressed[depth] = best_e;
+                            comp_len = depth + 1u;
+                            break;
+                        }
+                        if (dfs_vis[best_v] == 0u && depth + 1u < target_count)
+                        {
+                            dfs_vis[best_v] = 1u;
+                            cycle_compressed[depth] = best_e;
+                            ++depth;
+                            dfs_src[depth] = static_cast<std::uint8_t>(best_v);
+                            dfs_min[depth] = 0u;
+                        }
+                    }
+                    if (comp_len != 0u)
+                        break;
+                    dead_pair[start * target_count + next] = 1u;
+                }
+
+                ASSERT_EQ(cursor_res.length, oracle_res.length)
+                    << "target_count=" << target_count << " cycle=" << cycles_found;
+                ASSERT_EQ(comp_len, oracle_res.length)
+                    << "target_count=" << target_count << " cycle=" << cycles_found;
+                if (oracle_res.length == 0u)
+                    break;
+
+                for (std::uint32_t i = 0u; i < oracle_res.length; ++i)
+                {
+                    ASSERT_EQ(cycle_cursor[i], cycle_oracle[i]);
+                    ASSERT_EQ(cycle_compressed[i], cycle_oracle[i]);
+                    enum_oracle[cycle_oracle[i]] = 1u;
+                    enum_cursor[cycle_cursor[i]] = 1u;
+                    enum_compressed[cycle_compressed[i]] = 1u;
+                }
+                search_first_cursor = cycle_cursor[0] + 1u;
+                search_first_compressed = cycle_compressed[0] + 1u;
+                ++cycles_found;
+            }
+            EXPECT_GT(cycles_found, 30u);
+        }
     }
 } // namespace llaminar2::test

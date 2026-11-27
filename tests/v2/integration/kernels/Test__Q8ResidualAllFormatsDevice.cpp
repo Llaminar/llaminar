@@ -254,8 +254,10 @@ test::GpuPreparedGemm preparePromotedAsymmetric(TensorBase *source, DeviceId dev
       dynamic_cast<cpu::native_quantised::CPUNativeQuantisedGemmKernel *>(cold.store->gemmKernel(cold.ref));
   require(coldEngine && coldEngine->isValid(), "Actual cold CPU prepared expert is absent");
   const auto &packed = coldEngine->packedWeights();
-  require(packed.usesExpandedInt8() && packed.is_asymmetric,
-          "Authored asymmetric source must reach real expanded CPU storage");
+  const bool compact_five_bit = packed.usesCompactFiveBit();
+  require((compact_five_bit || packed.usesNibbleLUT() || packed.usesExpandedInt8()) &&
+              packed.is_asymmetric,
+          "Authored asymmetric source must reach real CPU-packed asymmetric storage");
   const std::vector<uint8_t> before(packed.native_interleaved.begin(),
                                     packed.native_interleaved.end());
   auto allocation =
@@ -264,11 +266,16 @@ test::GpuPreparedGemm preparePromotedAsymmetric(TensorBase *source, DeviceId dev
   require(std::equal(before.begin(), before.end(), packed.native_interleaved.begin()),
           "Actual promotion mutated its cold CPU execution source");
   const auto &descriptor = allocation->descriptor;
-  require(descriptor.codebook_id == kNativeQuantisedExpandedInt8MinCodebook &&
-              descriptor.source_codebook_id == native_quantised_formats::Q5_1.codebook_id &&
-              descriptor.source_is_superblock == 0 && descriptor.source_identity_present == 1 &&
+  const auto *source_info = native_quantised_formats::forSourceIdentity(
+      packed.codebook_id, packed.is_superblock);
+  require(source_info != nullptr, "Promoted source format is not cataloged");
+  const auto expected_migrated = migrationStableDeviceVnniFormat(*source_info);
+  require(descriptor.codebook_id == expected_migrated.codebook_id &&
+              descriptor.source_codebook_id == source_info->codebook_id &&
+              descriptor.source_is_superblock == (source_info->is_superblock ? 1 : 0) &&
+              descriptor.source_identity_present == 1 &&
               descriptor.mins && !descriptor.emins,
-          "Production CPU promotion did not publish the original asymmetric physical23 contract");
+          "Production CPU promotion did not publish the expected migration-stable asymmetric contract");
   auto engine = transfer::promotedEngine(device, descriptor, allocation);
   const auto kind = device.is_cuda()
                         ? factory::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
@@ -428,8 +435,13 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
         ASSERT_EQ(desc.k, k);
         EXPECT_EQ(desc.source_codebook_id, format.source_codebook_id);
         EXPECT_EQ(bool(desc.source_is_superblock), format.source_is_superblock);
-        EXPECT_EQ(desc.codebook_id, promotedAsymmetric ? kNativeQuantisedExpandedInt8MinCodebook
-                                                       : format.device_execution_codebook_id);
+        const auto *source_meta = native_quantised_formats::forSourceIdentity(
+            format.source_codebook_id, format.source_is_superblock);
+        ASSERT_NE(source_meta, nullptr);
+        EXPECT_EQ(desc.codebook_id,
+                  promotedAsymmetric
+                      ? migrationStableDeviceVnniFormat(*source_meta).codebook_id
+                      : format.device_execution_codebook_id);
         EXPECT_EQ(desc.source_identity_present, 1);
         // Per-engine publication starts cold even when another earlier engine
         // has already initialized the original backend's global codebook
@@ -954,9 +966,12 @@ TEST(Q8ResidualAllFormatsDevice, CUDAUntiledLarge) {
 TEST(Q8ResidualAllFormatsDevice, CUDAOriginalBlock32) {
   block32(DeviceId::cuda(0));
 }
-/** @brief Actual CPU-cold Q5_1 promotion remains exact under explicit native TwoTerm. */
+/** @brief Actual CPU-cold IQ1_S (physical23) and Q5_1 (CompactFiveBit cb7) promotion remain exact under explicit native TwoTerm. */
 TEST(Q8ResidualAllFormatsDevice, CUDAExpandedMinimumPromotion) {
   for (int m : {1, 15, 65}) {
+    prove(DeviceId::cuda(0), test::quantizedVerifierFormat("IQ1_S"), m, 64, 256,
+          false, false, SourcePreparation::PromotedCpuAsymmetric);
+    ASSERT_FALSE(::testing::Test::HasFailure());
     prove(DeviceId::cuda(0), test::quantizedVerifierFormat("Q5_1"), m, 64, 96,
           false, false, SourcePreparation::PromotedCpuAsymmetric);
     ASSERT_FALSE(::testing::Test::HasFailure());
@@ -982,9 +997,12 @@ TEST(Q8ResidualAllFormatsDevice, ROCmUntiledLarge) {
 TEST(Q8ResidualAllFormatsDevice, ROCmOriginalBlock32) {
   block32(DeviceId::rocm(0));
 }
-/** @brief Equivalent ROCm coverage for genuine physical23 CPU-cold promotion. */
+/** @brief Equivalent ROCm coverage for genuine physical23 (IQ1_S) and CompactFiveBit (Q5_1) CPU-cold promotion. */
 TEST(Q8ResidualAllFormatsDevice, ROCmExpandedMinimumPromotion) {
   for (int m : {1, 15, 65}) {
+    prove(DeviceId::rocm(0), test::quantizedVerifierFormat("IQ1_S"), m, 64, 256,
+          false, false, SourcePreparation::PromotedCpuAsymmetric);
+    ASSERT_FALSE(::testing::Test::HasFailure());
     prove(DeviceId::rocm(0), test::quantizedVerifierFormat("Q5_1"), m, 64, 96,
           false, false, SourcePreparation::PromotedCpuAsymmetric);
     ASSERT_FALSE(::testing::Test::HasFailure());

@@ -1890,6 +1890,13 @@ add_v2_test(V2_Integration_MoEOverlayCapturedActionDispatch
     LABELS "V2;Integration;ProductionTestPreflight;ExpertOverlay;CaptureIdentity;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30
 )
+add_v2_test(V2_Integration_MoEOverlayCycleSearchCompressedReplay
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_device_controller_protocol>
+        --gtest_filter=Test__MoEOverlayDeviceControllerProtocol.CycleSearchFirstStartAndCompressedGraphMatchOracleReplay
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ExpertOverlay;Dynamic;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayCycleSearchCompressedReplay)
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_epoch_lease_lifecycle
     V2_Unit_MoEOverlayEpochLeaseLifecycle
@@ -4035,6 +4042,12 @@ add_v2_test(V2_Integration_ROCmGroupedFFNFormatSelection
     COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info> --gtest_filter=ROCmGroupedFFNFormatSelection.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Quantization;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+add_v2_test(V2_Integration_CompactFiveBitMigrationFormatContract
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
+        --gtest_filter=Test__NativeQuantisedFormatInfo.MigrationStableAndReusableFormatsCoverEveryCodebook:Test__NativeQuantisedFormatInfo.RuntimeCaptureEnvelopeCoversEveryTierRepresentation
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Quantization;Regression"
+    TIMEOUT 30 NO_MPI NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CompactFiveBitMigrationFormatContract)
 
 # The learned-dispatch fitter evaluates millions of exact leaf objectives and
 # legal feature splits. ABI v7 keeps the full top-64 tree beam on CUDA or ROCm,
@@ -12408,6 +12421,13 @@ add_v2_test(V2_Integration_CUDA_MoEColdGroupedVerifierPublisherReplay
             --gtest_brief=1
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;Histogram;GraphCapture;Replay;ExplicitStream;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_CUDA_BatchedVerifierHistogramCommitReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.BatchedVerifierHistogramCommitReplay
+            --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;Histogram;GraphCapture;Replay;ExplicitStream;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_BatchedVerifierHistogramCommitReplay)
 add_v2_test(V2_Integration_CUDA_MoEAsyncHistogramCaptureLifecycle
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
             --gtest_filter=Test__CUDAMoEKernel.AsyncHistogramProducerPreparationPrecedesGraphCapture
@@ -24241,6 +24261,21 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
                 --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MTP;Histogram;GraphCapture;Replay;ExplicitStream;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_ROCm_BatchedVerifierHistogramCommitReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.BatchedVerifierHistogramCommitReplay
+                --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MTP;Histogram;GraphCapture;Replay;ExplicitStream;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_ROCm_PrefillHistogramLDSReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.PrefillHistogramLDSExactReplay
+                --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Histogram;GraphCapture;Replay;ExplicitStream;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCm_BatchedVerifierHistogramCommitReplay
+        V2_Integration_ROCm_PrefillHistogramLDSReplay)
     add_v2_test(V2_Integration_ROCm_MoEAsyncHistogramCaptureLifecycle
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
                 --gtest_filter=Test__ROCmMoEKernel.AsyncHistogramProducerPreparationPrecedesGraphCapture

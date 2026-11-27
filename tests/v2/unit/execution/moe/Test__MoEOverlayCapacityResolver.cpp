@@ -267,6 +267,10 @@ namespace llaminar2
             {
                 return 16;
             }
+            if (format.codebook_id == 6 || format.codebook_id == 7)
+            {
+                return 20; // CompactFiveBit preserves 5-bit payload across CPU<->GPU migration.
+            }
             return 32;
         }
 

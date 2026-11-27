@@ -4010,6 +4010,144 @@ TEST_F(Test__CUDAMoEKernel,
 #endif
 }
 
+/**
+ * @brief Replay batched multi-layer verifier histogram commit against single-layer oracle.
+ *
+ * Proves that commitGroupedVerifierHistogramsBatch launches a single 2D-grid kernel
+ * node across all contiguous layers and produces byte-identical DeviceMoELayerRuntime
+ * histograms across full, partial, zero-accepted, gated-off, and repeated replays.
+ */
+TEST_F(Test__CUDAMoEKernel, BatchedVerifierHistogramCommitReplay)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int num_layers = 4;
+    constexpr int max_m = 8;
+    constexpr int num_experts = 64;
+    constexpr int top_k = 4;
+    constexpr int max_slots = max_m * top_k;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    llaminar2::DeviceMoERuntimeTable::Config cfg;
+    cfg.device_id = device;
+    cfg.num_layers = num_layers;
+    cfg.num_experts = num_experts;
+    cfg.top_k = top_k;
+    cfg.mirror_to_device = true;
+    cfg.prefill_token_capacity = max_m;
+    cfg.deferred_verifier_token_capacity = max_m;
+    llaminar2::MoERuntimeTable batch_table(cfg);
+    llaminar2::MoERuntimeTable oracle_table(cfg);
+
+    CudaAllocation accepted_dev(sizeof(int32_t));
+    CudaAllocation pub_ok_dev(sizeof(int32_t));
+
+    // Capture batched (1 kernel node) and oracle (4 kernel nodes) CUDA graphs.
+    ScopedCudaTestGraph batch_graph(stream_, "batched verifier histogram commit");
+    ASSERT_TRUE(cuda_kernel_->commitGroupedVerifierHistogramsBatch(
+        launchContext(),
+        batch_table.deviceLayerState(0),
+        num_layers,
+        sizeof(llaminar2::DeviceMoELayerRuntime),
+        static_cast<const int32_t *>(accepted_dev.get()),
+        static_cast<const int32_t *>(pub_ok_dev.get()),
+        /*request_count=*/1,
+        /*rows_per_request=*/max_m,
+        /*total_rows=*/max_m,
+        num_experts,
+        top_k));
+    ASSERT_TRUE(batch_graph.finishAndInstantiate());
+
+    ScopedCudaTestGraph oracle_graph(stream_, "single-layer verifier histogram oracle");
+    for (int layer = 0; layer < num_layers; ++layer)
+    {
+        ASSERT_TRUE(cuda_kernel_->commitGroupedVerifierHistograms(
+            launchContext(),
+            oracle_table.deviceLayerState(layer),
+            static_cast<const int32_t *>(accepted_dev.get()),
+            static_cast<const int32_t *>(pub_ok_dev.get()),
+            /*request_count=*/1,
+            /*rows_per_request=*/max_m,
+            /*total_rows=*/max_m,
+            num_experts,
+            top_k));
+    }
+    ASSERT_TRUE(oracle_graph.finishAndInstantiate());
+
+    size_t batch_nodes = 0, oracle_nodes = 0;
+    ASSERT_EQ(cudaGraphGetNodes(batch_graph.nativeGraphForInspection(), nullptr, &batch_nodes), cudaSuccess);
+    ASSERT_EQ(cudaGraphGetNodes(oracle_graph.nativeGraphForInspection(), nullptr, &oracle_nodes), cudaSuccess);
+    EXPECT_EQ(batch_nodes, 1u);
+    EXPECT_EQ(oracle_nodes, static_cast<size_t>(num_layers));
+
+    const std::array<std::pair<int32_t, int32_t>, 6> cases{{
+        {8, 1}, {3, 1}, {1, 1}, {0, 1}, {8, 0}, {8, 1},
+    }};
+    for (size_t step = 0; step < cases.size(); ++step)
+    {
+        SCOPED_TRACE("step=" + std::to_string(step));
+        const int32_t accepted_rows = cases[step].first;
+        const int32_t pub_ok = cases[step].second;
+        for (int layer = 0; layer < num_layers; ++layer)
+        {
+            llaminar2::DeviceMoELayerRuntime base_b{}, base_o{};
+            std::memcpy(&base_b, &batch_table.hostLayerState(layer), sizeof(base_b));
+            std::memcpy(&base_o, &oracle_table.hostLayerState(layer), sizeof(base_o));
+            base_b.participant_id = base_o.participant_id = static_cast<uint32_t>(layer % 3);
+            base_b.participant_count = base_o.participant_count = 3u;
+            std::array<int32_t, max_slots> experts{}, pids{};
+            for (int s = 0; s < max_slots; ++s)
+            {
+                experts[static_cast<size_t>(s)] =
+                    (layer * 13 + s * 5 + static_cast<int>(step) * 3) % num_experts;
+                pids[static_cast<size_t>(s)] = (layer + s) % 3;
+            }
+            for (int e = 0; e < num_experts; ++e)
+            {
+                base_b.decode_histogram[e] = base_o.decode_histogram[e] =
+                    static_cast<uint64_t>(100 + layer * 10 + e);
+                base_b.grouped_verifier_histogram[e] =
+                    base_o.grouped_verifier_histogram[e] =
+                        static_cast<uint64_t>(50 + layer + e + step);
+                base_b.grouped_verifier_local_histogram[e] =
+                    base_o.grouped_verifier_local_histogram[e] =
+                        static_cast<uint64_t>(20 + layer + e);
+            }
+            ASSERT_EQ(cudaMemcpyAsync(batch_table.deviceLayerState(layer), &base_b, sizeof(base_b), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(oracle_table.deviceLayerState(layer), &base_o, sizeof(base_o), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(base_b.deferred_verifier_route_expert_ids, experts.data(), sizeof(experts), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(base_b.deferred_verifier_route_participant_ids, pids.data(), sizeof(pids), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(base_o.deferred_verifier_route_expert_ids, experts.data(), sizeof(experts), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(base_o.deferred_verifier_route_participant_ids, pids.data(), sizeof(pids), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+        }
+        ASSERT_EQ(cudaMemcpyAsync(accepted_dev.get(), &accepted_rows, sizeof(accepted_rows), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(pub_ok_dev.get(), &pub_ok, sizeof(pub_ok), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+        ASSERT_TRUE(batch_graph.launch());
+        ASSERT_TRUE(oracle_graph.launch());
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+        for (int layer = 0; layer < num_layers; ++layer)
+        {
+            llaminar2::DeviceMoELayerRuntime actual{}, expected{};
+            ASSERT_EQ(cudaMemcpy(&actual, batch_table.deviceLayerState(layer), sizeof(actual), cudaMemcpyDeviceToHost), cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(&expected, oracle_table.deviceLayerState(layer), sizeof(expected), cudaMemcpyDeviceToHost), cudaSuccess);
+            for (int e = 0; e < num_experts; ++e)
+            {
+                EXPECT_EQ(actual.decode_histogram[e], expected.decode_histogram[e]);
+                EXPECT_EQ(actual.grouped_verifier_histogram[e], expected.grouped_verifier_histogram[e])
+                    << "layer=" << layer << " expert=" << e;
+                EXPECT_EQ(actual.grouped_verifier_local_histogram[e], expected.grouped_verifier_local_histogram[e])
+                    << "layer=" << layer << " expert=" << e;
+            }
+        }
+    }
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterializesSpans)
 {
 #ifndef HAVE_CUDA

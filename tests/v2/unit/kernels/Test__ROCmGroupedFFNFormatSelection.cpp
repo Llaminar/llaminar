@@ -190,7 +190,8 @@ TEST(ROCmGroupedFFNFormatSelection, FixedQ5PitchRequiresMeasuredWidthsAndExactGa
         EXPECT_FALSE(classify(160,width,q5,q5k,sharedWeights(width,formats::Q8_0)));
     EXPECT_FALSE(classify(160,160,q5,sources(formats::Q5_K,formats::Q5_1,formats::Q8_0),exact));
     EXPECT_FALSE(classify(160,160,q5,q5k,sharedWeights(160,formats::Q8_K)));
-    EXPECT_FALSE(classify(160,160,reachable(formats::Q5_K),q5k,exact));
+    // CompactFiveBit keeps Q5_K on single physical reader cb=7 across CPU<->GPU migration.
+    EXPECT_EQ(classify(160,160,reachable(formats::Q5_K,true),q5k,exact),ffn::FixedQ5GatePitch::F160);
 }
 
 /** @test A fixed down reader must remain correct for every descriptor reachable after a move. */
@@ -218,7 +219,9 @@ TEST(ROCmGroupedFFNFormatSelection, PairedDownRequiresOriginalSourcePitchAndSing
                         q4,reachable(formats::Q5_K,false),formats::Q8_0));
     EXPECT_EQ(select(256,160,original,reachable(formats::Q4_K,true),q51,formats::Q8_0),
               ffn::FixedQ51DownPitch::F256);
-    EXPECT_FALSE(select(256,160,original,q4,reachable(formats::Q5_1,true),formats::Q8_0));
+    // CompactFiveBit keeps Q5_1 on single physical reader cb=7 across CPU<->GPU migration.
+    EXPECT_EQ(select(256,160,original,q4,reachable(formats::Q5_1,true),formats::Q8_0),
+              ffn::FixedQ51DownPitch::F256);
 }
 
 #endif

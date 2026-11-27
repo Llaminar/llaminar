@@ -158,15 +158,15 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
                     DeviceNativeQuantisedMatrixDesc descriptor;
                     require(payload.arrivalEpoch()==published->epoch() && payload.down() &&
                         payload.down()->exportNativeQuantisedMatrixDesc(descriptor) &&
-                        descriptor.codebook_id==kNativeQuantisedExpandedInt8MinCodebook &&
+                        descriptor.codebook_id==native_quantised_formats::Q5_1.codebook_id &&
                         descriptor.source_identity_present && descriptor.source_codebook_id==7 &&
                         !descriptor.source_is_superblock && descriptor.mins && !descriptor.emins,
-                        "actual Q5_1 CPU arrival retains physical23 and original source7 policy");
+                        "actual Q5_1 CPU arrival retains compact physical7 and original source7 policy");
                     int parts=0;
                     require(rocmGemv_native_quantised_query_serial_m1_config_with_policy(descriptor.source_codebook_id,
                         descriptor.n,descriptor.k,&parts,nullptr)&&parts==original_parts&&
                         descriptor.n==original_n&&descriptor.k==original_k,
-                        "physical23 arrival preserves the exact original physical7 source-policy partitions and K intervals");
+                        "compact five-bit arrival preserves the exact original physical7 source-policy partitions and K intervals");
                 }
             }
 

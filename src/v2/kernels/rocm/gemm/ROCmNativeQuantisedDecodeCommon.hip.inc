@@ -391,11 +391,22 @@ namespace llaminar2::rocm::native_quantised_internal
         const void *fn, const char *name, int threads);
 } // namespace llaminar2::rocm::native_quantised_internal
 
+/**
+ * @brief Select the historical policy for a self-describing execution format.
+ *
+ * Codebook 24 is the exact source-scale IQ4_XS execution layout (policy 4).
+ * Codebook 23 is a migration-only physical representation and therefore has
+ * no independent tuning corpus. Legacy one-ID callers retain the prior
+ * codebook-19 policy. Production callers carrying source provenance use the
+ * explicit two-ID entrypoints and never consult this default.
+ */
 static constexpr uint8_t defaultNativeQuantisedArithmeticPolicyCodebook(uint8_t execution_codebook_id)
 {
-    return execution_codebook_id == llaminar2::kNativeQuantisedExpandedInt8MinCodebook
-        ? static_cast<uint8_t>(llaminar2::native_quantised_formats::Q4_K.codebook_id)
-        : execution_codebook_id;
+    return execution_codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
+               ? static_cast<uint8_t>(4)
+               : execution_codebook_id == llaminar2::kNativeQuantisedExpandedInt8MinCodebook
+               ? static_cast<uint8_t>(19)
+               : execution_codebook_id;
 }
 
 extern "C" bool rocmQuantGemm_biasAdd(

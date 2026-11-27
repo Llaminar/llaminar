@@ -1034,6 +1034,9 @@ __device__ __forceinline__ float fastBlockContribution(
         }
     } else if constexpr (Traits::is_iq3_grid) {
         const auto* a32_lds = reinterpret_cast<LdsPtr<const std::int32_t>>(q8_blk->codes);
+        const std::uint64_t idx_bytes =
+            static_cast<std::uint64_t>(op.words[0]) |
+            (static_cast<std::uint64_t>(op.words[1]) << 32);
         std::uint32_t signs32 = op.words[2];
         std::uint32_t qh_byte = 0u;
         if constexpr (CB == 11u) {
@@ -1042,8 +1045,7 @@ __device__ __forceinline__ float fastBlockContribution(
         }
 #pragma unroll 1
         for (unsigned g = 0u; g < 8u; ++g) {
-            const std::uint32_t w = (g < 4u) ? op.words[0] : op.words[1];
-            int idx = static_cast<int>((w >> ((g & 3u) * 8u)) & 0xFFu);
+            int idx = static_cast<int>((idx_bytes >> (g * 8u)) & 0xFFu);
             if constexpr (CB == 11u) idx |= static_cast<int>((qh_byte >> g) & 1u) << 8;
             const std::uint32_t grid4 = decoder.template iq3_grid_lookup<CB>(idx);
             const std::uint8_t nibble = static_cast<std::uint8_t>((signs32 >> (g * 4u)) & 0x0Fu);

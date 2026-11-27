@@ -375,7 +375,8 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
         for (const auto &[format, q5_down, runtime_mutable, iq4_mixed] : cases)
         {
             if (model_binding && !runtime_mutable) continue;
-            if (promote_asymmetric && std::string_view(format.label) != "Q5_K") continue;
+            if (promote_asymmetric && std::string_view(format.label) != "Q5_K" &&
+                std::string_view(format.label) != "IQ1_S") continue;
             if (iq2_only && std::string_view(format.label) != "IQ2_S") continue;
             if (format.source_is_superblock && H % 256 != 0) continue;
             SCOPED_TRACE(std::string(format.label) + (q5_down ? "/Q5_1" : "/Q8_0") +
@@ -413,18 +414,25 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
             std::optional<PromotedCPUProjection> promoted_gate, promoted_up;
             if (promote_asymmetric)
             {
+                const bool expect_compact_five_bit = std::string_view(format.label) == "Q5_K";
                 for (std::size_t index = 0; index < cpu_weights.size(); ++index)
                 {
                     ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(sources[index].get(), cpu_weights[index]));
-                    ASSERT_TRUE(cpu_weights[index].usesExpandedInt8());
+                    if (expect_compact_five_bit)
+                        ASSERT_TRUE(cpu_weights[index].usesCompactFiveBit());
+                    else
+                        ASSERT_TRUE(cpu_weights[index].usesNibbleLUT());
                     ASSERT_TRUE(cpu_weights[index].is_asymmetric);
                 }
                 promoted_gate = promoteCPUProjection(backend, device, cpu_weights[0], ExpertTierWeightProjection::Gate, 88801);
                 promoted_up = promoteCPUProjection(backend, device, cpu_weights[1], ExpertTierWeightProjection::Up, 88802);
                 gate = promoted_gate->descriptor;
                 up = promoted_up->descriptor;
-                ASSERT_EQ(gate.codebook_id, kNativeQuantisedExpandedInt8MinCodebook);
-                ASSERT_EQ(up.codebook_id, kNativeQuantisedExpandedInt8MinCodebook);
+                const uint8_t expected_cb = expect_compact_five_bit
+                    ? native_quantised_formats::Q5_K.codebook_id
+                    : kNativeQuantisedExpandedInt8MinCodebook;
+                ASSERT_EQ(gate.codebook_id, expected_cb);
+                ASSERT_EQ(up.codebook_id, expected_cb);
                 ASSERT_EQ(gate.source_codebook_id, original_gate.source_codebook_id);
                 ASSERT_EQ(gate.source_is_superblock, original_gate.source_is_superblock);
                 ASSERT_NE(gate.source_identity_present, 0u);

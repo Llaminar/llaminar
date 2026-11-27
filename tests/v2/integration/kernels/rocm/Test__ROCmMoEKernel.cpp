@@ -4434,6 +4434,307 @@ TEST(Test__ROCmMoEKernel,
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
+/**
+ * @brief Replay batched multi-layer verifier histogram commit against single-layer oracle on ROCm.
+ *
+ * Proves that commitGroupedVerifierHistogramsBatch launches a single 2D-grid kernel
+ * node across all contiguous layers and produces byte-identical DeviceMoELayerRuntime
+ * histograms across full, partial, zero-accepted, gated-off, and repeated replays.
+ */
+TEST(Test__ROCmMoEKernel, BatchedVerifierHistogramCommitReplay)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    SKIP_IF_NO_ROCM();
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    constexpr int num_layers = 4;
+    constexpr int max_m = 8;
+    constexpr int num_experts = 64;
+    constexpr int top_k = 4;
+    constexpr int max_slots = max_m * top_k;
+    const DeviceId device = DeviceId::rocm(0);
+
+    ScopedHipDeviceStream stream_owner(/*device_ordinal=*/0);
+    ASSERT_EQ(stream_owner.status(), hipSuccess);
+    hipStream_t stream = stream_owner.get();
+    ROCmMoEKernel kernel(0);
+    static_cast<IMoEKernel &>(kernel).setGPUStream(stream);
+
+    DeviceMoERuntimeTable::Config cfg;
+    cfg.device_id = device;
+    cfg.num_layers = num_layers;
+    cfg.num_experts = num_experts;
+    cfg.top_k = top_k;
+    cfg.mirror_to_device = true;
+    cfg.prefill_token_capacity = max_m;
+    cfg.deferred_verifier_token_capacity = max_m;
+    MoERuntimeTable batch_table(cfg);
+    MoERuntimeTable oracle_table(cfg);
+
+    HipAllocation accepted_dev(sizeof(int32_t));
+    HipAllocation pub_ok_dev(sizeof(int32_t));
+
+    ScopedHipTestGraph batch_graph(0, stream, "batched verifier histogram commit");
+    ASSERT_TRUE(kernel.commitGroupedVerifierHistogramsBatch(
+        moeLaunchContext(stream),
+        batch_table.deviceLayerState(0),
+        num_layers,
+        sizeof(DeviceMoELayerRuntime),
+        static_cast<const int32_t *>(accepted_dev.get()),
+        static_cast<const int32_t *>(pub_ok_dev.get()),
+        /*request_count=*/1,
+        /*rows_per_request=*/max_m,
+        /*total_rows=*/max_m,
+        num_experts,
+        top_k));
+    ASSERT_TRUE(batch_graph.finishAndInstantiate());
+
+    ScopedHipTestGraph oracle_graph(0, stream, "single-layer verifier histogram oracle");
+    for (int layer = 0; layer < num_layers; ++layer)
+    {
+        ASSERT_TRUE(kernel.commitGroupedVerifierHistograms(
+            moeLaunchContext(stream),
+            oracle_table.deviceLayerState(layer),
+            static_cast<const int32_t *>(accepted_dev.get()),
+            static_cast<const int32_t *>(pub_ok_dev.get()),
+            /*request_count=*/1,
+            /*rows_per_request=*/max_m,
+            /*total_rows=*/max_m,
+            num_experts,
+            top_k));
+    }
+    ASSERT_TRUE(oracle_graph.finishAndInstantiate());
+
+    size_t batch_nodes = 0, oracle_nodes = 0;
+    ASSERT_EQ(hipGraphGetNodes(batch_graph.nativeGraphForInspection(), nullptr, &batch_nodes), hipSuccess);
+    ASSERT_EQ(hipGraphGetNodes(oracle_graph.nativeGraphForInspection(), nullptr, &oracle_nodes), hipSuccess);
+    EXPECT_EQ(batch_nodes, 1u);
+    EXPECT_EQ(oracle_nodes, static_cast<size_t>(num_layers));
+
+    const std::array<std::pair<int32_t, int32_t>, 6> cases{{
+        {8, 1}, {3, 1}, {1, 1}, {0, 1}, {8, 0}, {8, 1},
+    }};
+    for (size_t step = 0; step < cases.size(); ++step)
+    {
+        SCOPED_TRACE("step=" + std::to_string(step));
+        const int32_t accepted_rows = cases[step].first;
+        const int32_t pub_ok = cases[step].second;
+        for (int layer = 0; layer < num_layers; ++layer)
+        {
+            DeviceMoELayerRuntime base_b{}, base_o{};
+            std::memcpy(&base_b, &batch_table.hostLayerState(layer), sizeof(base_b));
+            std::memcpy(&base_o, &oracle_table.hostLayerState(layer), sizeof(base_o));
+            base_b.participant_id = base_o.participant_id = static_cast<uint32_t>(layer % 3);
+            base_b.participant_count = base_o.participant_count = 3u;
+            std::array<int32_t, max_slots> experts{}, pids{};
+            for (int s = 0; s < max_slots; ++s)
+            {
+                experts[static_cast<size_t>(s)] =
+                    (layer * 13 + s * 5 + static_cast<int>(step) * 3) % num_experts;
+                pids[static_cast<size_t>(s)] = (layer + s) % 3;
+            }
+            for (int e = 0; e < num_experts; ++e)
+            {
+                base_b.decode_histogram[e] = base_o.decode_histogram[e] =
+                    static_cast<uint64_t>(100 + layer * 10 + e);
+                base_b.grouped_verifier_histogram[e] =
+                    base_o.grouped_verifier_histogram[e] =
+                        static_cast<uint64_t>(50 + layer + e + step);
+                base_b.grouped_verifier_local_histogram[e] =
+                    base_o.grouped_verifier_local_histogram[e] =
+                        static_cast<uint64_t>(20 + layer + e);
+            }
+            ASSERT_EQ(hipMemcpyAsync(batch_table.deviceLayerState(layer), &base_b, sizeof(base_b), hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(oracle_table.deviceLayerState(layer), &base_o, sizeof(base_o), hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(base_b.deferred_verifier_route_expert_ids, experts.data(), sizeof(experts), hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(base_b.deferred_verifier_route_participant_ids, pids.data(), sizeof(pids), hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(base_o.deferred_verifier_route_expert_ids, experts.data(), sizeof(experts), hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(base_o.deferred_verifier_route_participant_ids, pids.data(), sizeof(pids), hipMemcpyHostToDevice, stream), hipSuccess);
+        }
+        ASSERT_EQ(hipMemcpyAsync(accepted_dev.get(), &accepted_rows, sizeof(accepted_rows), hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(pub_ok_dev.get(), &pub_ok, sizeof(pub_ok), hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_TRUE(batch_graph.launch());
+        ASSERT_TRUE(oracle_graph.launch());
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        for (int layer = 0; layer < num_layers; ++layer)
+        {
+            DeviceMoELayerRuntime actual{}, expected{};
+            ASSERT_EQ(hipMemcpy(&actual, batch_table.deviceLayerState(layer), sizeof(actual), hipMemcpyDeviceToHost), hipSuccess);
+            ASSERT_EQ(hipMemcpy(&expected, oracle_table.deviceLayerState(layer), sizeof(expected), hipMemcpyDeviceToHost), hipSuccess);
+            for (int e = 0; e < num_experts; ++e)
+            {
+                EXPECT_EQ(actual.decode_histogram[e], expected.decode_histogram[e]);
+                EXPECT_EQ(actual.grouped_verifier_histogram[e], expected.grouped_verifier_histogram[e])
+                    << "layer=" << layer << " expert=" << e;
+                EXPECT_EQ(actual.grouped_verifier_local_histogram[e], expected.grouped_verifier_local_histogram[e])
+                    << "layer=" << layer << " expert=" << e;
+            }
+        }
+    }
+#endif
+}
+
+/**
+ * @brief Replay ROCm LDS prefill histogram aggregation across skewed, full-512,
+ *        partial/empty, and repeated generations inside a captured HIP graph.
+ */
+TEST(Test__ROCmMoEKernel, PrefillHistogramLDSExactReplay)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    SKIP_IF_NO_ROCM();
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    constexpr int num_experts = 512;
+    constexpr int top_k = 10;
+    constexpr int max_m = 64;
+    constexpr int max_slots = max_m * top_k;
+    constexpr int d_model = 128;
+    constexpr int intermediate = 128;
+    const DeviceId device = DeviceId::rocm(0);
+
+    ScopedHipDeviceStream stream_owner(/*device_ordinal=*/0);
+    ASSERT_EQ(stream_owner.status(), hipSuccess);
+    hipStream_t stream = stream_owner.get();
+
+    ROCmMoEKernel kernel(0);
+    static_cast<IMoEKernel &>(kernel).setGPUStream(stream);
+    const auto req = MoEWorkspaceBuffers::rocmMoE(max_m, d_model, intermediate, num_experts, top_k);
+    DeviceWorkspaceManager workspace(device, req.total_bytes_with_alignment() + 4u * 1024u * 1024u);
+    ASSERT_TRUE(workspace.allocate(req));
+    kernel.bindWorkspace(&workspace);
+
+    std::vector<DeviceNativeQuantisedMatrixDesc> gates(num_experts), ups(num_experts), downs(num_experts);
+    for (int e = 0; e < num_experts; ++e)
+    {
+        const auto base = static_cast<std::uintptr_t>(0x200000 + e * 0x1000);
+        auto fill = [&](DeviceNativeQuantisedMatrixDesc &d, int n, int k, std::uintptr_t addr) {
+            d.payload = reinterpret_cast<const uint8_t *>(addr);
+            d.scales = reinterpret_cast<const void *>(addr + 0x200);
+            d.mins = reinterpret_cast<const void *>(addr + 0x400);
+            d.n = n; d.k = k; d.blocks_per_row = static_cast<uint32_t>(k / 32);
+            d.codebook_id = 5;
+            d.source_codebook_id = 5;
+            d.source_identity_present = 1;
+        };
+        fill(gates[static_cast<size_t>(e)], intermediate, d_model, base);
+        fill(ups[static_cast<size_t>(e)], intermediate, d_model, base + 0x600);
+        fill(downs[static_cast<size_t>(e)], d_model, intermediate, base + 0xC00);
+    }
+    const int gate_table = kernel.uploadGroupedExpertGateUpDescriptorTables(
+        gates.data(), ups.data(), num_experts, d_model, intermediate,
+        MoEDecodeDescriptorSource::RuntimePlacementTable);
+    const int down_table = kernel.uploadGroupedExpertDownDescriptorTable(
+        downs.data(), num_experts, d_model, intermediate,
+        MoEDecodeDescriptorSource::RuntimePlacementTable);
+    ASSERT_GE(gate_table, 0);
+    ASSERT_GE(down_table, 0);
+
+    DeviceMoERuntimeTable::Config cfg;
+    cfg.device_id = device;
+    cfg.num_layers = 1;
+    cfg.num_experts = num_experts;
+    cfg.top_k = top_k;
+    cfg.mirror_to_device = true;
+    cfg.prefill_token_capacity = max_m;
+    MoERuntimeTable table(cfg);
+
+    ScopedHipTestGraph graph(0, stream, "rocm lds prefill histogram replay");
+    ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+        table.deviceLayerState(0),
+        max_m,
+        max_m,
+        num_experts,
+        top_k,
+        gate_table,
+        down_table,
+        MoEGroupedPlanDemand::OrdinaryPrefill));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+
+    DeviceMoELayerRuntime base{};
+    std::memcpy(&base, &table.hostLayerState(0), sizeof(base));
+    base.active_epoch = 1u;
+    base.participant_id = 2;
+    base.participant_count = 4;
+    auto &bank = base.banks[base.active_bank];
+    bank.epoch = 1u;
+    bank.expert_count = num_experts;
+    for (int e = 0; e < num_experts; ++e)
+    {
+        bank.local_compute_mask[e] = 1u;
+        bank.replica_role[e] = static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+        bank.resident_participant_mask[e] =
+            (1u << base.participant_id) | (1u << static_cast<uint32_t>(e % 4));
+        auto &ex = bank.experts[e];
+        ex.logical_expert_id = e;
+        ex.owner_participant = base.participant_id;
+        ex.local_slot = e;
+        ex.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                                    DeviceMoEExpertFlags::LocalCompute);
+        ex.gate = gates[static_cast<size_t>(e)];
+        ex.up = ups[static_cast<size_t>(e)];
+        ex.down = downs[static_cast<size_t>(e)];
+    }
+
+    // Mode 0: heavy single-expert collision (all 640 slots -> expert 7).
+    // Mode 1: full 512-expert spread with mixed local/remote ownership.
+    // Mode 2: all-inactive (-1) sentinel rows (0 live slots).
+    // Mode 3: repeat Mode 1 to prove reset/replay equivalence.
+    for (const int mode : {0, 1, 2, 3})
+    {
+        SCOPED_TRACE("mode=" + std::to_string(mode));
+        std::array<int32_t, max_slots> r_experts{}, r_pids{};
+        std::array<uint64_t, num_experts> exp_sel{}, exp_loc{};
+        for (int e = 0; e < num_experts; ++e)
+        {
+            base.prefill_histogram[e] = static_cast<uint64_t>(10 + e);
+            base.prefill_local_histogram[e] = static_cast<uint64_t>(3 + (e % 7));
+            exp_sel[static_cast<size_t>(e)] = base.prefill_histogram[e];
+            exp_loc[static_cast<size_t>(e)] = base.prefill_local_histogram[e];
+        }
+        for (int s = 0; s < max_slots; ++s)
+        {
+            int expert = -1;
+            int pid = -1;
+            if (mode == 0)
+            {
+                expert = 7;
+                pid = (s % 3 == 0) ? 2 : 1;
+            }
+            else if (mode == 1 || mode == 3)
+            {
+                expert = (s * 17 + 5) % num_experts;
+                pid = (s + expert) % 4;
+            }
+            r_experts[static_cast<size_t>(s)] = expert;
+            r_pids[static_cast<size_t>(s)] = pid;
+            if (expert >= 0 && expert < num_experts)
+            {
+                ++exp_sel[static_cast<size_t>(expert)];
+                if (pid == static_cast<int>(base.participant_id))
+                    ++exp_loc[static_cast<size_t>(expert)];
+            }
+        }
+        ASSERT_EQ(hipMemcpyAsync(table.deviceLayerState(0), &base, sizeof(base), hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(base.route_expert_ids, r_experts.data(), sizeof(r_experts), hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(base.route_participant_ids, r_pids.data(), sizeof(r_pids), hipMemcpyHostToDevice, stream), hipSuccess);
+        ASSERT_TRUE(graph.launch());
+        DeviceMoELayerRuntime actual{};
+        ASSERT_EQ(hipMemcpyAsync(&actual, table.deviceLayerState(0), sizeof(actual), hipMemcpyDeviceToHost, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        for (int e = 0; e < num_experts; ++e)
+        {
+            EXPECT_EQ(actual.prefill_histogram[e], exp_sel[static_cast<size_t>(e)]) << "expert=" << e;
+            EXPECT_EQ(actual.prefill_local_histogram[e], exp_loc[static_cast<size_t>(e)]) << "expert=" << e;
+        }
+    }
+#endif
+}
+
 TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterializesSpans)
 {
     SKIP_IF_NO_ROCM();

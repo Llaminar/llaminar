@@ -43,7 +43,7 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
         constexpr int rows = 65, hidden_width = 2048, intermediate = 512, experts = 2, top_k = 2;
         void *stream = context.defaultStream();
         ASSERT_NE(stream,nullptr);
-        const auto &format = quantizedVerifierFormat("Q5_K");
+        const auto &format = quantizedVerifierFormat("IQ1_S");
         std::vector<std::unique_ptr<TensorBase>> sources;
         std::vector<GpuPreparedGemm> prepared;
         std::array<DeviceNativeQuantisedMatrixDesc,3> compact{};
@@ -57,14 +57,15 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
                 role == 2 ? hidden_width : intermediate,role == 2 ? intermediate : hidden_width,
                 99281u + role,"test.rocm.wmma.promoted." + std::to_string(role),
                 ModelContextId{2930000u + static_cast<unsigned>(role)},sources,prepared);
-            ASSERT_EQ(compact[role].codebook_id,7u);
+            ASSERT_EQ(compact[role].codebook_id,16u);
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(sources[role].get(),cpu_weights[role]));
-            ASSERT_TRUE(cpu_weights[role].usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights[role].usesNibbleLUT());
+            ASSERT_TRUE(cpu_weights[role].is_asymmetric);
             promoted[role] = promoteCPUProjection(backend,device,cpu_weights[role],roles[role],2930100u + role);
             const auto &desc = promoted[role].descriptor;
             ASSERT_EQ(desc.codebook_id,kNativeQuantisedExpandedInt8MinCodebook);
             ASSERT_TRUE(desc.source_identity_present);
-            ASSERT_EQ(desc.source_codebook_id,7u);
+            ASSERT_EQ(desc.source_codebook_id,16u);
             ASSERT_NE(desc.mins,nullptr);
         }
         auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
