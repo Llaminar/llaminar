@@ -2081,8 +2081,12 @@ TEST(PooledStepGuard, UnwindAfterPrepareCancelsStepAndReleasesGrant)
         std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
     auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
     auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    // This direct-stage suite exercises the COW/step-guard matrix; the
+    // persistent in-place tail is opted out explicitly (production default
+    // is persistent_tail=true; the tail economy measurement covers it).
     PooledKVDecodeBinding binding(pool.get(), table.get(), /*request_id=*/41,
-        /*slot=*/0, kv_heads, dimension, page_tokens, layers, issuances);
+        /*slot=*/0, kv_heads, dimension, page_tokens, layers, issuances,
+        /*persistent_tail=*/false);
 
     // N1 negative 1: a THROW between prepareStep and completeAndAdvance (a
     // graph-construction / execution throw) must cancel the step through the
@@ -2181,7 +2185,8 @@ TEST(PooledStepGuard, MissingLayerPublicationCancelsWholeStep)
     auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
     auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
     PooledKVDecodeBinding binding(pool.get(), table.get(), /*request_id=*/42,
-        /*slot=*/0, kv_heads, dimension, page_tokens, layers, issuances);
+        /*slot=*/0, kv_heads, dimension, page_tokens, layers, issuances,
+        /*persistent_tail=*/false);
 
     auto guard = binding.prepareStep(1);
     ASSERT_TRUE(guard);
@@ -2269,7 +2274,8 @@ TEST(PooledStepGuard, VersionEnvelopeExhaustionRefusesBeforeGraph)
     auto pool2 = authority2->createCPUPagePool(device, pool_geometry2, CPUStoragePlacement::local());
     auto table2 = CPUFP32PagedKVTable::create(authority2, device, table_geometry);
     PooledKVDecodeBinding binding(pool2.get(), table2.get(), /*request_id=*/44,
-        /*slot=*/0, kv_heads, dimension, page_tokens, /*layers=*/1, issuances);
+        /*slot=*/0, kv_heads, dimension, page_tokens, /*layers=*/1, issuances,
+        /*persistent_tail=*/false);
     EXPECT_EQ(binding.remainingIssuances(), issuances);
 
     MPIContext mpi{0, 1, MPI_COMM_WORLD};
@@ -2532,7 +2538,8 @@ TEST(PooledMatrix, LongDecodeWithinAdmittedEnvelopeDrainsCleanly)
     auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
     auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
     PooledKVDecodeBinding binding(pool.get(), table.get(), /*request_id=*/88,
-        /*slot=*/0, kv_heads, dimension, page_tokens, layers, issuances);
+        /*slot=*/0, kv_heads, dimension, page_tokens, layers, issuances,
+        /*persistent_tail=*/false);
     const size_t width = static_cast<size_t>(heads * dimension);
     MPIContext mpi{0, 1, MPI_COMM_WORLD};
     TensorFactory factory(mpi);

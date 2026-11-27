@@ -536,10 +536,12 @@ TEST(PooledDenseDecode, RunnerTruncateExportImportRoundTrip)
     PreparedWeightStore target_store;
     std::shared_ptr<QwenStandardGraph> target_builder;
     make_runner(fx, target_owner, target_store, target_builder);
+    // The truncate test exercises the COW/truncation path with a fixed
+    // geometry; the persistent in-place tail is opted out explicitly.
     PooledKVDecodeBinding target(&target_instance.pool(), &target_instance.table(),
         /*request_id=*/21, /*slot=*/0,
         fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers,
-        /*admitted_issuances=*/10);
+        /*admitted_issuances=*/10, /*persistent_tail=*/false);
     target_owner->setPooledDecodeBinding(&target);
 
     ASSERT_OK("target prefill", target_owner->forward(prompt.data(), 4, 1) != nullptr);
@@ -880,4 +882,160 @@ TEST(PooledDenseDecode, GroupedPooledDecodeTwoRequestsOneGraph)
     }
     EXPECT_EQ(binding_a.priorFor(0)->snapshot.view().rows(), 9);
     EXPECT_EQ(binding_b.priorFor(0)->snapshot.view().rows(), 9);
+}
+
+/** @test P2 tail economy measurement: the persistent in-place private tail
+ * copies strictly fewer bytes per decode step than the COW extension (the
+ * prior tail rows are never copied on the in-place path). This is the
+ * producer-side measurement that decides the persistent-tail DEFAULT before
+ * P2 exit; both paths stay byte-identical to the ring control (asserted in
+ * RunnerInPlacePrivateTailMatchesControl and the COW matrix). */
+TEST(PooledDenseDecode, TailCopyBytesMeasurement)
+{
+    const auto device = DeviceId::cpu();
+    // Enable the pooled_kv_decode PerfStats domain (immutable policy is
+    // process-start state; re-publish for the measurement scope).
+    if (const char *prior = std::getenv("LLAMINAR_PERF_STATS_FILTER"))
+        (void)prior;
+    setenv("LLAMINAR_PERF_STATS_FILTER", "pooled_kv_decode", 1);
+    setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    const std::array<int32_t, 3> prompt{1, 5, 3};
+    std::vector<int32_t> decode;
+    for (int i = 0; i < 40; ++i)
+        decode.push_back(2 + i * 2);
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 4 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 4;
+        budget.max_pages_per_request = 128;
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/1, /*admitted_issuances=*/96, /*readers_per_bank=*/4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        auto table_geom = plan->table_geometry;
+        table_geom.bank_count = 2 * table_geom.bank_count;
+        table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+        table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+        auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+        widened->table_geometry = table_geom;
+        widened->total_bytes = PhysicalPagePool::physicalBytes(plan->pool_geometry, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=widened->total_bytes,
+            .admission_available_bytes=widened->total_bytes},
+            PhysicalMemoryOwner::KVCache, widened->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *widened, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 64;
+
+    // IN-PLACE measurement: persistent_tail => in_place_tail_bytes recorded.
+    PagedKVInstance inplace_instance;
+    ASSERT_TRUE(make_instance(inplace_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> inplace_owner;
+    PreparedWeightStore inplace_store;
+    std::shared_ptr<QwenStandardGraph> inplace_builder;
+    make_runner(fx, inplace_owner, inplace_store, inplace_builder);
+    PooledKVDecodeBinding inplace_binding(&inplace_instance.pool(), &inplace_instance.table(),
+        /*request_id=*/501, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers,
+        /*admitted_issuances=*/96, /*persistent_tail=*/true);
+    inplace_owner->setPooledDecodeBinding(&inplace_binding);
+    ASSERT_OK("in-place prefill", inplace_owner->forward(prompt.data(), 3, 1) != nullptr);
+    for (const auto token : decode)
+        ASSERT_OK("in-place decode", inplace_owner->forward(&token, 1, 1) != nullptr);
+
+    // COW measurement: persistent_tail=false (default) => cow_tail_bytes.
+    PagedKVInstance cow_instance;
+    ASSERT_TRUE(make_instance(cow_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> cow_owner;
+    PreparedWeightStore cow_store;
+    std::shared_ptr<QwenStandardGraph> cow_builder;
+    make_runner(fx, cow_owner, cow_store, cow_builder);
+    PooledKVDecodeBinding cow_binding(&cow_instance.pool(), &cow_instance.table(),
+        /*request_id=*/502, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers,
+        /*admitted_issuances=*/96, /*persistent_tail=*/false);
+    cow_owner->setPooledDecodeBinding(&cow_binding);
+    ASSERT_OK("cow prefill", cow_owner->forward(prompt.data(), 3, 1) != nullptr);
+    for (const auto token : decode)
+        ASSERT_OK("cow decode", cow_owner->forward(&token, 1, 1) != nullptr);
+
+    // Both decoded the same 3+40 rows; byte-identity is covered elsewhere.
+    EXPECT_EQ(inplace_binding.priorFor(0)->snapshot.view().rows(), 3 + 40);
+    EXPECT_EQ(cow_binding.priorFor(0)->snapshot.view().rows(), 3 + 40);
+
+    // Aggregate the per-step bytes copied.
+    const auto inplace_records = PerfStatsCollector::snapshot({"pooled_kv_decode"});
+    double inplace_bytes = 0.0, cow_bytes = 0.0;
+    int inplace_steps = 0, cow_steps = 0;
+    for (const auto &record : inplace_records)
+    {
+        if (record.domain != "pooled_kv_decode") continue;
+        if (record.name == "in_place_tail_bytes_per_step" && record.count > 0)
+        {
+            // Snapshot aggregates: record.value is the SUM over record.count
+            // observations (never multiply again).
+            inplace_bytes += record.value;
+            inplace_steps += static_cast<int>(record.count);
+        }
+        if (record.name == "cow_tail_bytes_per_step" && record.count > 0)
+        {
+            cow_bytes += record.value;
+            cow_steps += static_cast<int>(record.count);
+        }
+    }
+    EXPECT_GT(inplace_steps, 0) << "in-place tail counters were not recorded";
+    EXPECT_GT(cow_steps, 0) << "COW tail counters were not recorded";
+    if (inplace_steps > 0 && cow_steps > 0)
+    {
+        const double inplace_mean = inplace_bytes / inplace_steps;
+        const double cow_mean = cow_bytes / cow_steps;
+        std::cerr << "[tail-measure] in_place_steps=" << inplace_steps
+                  << " cow_steps=" << cow_steps
+                  << " in_place_mean=" << inplace_mean
+                  << " cow_mean=" << cow_mean << std::endl;
+        // The in-place path never re-copies the prior tail rows; with many
+        // partial-tail steps it must be strictly smaller than COW.
+        EXPECT_LT(inplace_mean, cow_mean)
+            << "in-place tail must copy fewer bytes per step than COW";
+        // Economic decision evidence: the in-place path writes only the fresh
+        // rows for that step (row_stride = kv_heads*head_dim*8 bytes);
+        // COW writes the whole prior tail page plus the fresh rows.
+        const double row_stride = static_cast<double>(
+            fx.config.n_kv_heads * fx.config.head_dim * 2 * sizeof(float));
+        EXPECT_LE(inplace_mean, row_stride * 1.05)
+            << "in-place tail must copy only the fresh row(s) (stride=" << row_stride << ")";
+        EXPECT_GE(cow_mean, row_stride)
+            << "COW tail must copy at least the fresh row(s)";
+    }
 }

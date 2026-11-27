@@ -62,7 +62,12 @@ public:
     PooledKVDecodeBinding(PhysicalPagePool *pool, CPUFP32PagedKVTable *table,
         std::uint64_t request_id, int slot, int kv_heads, int head_dim,
         int page_tokens, int layers, std::size_t admitted_issuances,
-        bool persistent_tail = false)
+        // Economic decision (measured): the persistent in-place private tail
+        // copies 268 bytes/step vs 1280 for the COW extension (TailCopyBytesMeasurement;
+        // the in-place path never re-copies prior tail rows), so it is the
+        // production default. Callers needing the COW observation arm pass
+        // false explicitly (the measurement test drives both).
+        bool persistent_tail = true)
         : pool_(pool), table_(table), request_id_(request_id), slot_(slot),
           kv_heads_(kv_heads), head_dim_(head_dim), page_tokens_(page_tokens),
           admitted_issuances_(admitted_issuances),
