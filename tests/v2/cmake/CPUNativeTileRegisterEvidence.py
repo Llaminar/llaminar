@@ -1918,6 +1918,42 @@ def import_symbols(image: ObjectImage) -> frozenset:
 _STATIC_SELECTION_KEY = object()
 
 
+def _static_unit_fingerprint(unit: "Unit") -> bytes:
+    """Bind exact instruction classes and all Unit/EH state, rejecting unknown state.
+
+    Relocation-produced string subclasses carry semantic authority: their printed
+    spelling alone is deliberately insufficient. Future body attributes or line
+    classes require an explicit review of this boundary before admission.
+    """
+    if type(unit) is not Unit or type(unit.bodies) is not Bodies or set(vars(unit.bodies)) != {"eh"}:
+        raise ValueError("unsupported static Unit/body container state")
+    admitted = {str}
+    for name in ("TLSIEPage", "TLSIEOffsetLoad"):
+        marker = globals().get(name)
+        if marker is not None:
+            admitted.add(marker)
+    lines = []
+    for name, body in unit.bodies.items():
+        if type(name) is not str or type(body) is not list:
+            raise ValueError("unsupported static body shape")
+        if any(type(line) not in admitted for line in body):
+            raise ValueError("unsupported static instruction class")
+        lines.append((name, tuple((type(line).__qualname__, str(line)) for line in body)))
+
+    def builtin(value):
+        if type(value) in (str, int, bool, bytes, type(None)):
+            return type(value).__qualname__, value
+        if type(value) is dict:
+            return "dict", tuple(sorted((builtin(k), builtin(v)) for k, v in value.items()))
+        if type(value) in (tuple, list, set, frozenset):
+            content = tuple(builtin(v) for v in value)
+            return type(value).__qualname__, tuple(sorted(content)) if type(value) in (set, frozenset) else content
+        raise ValueError("unsupported static Unit field class")
+    fields = (unit.copy, unit.prefix, unit.functions, unit.imports, unit.noreturn,
+              unit.visibility, unit.macho, unit.object_identity, unit.bodies.eh)
+    return hashlib.sha256(repr((tuple(lines), builtin(fields))).encode()).digest()
+
+
 class TypedStaticExecutableSelection:
     """Ephemeral authority for one audited Unit selected by a complete native link."""
 
@@ -1926,11 +1962,11 @@ class TypedStaticExecutableSelection:
             raise ValueError("static selection requires the native verifier")
         self.unit, self.target = unit, target
         self.files, self.environment = dict(files), dict(environment)
-        self.unit_identity = hashlib.sha256(repr((unit, getattr(unit.bodies, "eh", {}))).encode()).digest()
+        self.unit_identity = _static_unit_fingerprint(unit)
 
     def check(self, unit: "Unit", target: str) -> None:
         """Recheck retained bytes and process environment at the call-model boundary."""
-        if unit != self.unit or target != self.target or hashlib.sha256(repr((unit, getattr(unit.bodies, "eh", {}))).encode()).digest() != self.unit_identity:
+        if unit != self.unit or target != self.target or _static_unit_fingerprint(unit) != self.unit_identity:
             raise ValueError("static selected Unit/target changed")
         if dict(os.environ) != self.environment:
             raise ValueError("static link environment changed")
@@ -2148,7 +2184,15 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     proof.unlink(missing_ok=True)
     cwd, output, artifacts = cwd.resolve(strict=True), output.resolve(strict=True), artifacts.resolve()
     env, files = dict(os.environ), {}
-    args = _static_response(list(argv), cwd, files)
+    original_argv = tuple(argv)
+
+    def retain(name, data):
+        path = artifacts / name
+        raw = data.encode() if isinstance(data, str) else data
+        path.write_bytes(raw)
+        files[str(path)] = _static_hash(raw)
+
+    args = _static_response(list(original_argv), cwd, files)
     _static_options(args)
     if args.count("-o") != 1 or args.index("-o") + 1 >= len(args):
         raise ValueError("static edge needs exactly one separate -o output")
@@ -2167,7 +2211,7 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     production_dep = (cwd / dep_tokens[0].split("=", 1)[1]).resolve(strict=True)
     dep_bytes = production_dep.read_bytes()
     files[str(production_dep)] = _static_hash(dep_bytes)
-    (artifacts / "original.d").write_bytes(dep_bytes)
+    retain("original.d", dep_bytes)
 
     def dependency_paths(data):
         text = data.decode().replace("\\\n", "")
@@ -2194,14 +2238,14 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
             raise ValueError("unexpected static relink argv delta")
         return command
     production = output.read_bytes()
-    (artifacts / "production.elf").write_bytes(production)
+    retain("production.elf", production)
 
     def run(label: str, command: list[str]) -> str:
         """Retain exact argv, environment and both output streams, even on failure."""
-        (artifacts / f"{label}.json").write_text(json.dumps(dict(argv=command, cwd=str(cwd), env=env), indent=2))
+        retain(f"{label}.json", json.dumps(dict(argv=command, cwd=str(cwd), env=env), indent=2))
         r = subprocess.run(command, cwd=cwd, env=env, capture_output=True, timeout=120)
-        (artifacts / f"{label}.stdout").write_bytes(r.stdout)
-        (artifacts / f"{label}.stderr").write_bytes(r.stderr)
+        retain(f"{label}.stdout", r.stdout)
+        retain(f"{label}.stderr", r.stderr)
         if r.returncode:
             raise ValueError(f"static {label} failed ({r.returncode})")
         return (r.stdout + r.stderr).decode("utf-8")
@@ -2231,7 +2275,7 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         raise ValueError("collect2 did not identify its actual linker")
     observed_linker = Path(match[0])
     linker = observed_linker.resolve(strict=True)
-    (artifacts / "linker-paths.json").write_text(json.dumps(dict(
+    retain("linker-paths.json", json.dumps(dict(
         observed=str(observed_linker), resolved=str(linker))))
     triplet = run("driver-triplet", [str(driver), "-dumpmachine"]).strip()
     if not re.fullmatch(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)+", triplet):
@@ -2251,7 +2295,7 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         raise ValueError("collect2 did not identify its native nm")
     nm = Path(nm_names[0]).resolve(strict=True)
     files[str(nm)] = _static_hash(nm.read_bytes())
-    (artifacts / "nm-path.txt").write_text(str(nm))
+    retain("nm-path.txt", str(nm))
     if not run("linker-version", [str(linker), "--version"]).startswith("GNU ld ("):
         raise ValueError("static linker is not GNU bfd")
     if (artifacts / "debug.elf").read_bytes() != production:
@@ -2259,7 +2303,7 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     emulation = _static_emulation(job_tokens, run("linker-emulations", [str(linker), "-V"]))
     script_command = [str(linker), "-m", emulation, "--verbose"]
     default_script = run("default-script", script_command)
-    (artifacts / "default-script.txt").write_text(default_script)
+    retain("default-script.txt", default_script)
     transactions = []
     for label in ("instrumented", "control", "map"):
         extras = [] if label == "control" else ["-Wl,--trace"]
@@ -2296,6 +2340,8 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
             if path in files and files[path] != digest:
                 raise ValueError(f"static input changed: {path}")
             files[path] = digest
+    if tuple(argv) != original_argv:
+        raise ValueError("static original argv changed during capture")
     if dict(os.environ) != env:
         raise ValueError("static environment changed during capture")
     if run("default-script-after", script_command) != default_script:
@@ -2306,8 +2352,11 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
             raise ValueError(f"static input changed: {path}")
     for p in artifacts.iterdir():
         if p.is_file() and p != proof:
-            files[str(p)] = _static_hash(p.read_bytes())
-    recipe = dict(schema=1, argv=argv, cwd=str(cwd), output=str(output), env=env, files=files)
+            actual = _static_hash(p.read_bytes())
+            if str(p) in files and files[str(p)] != actual:
+                raise ValueError(f"static retained artifact changed: {p}")
+            files[str(p)] = actual
+    recipe = dict(schema=1, argv=list(original_argv), cwd=str(cwd), output=str(output), env=env, files=files)
     proof.write_text(json.dumps(recipe, indent=2))
     return recipe
 

@@ -32,6 +32,32 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
         self.assertIsNotNone(C.CallModel.select(u, u, "f", dict(binding="direct", nonpreemptible="static-executable",
                                                                              link_evidence="0" * 64)))
 
+    def test_unit_fingerprint_binds_exact_line_types_and_body_state(self):
+        bodies = C.Bodies({"f": ["ret"]})
+        unit = C.Unit("x", bodies, "", {"f": "weak"}, frozenset(), frozenset(), {"f": "default"})
+        plain = C._static_unit_fingerprint(unit)
+        class UnknownInstruction(str):
+            pass
+        bodies["f"][0] = UnknownInstruction("ret")
+        with self.assertRaisesRegex(ValueError, "instruction class"):
+            C._static_unit_fingerprint(unit)
+        bodies["f"][0] = "ret"
+        self.assertEqual(C._static_unit_fingerprint(unit), plain)
+        for name in ("TLSIEPage", "TLSIEOffsetLoad"):
+            marker = getattr(C, name, None)
+            if marker is not None:
+                bodies["f"][0] = marker("ret")
+                self.assertNotEqual(C._static_unit_fingerprint(unit), plain)
+                bodies["f"][0] = "ret"
+        bodies.extra = True
+        with self.assertRaisesRegex(ValueError, "container state"):
+            C._static_unit_fingerprint(unit)
+        del bodies.extra
+        class UnknownBodies(C.Bodies):
+            pass
+        with self.assertRaisesRegex(ValueError, "container state"):
+            C._static_unit_fingerprint(unit._replace(bodies=UnknownBodies(bodies)))
+
     def test_rewriting_options_include_forwarded_forms(self):
         for option in ("-flto", "-flto=auto", "--gc-sections", "--icf=all", "-r", "--relocatable", "-shared"):
             for arg in (option, "-Wl," + option):
