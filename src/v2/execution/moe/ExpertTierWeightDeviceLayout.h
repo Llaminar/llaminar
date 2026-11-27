@@ -96,6 +96,17 @@ namespace llaminar2
         Projection source_,destination_;
     };
 
+    // Tuple matching is exact only when each source identity names one catalog entry.
+    static_assert([] {
+        constexpr auto &formats = native_quantised_formats::kAllSourceFormats;
+        for (std::size_t i = 0; i < formats.size(); ++i)
+            for (std::size_t j = i + 1; j < formats.size(); ++j)
+                if (formats[i].metadata->codebook_id == formats[j].metadata->codebook_id &&
+                    formats[i].metadata->is_superblock == formats[j].metadata->is_superblock)
+                    return false;
+        return true;
+    }(), "Expert source identities must be unique");
+
     /**
      * @brief Reject original K origins the resident coded CPU header cannot represent.
      * @param source Authenticated original format, not the device decoder ID.
