@@ -1926,16 +1926,20 @@ class TypedStaticExecutableSelection:
             raise ValueError("static selection requires the native verifier")
         self.unit, self.target = unit, target
         self.files, self.environment = dict(files), dict(environment)
-        self.unit_identity = hashlib.sha256(pickle.dumps(unit)).digest()
+        self.unit_identity = hashlib.sha256(repr((unit, getattr(unit.bodies, "eh", {}))).encode()).digest()
 
     def check(self, unit: "Unit", target: str) -> None:
         """Recheck retained bytes and process environment at the call-model boundary."""
-        if unit != self.unit or target != self.target or hashlib.sha256(pickle.dumps(unit)).digest() != self.unit_identity:
+        if unit != self.unit or target != self.target or hashlib.sha256(repr((unit, getattr(unit.bodies, "eh", {}))).encode()).digest() != self.unit_identity:
             raise ValueError("static selected Unit/target changed")
         if dict(os.environ) != self.environment:
             raise ValueError("static link environment changed")
         for path, digest in self.files.items():
-            if _static_hash(Path(path).read_bytes()) != digest:
+            try:
+                actual = _static_hash(Path(path).read_bytes())
+            except OSError as error:
+                raise ValueError(f"static input unavailable: {path}") from error
+            if actual != digest:
                 raise ValueError(f"static input changed: {path}")
 
 
