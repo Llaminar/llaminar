@@ -128,8 +128,8 @@ GCC 14 witness in the pinned toolchain:
 - `opaqueStripColumn()`: whether an empty register barrier re-derives the strip
   column in every K block;
 - `q5GroupFifth()`: which fifth-bit addressing a Q5 program uses;
-- `hoistsSourceHeader()`: which IQ4_XS family (SDOT) walks one superblock at a
-  time instead of one flat block loop;
+- `hoistsSourceHeader()`: which IQ4_XS tile (single-row SDOT) walks one
+  superblock at a time instead of one flat block loop;
 - the ordered `-0` partition seed (`orderedPartitionSeedNEON()`) and the
   programs that keep the partition-0 select instead;
 - the backend-native row-pair accumulator carry, and `no-thread-jumps` on

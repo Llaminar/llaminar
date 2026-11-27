@@ -867,16 +867,16 @@ namespace llaminar2::cpu::native_quantised
          * @brief Whether a per-block superblock-coded walk streams units and hoists its source header.
          * @tparam Ops Admitted operation set.
          * @tparam Physical Prepared encoding.
-         * @return True for IQ4_XS under the SDOT family. The SMMLA row-pair walk
-         * addresses each block's unit and header from the constant geometry in
-         * one flat block loop: a superblock loop around its blocks keeps the
+         * @return True for the single-row SDOT IQ4_XS tile. The multi-row tiles
+         * address each block's unit and header from the constant geometry in one
+         * flat block loop: a superblock loop around their blocks keeps the
          * bounds, unit and header addresses live through every block and spills
          * the column and partition state there. The ASIMD widening walk keeps
          * per-block header addressing too: its widened products already occupy
          * the vector file. Q6_K keeps its per-block addressing for the same reason.
          */
         template <typename Ops, Encoding Physical> static constexpr bool hoistsSourceHeader() noexcept
-        { return Physical == Encoding::NibbleLUTSourceScale && Ops::instruction == Dot::DotProd; }
+        { return Physical == Encoding::NibbleLUTSourceScale && Ops::instruction == Dot::DotProd && Rows == 1; }
 
         /**
          * @brief Whether a coded tile walks its K blocks flat, widening the header factors per block.
@@ -1451,10 +1451,10 @@ namespace llaminar2::cpu::native_quantised
          * program with the GCC 14 tile register and stack-traffic witness.
          */
         static constexpr std::string_view kUnthreadedPrograms[] = {
-            "1:1:0:0:1:1", "1:1:0:1:0:0", "1:1:0:2:0:0", "2:0:0:4:2:0", "2:1:0:2:0:0", "2:2:1:4:2:0",
-            "3:0:0:4:2:0", "3:0:0:7:0:0", "3:1:0:7:0:0", "3:1:1:4:2:0", "3:2:1:4:2:0", "4:0:0:4:2:0",
-            "4:0:0:6:1:1", "4:0:0:7:0:0", "4:0:1:4:2:0", "4:1:0:4:2:0", "4:1:0:7:0:0", "4:1:1:4:2:0",
-            "4:1:1:6:1:1", "4:2:1:6:1:1",
+            "1:1:0:0:1:1", "1:1:0:1:0:0", "1:1:0:2:0:0", "2:0:0:4:2:0", "2:1:0:2:0:0", "2:1:0:4:2:0",
+            "2:2:1:4:2:0", "3:0:0:4:2:0", "3:0:0:7:0:0", "3:1:0:4:2:0", "3:1:0:7:0:0", "3:1:1:4:2:0",
+            "3:2:1:4:2:0", "4:0:0:4:2:0", "4:0:0:6:1:1", "4:0:0:7:0:0", "4:0:1:4:2:0", "4:1:0:4:2:0",
+            "4:1:0:7:0:0", "4:1:1:4:2:0", "4:1:1:6:1:1", "4:2:1:6:1:1",
         };
 
         /** @brief Program-key fields rows:family:policy:encoding:map:minimum of one listed key; -1 if malformed. */
