@@ -263,8 +263,8 @@ class StaticSelectionNativeTest(unittest.TestCase):
                             return
                 self.fail("native final symbol missing")
             return change
-        inject("wrong-address", elf_edit(symbol_field("address", 4)), "nm disagrees|extent mismatch|outside executable")
-        inject("wrong-size", elf_edit(symbol_field("size", 4)), "nm disagrees|extent mismatch|outside executable")
+        inject("wrong-address", elf_edit(symbol_field("address", 4)), "^static input/final symbol extent mismatch$")
+        inject("wrong-size", elf_edit(symbol_field("size", 4)), "^static native nm disagrees with selected/final symbol extent$")
         inject("global-binding", elf_edit(symbol_field("binding", 0x12)), "weak/default")
         inject("hidden-binding", elf_edit(symbol_field("visibility", 2)), "weak/default")
         def ambiguous_map(text):
