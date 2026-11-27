@@ -51,6 +51,11 @@ namespace llaminar2::cpu::native_quantised
         {1, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::Q5NativeSingleScale, 0, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
         {1, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::Q5NativeSingleScale, 1, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
         {2, NEONRowDot::I8MM, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {1, NEONRowDot::DotProd, NEONRowPolicy::BackendNative, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {4, NEONRowDot::DotProd, NEONRowPolicy::BackendNative, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::DotProd, NEONRowPolicy::BackendNative, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {2, NEONRowDot::I8MM, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::I8MM, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
     };
 
     static_assert([] {
