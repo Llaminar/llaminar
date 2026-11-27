@@ -1265,3 +1265,239 @@ TEST(PooledDenseDecode, TailCopyBytesMeasurement)
             << "COW tail must copy at least the fresh row(s)";
     }
 }
+
+/** @test P3 M1: shared-prefix attach deduplicates immutable frames.
+ * A fresh binding attaches an exact prefix of another live request's
+ * publication as SHARED frames (full pages adopted verbatim, one private
+ * COW page clipped to the partial remainder), then both requests diverge
+ * and continue — each stays byte-exact against its own uninterrupted
+ * control. The source keeps decoding around the shared frames, proving
+ * the attach never mutates the source and the source never mutates the
+ * attached prefix. */
+TEST(PooledDenseDecode, SharedPrefixAttachDeduplicatesAndDiverges)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 10> prompt_src{1, 3, 5, 7, 9, 11, 13, 15, 17, 19};
+    const std::array<int32_t, 2> src_after{2, 4};
+    const std::array<int32_t, 3> dst_after{6, 8, 10};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 24;
+
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 4 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 8;
+        budget.max_pages_per_request = 64;
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/fx.config.n_layers, /*admitted_issuances=*/10, /*readers_per_bank=*/4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        auto table_geom = plan->table_geometry;
+        table_geom.bank_count = 2 * table_geom.bank_count;
+        table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+        table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+        auto pool_geom = plan->pool_geometry;
+        pool_geom.frames = 64 + 8 * pool_geom.frames;
+        pool_geom.request_records = 8;
+        auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+        widened->pool_geometry = pool_geom;
+        widened->table_geometry = table_geom;
+        widened->total_bytes = PhysicalPagePool::physicalBytes(pool_geom, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=widened->total_bytes,
+            .admission_available_bytes=widened->total_bytes},
+            PhysicalMemoryOwner::KVCache, widened->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *widened, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    // SOURCE: prefill 10 (page 8 full + 2 partial), then 2 decodes = 12 rows.
+    PagedKVInstance src_instance;
+    ASSERT_TRUE(make_instance(src_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> src_owner;
+    PreparedWeightStore src_store;
+    std::shared_ptr<QwenStandardGraph> src_builder;
+    make_runner(fx, src_owner, src_store, src_builder);
+    PooledKVDecodeBinding src(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/401, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    src_owner->setPooledDecodeBinding(&src);
+    ASSERT_OK("source prefill", src_owner->forward(prompt_src.data(), 10, 1) != nullptr);
+    ASSERT_OK("source decode 0", src_owner->forward(&src_after[0], 1, 1) != nullptr);
+    ASSERT_OK("source decode 1", src_owner->forward(&src_after[1], 1, 1) != nullptr);
+    EXPECT_EQ(src.priorFor(0)->snapshot.view().rows(), 12);
+    const auto &src_pages = src.priorFor(0)->snapshot.view().pages();
+    ASSERT_EQ(static_cast<int>(src_pages.size()), 2) << "10-row prefill + 2 decode = page 8 + page 4";
+
+    // DESTINATION: attached prefix of 9 rows (page 8 full + 1 row COW).
+    // This is the SAME instance authority (dedup only within one authority).
+    PagedKVInstance dst_instance;
+    ASSERT_TRUE(make_instance(dst_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> dst_owner;
+    PreparedWeightStore dst_store;
+    std::shared_ptr<QwenStandardGraph> dst_builder;
+    make_runner(fx, dst_owner, dst_store, dst_builder);
+    // DELIBERATE NEGATIVE: attach across authorities must refuse before any
+    // byte is shared (the pooled authority is the isolation domain).
+    {
+        PooledKVDecodeBinding foreign(&dst_instance.pool(), &dst_instance.table(),
+            /*request_id=*/402, /*slot=*/0,
+            fx.config.n_kv_heads, fx.config.head_dim,
+            /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+            /*persistent_tail=*/false);
+        EXPECT_FALSE(foreign.attachSharedPrefix(src, 9))
+            << "cross-authority prefix attach must refuse";
+        EXPECT_FALSE(foreign.hasLivePublication());
+    }
+    // Same-authority attach, mid-page prefix (9 = 8 full + 1 partial).
+    PooledKVDecodeBinding dst(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/403, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    ASSERT_TRUE(dst.attachSharedPrefix(src, 9));
+    EXPECT_EQ(dst.cursorEpoch(), 1u);
+    EXPECT_EQ(dst.nextPosition(), 9);
+    const auto &ancestry = dst.prefixAncestryRefs();
+    ASSERT_EQ(ancestry.size(), 1u);
+    EXPECT_EQ(ancestry[0].request_id, 401u);
+    EXPECT_EQ(ancestry[0].slot, 0);
+    // Register the destination binding on its runner (decode below reads
+    // the attached pooled publication, never the ring).
+    dst_owner->setPooledDecodeBinding(&dst);
+    // Dedup proof: page 0 is a SHARED reference to the source's frame; the
+    // partial page is a PRIVATE COW clip (never the whole shared page).
+    const auto &dst_pages = dst.priorFor(0)->snapshot.view().pages();
+    ASSERT_EQ(static_cast<int>(dst_pages.size()), 2);
+    EXPECT_TRUE(dst_pages[0].sharedBacked()) << "full prefix pages are deduplicated shared frames";
+    EXPECT_FALSE(dst_pages[1].sharedBacked()) << "partial prefix remainder is a private COW clip";
+    EXPECT_EQ(dst_pages[1].rows(), 1);
+    // Byte-identity of the attached prefix vs the source's matching rows.
+    {
+        const auto src_view = src.priorFor(0)->snapshot.view();
+        const auto dst_view = dst.priorFor(0)->snapshot.view();
+        for (int row = 0; row < 9; ++row)
+        {
+            for (int h = 0; h < fx.config.n_kv_heads; ++h)
+            {
+                EXPECT_EQ(std::memcmp(dst_view.key(row, h), src_view.key(row, h),
+                        static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                    << "attached prefix K diverged at row " << row;
+                EXPECT_EQ(std::memcmp(dst_view.value(row, h), src_view.value(row, h),
+                        static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                    << "attached prefix V diverged at row " << row;
+            }
+        }
+    }
+    // Negative: attach again on a destination with live history refuses.
+    EXPECT_FALSE(dst.attachSharedPrefix(src, 9))
+        << "attach into a destination with live history must refuse";
+    // Negative: an out-of-range prefix refuses; the destination is unchanged.
+    EXPECT_FALSE(dst.attachSharedPrefix(src, 13));
+    EXPECT_EQ(dst.nextPosition(), 9);
+
+    // DIVERGENCE: source decodes 2 more; destination decodes 3 different
+    // tokens. Each request is compared to its OWN uninterrupted control.
+    PagedKVInstance ctrl_src_instance;
+    ASSERT_TRUE(make_instance(ctrl_src_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> ctrl_src_owner;
+    PreparedWeightStore ctrl_src_store;
+    std::shared_ptr<QwenStandardGraph> ctrl_src_builder;
+    make_runner(fx, ctrl_src_owner, ctrl_src_store, ctrl_src_builder);
+    PooledKVDecodeBinding ctrl_src(&ctrl_src_instance.pool(), &ctrl_src_instance.table(),
+        /*request_id=*/404, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    ctrl_src_owner->setPooledDecodeBinding(&ctrl_src);
+    ASSERT_OK("control source prefill", ctrl_src_owner->forward(prompt_src.data(), 10, 1) != nullptr);
+    // Control for DST: an uninterrupted request with the same attach prefix
+    // tokens (prompt 1..9) then the same divergence tokens.
+    PagedKVInstance ctrl_dst_instance;
+    ASSERT_TRUE(make_instance(ctrl_dst_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> ctrl_dst_owner;
+    PreparedWeightStore ctrl_dst_store;
+    std::shared_ptr<QwenStandardGraph> ctrl_dst_builder;
+    make_runner(fx, ctrl_dst_owner, ctrl_dst_store, ctrl_dst_builder);
+    PooledKVDecodeBinding ctrl_dst(&ctrl_dst_instance.pool(), &ctrl_dst_instance.table(),
+        /*request_id=*/405, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    ctrl_dst_owner->setPooledDecodeBinding(&ctrl_dst);
+    ASSERT_OK("control dst prefill", ctrl_dst_owner->forward(prompt_src.data(), 9, 1) != nullptr);
+
+    const std::size_t vocab = static_cast<std::size_t>(fx.config.vocab_size);
+    // Source control: replicate the source's COMPLETE history first (prefill
+    // already done; the 2 pre-attach decode tokens), then compare the same
+    // step's logits for the divergence tokens.
+    for (int t = 0; t < static_cast<int>(src_after.size()); ++t)
+    {
+        ASSERT_NE(ctrl_src_owner->forward(&src_after[t], 1, 1), nullptr)
+            << "control source pre-decode " << t;
+    }
+    for (int t = 0; t < static_cast<int>(src_after.size()); ++t)
+    {
+        const float *src_logits = src_owner->forward(&src_after[t], 1, 1);
+        ASSERT_NE(src_logits, nullptr);
+        const float *ctrl_logits = ctrl_src_owner->forward(&src_after[t], 1, 1);
+        ASSERT_NE(ctrl_logits, nullptr);
+        EXPECT_EQ(std::memcmp(src_logits, ctrl_logits, vocab * sizeof(float)), 0)
+            << "source diverged after shared-prefix attach at token " << t;
+    }
+    // Destination control: prefill the same 9-token prefix, then the same
+    // 3 divergence tokens — an uninterrupted request with the same history.
+    const float *ctrl_dst_logits = nullptr;
+    for (int t = 0; t < static_cast<int>(dst_after.size()); ++t)
+    {
+        ctrl_dst_logits = ctrl_dst_owner->forward(&dst_after[t], 1, 1);
+        ASSERT_NE(ctrl_dst_logits, nullptr);
+    }
+    const float *dst_logits = nullptr;
+    for (int t = 0; t < static_cast<int>(dst_after.size()); ++t)
+    {
+        dst_logits = dst_owner->forward(&dst_after[t], 1, 1);
+        ASSERT_NE(dst_logits, nullptr);
+    }
+    ASSERT_NE(ctrl_dst_logits, nullptr);
+    EXPECT_EQ(std::memcmp(dst_logits, ctrl_dst_logits, vocab * sizeof(float)), 0)
+        << "attached-prefix request diverged from its uninterrupted control";
+    const auto src_after_view = src.priorFor(0)->snapshot.view();
+    const auto dst_after_view = dst.priorFor(0)->snapshot.view();
+    for (int row = 0; row < 8; ++row)
+    {
+        EXPECT_EQ(std::memcmp(dst_after_view.key(row, 0), src_after_view.key(row, 0),
+                static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+            << "shared full page mutated after source continued at row " << row;
+    }
+}

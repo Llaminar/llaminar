@@ -767,6 +767,210 @@ public:
         return true;
     }
 
+    /**
+     * @brief P3 M1: attach a compatible PREFIX of another live request's
+     * publication to THIS request's fresh bank as DEDUPLICATED shared frames.
+     *
+     * Every full page strictly inside the prefix is adopted as a SHARED
+     * immutable reference to the source's actual frame (zero-copy: the pool
+     * keeps the frame while either request holds it, and the source may keep
+     * decoding — its next step COWs/moves around the shared page). The final
+     * page of the prefix, when it ends MID-PAGE, is COW'd privately (the
+     * shared page's prefix bytes are copied into a fresh private page clipped
+     * to the exact remainder); a prefix that ends exactly on a page boundary
+     * shares every page and copies nothing.
+     *
+     * Ownership/custody: the new bank is published under THIS request's own
+     * accepted-work issuance (tryBeginReserved); the COW'd private page is
+     * admitted as ONE normal pool grant per layer, retained for the bank's
+     * lifetime (the same rule as truncate). The source publication is never
+     * mutated; two requests sharing a prefix only ever share IMMUTABLE pages.
+     *
+     * Identity checks (fail-closed, all verifiable here): the source must be
+     * a DISTINCT live binding of the same pool+table authority (the pooled
+     * authority IS the authentic isolation domain — a foreign table has a
+     * different incarnation and refuses before any byte is shared) with a
+     * live publication of identical extent on EVERY layer, identical
+     * geometry (kv heads / head dim / page tokens / layer count), and the
+     * requested prefix extent must be page-consistent with the source pages.
+     * The collision-resolving ancestry proof is the source publication's
+     * exact ref identity (authority_id + publication_version + request_id +
+     * slot) — recorded verbatim and exposed via prefixAncestryRefs(); two
+     * different contents can never carry the same ancestry. This attachment
+     * restores NO sampler / RNG / history / placement state — only native
+     * K/V bytes enter the bank.
+     *
+     * @param source Other live binding sharing this binding's pool+table.
+     * @param rows Exact prefix row count (0 < rows <= source rows).
+     * @return True on success (this binding now has a live publication of
+     * exactly @p rows rows per layer); false without mutation on any refuse.
+     */
+    bool attachSharedPrefix(const PooledKVDecodeBinding &source, int rows)
+    {
+        if (!pool_ || !table_ || rows <= 0 || cancelled_)
+            return false;
+        if (this == &source || source.pool() != pool_ || source.table() != table_)
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Shared prefix attach requires a DISTINCT binding of the SAME pool/table");
+            return false;
+        }
+        if (source.cancelled())
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Shared prefix source is cancelled");
+            return false;
+        }
+        if (hasLivePublication())
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Shared prefix attach requires a FRESH destination (live history exists)");
+            return false;
+        }
+        // Same geometry: identical kv_heads/head_dim/page_tokens/layers.
+        if (source.kv_heads_ != kv_heads_ || source.head_dim_ != head_dim_ ||
+            source.page_tokens_ != page_tokens_ || source.cells_.size() != cells_.size())
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Shared prefix geometry mismatch");
+            return false;
+        }
+        // Every layer of the source must hold the same exact row extent
+        // (a per-layer skew is refused — no partial-layer port).
+        int source_rows = 0;
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            const auto *src_prior = source.priorFor(static_cast<int>(layer));
+            if (!src_prior || !src_prior->live())
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Shared prefix source layer " << layer
+                          << " has no live publication");
+                return false;
+            }
+            const int layer_rows = src_prior->snapshot.view().rows();
+            if (layer == 0) source_rows = layer_rows;
+            else if (layer_rows != source_rows)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Shared prefix source layers differ in extent");
+                return false;
+            }
+        }
+        if (rows > source_rows)
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Shared prefix rows exceed the source extent");
+            return false;
+        }
+        const int full_pages = rows / page_tokens_;
+        const int tail_rows = rows % page_tokens_;
+        const std::size_t cow_pages = tail_rows > 0 ? cells_.size() : 0;
+        std::optional<PhysicalPagePool::Grant> cow_grant;
+        if (cow_pages)
+        {
+            cow_grant = pool_->tryAdmit(cow_pages);
+            if (!cow_grant)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Shared prefix COW grant refused");
+                return false;
+            }
+        }
+        // All-or-none across layers: pre-admit every bank before mutating
+        // any cell; any failure leaves every cell untouched.
+        std::vector<std::optional<CPUFP32PagedKVTable::Update>> updates;
+        updates.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            auto update = table_->tryBeginReserved(*reservation_);
+            if (!update)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Shared prefix bank refused at layer " << layer);
+                return false;
+            }
+            const auto &src_pages = source.priorFor(static_cast<int>(layer))
+                                        ->snapshot.view().pages();
+            if (full_pages > static_cast<int>(src_pages.size()) ||
+                (tail_rows > 0 && full_pages >= static_cast<int>(src_pages.size())))
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Shared prefix page geometry malformed");
+                return false;
+            }
+            for (int p = 0; p < full_pages; ++p)
+            {
+                auto shared = src_pages[static_cast<std::size_t>(p)].share();
+                update->appendShared(std::move(shared), kv_heads_, head_dim_);
+            }
+            if (tail_rows > 0)
+            {
+                // Partial COW: copy ONLY the prefix remainder rows into a
+                // fresh private page (never the whole shared page).
+                const auto &last = src_pages[static_cast<std::size_t>(full_pages)];
+                const auto layout = KVNativeStorageLayout::resolve(
+                    KVCacheFamily::AttentionOnly, kv_heads_, head_dim_,
+                    "fp32", DeviceId::cpu());
+                const auto stride = layout.pagePayload(1).totalBytes();
+                const auto &frame = cow_grant->assignFrame();
+                auto write = cow_grant->prepareAppend(
+                    frame, static_cast<std::size_t>(tail_rows) * stride);
+                if (!write)
+                {
+                    LOG_ERROR("[PooledKVDecodeBinding] Shared prefix COW append refused");
+                    return false;
+                }
+                write->copyFrom(last.storage().first(
+                    static_cast<std::size_t>(tail_rows) * stride));
+                auto committed = write->commit();
+                update->append(CPUFP32KVPage(std::move(committed), kv_heads_, head_dim_));
+            }
+            updates.push_back(std::move(*update));
+        }
+        // Publish all layers: the bind calls are atomic per layer (a bind
+        // refusal leaves the earlier published bank superseded-but-live for
+        // readers of THIS request only — the destination was fresh, so a
+        // failed mid-way bind is surfaced as a hard refuse and the caller
+        // must not use this binding; no partial EXPOSURE exists).
+        std::vector<PagedKVSnapshotRef> refs;
+        refs.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            auto snapshot = updates[static_cast<std::size_t>(layer)]->commit();
+            if (!table_->bindPublication(snapshot, request_id_, slot_))
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Shared prefix bind refused at layer " << layer);
+                return false;
+            }
+            refs.push_back(table_->refFor(snapshot, request_id_, slot_));
+            if (!refs.back().valid())
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Shared prefix ref refused at layer " << layer);
+                return false;
+            }
+            auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
+            cell.ref = refs.back();
+            cell.snapshot = std::move(snapshot);
+        }
+        // Retain the COW grant for the bank's lifetime (my private pages
+        // stay owned by this binding, never retiring while read).
+        if (cow_grant)
+            private_publication_grant_ = std::move(cow_grant);
+        // Ancestry = the SOURCE's exact publication refs (the content
+        // identity the prefix was exported from), per layer.
+        prefix_ancestry_refs_.clear();
+        prefix_ancestry_refs_.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            const auto *src_cell = source.priorFor(static_cast<int>(layer));
+            prefix_ancestry_refs_.push_back(src_cell ? src_cell->ref : PagedKVSnapshotRef{});
+        }
+        ++cursor_epoch_;
+        return true;
+    }
+
+    /**
+     * @return The exact source ref identities this binding's prefix was
+     * attached from (per layer), or empty when no shared attach happened.
+     * The recorded identity is the collision-resolving ancestry proof of the
+     * shared content (never a content hash the caller could collide).
+     */
+    const std::vector<PagedKVSnapshotRef> &prefixAncestryRefs() const noexcept
+    {
+        return prefix_ancestry_refs_;
+    }
+
 private:
     static constexpr std::size_t kRequiredBanksPerLayer = 2;
     struct PooledPublicationCellPair
@@ -806,6 +1010,8 @@ private:
     /** Grant owning the frames of the LAST truncation/import bank (private
      * materialized pages must stay owned for the bank's lifetime). */
     std::optional<PhysicalPagePool::Grant> private_publication_grant_;
+    /** Exact source-ref ancestry recorded by attachSharedPrefix (per layer). */
+    std::vector<PagedKVSnapshotRef> prefix_ancestry_refs_;
     int step_rows_ = 0;
     bool step_prepared_ = false;
     /** Persistent exclusive-tail grant (one frame per layer), admitted at binding. */
