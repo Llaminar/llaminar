@@ -5379,6 +5379,18 @@ def require_ordered_adds(sites: dict[str, list[int]], identity: str, mode: str, 
                          + "; ".join(failures[:6]))
 
 
+def expanded_register_limits(limits: dict) -> dict:
+    """Preserve qualified Q4-neighbor ceilings without resurrecting retired source programs."""
+    limits = dict(limits)
+    retired = {":".join(map(str, key[:-1])) for key in row_decomposition_keys()}
+    for key, ceiling in tuple(limits.items()):
+        if key.endswith(":0:1:1"):
+            coded = key.removesuffix(":0:1:1") + ":6:1:1"
+            if coded not in retired:
+                limits[coded] = ceiling
+    return limits
+
+
 def require_registers(counts: dict[str, int], identity: str, mode: str, budget: dict | None = None) -> None:
     """Single-row programs must not spill; grouped programs must stay within the committed ratchet."""
     if budget is None:
@@ -5388,13 +5400,7 @@ def require_registers(counts: dict[str, int], identity: str, mode: str, budget: 
         raise ValueError(f"no qualified tile register budget for compiler {identity} envelope {mode}")
     # The coded Q4_K leaf replaces the former Q4_K identity-nibble leaf;
     # its same-width Q4_1 neighbour retains the identical qualified ceiling.
-    limits = dict(limits)
-    retired = {":".join(map(str, key[:-1])) for key in row_decomposition_keys()}
-    for key, ceiling in tuple(limits.items()):
-        if key.endswith(":0:1:1"):
-            coded = key.removesuffix(":0:1:1") + ":6:1:1"
-            if coded not in retired:
-                limits[coded] = ceiling
+    limits = expanded_register_limits(limits)
     failures = [failure["detail"] for failure in register_failures(counts, limits)]
     if failures:
         raise ValueError(f"native NEON tile register policy violated ({len(failures)}): " + "; ".join(failures[:6]))
@@ -5469,10 +5475,7 @@ def admission_failures(fields: dict, identity: str, mode: str) -> list[dict]:
         failures.append({"reason": "budget_missing", "programs": sorted(map(program_key, fields["program_violations"])),
                          "detail": f"no qualified tile register budget for compiler {identity} envelope {mode}"})
     else:
-        limits = dict(budget)
-        for key, ceiling in tuple(limits.items()):
-            if key.endswith(":0:1:1"):
-                limits[key.removesuffix(":0:1:1") + ":6:1:1"] = ceiling
+        limits = expanded_register_limits(budget)
         failures += register_failures(fields["program_violations"], limits)
     try:
         require_ordered_adds(fields["ordered_adds"], identity, mode)
