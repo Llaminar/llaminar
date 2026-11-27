@@ -441,10 +441,15 @@ namespace llaminar2::cpu::native_quantised
                     Physical, int(Map), Minimum, true>();
                 using LastOps = std::conditional_t<tail == Ops::instruction, Ops,
                     multi_scale::NEONMultiScaleOps<tail>>;
+                if constexpr (Rows <= 2)
+                    return run<PairOps, Policy, Physical, Map, Minimum, Strips>();
+                else
+                {
                 using FirstMap = typename CPUNativeNEONProjectionTile<2>::NibbleMap;
                 using LastMap = typename CPUNativeNEONProjectionTile<Rows - 2>::NibbleMap;
                 rowSlice<2, 0>().template run<PairOps, Policy, Physical, FirstMap(Map), Minimum, Strips>();
                 rowSlice<Rows - 2, 2>().template run<LastOps, Policy, Physical, LastMap(Map), Minimum, Strips>();
+                }
             }
             else
                 run<Ops, Policy, Physical, Map, Minimum, Strips>();
@@ -467,8 +472,13 @@ namespace llaminar2::cpu::native_quantised
                     Encoding::CompactMultiScale, Codebook, Codebook == 7, true>();
                 using LastOps = std::conditional_t<tail == Ops::instruction, Ops,
                     multi_scale::NEONMultiScaleOps<tail>>;
-                rowSlice<2, 0>().template runCoded<PairOps, Policy, Codebook, Strips>();
-                rowSlice<Rows - 2, 2>().template runCoded<LastOps, Policy, Codebook, Strips>();
+                if constexpr (Rows <= 2)
+                    return runCoded<PairOps, Policy, Codebook, Strips>();
+                else
+                {
+                    rowSlice<2, 0>().template runCoded<PairOps, Policy, Codebook, Strips>();
+                    rowSlice<Rows - 2, 2>().template runCoded<LastOps, Policy, Codebook, Strips>();
+                }
             }
             else
                 runCoded<Ops, Policy, Codebook, Strips>();

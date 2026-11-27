@@ -26,7 +26,8 @@ for source, pair, tail in re.findall(r"NEON_ROW_ROUTE ([0-9:]+) ([0-9]+) ([0-9]+
     key = tuple(map(int, source.split(":"))) + (0,)
     suffix = key[2:]
     assert key not in compiled, f"duplicate compiled route {key}"
-    compiled[key] = ((2, int(pair), *suffix), (key[0] - 2, int(tail), *suffix))
+    compiled[key] = (((key[0], int(pair), *suffix),) if key[0] <= 2 else
+                     ((2, int(pair), *suffix), (key[0] - 2, int(tail), *suffix)))
 assert compiled == routing, "compiled routing differs from checker source-derived routing"
 for source, leaves in routing.items():
     admitted = evidence.dispatched_tile_keys(*source[:2])

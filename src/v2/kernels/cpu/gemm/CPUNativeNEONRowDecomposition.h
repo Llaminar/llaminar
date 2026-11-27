@@ -1,6 +1,6 @@
 /**
  * @file CPUNativeNEONRowDecomposition.h
- * @brief Exact ordered projection keys executed as two existing physical row programs.
+ * @brief Exact projection keys routed to admitted existing physical row programs.
  *
  * Row decomposition changes only payload reuse, never a row's K partitions,
  * integer products, scale operations or FP fold order. It is a static execution
@@ -18,6 +18,7 @@ namespace llaminar2::cpu::native_quantised
     {
         int rows;
         multi_scale::NEONByteDot family;
+        CPUProjectionNumericalPolicy policy;
         CPUNativeQuantisedEncoding encoding;
         int map;
         bool minimum;
@@ -26,35 +27,41 @@ namespace llaminar2::cpu::native_quantised
     };
 
     using NEONRowDot = multi_scale::NEONByteDot;
+    using NEONRowPolicy = CPUProjectionNumericalPolicy;
     using NEONRowEncoding = CPUNativeQuantisedEncoding;
 
-    /** @brief Ordered-only source keys; absent keys retain their original physical tile. */
+    /** @brief Exact source keys; rows 1/2 select one same-row leaf, rows 3/4 select two live slices. */
     inline constexpr NEONRowDecompositionKey kNEONRowDecompositions[] = {
-        {3, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
-        {3, NEONRowDot::ASIMD, NEONRowEncoding::NibbleLUTSourceScale, 2, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
-        {4, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
-        {4, NEONRowDot::ASIMD, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
-        {4, NEONRowDot::ASIMD, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
-        {3, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::ASIMD},
-        {3, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
-        {3, NEONRowDot::DotProd, NEONRowEncoding::NibbleLUTSourceScale, 2, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
-        {3, NEONRowDot::DotProd, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
-        {4, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
-        {4, NEONRowDot::DotProd, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
-        {4, NEONRowDot::DotProd, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
-        {4, NEONRowDot::I8MM, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {3, NEONRowDot::ASIMD, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {3, NEONRowDot::ASIMD, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::NibbleLUTSourceScale, 2, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {4, NEONRowDot::ASIMD, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {4, NEONRowDot::ASIMD, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {4, NEONRowDot::ASIMD, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {3, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::ASIMD},
+        {3, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {3, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::NibbleLUTSourceScale, 2, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {3, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 7, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::Q4KSuperblockCoded, 1, true, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {4, NEONRowDot::I8MM, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
+        {1, NEONRowDot::DotProd, NEONRowPolicy::BackendNative, NEONRowEncoding::Q5NativeSingleScale, 0, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {1, NEONRowDot::DotProd, NEONRowPolicy::BackendNative, NEONRowEncoding::Q5NativeSingleScale, 1, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {1, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {1, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::Q5NativeSingleScale, 0, false, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {1, NEONRowDot::DotProd, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::Q5NativeSingleScale, 1, true, NEONRowDot::ASIMD, NEONRowDot::ASIMD},
+        {2, NEONRowDot::I8MM, NEONRowPolicy::GPUAlignedExpert, NEONRowEncoding::CompactMultiScale, 11, false, NEONRowDot::DotProd, NEONRowDot::DotProd},
     };
 
-    /** @brief Compile-time selection; backend-native arithmetic is never decomposed. */
+    /** @brief Compile-time exact-key selection; unlisted arithmetic programs retain their physical tile. */
     template <int Rows, NEONRowDot Family, CPUProjectionNumericalPolicy Policy,
               NEONRowEncoding Encoding, int Map, bool Minimum>
     consteval bool decomposeNEONRows()
     {
-        if constexpr (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-            for (const auto &key : kNEONRowDecompositions)
-                if (key.rows == Rows && key.family == Family && key.encoding == Encoding &&
-                    key.map == Map && key.minimum == Minimum)
-                    return true;
+        for (const auto &key : kNEONRowDecompositions)
+            if (key.rows == Rows && key.family == Family && key.policy == Policy && key.encoding == Encoding &&
+                key.map == Map && key.minimum == Minimum)
+                return true;
         return false;
     }
     /** @brief Resolve the pair instruction family from the same exact routing authority. */
@@ -64,7 +71,7 @@ namespace llaminar2::cpu::native_quantised
     {
         static_assert(decomposeNEONRows<Rows, Family, Policy, Encoding, Map, Minimum>());
         for (const auto &key : kNEONRowDecompositions)
-            if (key.rows == Rows && key.family == Family && key.encoding == Encoding &&
+            if (key.rows == Rows && key.family == Family && key.policy == Policy && key.encoding == Encoding &&
                 key.map == Map && key.minimum == Minimum)
                 return Tail ? key.tail_family : key.pair_family;
         throw "missing exact NEON row decomposition";

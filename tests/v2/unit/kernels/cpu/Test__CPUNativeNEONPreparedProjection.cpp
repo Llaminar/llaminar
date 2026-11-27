@@ -52,6 +52,10 @@ struct CPUNativeNEONProjectionWideOracle
             return tile.template run<Ops, Policy, E::NibbleLUTSourceScale, M::NonLinear, false, 0>();
         case E::Q4KSuperblockCoded:
             return tile.template run<Ops, Policy, E::Q4KSuperblockCoded, M::Unsigned, true, 0>();
+        case E::Q5NativeSingleScale:
+            if (tile.weights_.is_asymmetric)
+                return tile.template run<Ops, Policy, E::Q5NativeSingleScale, M::Unsigned, true, 0>();
+            return tile.template run<Ops, Policy, E::Q5NativeSingleScale, M::Centered, false, 0>();
         default: throw std::invalid_argument("wide oracle requires a row-decomposition source");
         }
     }
@@ -822,7 +826,8 @@ void verifyRowDecomposition()
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
         const auto encoding = preparedEncodingForSource(*source.metadata);
-        if (!(encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+        if (!(encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale ||
+              encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
               encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded ||
               (encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
                (source.metadata->codebook_id == 7 || source.metadata->codebook_id == 11))))
@@ -869,6 +874,13 @@ void verifyRowDecomposition()
 template <typename Ops> void verifyRowDecompositionPolicies()
 {
     using P = CPUProjectionNumericalPolicy;
+    if constexpr (Ops::instruction != ms::NEONByteDot::I8MM)
+    {
+        verifyRowDecomposition<Ops, 1, P::GPUAlignedExpert>();
+        verifyRowDecomposition<Ops, 1, P::BackendNative>();
+    }
+    verifyRowDecomposition<Ops, 2, P::GPUAlignedExpert>();
+    verifyRowDecomposition<Ops, 2, P::BackendNative>();
     verifyRowDecomposition<Ops, 3, P::GPUAlignedExpert>();
     verifyRowDecomposition<Ops, 4, P::GPUAlignedExpert>();
     verifyRowDecomposition<Ops, 3, P::BackendNative>();
@@ -879,8 +891,8 @@ template <typename Ops> void verifyRowDecompositionPolicies()
 TEST_F(CPUNativeNEONPreparedProjection, DumpRowDecompositionKeys)
 {
     for (const auto &key : kNEONRowDecompositions)
-        std::printf("NEON_ROW_ROUTE %d:%d:1:%d:%d:%d %d %d\n", key.rows, int(key.family),
-            int(key.encoding), key.map, int(key.minimum), int(key.pair_family), int(key.tail_family));
+        std::printf("NEON_ROW_ROUTE %d:%d:%d:%d:%d:%d %d %d\n", key.rows, int(key.family),
+            int(key.policy), int(key.encoding), key.map, int(key.minimum), int(key.pair_family), int(key.tail_family));
 }
 
 /** @test Original wide and installed row-pair programs have identical output and guard bytes. */

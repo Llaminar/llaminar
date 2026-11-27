@@ -4159,7 +4159,7 @@ def compact_programs(image: ObjectImage) -> dict[str, tuple[str, str]]:
     return found
 
 
-def row_decomposition_keys(root: Path | None = None) -> dict[tuple, tuple[tuple, tuple]]:
+def row_decomposition_keys(root: Path | None = None) -> dict[tuple, tuple[tuple, ...]]:
     """Read exact source/replacement keys from the production C++ routing authority, not a second key list.
 
     The native CTest dump compares these parsed keys with the compiled constexpr table.
@@ -4172,7 +4172,7 @@ def row_decomposition_keys(root: Path | None = None) -> dict[tuple, tuple[tuple,
     encoding_source = (gemm / "CPUNativeQuantisedPreparedFootprint.h").read_text()
     encoding_body = encoding_source.split("enum class CPUNativeQuantisedEncoding", 1)[1].split("};", 1)[0]
     encodings = {name: int(number) for name, number in re.findall(r"(\w+)\s*=\s*(\d+)", encoding_body)}
-    entry = re.compile(r"\{([34]), NEONRowDot::(\w+), NEONRowEncoding::(\w+), (\d+), "
+    entry = re.compile(r"\{([1-4]), NEONRowDot::(\w+), NEONRowPolicy::(\w+), NEONRowEncoding::(\w+), (\d+), "
                        r"(true|false), NEONRowDot::(\w+), NEONRowDot::(\w+)\},")
     result = {}
     for line in table.splitlines():
@@ -4181,13 +4181,15 @@ def row_decomposition_keys(root: Path | None = None) -> dict[tuple, tuple[tuple,
         match = entry.fullmatch(line.strip())
         if not match:
             raise ValueError(f"unrecognized NEON row-decomposition entry: {line}")
-        rows, family, encoding, mapping, minimum, pair, tail = match.groups()
+        rows, family, policy, encoding, mapping, minimum, pair, tail = match.groups()
         rows, family, encoding = int(rows), DOTS[family], encodings[encoding]
-        suffix = (1, encoding, int(mapping), int(minimum == "true"), 0)
+        suffix = ({"BackendNative": 0, "GPUAlignedExpert": 1}[policy],
+                  encoding, int(mapping), int(minimum == "true"), 0)
         key = (rows, family, *suffix)
         if key in result:
             raise ValueError(f"duplicate NEON row-decomposition key: {key}")
-        result[key] = ((2, DOTS[pair], *suffix), (rows - 2, DOTS[tail], *suffix))
+        result[key] = (((rows, DOTS[pair], *suffix),) if rows <= 2 else
+                       ((2, DOTS[pair], *suffix), (rows - 2, DOTS[tail], *suffix)))
     if not result:
         raise ValueError("empty NEON row-decomposition table")
     return result
