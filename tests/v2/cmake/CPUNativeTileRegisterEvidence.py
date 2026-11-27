@@ -2199,8 +2199,88 @@ def _static_ninja_record(text: str, target: str, mtime_ns: int, cwd: Path) -> se
     return set(entries)
 
 
+def _static_dso(data: bytes, target: str | None = None) -> tuple[list[str], str | None]:
+    """Read an actual non-PIE ET_DYN's needed names/SONAME and target definitions."""
+    headers, _ = _static_elf(data)
+    dynamic = [h for h in headers if h["type"] == 6]
+    if _field(data, 16, 2) != 3 or len(dynamic) != 1:
+        raise ValueError("implicit linker input is not an ELF DSO with a dynamic table")
+    h = dynamic[0]
+    if h["entsize"] != 16 or h["size"] % 16 or not 0 < h["link"] < len(headers):
+        raise ValueError("implicit DSO dynamic table bounds")
+    strings = headers[h["link"]]
+    needed, sonames = [], []
+    for b in range(h["offset"], h["offset"]+h["size"], 16):
+        tag, value = _field(data, b, 8), _field(data, b+8, 8)
+        if tag == 0x6ffffffb and value & 0x8000000:
+            raise ValueError("implicit linker input is PIE, not a DSO")
+        if tag in (1, 14):
+            name = _string(data, strings["offset"]+value, strings["offset"]+strings["size"])
+            (needed if tag == 1 else sonames).append(name)
+    if len(sonames) > 1 or len(set(needed)) != len(needed):
+        raise ValueError("ambiguous implicit DSO dynamic names")
+    if target is not None and any(s[0] == target and s[3] != 0 for s in _static_symbols(data, headers, 11)):
+        raise ValueError("implicit DSO defines the selected target in dynsym")
+    return needed, sonames[0] if sonames else None
+
+
+def _static_implicit_dsos(dependencies: set[Path], traced: set[Path], verbose: str,
+                          cwd: Path, target: str | None) -> list[dict]:
+    """Prove each untraced input via actual ordered BFD resolution and DSO bytes.
+
+    This is not an inventory union: trace extras always fail. Each missing input
+    must be a non-PIE DSO reached from an already proven parent through an actual
+    DT_NEEDED name and exactly one native 'needed by'/'found' resolution pair.
+    Failed search attempts remain diagnostic output, never admitted inputs.
+    """
+    if traced - dependencies:
+        raise ValueError("static trace/dependency input set mismatch: extra trace input")
+    missing = dependencies - traced
+    if not missing:
+        return []
+    if not target:
+        raise ValueError("implicit DSO closure requires the verifier's selected target")
+    roots = set()
+    for p in traced:
+        data = p.read_bytes()
+        if data[:6] == b"\x7fELF\x02\x01" and _field(data, 16, 2) == 3:
+            _static_dso(data)
+            roots.add(p)
+    # Validate every difference member before interpreting any textual claims.
+    dynamic = {p: _static_dso(p.read_bytes(), target) for p in missing}
+    admitted, records, pending, found_names = set(), [], None, set()
+    for line in verbose.splitlines():
+        needed = re.fullmatch(r"([^\s/]+) needed by (\S+)", line)
+        found = re.fullmatch(r"found ([^\s/]+) at (\S+)", line)
+        if needed:
+            if pending is not None:
+                raise ValueError("ambiguous native DSO needed/found sequence")
+            name, raw_parent = needed.groups()
+            parent = (cwd / raw_parent).resolve(strict=True)
+            if parent not in roots | admitted or name not in _static_dso(parent.read_bytes())[0]:
+                raise ValueError("native DSO parent does not prove DT_NEEDED reachability")
+            pending = name, parent
+        elif found:
+            name, raw_path = found.groups()
+            if pending is None or pending[0] != name or name in found_names:
+                raise ValueError("unmatched, wrong-name or duplicate native DSO resolution")
+            p = (cwd / raw_path).resolve(strict=True)
+            if p not in missing or p in admitted:
+                raise ValueError("native DSO found path is not the unique missing input")
+            soname = dynamic[p][1]
+            if soname is not None and soname != name:
+                raise ValueError("native DSO SONAME disagrees with needed/found name")
+            records.append(dict(name=name, parent=str(pending[1]), path=str(p), soname=soname))
+            found_names.add(name)
+            admitted.add(p)
+            pending = None
+    if pending is not None or admitted != missing:
+        raise ValueError("missing native successful resolution for implicit DSO closure")
+    return records
+
+
 def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Path,
-                        ninja: Path | None = None) -> dict:
+                        ninja: Path | None = None, target: str | None = None) -> dict:
     """Capture a bounded GNU14/ld.bfd production edge; diagnostics never mint authority.
 
     Caller supplies the exact ordered Ninja driver edge, not a shell command. Every
@@ -2364,7 +2444,14 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     script_command = [str(linker), "-m", emulation, "--verbose"]
     default_script = run("default-script", script_command)
     retain("default-script.txt", default_script)
+    verbose = run("verbose", relink("verbose", ["-Wl,--verbose"]))
+    if (artifacts / "verbose.elf").read_bytes() != production:
+        raise ValueError("static verbose differs from production")
+    if dependency_paths((artifacts / "verbose.d").read_bytes()) != original_dependencies:
+        raise ValueError("static verbose dependency set differs from production")
     transactions = []
+    first_traces = None
+    implicit_records = None
     for label in ("instrumented", "control", "map"):
         extras = [] if label == "control" else ["-Wl,--trace"]
         if label == "map":
@@ -2377,10 +2464,14 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         dependencies = dependency_paths(dependency)
         if dependencies != original_dependencies:
             raise ValueError("static relink dependency set differs from production")
-        traces = (set(map(Path, transactions[0])) if label == "control" and not trace.strip()
+        traces = (first_traces if label == "control" and not trace.strip()
                   else _static_trace_paths(trace, cwd))
-        if dependencies != traces or not dependencies:
-            raise ValueError("static trace/dependency input set mismatch")
+        records = _static_implicit_dsos(dependencies, traces, verbose, cwd, target)
+        if first_traces is None:
+            first_traces, implicit_records = traces, records
+        elif traces != first_traces or records != implicit_records:
+            raise ValueError("native DSO resolution changed between transactions")
+        retain(f"{label}-implicit-dsos.json", json.dumps(records, indent=2))
         inventory = {}
         for p in dependencies:
             data = p.read_bytes()
@@ -2427,7 +2518,7 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
                                        unit: "Unit", object_bytes: bytes, replay_bytes: bytes,
                                        target: str, ninja: Path | None = None) -> TypedStaticExecutableSelection:
     """Reconstruct native closure and prove the kept input owns the actual AArch64 callee."""
-    recipe = capture_static_link(argv, cwd, output, artifacts, ninja=ninja)
+    recipe = capture_static_link(argv, cwd, output, artifacts, ninja=ninja, target=target)
     # A capture recipe is never itself sufficient: the following proof uses bytes.
     image = read_object(object_bytes)
     if object_bytes != replay_bytes or unit.object_identity != image_fingerprint(image):
