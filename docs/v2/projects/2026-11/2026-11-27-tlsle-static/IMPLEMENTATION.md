@@ -104,3 +104,41 @@ Focused synthetic coverage is explicitly registered in ProductionTestPreflight.
 Original whole-object 549 and pre-slice 541 rejections remain the native controls.
 This implementation is committed before developer verification as directed;
 no T-a or Q5 qualification is claimed.
+
+### Initial-exec developer validation and next native stop
+
+Owner confirmed push of fb0be0970 before verification. Reviewer requested that
+Analysis consume typed object-normalizer markers rather than trusting a symbolic
+operand substring. Fix 99f3ff013 was committed before its tests; parent confirmed
+its push as 0c88807e3 on the integration branch. Plain assembly and flattened
+normalized text now fail closed without those markers.
+
+- Focused Python selection (TLSInitialExecPairTest, TLSLocalExecPairTest,
+  TLSDescriptorTest, CallModelTest, CallProvenanceTest, RelocationTest): 45 passed.
+- Fresh real portability CMake configure in `/tmp/pr73-tlsie-portability`:
+  Release, Homebrew Ninja, native NEON and explicit Homebrew OpenMP flags/library
+  and include; successful. Explicit initial-exec CTest passed with
+  ProductionTestPreflight label (rerun after marker fix also passed).
+- Native whole-object control script:
+  `/tmp/pr73-tlsle-native-inspection/check_ie.py`; output `ie-result.txt` and
+  next-stop details `ie-next-facts.txt` beside it. Original checker still rejects
+  549; pre-IE base b4edb641b still rejects 541. Complete retained production object
+  SHA256 remains 2e4caad3baaa10cd948e53c696be499df93c65948d0f9f3a1ed49104c16d14f0.
+- Initial printer attempt used retained raw-byte output, incompatible with the
+  parser's expected printer mode. Reacquired directly from native GNU objdump
+  using `-dr --no-show-raw-insn` on the complete remote production.o; no output
+  filtering, slicing, stripping or object modification. New output retained as
+  `WeightManager.no-raw.objdump`.
+- Live complete-object relocation reader now completes; exact initial-exec pair
+  extraction covers 12 instructions. Whole-object normalization still exits 1:
+  existing local-exec zero-addend contract rejects the +16 pair in function
+  `_ZN9llaminar214KernelProfiler6recordENS_10KernelTypeEm`, section of the same
+  name prefixed `.text.`, offsets 0x3b0/0x3b4. Symbol:
+  `_ZZN9llaminar214KernelProfiler18current_device_keyB5cxx11EvE10device_key`.
+  Records are 549/551, each addend +16; instructions are
+  `add x4, x20, #0x0, lsl #12` / `add x4, x4, #0x0`.
+  No admission expansion was made for this next unsupported native form.
+
+This is developer evidence only. Whole-object T-a is still BLOCKED, not PASS;
+there is no traffic, static-binding or Q5 qualification. Independent review is
+required before qualification effect. Scratch evidence is not staged.
