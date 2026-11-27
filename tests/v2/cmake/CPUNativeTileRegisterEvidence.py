@@ -2065,8 +2065,8 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
     if not version.startswith("14."):
         raise ValueError("static capture supports GNU14 only")
     jobs = run("driver-jobs", args + ["-###"])
-    collect = [shlex.split(line)[0] for line in jobs.splitlines() if line.lstrip().startswith('"/')
-               and "collect2" in line]
+    collect = [shlex.split(line)[0] for line in jobs.splitlines()
+               if line.strip() and Path(shlex.split(line)[0]).name == "collect2"]
     if len(collect) != 1:
         raise ValueError("static driver must expose one collect2 job")
     cp = Path(collect[0]).resolve(strict=True)
@@ -2085,10 +2085,15 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         raise ValueError("static linker is not GNU bfd")
     if (artifacts / "debug.elf").read_bytes() != production:
         raise ValueError("collect2 debug preparation changed production bytes")
-    default_script = run("default-script", [str(linker), "--verbose"])
+    job_tokens = [token for line in jobs.splitlines() if line.strip() and
+                  Path(shlex.split(line)[0]).name == "collect2" for token in shlex.split(line)]
+    emulations = [job_tokens[i+1] for i, t in enumerate(job_tokens[:-1]) if t == "-m"]
+    if len(emulations) != 1:
+        raise ValueError("static link requires one explicit collect2 emulation")
+    script_command = [str(linker), "-m", emulations[0], "--verbose"]
+    default_script = run("default-script", script_command)
     (artifacts / "default-script.txt").write_text(default_script)
     # GNU14 exposes the plugin on the actual job even when there is no LTO work.
-    job_tokens = [token for line in jobs.splitlines() if "collect2" in line for token in shlex.split(line)]
     for i, token in enumerate(job_tokens):
         if token in ("-plugin", "--plugin"):
             p = Path(job_tokens[i+1]).resolve(strict=True)
@@ -2133,10 +2138,13 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
         if transactions and transactions[0] != inventory:
             raise ValueError("static input changed between transactions")
         transactions.append(inventory)
-        files.update(inventory)
+        for path, digest in inventory.items():
+            if path in files and files[path] != digest:
+                raise ValueError(f"static input changed: {path}")
+            files[path] = digest
     if dict(os.environ) != env:
         raise ValueError("static environment changed during capture")
-    if run("default-script-after", [str(linker), "--verbose"]) != default_script:
+    if run("default-script-after", script_command) != default_script:
         raise ValueError("static default script changed")
     files[str(output)] = _static_hash(production)
     for path, digest in files.items():
@@ -2193,12 +2201,10 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
     if mapping.count(boundary) != 1 or mapping.count("Discarded input sections") != 1:
         raise ValueError("ambiguous GNU map kept/discarded boundary")
     discarded, kept = mapping.split(boundary)
-    if discarded.index("Discarded input sections") > len(discarded):
-        raise ValueError("static discarded boundary")
     # GNU map input-section lines may wrap once between section name and address.
     intervals = re.findall(r"^ (\.[^\s]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+([^\n]+)$", kept, re.M)
     owners = [(n, int(a, 16), int(s, 16), p.strip()) for n,a,s,p in intervals
-              if int(a, 16) <= address < address+size <= int(a, 16)+int(s, 16)]
+              if int(a, 16) < address+size and address < int(a, 16)+int(s, 16)]
     if len(owners) != 1:
         raise ValueError("static map has ambiguous/missing kept owner")
     name, placed, extent, owner = owners[0]
@@ -2219,6 +2225,9 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
     if placed + original.value != address or original.size != size:
         raise ValueError("static input/final symbol extent mismatch")
     files = dict(recipe["files"])
+    for path, digest in files.items():
+        if _static_hash(Path(path).read_bytes()) != digest:
+            raise ValueError(f"static artifact changed after capture: {path}")
     for p in artifacts.iterdir():
         if p.is_file():
             files[str(p.resolve())] = _static_hash(p.read_bytes())
