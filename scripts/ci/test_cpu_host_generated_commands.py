@@ -85,3 +85,99 @@ class GeneratedCommands(unittest.TestCase):
             result = subprocess.run(comma_command + ['-DTEST_COMMA=ON'], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('nvcc separator', result.stderr)
+
+
+# Real CMake generation through V2CPUSecondaryEnvelope.cmake: a dedicated
+# subdirectory drops the canonical envelope and declares its own per target.
+SECONDARY_PROJECT = r'''
+cmake_minimum_required(VERSION 4.0)
+project(SecondaryEnvelope LANGUAGES C CXX)
+set(CMAKE_SYSTEM_PROCESSOR "${TEST_PROCESSOR}")
+include("${MODULE}")
+llaminar_configure_cpu_instruction_set()
+add_compile_definitions(UNRELATED_DEFINITION=1)
+add_executable(canonical fixture.cpp)
+if(TEST_LATE)
+ v2_cpu_secondary_envelope_contract_arguments(early)
+endif()
+if(TEST_ROOT_DECLARATION)
+ v2_declare_cpu_secondary_envelope_target(canonical SCALAR)
+endif()
+add_subdirectory(secondary)
+v2_cpu_secondary_envelope_contract_arguments(arguments)
+string(JOIN "\n" content ${arguments})
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/contract-arguments.txt" CONTENT "${content}\n")
+file(WRITE "${CMAKE_BINARY_DIR}/expected.json" "{\"flags\":\"${LLAMINAR_CPU_COMPILE_FLAGS}\",\"definitions\":\"${LLAMINAR_CPU_COMPILE_DEFINITIONS}\"}")
+'''
+SECONDARY_SUBDIRECTORY = r'''
+include("${MODULE}")
+v2_enter_cpu_secondary_envelope_scope()
+foreach(isa IN LISTS SECONDARY_ISAS)
+ add_executable(secondary_${isa} ../fixture.cpp)
+ v2_declare_cpu_secondary_envelope_target(secondary_${isa} ${isa})
+endforeach()
+'''
+
+
+class GeneratedSecondaryEnvelopes(unittest.TestCase):
+    def test_secondary_scope_generates_one_coherent_envelope_per_target(self):
+        from cpu_host_compile_contract import secondary_envelopes
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compilers = {}
+            for language in ('C', 'CXX'):
+                compiler = root / ('compiler-' + language)
+                compiler.write_text('#!/bin/sh\nexit 0\n')
+                compiler.chmod(0o755)
+                compilers[language] = str(compiler)
+            (root / 'CMakeLists.txt').write_text(SECONDARY_PROJECT)
+            (root / 'secondary').mkdir()
+            (root / 'secondary' / 'CMakeLists.txt').write_text(SECONDARY_SUBDIRECTORY)
+            (root / 'fixture.cpp').write_text('int main() { return 0; }\n')
+
+            def configure(name, processor, isa, secondary_isas, *extra):
+                command = ['cmake', '-S', str(root), '-B', str(root / name), '-G', 'Ninja',
+                           '-DCMAKE_MAKE_PROGRAM=' + shutil.which('ninja'), '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+                           '-DCMAKE_BUILD_TYPE=Release', '-DLLAMINAR_CPU_ISA=' + isa, '-DTEST_PROCESSOR=' + processor,
+                           '-DMODULE=' + str(ROOT / 'tests/v2/cmake/V2CPUSecondaryEnvelope.cmake'),
+                           '-DSECONDARY_ISAS=' + ';'.join(secondary_isas), *extra]
+                for language, compiler in compilers.items():
+                    command += [f'-DCMAKE_{language}_COMPILER={compiler}', f'-DCMAKE_{language}_COMPILER_ID=GNU',
+                                f'-DCMAKE_{language}_COMPILER_FORCED=TRUE', f'-DCMAKE_{language}_COMPILER_WORKS=TRUE']
+                return subprocess.run(command, capture_output=True, text=True)
+
+            for isa, secondary_isas in (('AVX512', ['SCALAR', 'AVX2']), ('AVX2', ['SCALAR'])):
+                with self.subTest(isa=isa):
+                    result = configure(isa, 'x86_64', isa, secondary_isas)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    build = root / isa
+                    expected = json.loads((build / 'expected.json').read_text())
+                    groups = dict(targets=[], flags=[], definitions=[], objects=[])
+                    for line in (build / 'contract-arguments.txt').read_text().splitlines():
+                        option, value = line.split('=', 1)
+                        groups[dict(zip(('--secondary-envelope', '--secondary-flags', '--secondary-definition', '--secondary-objects'),
+                                        groups))[option]].append(value)
+                    secondary = secondary_envelopes(*groups.values())
+                    self.assertEqual(sorted(secondary), sorted('secondary_' + item for item in secondary_isas))
+                    self.assertEqual(secondary['secondary_SCALAR'].flags, '-march=x86-64')
+                    rows = json.loads((build / 'compile_commands.json').read_text())
+                    self.assertEqual(len(rows), 1 + len(secondary_isas))
+                    for row in rows:
+                        # Unrelated directory definitions survive; no -mno-* lowering exists.
+                        self.assertIn('-DUNRELATED_DEFINITION=1', row['command'])
+                        self.assertNotIn('-mno-', row['command'])
+                    database = build / 'compile_commands.json'
+                    verify(database, expected['flags'], expected['definitions'].split(';'), compilers, secondary)
+                    # Without its binding, every reduced row fails against the canonical envelope.
+                    with self.assertRaisesRegex(ValueError, 'mismatched CPU envelope'):
+                        verify(database, expected['flags'], expected['definitions'].split(';'), compilers)
+
+            for name, processor, isa, secondary_isas, extra, message in (
+                    ('late', 'x86_64', 'AVX512', ['SCALAR'], ['-DTEST_LATE=ON'], 'after the host compile contract'),
+                    ('root', 'x86_64', 'AVX512', [], ['-DTEST_ROOT_DECLARATION=ON'], 'v2_enter_cpu_secondary_envelope_scope'),
+                    ('arm-scalar', 'aarch64', 'NEON', ['SCALAR'], [], 'x86-64 only')):
+                with self.subTest(negative=name):
+                    result = configure(name, processor, isa, secondary_isas, *extra)
+                    self.assertNotEqual(result.returncode, 0)
+                    # CMake wraps diagnostics; compare whitespace-normalized text.
+                    self.assertIn(message, ' '.join(result.stderr.split()))

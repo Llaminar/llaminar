@@ -1,6 +1,13 @@
 # @file V2CPUHostCompilerTests.cmake
 # @brief Register host ISA forwarding controls and actual build command admission.
+#
+# The compile contract binds every compile-database row to the canonical CPU
+# envelope, except the exact object rows of declared secondary-envelope targets
+# (V2CPUSecondaryEnvelope.cmake), which are bound to their own envelope. Include
+# this module after every module that declares secondary envelopes; a later
+# declaration is a configure error.
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/V2CPUSecondaryEnvelope.cmake")
 v2_add_core_free_test(V2_Unit_CPUHostCompilerOptions
     COMMAND "${Python3_EXECUTABLE}" -m unittest discover
         -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
@@ -13,12 +20,14 @@ set(V2_CPU_HOST_DEFINITION_ARGS)
 foreach(definition IN LISTS LLAMINAR_CPU_COMPILE_DEFINITIONS)
     list(APPEND V2_CPU_HOST_DEFINITION_ARGS "--definition=${definition}")
 endforeach()
+v2_cpu_secondary_envelope_contract_arguments(V2_CPU_HOST_SECONDARY_ENVELOPE_ARGS)
 v2_add_core_free_test(V2_Integration_CPUHostCompileContract
     COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci/cpu_host_compile_contract.py"
         --database "${CMAKE_BINARY_DIR}/compile_commands.json"
         "--flags=${LLAMINAR_CPU_COMPILE_FLAGS}"
         ${V2_CPU_HOST_DEFINITION_ARGS}
+        ${V2_CPU_HOST_SECONDARY_ENVELOPE_ARGS}
         "--compiler-C=${CMAKE_C_COMPILER}"
         "--compiler-CXX=${CMAKE_CXX_COMPILER}"
         "--compiler-CUDA=${CMAKE_CUDA_COMPILER}"

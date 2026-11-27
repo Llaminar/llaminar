@@ -33,6 +33,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/../../../cmake/OpenMPRuntimeBinding.cmake")
 llaminar_openmp_runtime_soname(LLAMINAR_OPENMP_RUNTIME_SONAME)
 enable_testing()
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/V2CPUArchitectureTests.cmake")
+# Secondary CPU envelopes are declared before the host compile contract consumes them.
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/V2CPUExplicitRoundingTests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/V2CPUHostCompilerTests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/V2ARMEnvelopeWorkflowTests.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/../cmake/V2CPUExplicitRoundingTests.cmake")
