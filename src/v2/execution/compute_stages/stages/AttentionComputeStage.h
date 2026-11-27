@@ -146,6 +146,18 @@ namespace llaminar2
              */
             const PagedKVSnapshotRef *pooled_ref_cell = nullptr;
             /**
+             * @brief Per-request pooled ref cells for a GROUPED decode.
+             *
+             * When @p pooled_table is non-null and @p pooled_ref_cells is
+             * non-empty (size == @p batch_size), this stage consumes N pooled
+             * publications in ONE grouped pooled kernel invocation — one ref
+             * per decode row, never a stage-level row-replay loop. Each cell
+             * is a DISTINCT request's current publication; duplicate cells or
+             * a cell also named by @p pooled_ref_cell are refused during
+             * execution.
+             */
+            std::vector<const PagedKVSnapshotRef *> pooled_ref_cells;
+            /**
              * @brief Derive the decode position from the pooled publication rows.
              *
              * The pooled runner's host position counter is not the authority:

@@ -38,6 +38,16 @@ struct PagedKVSnapshotRef
      */
     int bank_hint = -1;
     bool valid() const noexcept { return authority_id != 0 && publication_version != 0; }
+    /** @return Whether two refs name the exact same publication (identity + version). */
+    bool operator==(const PagedKVSnapshotRef &other) const noexcept
+    {
+        return authority_id == other.authority_id &&
+            publication_version == other.publication_version &&
+            request_id == other.request_id &&
+            slot == other.slot;
+    }
+    /** @return Negation of @ref operator==. */
+    bool operator!=(const PagedKVSnapshotRef &other) const noexcept { return !(*this == other); }
 };
 
 /**

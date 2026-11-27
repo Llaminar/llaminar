@@ -556,6 +556,8 @@ namespace llaminar2
         bool mtp_mirrored_lm_head_graph_active_ = false;
         bool mtp_kv_cache_only_graph_active_ = false;
         bool prefix_runtime_rehydration_graph_active_ = false;
+        /** P2 grouped pooled decode: ALL rows project logits (never last-row-only). */
+        bool pooled_group_decode_active_ = false;
         std::optional<ForwardExecutionPhase> forward_execution_phase_;
         const ForwardInput *forward_input_construction_=nullptr; ///< Construction-only scoped binding, never live model state.
         /// Borrowed only within a validated main-prefill graph construction scope.

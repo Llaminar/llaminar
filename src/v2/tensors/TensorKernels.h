@@ -2214,6 +2214,50 @@ namespace llaminar2
         }
 
         /**
+         * @brief Compute grouped pooled decode rows, one per request (P2).
+         *
+         * A grouped pooled decode graph carries N live requests in ONE forward:
+         * each row r owns its own pooled publication. This entry consumes the
+         * whole per-request paged-view descriptor set through one grouped API
+         * and preserves each request's ordinary serial-decode math (design
+         * §13.2 "ordinary grouped decode remains genuinely grouped"). Row-local
+         * internal loops inside the implementation are allowed; calling
+         * `compute_pooled_snapshot_decoder()` once per request at the stage
+         * layer is NOT — it would turn the production graph into a row-replay
+         * loop crossing the polymorphic dispatch path per request.
+         *
+         * @param Q Row-major query tensor `[request_count, q_dim]`.
+         * @param paged_views One exact pooled paged view per request (distinct
+         *        publications; never the same view twice).
+         * @param positions One logical decode position per request (publication
+         *        row count - 1; the publication is the authority).
+         * @param output Row-major output tensor matching @p Q.
+         * @return true only when the grouped pooled implementation executed.
+         */
+        virtual bool compute_pooled_request_batch_decoder(
+            const ITensor *Q, const PagedKVReadView *const *paged_views,
+            const int *positions, ITensor *output, int request_count,
+            int n_heads, int n_kv_heads, int head_dim, bool causal,
+            int window_size, int head_start, int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &policy)
+        {
+            (void)Q;
+            (void)paged_views;
+            (void)positions;
+            (void)output;
+            (void)request_count;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)head_start;
+            (void)gqa_n_rep;
+            (void)policy;
+            return false;
+        }
+
+        /**
          * @brief Compute independent request-batched decode rows from per-request KV views.
          *
          * A request batch does not share one contiguous KV history: request

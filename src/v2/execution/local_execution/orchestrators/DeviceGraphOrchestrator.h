@@ -703,8 +703,12 @@ namespace llaminar2
     private:
         /** Caller-owned pooled decode binding attached for the current serving interval. */
         PooledKVDecodeBinding *pooled_kv_binding_ = nullptr;
+        /** Grouped pooled decode: N caller-owned bindings, ONE graph. */
+        std::vector<PooledKVDecodeBinding *> pooled_kv_binding_group_;
         /** N1: RAII owner of the current pooled step (cancels on unwind). */
         PooledKVDecodeBinding::StepGuard pooled_step_guard_;
+        /** N1 (grouped): one guard per member; all advance or all cancel. */
+        std::vector<PooledKVDecodeBinding::StepGuard> pooled_step_guards_;
     private:
         // Only the original Rank can order these phases across every participant.
         /** @brief Join original prior producers and publish this grouped channel's reset close before any TP peer awaits. */
@@ -888,6 +892,19 @@ namespace llaminar2
         }
 
         /**
+         * @brief Test-only: attach a GROUPED pooled decode set (N bindings, one graph).
+         *
+         * When non-empty this takes precedence over the single binding. All
+         * members must share one pool/table (validated each forward). Like
+         * the single-binding setter this has NO production caller while the
+         * pooled decode path is under qualification.
+         */
+        void setPooledDecodeGroup(std::vector<PooledKVDecodeBinding *> bindings) noexcept
+        {
+            pooled_kv_binding_group_ = std::move(bindings);
+        }
+
+        /**
          * @brief Test-only: set the host decode cursor for a pooled forward.
          *
          * A runner-level truncate/import changes the pooled publication's
@@ -902,6 +919,24 @@ namespace llaminar2
         {
             if (!state_.positions.empty())
                 state_.positions[0] = position;
+        }
+
+        /**
+         * @brief Test-only: seed the per-REQUEST decode cursors for a GROUPED pooled forward.
+         *
+         * Grouped pooled decode (N bindings, one graph) checks each member's
+         * publication row count against its OWN host cursor row (request r
+         * uses positions[r]). This setter exists only for the runner-level
+         * unit fixture to model re-seating N requests after a shared-prefix
+         * attach; production restoration goes through the request/prefix
+         * admission path.
+         */
+        void setPooledDecodePositions(std::vector<int> positions) noexcept
+        {
+            state_.positions = std::move(positions);
+            if (!state_.sequence_lengths.empty() &&
+                state_.sequence_lengths.size() < state_.positions.size())
+                state_.sequence_lengths.resize(state_.positions.size(), 0);
         }
 
         /**

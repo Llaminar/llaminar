@@ -195,12 +195,16 @@ namespace llaminar2
 
         const bool scalar_decode =
             request.seq_len == 1 && request.batch_size <= 1;
+        const bool grouped_continuation_decode =
+            request.seq_len == 1 && request.batch_size > 1 &&
+            request.logical_position > 0;
         const bool short_continuation_decode =
             request.batch_size <= 1 &&
             request.seq_len > 1 &&
             request.seq_len <= std::max(1, request.decode_max_seq_len) &&
             request.logical_position > 0;
-        return scalar_decode || short_continuation_decode
+        return scalar_decode || grouped_continuation_decode ||
+                       short_continuation_decode
                    ? ForwardExecutionPhase::Decode
                    : ForwardExecutionPhase::Prefill;
     }

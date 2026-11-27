@@ -271,7 +271,8 @@ namespace llaminar2
             const ActivationBuffers &buffers,
             TensorBase *lm_head_input,
             int total_tokens,
-            std::optional<DeviceRowRange> verifier_rows)
+            std::optional<DeviceRowRange> verifier_rows,
+            bool pooled_group_decode_active)
         {
             const TensorBase *normalized = buffers.normalized;
             const TensorBase *compact_rows = buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
@@ -300,7 +301,12 @@ namespace llaminar2
                 layout.verifier_rows = verifier_rows;
                 layout.compute_all_positions =
                     config.compute_all_position_logits ||
-                    config.live_mtp_request_batch_condition;
+                    config.live_mtp_request_batch_condition ||
+                    // P2 grouped pooled decode: N decode rows in one graph
+                    // must ALL project logits (each request reads its own
+                    // row) — the "prefill computes only the last row"
+                    // heuristic would silently drop every request but one.
+                    (pooled_group_decode_active && total_tokens > 1);
                 /*
                  * A full-identity verifier bypasses the compact row-copy stage,
                  * but its normalized activation still begins at physical row
@@ -1765,6 +1771,21 @@ namespace llaminar2
         ForwardExecutionPhaseScope execution_phase_scope(
             *this,
             input.execution_phase);
+        // P2 grouped pooled decode: N requests, one graph — declare BEFORE any
+        // LM head layout is described, so every row projects logits.
+        struct PooledGroupedDecodeScope
+        {
+            QwenGraphBase &owner;
+            bool previous;
+            PooledGroupedDecodeScope(QwenGraphBase &o, bool active)
+                : owner(o), previous(o.pooled_group_decode_active_)
+            {
+                owner.pooled_group_decode_active_ = active;
+            }
+            ~PooledGroupedDecodeScope() { owner.pooled_group_decode_active_ = previous; }
+        } pooled_group_scope(
+            *this,
+            input.pooled_kv_group && input.pooled_kv_group->size() > 1);
         DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
 
         /*
@@ -2494,7 +2515,8 @@ namespace llaminar2
 
         const LMHeadInputLayout lm_layout =
             describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
-                projectionVerifierRows(device, input.seq_len, input.batch_size, input.sequence_lengths_device));
+                projectionVerifierRows(device, input.seq_len, input.batch_size, input.sequence_lengths_device),
+                pooled_group_decode_active_);
 
         LMHeadStage::Params lm_params;
         // Feed LM head from final RMSNorm, bucket one-row scratch, or compact
@@ -2847,7 +2869,8 @@ namespace llaminar2
 
             const LMHeadInputLayout lm_layout =
                 describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
-                    projectionVerifierRows(device, input.seq_len, input.batch_size, input.sequence_lengths_device));
+                    projectionVerifierRows(device, input.seq_len, input.batch_size, input.sequence_lengths_device),
+                    pooled_group_decode_active_);
 
             LMHeadStage::Params lm_params;
             lm_params.hidden_states = lm_head_input;
@@ -3258,7 +3281,8 @@ namespace llaminar2
 
                 const LMHeadInputLayout lm_layout =
                     describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
-                        projectionVerifierRows(stage_device, input.seq_len, input.batch_size, input.sequence_lengths_device));
+                        projectionVerifierRows(stage_device, input.seq_len, input.batch_size, input.sequence_lengths_device),
+                        pooled_group_decode_active_);
 
                 LMHeadStage::Params lm_params;
                 lm_params.hidden_states = lm_head_input;
@@ -4925,12 +4949,90 @@ namespace llaminar2
             kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
 
         // P2 production caller: when the runner supplied a pooled decode
-        // binding, the append and attention use pooled pages (CPU single-row
-        // dense decode only). The pooled branch is decided HERE, before any
-        // ring work, and refuses every other combination (never a fallback).
+        // binding (or a GROUPED binding set), the append and attention use
+        // pooled pages (CPU single-row dense decode only). The pooled branch
+        // is decided HERE, before any ring work, and refuses every other
+        // combination (never a fallback). GROUPED: N bindings, one graph; see
+        // IGraphBuilder.h for the genuine grouped-decode contract.
         auto *pooled = forward_input_construction_
             ? forward_input_construction_->pooled_kv
             : nullptr;
+        const auto *pooled_group = forward_input_construction_
+            ? forward_input_construction_->pooled_kv_group
+            : nullptr;
+        if (pooled_group)
+        {
+            if (pooled)
+                throw std::invalid_argument("Pooled single binding and grouped bindings are mutually exclusive");
+            if (!device.is_cpu() || batch_size !=
+                    static_cast<int>(pooled_group->size()) ||
+                kv_cache != nullptr || predictor_layout != nullptr ||
+                pooled_group->empty())
+            {
+                std::ostringstream why;
+                why << "Pooled grouped decode requires CPU, one binding per decode row, no ring cache"
+                    << " (cpu=" << device.is_cpu() << " batch=" << batch_size
+                    << " group=" << pooled_group->size()
+                    << " seq=" << seq_len
+                    << " kv_cache=" << (kv_cache != nullptr)
+                    << " predictor=" << (predictor_layout != nullptr) << ")";
+                throw std::invalid_argument(why.str());
+            }
+            // The group is ONE pool/table authority: a mixed pair would let
+            // two publications from different authorities be batched.
+            for (const auto *member : *pooled_group)
+            {
+                if (!member || member->pool() != pooled_group->front()->pool() ||
+                    member->table() != pooled_group->front()->table())
+                    throw std::invalid_argument("Pooled grouped decode members must share one pool/table authority");
+            }
+            // N per-request append stages: each member appends ITS OWN row of
+            // the batch K/V projection (row r of the N-row tensor).
+            std::vector<std::string> append_nodes;
+            for (int r = 0; r < batch_size; ++r)
+            {
+                auto *member = (*pooled_group)[static_cast<std::size_t>(r)];
+                auto *cell = member->nextCell(layer_idx);
+                if (!cell)
+                    throw std::invalid_argument("Pooled grouped decode member has no next cell");
+                const std::string node = prefix + "kv_append_r" + std::to_string(r);
+                graph.addNode(node,
+                              ComputeStageFactory::createPooledKVAppend({
+                                  .device_id = device,
+                                  .K = buffers.K,
+                                  .V = buffers.V,
+                                  .pool = member->pool(),
+                                  .table = member->table(),
+                                  .ref_out = cell,
+                                  .prior = member->priorFor(layer_idx),
+                                  .grant = member->stepGrant(),
+                                  .binding = member,
+                                  .issuance = member->issuance(),
+                                  .request_id = member->requestId(),
+                                  .slot = member->slot(),
+                                  .layer_idx = layer_idx,
+                                  .kv_heads = member->kvHeads(),
+                                  .head_dim = member->headDim(),
+                                  .page_tokens = member->pageTokens(),
+                                  // Each member appends exactly its own row.
+                                  .live_rows = 1,
+                                  .row_offset = r,
+                              }),
+                              device);
+                graph.addDependency(node, rope_dependency);
+                // Chain r+1 after r: execution order is deterministic (the
+                // row appends are independent but the single-row CPU graph
+                // device has one execution timeline; a chain keeps the
+                // attention fan-in single-source and never reorders row
+                // publication relative to the graph's own topological order).
+                if (r > 0)
+                    graph.addDependency(node, append_nodes.back());
+                append_nodes.push_back(node);
+            }
+            // Attention must wait for EVERY request append: the chain makes
+            // the LAST node's completion imply all prior appends published.
+            return append_nodes.back();
+        }
         if (pooled)
         {
             if (!device.is_cpu() || batch_size != 1 ||
@@ -5415,7 +5517,36 @@ namespace llaminar2
             auto *pooled = forward_input_construction_
                 ? forward_input_construction_->pooled_kv
                 : nullptr;
-            if (pooled && total_tokens == 1)
+            const auto *pooled_group = forward_input_construction_
+                ? forward_input_construction_->pooled_kv_group
+                : nullptr;
+            if (pooled_group)
+            {
+                // P2 GROUPED pooled decode attention: one graph, N per-request
+                // publication refs (one per decode row), consumed through the
+                // grouped pooled kernel entry. The append stages published all
+                // N cells in this graph chain before this node runs.
+                if (pooled)
+                    throw std::invalid_argument("Pooled single and grouped bindings are mutually exclusive");
+                if (!device.is_cpu() || total_tokens != batch_size ||
+                    pooled_group->size() != static_cast<std::size_t>(batch_size))
+                    throw std::invalid_argument("Pooled grouped attention requires one ref per decode row");
+                attn_params.kv_cache = nullptr;
+                attn_params.pooled_table = pooled_group->front()->table();
+                attn_params.n_kv_heads = pooled_group->front()->kvHeads();
+                attn_params.head_dim = pooled_group->front()->headDim();
+                attn_params.active_query_rows_device = nullptr;
+                attn_params.pooled_position_from_publication = true;
+                for (int r = 0; r < batch_size; ++r)
+                {
+                    auto *member = (*pooled_group)[static_cast<std::size_t>(r)];
+                    auto *cell = member->nextCell(layer_idx);
+                    if (!cell)
+                        throw std::invalid_argument("Pooled grouped member has no attention cell");
+                    attn_params.pooled_ref_cells.push_back(&cell->ref);
+                }
+            }
+            else if (pooled && total_tokens == 1)
             {
                 // Pooled DECODE attention: the pooled append stage publishes
                 // the ref into the cell during graph execution; attention reads
@@ -5481,6 +5612,14 @@ namespace llaminar2
                 graph.addDependency(prefix + "attention", kv_append_dependency);
                 if (phase_split_handoff)
                     graph.addDependency(prefix + "attention", rope_dependency);
+            }
+            else if (pooled_group && pooled_group->size() > 1)
+            {
+                // GROUPED pooled decode: the attention consumes the ref cells
+                // the N append stages publish at execute time, so it must wait
+                // for the CHAIN of all row appends (the last append in the
+                // chain implies every prior row published).
+                graph.addDependency(prefix + "attention", kv_append_dependency);
             }
             else
                 graph.addDependency(prefix + "attention", rope_dependency);

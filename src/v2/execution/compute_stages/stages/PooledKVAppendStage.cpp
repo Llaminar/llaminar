@@ -146,6 +146,41 @@ bool PooledKVAppendStage::execute(IDeviceContext *ctx)
         LOG_ERROR("[PooledKVAppendStage] Pooled append requires positive live rows");
         return false;
     }
+    // Grouped pooled decode: this stage appends only ITS OWN row of the batch
+    // K/V projection (offset 0 = the ordinary single-request path, where the
+    // multi-row prefill semantics already use live_rows). An offset into a
+    // row outside the tensor refuses before mutation; offset 0 keeps the
+    // existing live_rows contract (a 1-row tensor may drive a multi-row
+    // prefill in the direct-stage fixture).
+    if (params_.row_offset < 0 ||
+        (params_.row_offset > 0 &&
+         (static_cast<std::size_t>(params_.row_offset) >= params_.K->rows() ||
+          static_cast<std::size_t>(params_.row_offset + rows) > params_.K->rows())))
+    {
+        LOG_ERROR("[PooledKVAppendStage] Pooled append row offset outside the K/V tensor"
+                  << " offset=" << params_.row_offset
+                  << " rows=" << rows
+                  << " K_rows=" << params_.K->rows());
+        return false;
+    }
+    if (params_.row_offset > 0)
+    {
+        // The batch K/V projection is row-major [batch_tokens, kv_width];
+        // each request's row is kv_heads*head_dim floats. The tensor's
+        // declarative cols() can differ (GQA/token layout), so the AUTHENTIC
+        // per-row stride is the native K row width from the layout authority
+        // — exactly what writePageRows later uses per row.
+        const std::size_t k_row_floats = geometry.row_floats;
+        if (params_.K->cols() < k_row_floats)
+        {
+            LOG_ERROR("[PooledKVAppendStage] K/V tensor narrower than the native K row"
+                      << " cols=" << params_.K->cols()
+                      << " needed=" << k_row_floats);
+            return false;
+        }
+        k += static_cast<std::size_t>(params_.row_offset) * k_row_floats;
+        v += static_cast<std::size_t>(params_.row_offset) * k_row_floats;
+    }
     if (params_.kv_heads <= 0 || params_.head_dim <= 0 || params_.page_tokens <= 0)
     {
         LOG_ERROR("[PooledKVAppendStage] Pooled append requires positive KV geometry");

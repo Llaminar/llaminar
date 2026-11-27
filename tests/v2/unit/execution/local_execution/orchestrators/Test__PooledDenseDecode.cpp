@@ -721,3 +721,161 @@ TEST(PooledDenseDecode, RunnerCancellationRetiresBorrowersExactly)
     // Release the borrower; the replacement's own writes remain valid.
     borrowed.reset();
 }
+
+/** @test P2 GENUINELY grouped pooled decode: N requests, ONE graph. Two
+ * bindings on one shared pool/table are attached to ONE graph via
+ * setPooledDecodeGroup; a single forward(tokens, 1, 2) appends both rows'
+ * K/V to their OWN publications and computes both rows against their own
+ * exact refs through ONE grouped pooled kernel entry (no stage-level
+ * row-replay loop, no per-request graphs). Every decode row's logits are
+ * byte-compared against that request's own uninterrupted ring control at the
+ * same position, and each publication grows independently. */
+TEST(PooledDenseDecode, GroupedPooledDecodeTwoRequestsOneGraph)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 3> prompt_a{1, 5, 3};
+    const std::array<int32_t, 4> prompt_b{2, 3, 5};
+    const std::array<int32_t, 6> decode_a{2, 4, 6, 8, 10, 12};
+    const std::array<int32_t, 5> decode_b{1, 3, 5, 7, 9};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out,
+                           int batch)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, batch,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(batch, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 16;
+
+    // RING SLOT ORACLE: one 2-slot runner; every decode step advances BOTH
+    // slots in ONE batched serving graph (row 0 = A, row 1 = B). This gives a
+    // same-M=2 graph shape with the ORDINARY ring cache — the only difference
+    // vs the pooled group is the KV source (pooled pages vs ring slots), so a
+    // byte-exact match proves the pooled grouped machinery produced identical
+    // results for a genuinely grouped one-graph decode.
+    std::unique_ptr<DeviceGraphOrchestrator> ring_owner;
+    PreparedWeightStore ring_store;
+    std::shared_ptr<QwenStandardGraph> ring_builder;
+    make_runner(fx, ring_owner, ring_store, ring_builder, 2);
+    // Ring prefills through the SAME slot batched API (slot 0 = A, slot 1 = B):
+    // the ordinary forward() would place both in request 0.
+    ASSERT_OK("ring A prefill", ring_owner->forwardServingRows(
+        {0}, {std::vector<int>(prompt_a.begin(), prompt_a.end())}));
+    ASSERT_OK("ring B prefill", ring_owner->forwardServingRows(
+        {1}, {std::vector<int>(prompt_b.begin(), prompt_b.end())}));
+
+    // Pooled grouped: ONE shared instance, TWO bindings, batch=2 one-graph.
+    PagedKVPoolBudget budget;
+    budget.remaining_budget_bytes = 3 * 1024 * 1024;
+    budget.frame_bytes = 4 * 1024;
+    budget.request_records = 4;
+    budget.max_pages_per_request = 64;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+        /*layers=*/fx.config.n_layers, /*admitted_issuances=*/8, /*readers_per_bank=*/4);
+    auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+    ASSERT_TRUE(plan);
+    auto table_geom = plan->table_geometry;
+    table_geom.bank_count = 2 * table_geom.bank_count;
+    table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+    table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+    auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+    widened->table_geometry = table_geom;
+    widened->total_bytes = PhysicalPagePool::physicalBytes(plan->pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+    PhysicalMemoryPlanBuilder mbuilder;
+    mbuilder.add({.world_rank=0, .device=device,
+        .total_bytes=widened->total_bytes,
+        .admission_available_bytes=widened->total_bytes},
+        PhysicalMemoryOwner::KVCache, widened->total_bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mbuilder.build()), 0);
+    auto created = PagedKVInstance::create(authority, *widened, device);
+    ASSERT_TRUE(created);
+    PagedKVInstance instance = std::move(*created);
+
+    std::unique_ptr<DeviceGraphOrchestrator> grouped_owner;
+    PreparedWeightStore grouped_store;
+    std::shared_ptr<QwenStandardGraph> grouped_builder;
+    make_runner(fx, grouped_owner, grouped_store, grouped_builder, 2);
+    PooledKVDecodeBinding binding_a(&instance.pool(), &instance.table(),
+        /*request_id=*/301, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/8);
+    PooledKVDecodeBinding binding_b(&instance.pool(), &instance.table(),
+        /*request_id=*/302, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/8);
+    // Prefill each request through its own single-binding forward (identical
+    // M=1 math to the ring prefills above, no cross-request pooling yet).
+    grouped_owner->setPooledDecodeBinding(&binding_a);
+    grouped_owner->setPooledDecodePositions({0, 0});
+    ASSERT_OK("pooled A prefill", grouped_owner->forward(prompt_a.data(), 3, 1) != nullptr);
+    grouped_owner->setPooledDecodeBinding(nullptr);
+    grouped_owner->setPooledDecodeBinding(&binding_b);
+    grouped_owner->setPooledDecodePositions({0, 0});
+    ASSERT_OK("pooled B prefill", grouped_owner->forward(prompt_b.data(), 4, 1) != nullptr);
+    grouped_owner->setPooledDecodeBinding(nullptr);
+    // GENUINELY GROUPED decode: both bindings, batch=2, ONE graph per step.
+    grouped_owner->setPooledDecodeGroup({&binding_a, &binding_b});
+
+    const std::size_t vocab = static_cast<std::size_t>(fx.config.vocab_size);
+    for (int step = 0; step < static_cast<int>(decode_a.size()); ++step)
+    {
+        const bool b_live = step < static_cast<int>(decode_b.size());
+        grouped_owner->setPooledDecodePositions({3 + step, 4 + step});
+        // Ring slot oracle: advance A (and B when live) in one batched graph.
+        std::vector<int> ring_slots{0};
+        std::vector<std::vector<int>> ring_rows{{std::vector<int>{decode_a[step]}}};
+        if (b_live)
+        {
+            ring_slots.push_back(1);
+            ring_rows.push_back({std::vector<int>{decode_b[step]}});
+        }
+        ASSERT_OK("ring batched", ring_owner->forwardServingRows(ring_slots, ring_rows));
+        const float *ring_logits_a = ring_owner->servingRowLogits(0);
+        ASSERT_NE(ring_logits_a, nullptr) << "ring A logits " << step;
+        const float *grouped_row_a = nullptr;
+        if (b_live)
+        {
+            const float *ring_logits_b = ring_owner->servingRowLogits(1);
+            ASSERT_NE(ring_logits_b, nullptr) << "ring B logits " << step;
+            int32_t batch_tokens[2] = {decode_a[step], decode_b[step]};
+            const auto *grouped = grouped_owner->forward(batch_tokens, 1, 2);
+            ASSERT_NE(grouped, nullptr) << "grouped forward " << step;
+            grouped_row_a = grouped;
+            const float *grouped_row_b = grouped + vocab;
+            EXPECT_EQ(std::memcmp(ring_logits_b, grouped_row_b, vocab * sizeof(float)), 0)
+                << "grouped request B diverged at step " << step;
+        }
+        else
+        {
+            grouped_owner->setPooledDecodeGroup({});
+            grouped_owner->setPooledDecodeBinding(&binding_a);
+            // A has 3+5=8 rows after the grouped steps; its cursor is 8.
+            grouped_owner->setPooledDecodePositions({8, 9});
+            const auto *grouped = grouped_owner->forward(&decode_a[step], 1, 1);
+            ASSERT_NE(grouped, nullptr);
+            grouped_row_a = grouped;
+            grouped_owner->setPooledDecodeBinding(nullptr);
+            grouped_owner->setPooledDecodeGroup({&binding_a, &binding_b});
+        }
+        EXPECT_EQ(std::memcmp(ring_logits_a, grouped_row_a, vocab * sizeof(float)), 0)
+            << "grouped request A diverged at step " << step;
+    }
+    EXPECT_EQ(binding_a.priorFor(0)->snapshot.view().rows(), 9);
+    EXPECT_EQ(binding_b.priorFor(0)->snapshot.view().rows(), 9);
+}

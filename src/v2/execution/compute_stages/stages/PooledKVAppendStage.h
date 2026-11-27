@@ -138,6 +138,14 @@ public:
         int page_tokens = 0;
         /** Live rows this graph appends (decode always 1; buffer capacity is larger). */
         int live_rows = 1;
+        /**
+         * @brief Row index of THIS request inside the batch K/V projection.
+         *
+         * Grouped pooled decode: one graph carries N rows in the K/V
+         * projection; member r appends exactly row r (default 0 = single
+         * request). The stage never walks beyond its own row.
+         */
+        int row_offset = 0;
     };
 
     explicit PooledKVAppendStage(Params params);

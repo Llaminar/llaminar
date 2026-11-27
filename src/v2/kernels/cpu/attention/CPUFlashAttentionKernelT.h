@@ -1881,6 +1881,57 @@ namespace llaminar2
                 position_offset, head_start, gqa_n_rep, policy);
         }
 
+        bool compute_pooled_request_batch_decoder(
+            const ITensor *Q, const PagedKVReadView *const *paged_views,
+            const int *positions, ITensor *output, int request_count,
+            int n_heads, int n_kv_heads, int head_dim, bool causal,
+            int window_size, int head_start, int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &policy) override
+        {
+            // P2 grouped pooled decode: ONE grouped entry consumes every
+            // request's exact paged view (never a stage-level row-replay loop).
+            const auto *q = dynamic_cast<const FP32Tensor *>(Q);
+            auto *out = dynamic_cast<FP32Tensor *>(output);
+            if (!q || !out || request_count <= 0 || !paged_views ||
+                !positions || !n_heads || !n_kv_heads || !head_dim)
+                return false;
+            if (q->rows() < static_cast<std::size_t>(request_count) ||
+                out->rows() < static_cast<std::size_t>(request_count))
+                return false;
+            const std::size_t cols = q->cols();
+            std::span<const float> query(q->fp32_data(),
+                static_cast<std::size_t>(request_count) * cols);
+            std::span<float> result(out->mutable_data(),
+                static_cast<std::size_t>(request_count) * out->cols());
+            for (int request = 0; request < request_count; ++request)
+            {
+                const auto *view = static_cast<const CPUFP32PagedKVView *>(
+                    paged_views[request]->native_handle);
+                if (!view || !paged_views[request]->valid() ||
+                    view->dimension() != paged_views[request]->dimension ||
+                    view->heads() != paged_views[request]->heads ||
+                    view->rows() != paged_views[request]->rows)
+                    return false;
+                if (positions[request] != view->rows() - 1)
+                    return false;
+            }
+            for (int request = 0; request < request_count; ++request)
+            {
+                const auto *view = static_cast<const CPUFP32PagedKVView *>(
+                    paged_views[request]->native_handle);
+                std::span<const float> request_q(
+                    query.data() + static_cast<std::size_t>(request) * cols, cols);
+                std::span<float> request_out(
+                    result.data() + static_cast<std::size_t>(request) * out->cols(),
+                    out->cols());
+                if (!compute_paged_fp32(request_q, *view, request_out, 1,
+                        n_heads, causal, window_size, positions[request],
+                        head_start, gqa_n_rep, policy))
+                    return false;
+            }
+            return true;
+        }
+
         // Allow parity tests to call private static helpers directly
         friend class ::AVX2Q16DotParityTest;
 

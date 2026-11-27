@@ -768,6 +768,18 @@ namespace llaminar2
          * construction (never falls back to the ring).
          */
         PooledKVDecodeBinding *pooled_kv = nullptr;
+        /**
+         * @brief P2 GROUPED pooled decode: N bindings, one graph (CPU decode).
+         *
+         * When non-empty and @p pooled_kv is null, the graph builds N
+         * per-request pooled append stages per layer (each with its own ref
+         * cell, prior and step grant) and ONE attention stage that consumes
+         * all N publications through the grouped pooled kernel entry. This is
+         * the genuine grouped-decode contract (design §13.2): one graph, N
+         * refs — never N separate graphs or a stage-level row-replay loop.
+         * All bindings must share the SAME pool and table (one PMA instance).
+         */
+        const std::vector<PooledKVDecodeBinding *> *pooled_kv_group = nullptr;
 
         // ----- Pipeline Parallelism -----
 

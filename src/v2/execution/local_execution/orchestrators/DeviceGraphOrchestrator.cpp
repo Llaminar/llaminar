@@ -14425,11 +14425,14 @@ namespace llaminar2
             !executableForwardSubmissionIntent(input.graph_submission_intent))
             throw std::invalid_argument("DGO has an unknown forward graph construction intent");
         ForwardInput build_input = input;
-        // P2 pooled decode: the runner attached a pooled binding; every forward
-        // graph built while attached consumes pooled pages (the graph builder
-        // refuses combinations it cannot support).
+        // P2 pooled decode: the runner attached a pooled binding (or a
+        // GROUPED binding set); every forward graph built while attached
+        // consumes pooled pages (the graph builder refuses combinations it
+        // cannot support).
         if (pooled_kv_binding_)
             build_input.pooled_kv = pooled_kv_binding_;
+        if (!pooled_kv_binding_group_.empty())
+            build_input.pooled_kv_group = &pooled_kv_binding_group_;
         if(build_input.graph_submission_intent!=ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
             build_input.device.is_gpu() && build_input.batch_size==1 &&
             build_input.execution_role==ForwardExecutionRole::MainInference &&
@@ -18230,8 +18233,15 @@ namespace llaminar2
 
         TensorBase *logits_output = state_.logits.get();
         TensorBase *logits_local_output = state_.logits_local.get();
+        // P2 pooled GROUPED decode: N decode rows in one graph — every row
+        // must project terminal logits, so the all-position output bank is
+        // required exactly like live request-batch conditions (no last-row
+        // shortcut).
+        const bool pooled_group_logits =
+            !pooled_kv_binding_group_.empty();
         if (compute_all_position_logits_ ||
-            live_mtp_request_batch_condition_)
+            live_mtp_request_batch_condition_ ||
+            pooled_group_logits)
         {
             const auto &config = graph_builder_->config();
             size_t rows = static_cast<size_t>(total_tokens);
@@ -18373,11 +18383,15 @@ namespace llaminar2
                 "device-state publication stream");
         }
         input.device = state_.device_id;
-        input.kv_cache = pooled_kv_binding_ ? nullptr : state_.kv_cache.get();
-        // P2 pooled decode: the runner attached a pooled binding; the pooled
-        // graph consumes pooled pages and must NOT use the ring cache (the
-        // graph builder refuses ring+pooled combinations).
+        const bool pooled_attached = pooled_kv_binding_ ||
+            !pooled_kv_binding_group_.empty();
+        input.kv_cache = pooled_attached ? nullptr : state_.kv_cache.get();
+        // P2 pooled decode: the runner attached a pooled binding (or GROUPED
+        // set); the pooled graph consumes pooled pages and must NOT use the
+        // ring cache (the graph builder refuses ring+pooled combinations).
         input.pooled_kv = pooled_kv_binding_;
+        if (!pooled_kv_binding_group_.empty())
+            input.pooled_kv_group = &pooled_kv_binding_group_;
         /*
          * R24 M6: admit the step's COMPLETE page demand (all layers, one pool
          * grant) BEFORE the graph builds or runs. A page shortage refuses the
@@ -18388,7 +18402,91 @@ namespace llaminar2
          * agree or the forward is refused (a shifted origin or prefix attach
          * that would break rows-1 is rejected, not silently mis-attended).
          */
-        if (pooled_kv_binding_)
+        if (!pooled_kv_binding_group_.empty())
+        {
+            // P2 GROUPED pooled decode: N bindings, one graph. Every member is
+            // admitted for THIS step before graph execution (all-or-none):
+            // a single member's refusal cancels the whole group's step and
+            // refuses the forward. Positions are checked per request against
+            // the host cursor row state_.
+            if (pooled_kv_binding_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Pooled single and grouped bindings are mutually exclusive");
+                return std::nullopt;
+            }
+            if (static_cast<int>(pooled_kv_binding_group_.size()) != batch_size)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Pooled grouped decode requires one binding per decode row"
+                          << " (group=" << pooled_kv_binding_group_.size()
+                          << " batch=" << batch_size << ")");
+                return std::nullopt;
+            }
+            for (const auto *member : pooled_kv_binding_group_)
+            {
+                if (!member)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Pooled grouped decode member is null");
+                    return std::nullopt;
+                }
+            }
+            // One authority: all members share one pool+table (a mixed pair
+            // would batch publications from different authorities).
+            const auto *first = pooled_kv_binding_group_.front();
+            for (const auto *member : pooled_kv_binding_group_)
+            {
+                if (member->pool() != first->pool() ||
+                    member->table() != first->table())
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Pooled grouped decode members must share one pool/table");
+                    return std::nullopt;
+                }
+            }
+            for (int r = 0; r < batch_size; ++r)
+            {
+                auto *member = pooled_kv_binding_group_[static_cast<std::size_t>(r)];
+                // M4: a continued/chunked prefill with live pooled history is
+                // refused (decode-only; per-request gate).
+                if (input.execution_phase == ForwardExecutionPhase::Prefill &&
+                    member->hasLivePublication())
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Continued pooled prefill refused "
+                        "(live pooled history; pooled attention is decode-only)");
+                    return std::nullopt;
+                }
+                const int pooled_next_position = member->nextPosition();
+                if (pooled_next_position != state_.positions[static_cast<std::size_t>(r)])
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Pooled grouped decode position authority "
+                        "disagrees with the host cursor (request=" << r
+                        << " publication=" << pooled_next_position
+                        << " cursor=" << state_.positions[static_cast<std::size_t>(r)]
+                        << "); refusing pooled forward");
+                    return std::nullopt;
+                }
+            }
+            // N1: every member gets its own StepGuard; any later throw
+            // unwinds through all guards (each cancels its own grant) and no
+            // layer publication becomes visible. Only a complete, successful
+            // forward completes ALL of them.
+            pooled_step_guards_.clear();
+            pooled_step_guards_.reserve(static_cast<std::size_t>(batch_size));
+            for (auto *member : pooled_kv_binding_group_)
+            {
+                auto guard = member->prepareStep(1);
+                if (!guard)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Pooled grouped step admission "
+                        "refused (page/version/bank headroom); refusing forward before graph execution");
+                    pooled_step_guards_.clear();
+                    return std::nullopt;
+                }
+                pooled_step_guards_.push_back(std::move(guard));
+            }
+        }
+        else if (pooled_kv_binding_)
         {
             // M4: a continued/chunked prefill with live pooled history is
             // refused BEFORE graph execution — pooled attention is single-row
@@ -18743,6 +18841,21 @@ namespace llaminar2
         // forward advances next→current for EVERY layer (row-count check);
         // any failure or missing layer cancels every not-yet-visible
         // publication, so layers never disagree or lose history.
+        if (success && !pooled_step_guards_.empty())
+        {
+            // Grouped: advance EVERY member or cancel ALL (all-or-none).
+            for (auto &guard : pooled_step_guards_)
+            {
+                if (!guard.completeAndAdvance())
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Pooled grouped forward succeeded but a "
+                        "step publication is incomplete; cancelling every step");
+                    success = false;
+                    break;
+                }
+            }
+        }
         if (success && pooled_step_guard_)
         {
             if (!pooled_step_guard_.completeAndAdvance())
@@ -18754,6 +18867,7 @@ namespace llaminar2
             }
         }
         pooled_step_guard_ = PooledKVDecodeBinding::StepGuard{};
+        pooled_step_guards_.clear();
 
         std::string overlay_finish_error;
         if (!overlay_graph_scope.finish(
