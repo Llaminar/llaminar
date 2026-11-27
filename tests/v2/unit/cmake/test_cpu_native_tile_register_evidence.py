@@ -1260,6 +1260,78 @@ def tls_sequence(register: str = "x2", symbols: tuple = (TLS,) * 4, order: tuple
     return "\n".join(lines[index] for index in order) + "\n"
 
 
+def tlsle_sequence(base: str = "x1", dest: str = "x2") -> str:
+    """Recorded local-exec relocation shape; literal operands are relocation placeholders."""
+    return (f"\tadd\t{dest}, {base}, #0x0, lsl #12 !{CHECKER.TLSLE_PAIR[0]}:{TLS}\n"
+            f"\tadd\t{dest}, {dest}, #0x0 !{CHECKER.TLSLE_PAIR[1]}:{TLS}\n")
+
+
+class TLSLocalExecPairTest(unittest.TestCase):
+    """Exact pair modelling, without weakening the generic relocation or call grammar."""
+
+    def test_pair_preserves_stack_facts_and_has_no_call_traffic(self) -> None:
+        body = ("\tstp\tx29, x30, [sp, #-32]!\n\tmov\tx29, sp\n"
+                "\tadd\tx9, sp, #16\n\tmrs\tx1, tpidr_el0\n.Lk:\n" + tlsle_sequence() +
+                "\tstr\tq0, [x9]\n\tsub\tx5, x5, #1\n\tcbnz\tx5, .Lk\n"
+                "\tldp\tx29, x30, [sp], #32\n\tret\n")
+        for _ in range(3):
+            counts, _, errors = traffic(body)
+            self.assertEqual(errors, [])
+            self.assertEqual(counts["fp"], {"1": 1})
+            self.assertFalse(counts["tls_call"])
+
+    def test_stack_source_is_not_erased_by_zero_placeholders(self) -> None:
+        _, _, errors = traffic("\tadd\tx1, sp, #0\n" + tlsle_sequence() + "\tret\n")
+        self.assertTrue(any("relocated arithmetic on a stack address" in error for error in errors), errors)
+
+    def test_orphan_mismatch_wrong_register_and_unsupported_forms_fail(self) -> None:
+        pair = tlsle_sequence()
+        cases = {
+            "orphan high": pair.splitlines()[0] + "\n",
+            "orphan low": pair.splitlines()[1] + "\n",
+            "mismatched symbol": pair.replace(CHECKER.TLSLE_PAIR[1] + ":" + TLS,
+                                               CHECKER.TLSLE_PAIR[1] + ":other"),
+            "wrong register": pair.replace("x2, x2,", "x2, x3,"),
+            "wrong shift": pair.replace("lsl #12", "lsl #16"),
+            "32-bit": pair.replace("x2", "w2"),
+            "SP": pair.replace("x1", "sp"),
+            "nonzero placeholder": pair.replace("#0x0", "#0x1"),
+            "not consecutive": pair.replace("\n", "\n\tnop\n", 1),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "TLS local-exec"):
+                traffic(body + "\tret\n")
+
+    def test_non_local_exec_and_unsupported_low_pair_fail_in_object_reader(self) -> None:
+        functions = [("f", tlsle_sequence() + "\tret\n")]
+        original = witness_object(functions)
+        header = elf_header_offset(original, ".rela.text.f")
+        offset = int.from_bytes(original[header + 24:header + 32], "little")
+        for record, kind in ((0, 539), (1, 550), (1, 552)):
+            data = bytearray(original)
+            data[offset + record * 24 + 8:offset + record * 24 + 12] = kind.to_bytes(4, "little")
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "not admitted in code"):
+                CHECKER.read_object(bytes(data))
+
+    def test_addend_and_function_boundary_fail(self) -> None:
+        functions = [("f", tlsle_sequence() + "\tret\n")]
+        original = witness_object(functions)
+        header = elf_header_offset(original, ".rela.text.f")
+        offset = int.from_bytes(original[header + 24:header + 32], "little")
+        data = bytearray(original)
+        data[offset + 16:offset + 24] = (1).to_bytes(8, "little")
+        with self.assertRaisesRegex(ValueError, "TLS local-exec"):
+            CHECKER.normalize_disassembly(disassembly(functions).replace(
+                CHECKER.TLSLE_PAIR[0] + "\t" + TLS, CHECKER.TLSLE_PAIR[0] + "\t" + TLS + "+0x1"),
+                CHECKER.read_object(bytes(data)))
+        with self.assertRaisesRegex(ValueError, "printed relocation"):
+            CHECKER.normalize_disassembly(disassembly(functions), CHECKER.read_object(bytes(data)))
+        image = CHECKER.read_object(original)
+        code, _ = CHECKER.parse_disassembly(disassembly(functions), False)
+        with self.assertRaisesRegex(ValueError, "function boundary"):
+            CHECKER.tlsle_groups(code, image, {"f": (".text.f", 0, 4), "g": (".text.f", 4, 12)})
+
+
 class TLSDescriptorTest(unittest.TestCase):
     """The only admitted indirect call: an exact TLS descriptor sequence. It clobbers x0/x30 only, is counted
     per loop, and every perturbation (reorder, mixed symbol, stray relocation, CALL on a non-blr, register

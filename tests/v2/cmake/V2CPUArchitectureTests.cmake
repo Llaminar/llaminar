@@ -482,6 +482,13 @@ foreach(v2_tile_register_shard IN ITEMS analysis binding-0 binding-1 binding-2 b
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeTileRegisterEvidence${v2_tile_register_name})
 endforeach()
+# Focused regression for the native selected-object TLS local-exec admission defect.
+v2_add_core_free_test(V2_Integration_CPUNativeTileTLSLocalExecPair
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py"
+        TLSLocalExecPairTest
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeTileTLSLocalExecPair)
 # The stack-traffic table, key map, role map, gate and driver-receipt controls (compiler-free, a few seconds).
 foreach(scope IN ITEMS Unit Integration)
     set(labels V2 ${scope} CPU DeviceFree ISA Build Regression)

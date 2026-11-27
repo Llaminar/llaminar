@@ -681,7 +681,10 @@ class ObjectImage(NamedTuple):
         return "_" if self.macho else ""
 
 
-ELF_RELOCATIONS = {257: "R_AARCH64_ABS64", 275: "R_AARCH64_ADR_PREL_PG_HI21", 277: "R_AARCH64_ADD_ABS_LO12_NC",
+TLSLE_PAIR = ("R_AARCH64_TLSLE_ADD_TPREL_HI12", "R_AARCH64_TLSLE_ADD_TPREL_LO12_NC")
+
+
+ELF_RELOCATIONS = {549: TLSLE_PAIR[0], 551: TLSLE_PAIR[1], 257: "R_AARCH64_ABS64", 275: "R_AARCH64_ADR_PREL_PG_HI21", 277: "R_AARCH64_ADD_ABS_LO12_NC",
                    278: "R_AARCH64_LDST8_ABS_LO12_NC", 279: "R_AARCH64_TSTBR14", 280: "R_AARCH64_CONDBR19",
                    282: "R_AARCH64_JUMP26", 283: "R_AARCH64_CALL26", 284: "R_AARCH64_LDST16_ABS_LO12_NC",
                    285: "R_AARCH64_LDST32_ABS_LO12_NC", 286: "R_AARCH64_LDST64_ABS_LO12_NC",
@@ -696,7 +699,7 @@ MACHO_RELOCATIONS = {0: "ARM64_RELOC_UNSIGNED", 1: "ARM64_RELOC_SUBTRACTOR", 2: 
 
 # Relocations admitted on instructions, and (for Mach-O, from mach-o/arm64/reloc.h) their required
 # r_pcrel / r_length (2 = 4 bytes).
-CODE_RELOCATIONS = frozenset({"R_AARCH64_CALL26", "R_AARCH64_JUMP26", "R_AARCH64_CONDBR19", "R_AARCH64_TSTBR14",
+CODE_RELOCATIONS = frozenset({*TLSLE_PAIR, "R_AARCH64_CALL26", "R_AARCH64_JUMP26", "R_AARCH64_CONDBR19", "R_AARCH64_TSTBR14",
                               "R_AARCH64_ADR_PREL_PG_HI21", "R_AARCH64_ADR_GOT_PAGE", "R_AARCH64_ADD_ABS_LO12_NC",
                               "R_AARCH64_LDST8_ABS_LO12_NC", "R_AARCH64_LDST16_ABS_LO12_NC",
                               "R_AARCH64_LDST32_ABS_LO12_NC", "R_AARCH64_LDST64_ABS_LO12_NC",
@@ -1244,6 +1247,7 @@ def _normalize_disassembly(disassembly: str, image: ObjectImage) -> dict[str, li
                                  f"{printed} != {actual}")
     extents = function_extents(image)
     tlsdesc = tlsdesc_groups(code, image, extents)
+    tlsdesc.update(tlsle_groups(code, image, extents))
     owned = {(section, address) for section, start, end in extents.values() for address in range(start, end, 4)}
     for name, table in image.relocations.items():
         orphans = [address for address in table if (name, address) not in owned]
@@ -1349,6 +1353,43 @@ def tlsdesc_groups(code: dict, image: ObjectImage, extents: dict) -> dict[tuple[
                        if record[0] in TLSDESC_SEQUENCE and address not in claimed)
         if stray:
             raise ValueError(f"TLS descriptor relocation outside an exact sequence at {section}+{stray[0]:#x}")
+    return result
+
+
+def tlsle_groups(code: dict, image: ObjectImage, extents: dict) -> dict[tuple[str, int], str]:
+    """Model only the consecutive ELF AArch64 local-exec HI12/LO12_NC ADD pair.
+
+    Both relocations name the same symbol with zero addend, inside one function.
+    HI12 is `add xD, xB, #0, lsl #12`; LO12_NC is `add xD, xD, #0`.
+    D/B are x0-x30 (never SP/ZR); no other TLSLE forms are admitted. Preserve
+    symbolic operands, not numeric zero: normal provenance analysis must still
+    reject relocated arithmetic on any stack-derived input. This is arithmetic,
+    not a resolver call: it changes only xD, not NZCV or any call-frame counter.
+    """
+    result = {}
+    high = re.compile(r"^add x([0-9]|[12][0-9]|30), x([0-9]|[12][0-9]|30), #0(?:x0)?, lsl #12$")
+    low = re.compile(r"^add x([0-9]|[12][0-9]|30), x([0-9]|[12][0-9]|30), #0(?:x0)?$")
+    for section, table in image.relocations.items():
+        claimed = set()
+        for head, record in sorted(table.items()):
+            if record[0] != TLSLE_PAIR[0]:
+                continue
+            tail = table.get(head + 4)
+            if image.macho or tail != (TLSLE_PAIR[1], record[1], 0) or record[2]:
+                raise ValueError("TLS local-exec pair is incomplete, mixed-symbol or has an addend")
+            if not any(sec == section and start <= head and head + 8 <= end
+                       for sec, start, end in extents.values()):
+                raise ValueError("TLS local-exec pair crosses a function boundary")
+            texts = [" ".join(code[section][address][0].split()) for address in (head, head + 4)]
+            first, second = high.fullmatch(texts[0]), low.fullmatch(texts[1])
+            if not first or not second or first[1] != second[1] or first[1] != second[2]:
+                raise ValueError("TLS local-exec pair has unsupported ADD form or register chain")
+            dest, base = first[1], first[2]
+            result[(section, head)] = f"add\tx{dest}, x{base}, :tprel_hi12:{record[1]}"
+            result[(section, head + 4)] = f"add\tx{dest}, x{dest}, :tprel_lo12_nc:{record[1]}"
+            claimed.update((head, head + 4))
+        if any(record[0] in TLSLE_PAIR and address not in claimed for address, record in table.items()):
+            raise ValueError("TLS local-exec relocation outside an exact HI12/LO12_NC pair")
     return result
 
 
