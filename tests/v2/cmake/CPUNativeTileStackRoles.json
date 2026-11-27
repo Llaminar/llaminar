@@ -6877,8 +6877,8 @@
    }
   }
  },
- "pr73-neon-stack-iq4-ordered-schedule": {
-  "file_sha256": "45cb42e08c32edb98d6e708c176a8f83e14f4fce6a29d2d607d41e28581d24fc",
+ "pr73-neon-stack-iq4-q5-scalar-half": {
+  "file_sha256": "76fb07fa7be84c25bf1cd2e907c65e5f8ccca907146d4cab5ed3b7e14ff0d524",
   "kernel_functions": [
    {
     "signature": "inline void executeBlockProgram() const noexcept"

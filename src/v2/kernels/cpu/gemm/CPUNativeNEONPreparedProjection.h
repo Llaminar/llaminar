@@ -89,7 +89,7 @@ namespace llaminar2::cpu::native_quantised
     [[gnu::always_inline]] inline float q5KRowActivationScaleNEON(std::uint16_t value) noexcept
     {
         if ((value & 0x7c00u) != 0x7c00u)
-            return vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(value))), 0);
+            return static_cast<float>(std::bit_cast<float16_t>(value));
         return std::bit_cast<float>(((std::uint32_t(value) & 0x8000u) << 16) |
             0x7f800000u | ((std::uint32_t(value) & 0x03ffu) << 13));
     }
