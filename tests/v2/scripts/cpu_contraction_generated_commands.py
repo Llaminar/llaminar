@@ -17,14 +17,15 @@ import subprocess
 import sys
 import tempfile
 
-from check_cpu_contraction_witness import (ENVELOPES, SETTINGS, compiler_identity, derive_command,
+from check_cpu_contraction_witness import (ATTRIBUTION_SETTINGS, CONTRACT_OFF, ENVELOPES, SETTINGS,
+                                           attribution_command, compiler_identity, derive_command,
                                            expected_counts)
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'tests/v2/cmake'))
 from CPUCodegenEnvelope import target_command  # noqa: E402
 
-SCHEMA = 1
+SCHEMA = 2
 INPUTS = ('tests/v2/cmake/V2CPUContractionProof.cmake', 'cmake/CPUInstructionSet.cmake',
           'tests/v2/scripts/cpu_contraction_generated_commands.py',
           'tests/v2/scripts/check_cpu_contraction_witness.py', 'tests/v2/cmake/CPUCodegenEnvelope.py')
@@ -50,7 +51,7 @@ set(CMAKE_SYSTEM_PROCESSOR x86_64)
 set(CMAKE_CXX_FLAGS "${MANUAL_FLAGS} ${CMAKE_CXX_FLAGS}")
 include("${AUTHORITY}")
 llaminar_configure_cpu_instruction_set()
-add_library(core SHARED core.cpp)
+add_library(core SHARED core.cpp prefill.cpp)
 target_compile_features(core PUBLIC cxx_std_23)
 # Stand-in for OpenMP::OpenMP_CXX: a target compile option the witness must inherit.
 target_compile_options(core PRIVATE -fopenmp)
@@ -58,6 +59,7 @@ target_compile_definitions(core PUBLIC CORE_PUBLIC_DEFINITION)
 set(V2_CPU_TARGET_X86 ON)
 set(V2_CPU_CONTRACTION_CODEGEN_TARGET core)
 set(V2_CPU_CONTRACTION_CODEGEN_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/core.cpp")
+set(V2_CPU_CONTRACTION_PREFILL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/prefill.cpp")
 enable_testing()
 include("${MODULE}")
 '''
@@ -83,7 +85,7 @@ def observe(root, name, tools, compiler, generator, build_type, isa, extra=()):
                    if key not in ('CFLAGS', 'CXXFLAGS', 'CPPFLAGS', 'LDFLAGS')}
     result = subprocess.run(command + list(extra), capture_output=True, text=True, env=environment)
     observation = dict(returncode=result.returncode, output=result.stdout + result.stderr,
-                       tests=[], plan=None, core_command=None)
+                       tests=[], plan=None, core_command=None, prefill_command=None)
     if result.returncode != 0:
         return observation
     listing = subprocess.run([tools['ctest'], '--test-dir', str(build), '-N'], capture_output=True,
@@ -94,9 +96,10 @@ def observe(root, name, tools, compiler, generator, build_type, isa, extra=()):
     if plan_path.exists():
         plan = json.loads(plan_path.read_text())
         observation['plan'] = plan
-        observation['core_command'] = target_command(argparse.Namespace(
-            compile_database=plan['compile_database'], target_source=plan['codegen_source'],
-            compiler=plan['compiler']['path']))[0]
+        for field, source in (('core_command', 'codegen_source'), ('prefill_command', 'prefill_source')):
+            observation[field] = target_command(argparse.Namespace(
+                compile_database=plan['compile_database'], target_source=plan[source],
+                compiler=plan['compiler']['path']))[0]
     return observation
 
 
@@ -115,6 +118,26 @@ def derived(observation):
             for envelope in ENVELOPES for setting in SETTINGS}
 
 
+def derived_attribution(observation):
+    """Re-derive every packed-prefill attribution command from a recorded plan and prefill command."""
+    plan = observation['plan']
+    return {f'{envelope}/{setting}': attribution_command(observation['prefill_command'], plan['configured'],
+                                                         plan['envelopes'][envelope], setting)
+            for envelope in ENVELOPES for setting in ATTRIBUTION_SETTINGS}
+
+
+def require_production_command(case, key, command, flags, envelope, build_type):
+    """One derived command keeps its envelope block and every production token of the fixture core."""
+    require(bool(flags) and flags[0] in command, case, key + ' lacks its envelope flags')
+    start = command.index(flags[0])
+    require(command[start:start + len(flags)] == flags, case, key + ' splits its envelope flags')
+    for token in ('-std=gnu++23', '-fPIC', '-fopenmp', '-O3', '-DCORE_PUBLIC_DEFINITION'):
+        require(token in command, case, f'{key} lacks production token {token}')
+    require(('-g' in command) == (build_type == 'Integration'), case, key + ' changed debug info')
+    if envelope == 'AVX2':
+        require(not [t for t in command if t.startswith('-mavx512')], case, key + ' leaks AVX-512')
+
+
 def verify_qualified(case, isa, build_type, observation, identity):
     """A qualified tree records its plan and registers the proof and both Unit tests."""
     require(observation['returncode'] == 0, case, 'configure failed:\n' + observation['output'])
@@ -128,17 +151,19 @@ def verify_qualified(case, isa, build_type, observation, identity):
     require(sorted(commands) == sorted(expected_counts()), case, 'incomplete derived commands')
     for key, command in commands.items():
         envelope, setting = key.split('/')
-        flags = plan['envelopes'][envelope]['flags'].split()
-        require(bool(flags) and flags[0] in command, case, key + ' lacks its envelope flags')
-        start = command.index(flags[0])
-        require(command[start:start + len(flags)] == flags, case, key + ' splits its envelope flags')
-        for token in ('-std=gnu++23', '-fPIC', '-fopenmp', '-O3', '-DCORE_PUBLIC_DEFINITION'):
-            require(token in command, case, f'{key} lacks production token {token}')
-        require(('-g' in command) == (build_type == 'Integration'), case, key + ' changed debug info')
-        if envelope == 'AVX2':
-            require(not [t for t in command if t.startswith('-mavx512')], case, key + ' leaks AVX-512')
+        require_production_command(case, key, command, plan['envelopes'][envelope]['flags'].split(),
+                                   envelope, build_type)
         require(command.count('-ffp-contract=fast') == int(setting == 'stricter'), case,
                 key + ' has the wrong contraction setting')
+    require(plan.get('prefill_source', '').endswith('prefill.cpp'), case, 'plan does not name the prefill TU')
+    attribution = derived_attribution(observation)
+    for key, command in attribution.items():
+        envelope, setting = key.split('/')
+        require_production_command(case, 'prefill ' + key, command, plan['envelopes'][envelope]['flags'].split(),
+                                   envelope, build_type)
+        require([t for t in command if t.startswith('-ffp-contract=')]
+                == ([CONTRACT_OFF] if setting == 'contract-off' else []), case,
+                'prefill ' + key + ' has the wrong contraction setting')
     for test in (PROOF_TEST,) + UNIT_TESTS:
         require(test in observation['tests'], case, test + ' is not registered')
 
@@ -195,6 +220,7 @@ def build(args):
         root = pathlib.Path(directory)
         (root / 'CMakeLists.txt').write_text(PROJECT)
         (root / 'core.cpp').write_text('int core;\n')
+        (root / 'prefill.cpp').write_text('int prefill;\n')
         compiler = identity['path']
         for isa, build_type in QUALIFIED:
             observations[f'{isa}-{build_type}'] = observe(

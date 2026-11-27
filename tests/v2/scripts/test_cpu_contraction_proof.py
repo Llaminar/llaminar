@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tool-free controls for the x86 contraction witness: receipts, identity, commands, matcher.
+"""Tool-free controls for the x86 contraction witnesses: receipts, identity, commands, matcher, attribution.
 
 ContractionProofAdmission replays synthetic plans, compilation databases and
 receipts through the actual builder/verifier helpers. GeneratedCommandsReceipt
@@ -18,8 +18,11 @@ import unittest
 
 import cpu_contraction_generated_commands as generated
 import cpu_contraction_proof as proof
-from check_cpu_contraction_witness import (ENVELOPES, SETTINGS, count_fused, derive_command,
-                                           expected_counts, planned_commands, symbol_bodies)
+from check_cpu_contraction_witness import (ATTRIBUTION_SETTINGS, ENVELOPES, PREFILL_FUNCTIONS, SETTINGS,
+                                           attribution_command, count_fused, derive_command,
+                                           expected_attribution_control, expected_counts,
+                                           planned_attribution_commands, planned_commands,
+                                           require_attribution, symbol_bodies, unattributed_symbols)
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 SCRIPT = pathlib.Path(__file__).with_name('cpu_contraction_proof.py')
@@ -48,6 +51,15 @@ def core_command(compiler, source, extra=(), isa='AVX512', debug_info=True):
             + list(extra) + ['-MD', '-MT', 'core.o', '-MF', 'core.o.d', '-o', 'core.o', '-c', source])
 
 
+def valid_attribution():
+    """Attribution evidence the verifier must accept: controls detected, every function covered, no site."""
+    control = expected_attribution_control()
+    return {envelope: dict(control=control[envelope],
+                           prefill=dict(symbols=321, fused=12, unattributed=[],
+                                        functions={name: 5 for name in PREFILL_FUNCTIONS}))
+            for envelope in ENVELOPES}
+
+
 class Fixture:
     """A synthetic configured tree: stub compiler, database, plan and valid receipt."""
 
@@ -58,26 +70,34 @@ class Fixture:
         self.compiler.chmod(0o755)
         self.source = self.root / 'core.cpp'
         self.source.write_text('int core;\n')
+        self.prefill = self.root / 'prefill.cpp'
+        self.prefill.write_text('int prefill;\n')
         self.database = self.root / 'compile_commands.json'
         self.write_database(core_command(str(self.compiler), str(self.source), extra))
         self.plan_path = self.root / 'plan.json'
         self.report_path = self.root / 'proof.json'
         self.plan = dict(schema=1, build_type='Integration', compiler=proof.compiler_identity(
             str(self.compiler)), configured=CONFIGURED, envelopes=ENVELOPE_PLAN,
-            codegen_source=str(self.source), compile_database=str(self.database),
+            codegen_source=str(self.source), prefill_source=str(self.prefill),
+            compile_database=str(self.database),
             objdump=str(self.compiler), stricter_setting='-ffp-contract=fast')
         self.plan_path.write_text(json.dumps(self.plan))
 
-    def write_database(self, command):
-        """Publish one core row exactly as CMake's command form."""
-        self.database.write_text(json.dumps([dict(directory=str(self.root), file=str(self.source),
-                                                  command=shlex.join(command))]))
+    def write_database(self, command, prefill_command=None):
+        """Publish the core and packed-prefill rows exactly as CMake's command form."""
+        if prefill_command is None:
+            prefill_command = [str(self.prefill) if token == str(self.source) else token for token in command]
+        self.database.write_text(json.dumps([
+            dict(directory=str(self.root), file=str(self.source), command=shlex.join(command)),
+            dict(directory=str(self.root), file=str(self.prefill), command=shlex.join(prefill_command))]))
 
     def valid_report(self):
         """Return a receipt the verifier must accept."""
         _, digest, commands = planned_commands(self.plan)
+        _, prefill_digest, attribution_commands = planned_attribution_commands(self.plan)
         return proof.make_report(ROOT, self.plan_path, self.plan['compiler'], digest, commands,
-                                 expected_counts(), dict(path='objdump'), ['evidence'])
+                                 expected_counts(), dict(path='objdump'), ['evidence'], prefill_digest,
+                                 attribution_commands, valid_attribution())
 
     def verify(self, report):
         """Run the installed verifier on one receipt; return (accepted, stderr)."""
@@ -108,8 +128,24 @@ class ContractionProofAdmission(unittest.TestCase):
             del missing_symbol['counts']['AVX512/canonical']['negativeAVX512']
             foreign_command = copy.deepcopy(valid)
             foreign_command['commands']['AVX2/stricter'].remove('-ffp-contract=fast')
+            foreign_attribution_command = copy.deepcopy(valid)
+            foreign_attribution_command['attribution_commands']['AVX512/contract-off'].remove('-ffp-contract=off')
+            contracted_site = copy.deepcopy(valid)
+            contracted_site['attribution']['AVX2']['prefill']['unattributed'] = ['_ZN9llaminar2orderedPanel']
+            undetected_control = copy.deepcopy(valid)
+            undetected_control['attribution']['AVX512']['control']['unattributed'] = ['attributionContractedAVX2']
+            uncovered_function = copy.deepcopy(valid)
+            uncovered_function['attribution']['AVX2']['prefill']['functions']['pooledChunk'] = 0
+            missing_envelope = copy.deepcopy(valid)
+            del missing_envelope['attribution']['AVX512']
             for name, report in [('stale sources', {**valid, 'sources': {}}),
-                                 ('old schema', {**valid, 'version': 1}),
+                                 ('old schema', {**valid, 'version': 2}),
+                                 ('foreign attribution command', foreign_attribution_command),
+                                 ('compiler-introduced contraction', contracted_site),
+                                 ('undetected control', undetected_control),
+                                 ('uncovered prefill function', uncovered_function),
+                                 ('missing attribution envelope', missing_envelope),
+                                 ('missing attribution', {k: v for k, v in valid.items() if k != 'attribution'}),
                                  ('mutated count', mutated_counts), ('missing setting', missing_key),
                                  ('missing symbol', missing_symbol), ('foreign command', foreign_command),
                                  ('foreign plan', {**valid, 'plan_sha256': '0' * 64})]:
@@ -155,6 +191,18 @@ class ContractionProofAdmission(unittest.TestCase):
             self.assertFalse(accepted)
             self.assertIn('core compile command changed', error)
 
+    def test_prefill_command_change_is_stale(self):
+        """Changing the packed-prefill TU's own production flags invalidates the receipt."""
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            valid = fixture.valid_report()
+            core = core_command(str(fixture.compiler), str(fixture.source))
+            prefill = core_command(str(fixture.compiler), str(fixture.prefill), ['-funroll-loops'])
+            fixture.write_database(core, prefill)
+            accepted, error = fixture.verify(valid)
+            self.assertFalse(accepted)
+            self.assertIn('Packed-prefill compile command changed', error)
+
     def test_derivation_parity_and_rejections(self):
         """Only the named ISA block, its definitions and the stricter setting may differ."""
         core = core_command('g++', 'core.cpp')
@@ -191,6 +239,66 @@ class ContractionProofAdmission(unittest.TestCase):
                     derive_command(command, CONFIGURED, ENVELOPE_PLAN['AVX2'], 'canonical',
                                    '-ffp-contract=fast')
 
+    def test_attribution_command_derivation(self):
+        """Attribution commands are the canonical derivation, plus exactly -ffp-contract=off when off."""
+        core = core_command('g++', 'prefill.cpp')
+        for envelope in ENVELOPES:
+            canonical = derive_command(core, CONFIGURED, ENVELOPE_PLAN[envelope], 'canonical', None)
+            for setting in ATTRIBUTION_SETTINGS:
+                with self.subTest(envelope=envelope, setting=setting):
+                    command = attribution_command(core, CONFIGURED, ENVELOPE_PLAN[envelope], setting)
+                    expected = canonical + (['-ffp-contract=off'] if setting == 'contract-off' else [])
+                    self.assertEqual(command, expected)
+        with self.assertRaisesRegex(ValueError, 'unknown attribution setting'):
+            attribution_command(core, CONFIGURED, ENVELOPE_PLAN['AVX2'], 'stricter')
+
+    def test_attribution_flags_compiler_introduced_fma(self):
+        """Only a fused body that -ffp-contract=off changes (or drops) is compiler-introduced."""
+        canonical = symbol_bodies(
+            '0000000000000000 <source>:\n'
+            '   0:\tvfmadd231ps %ymm2,%ymm1,%ymm0\n'
+            '   5:\tjmp    40 <source+0x40>\n'
+            '0000000000000010 <contracted>:\n'
+            '  10:\tvfmadd132ps %ymm2,%ymm1,%ymm0\n'
+            '0000000000000020 <plain>:\n'
+            '  20:\tvaddps %ymm1,%ymm0,%ymm0\n'
+            '0000000000000030 <vanished>:\n'
+            '  30:\tvfnmadd231ps %ymm2,%ymm1,%ymm0\n')
+        contract_off = symbol_bodies(
+            '0000000000000100 <source>:\n'
+            ' 100:\tvfmadd231ps %ymm2,%ymm1,%ymm0\n'
+            ' 105:\tjmp    140 <source+0x40>\n'
+            '0000000000000110 <contracted>:\n'
+            ' 110:\tvmulps %ymm2,%ymm1,%ymm1\n'
+            ' 114:\tvaddps %ymm1,%ymm0,%ymm0\n'
+            '0000000000000120 <plain>:\n'
+            ' 120:\tvsubps %ymm1,%ymm0,%ymm0\n')
+        # Addresses alone never distinguish bodies; a non-fused difference is not a contraction.
+        self.assertEqual(unattributed_symbols(canonical, contract_off), ['contracted', 'vanished'])
+        self.assertEqual(unattributed_symbols(canonical, canonical), [])
+        # A source FMA rewritten by the compiler (same count, different body) is not attributable either.
+        rewritten = dict(contract_off, source=contract_off['source'].replace('231ps', '213ps'),
+                         contracted=canonical['contracted'], vanished=canonical['vanished'])
+        self.assertEqual(unattributed_symbols(canonical, rewritten), ['source'])
+
+    def test_attribution_requirements(self):
+        """The builder's acceptance rule rejects every incomplete or contracted result with its sites."""
+        require_attribution(valid_attribution())
+        contracted = valid_attribution()
+        contracted['AVX512']['prefill']['unattributed'] = ['siteA', 'siteB']
+        empty = valid_attribution()
+        empty['AVX2']['prefill']['symbols'] = 0
+        for name, attribution, message in [
+                ('sites', contracted, 'compiler-introduced contraction in CPUNativeX86PackedPrefill.cpp: siteA, siteB'),
+                ('no symbols', empty, 'no disassembled CPUNativeX86PackedPrefill.cpp symbols'),
+                ('missing envelope', {'AVX2': valid_attribution()['AVX2']}, 'every x86 envelope'),
+                ('control', {**valid_attribution(), 'AVX2': {**valid_attribution()['AVX2'],
+                                                             'control': dict(unattributed=[], source_fused={})}},
+                 'control was not detected')]:
+            with self.subTest(name):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    require_attribution(attribution)
+
     def test_matcher_self_test(self):
         """Every FMA family form is counted per symbol; other vector opcodes are not."""
         disassembly = (
@@ -218,15 +326,17 @@ def synthetic_observations(identity):
     for isa, build_type in generated.QUALIFIED:
         plan = dict(schema=1, build_type=build_type, compiler=identity,
                     configured={'isa': isa, **ENVELOPE_PLAN[isa]}, envelopes=ENVELOPE_PLAN,
-                    codegen_source='core.cpp', compile_database='compile_commands.json',
+                    codegen_source='core.cpp', prefill_source='prefill.cpp',
+                    compile_database='compile_commands.json',
                     objdump='objdump', stricter_setting='-ffp-contract=fast')
         core = core_command('g++', 'core.cpp', isa=isa, debug_info=build_type == 'Integration')
         observations[f'{isa}-{build_type}'] = dict(
             returncode=0, output='', plan=plan, core_command=core[:core.index('-MD')],
+            prefill_command=core[:core.index('-MD')],
             tests=sorted((generated.PROOF_TEST,) + generated.UNIT_TESTS))
     for case, (_, _, status) in generated.UNQUALIFIED.items():
         observations[case] = dict(returncode=0, output='-- V2: x86 ... ' + status, plan=None,
-                                  core_command=None, tests=sorted(generated.UNIT_TESTS))
+                                  core_command=None, prefill_command=None, tests=sorted(generated.UNIT_TESTS))
     manual = copy.deepcopy(observations['AVX2-Release'])
     manual['core_command'].insert(1, '-mavx512f')
     observations[generated.MANUAL] = manual
@@ -272,6 +382,12 @@ class GeneratedCommandsReceipt(unittest.TestCase):
                                       valid['observations']['AVX2-Release']['core_command'])
             no_openmp = copy.deepcopy(valid)
             no_openmp['observations']['AVX512-Integration']['core_command'].remove('-fopenmp')
+            prefill_no_openmp = copy.deepcopy(valid)
+            prefill_no_openmp['observations']['AVX2-Release']['prefill_command'].remove('-fopenmp')
+            prefill_contract = copy.deepcopy(valid)
+            prefill_contract['observations']['AVX2-Integration']['prefill_command'].append('-ffp-contract=off')
+            no_prefill_source = copy.deepcopy(valid)
+            del no_prefill_source['observations']['AVX512-Release']['plan']['prefill_source']
             dropped = copy.deepcopy(valid)
             del dropped['observations']['none']
             upgraded = {**identity, 'sha256': 'b' * 64}
@@ -287,7 +403,10 @@ class GeneratedCommandsReceipt(unittest.TestCase):
                     ('missing UNQUALIFIED status', missing_status, identity, 'UNQUALIFIED'),
                     ('manual flag in qualified tree', leaked, identity, 'ambiguous manual ISA'),
                     ('manual flag accepted', accepted_manual, identity, 'was accepted'),
-                    ('lost OpenMP', no_openmp, identity, '-fopenmp')]:
+                    ('lost OpenMP', no_openmp, identity, '-fopenmp'),
+                    ('prefill lost OpenMP', prefill_no_openmp, identity, 'prefill AVX2/canonical lacks'),
+                    ('prefill contraction setting', prefill_contract, identity, 'wrong contraction setting'),
+                    ('plan without prefill TU', no_prefill_source, identity, 'prefill TU')]:
                 with self.subTest(name):
                     accepted, error = self.run_verify(root, configured, report)
                     self.assertFalse(accepted)

@@ -1,5 +1,5 @@
 # @file V2CPUContractionProof.cmake
-# @brief Register the bounded x86 contribution-helper contraction witness against production codegen.
+# @brief Register the x86 contribution-helper and packed-prefill contraction witnesses against production codegen.
 #
 # The witness compiles the real x86 single-scale contribution helpers with the
 # actual ordered compile command of one production core translation unit,
@@ -8,6 +8,13 @@
 # separately recorded stricter setting appends -ffp-contract=fast. The standard,
 # extensions, PIC, OpenMP, configuration optimisation, target options and
 # definitions are therefore exactly the core's; nothing is reconstructed here.
+#
+# The same proof attributes every fused instruction of the whole packed-prefill
+# TU (V2_CPU_CONTRACTION_PREFILL_SOURCE, compiled without -ffp-contract=off) to
+# an explicit source FMA: its own database command is compiled per envelope
+# canonically and with -ffp-contract=off, and every function body containing a
+# fused instruction must be identical under both. A mul/add control compiled
+# with the same commands must be detected as contracted.
 #
 # Configure records the compiler identity (resolved path, SHA256 and --version)
 # in a plan beside the receipt. The builder refuses a compiler that changed
@@ -29,7 +36,8 @@
 # Inputs owned by the including directory: LLAMINAR_CPU_* from the canonical
 # ISA authority, V2_CPU_TARGET_X86, Python3_EXECUTABLE and CMAKE_OBJDUMP.
 # V2_CPU_CONTRACTION_CODEGEN_TARGET/SOURCE default to the production core and
-# its routed-expert kernel TU; the focused configure fixture overrides them.
+# its routed-expert kernel TU, V2_CPU_CONTRACTION_PREFILL_SOURCE to the x86
+# packed-prefill TU; the focused configure fixture overrides them.
 include_guard(GLOBAL)
 
 get_filename_component(V2_CPU_CONTRACTION_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
@@ -45,6 +53,10 @@ if(NOT DEFINED V2_CPU_CONTRACTION_CODEGEN_TARGET)
 endif()
 if(NOT DEFINED V2_CPU_CONTRACTION_CODEGEN_SOURCE)
     set(V2_CPU_CONTRACTION_CODEGEN_SOURCE "${V2_CPU_CONTRACTION_ROOT}/src/v2/kernels/cpu/moe/CPUMoEKernel.cpp")
+endif()
+if(NOT DEFINED V2_CPU_CONTRACTION_PREFILL_SOURCE)
+    set(V2_CPU_CONTRACTION_PREFILL_SOURCE
+        "${V2_CPU_CONTRACTION_ROOT}/src/v2/kernels/cpu/gemm/CPUNativeX86PackedPrefill.cpp")
 endif()
 set(V2_CPU_CONTRACTION_SCRIPTS "${V2_CPU_CONTRACTION_ROOT}/tests/v2/scripts")
 
@@ -149,6 +161,7 @@ if(V2_CPU_CONTRACTION_QUALIFIED)
     v2_cpu_contraction_json_array(V2_CPU_CONTRACTION_J_DEFINITIONS ${LLAMINAR_CPU_COMPILE_DEFINITIONS})
     v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_BUILD "${CMAKE_BUILD_TYPE}")
     v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_SOURCE "${V2_CPU_CONTRACTION_CODEGEN_SOURCE}")
+    v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_PREFILL "${V2_CPU_CONTRACTION_PREFILL_SOURCE}")
     v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_DATABASE "${V2_CPU_CONTRACTION_DATABASE}")
     v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_OBJDUMP "${CMAKE_OBJDUMP}")
     set(V2_CPU_CONTRACTION_J_ENVELOPES "{}")
@@ -166,7 +179,8 @@ if(V2_CPU_CONTRACTION_QUALIFIED)
 \"compiler\":${V2_CPU_CONTRACTION_J_IDENTITY},\
 \"configured\":{\"isa\":${V2_CPU_CONTRACTION_J_ISA},\"flags\":${V2_CPU_CONTRACTION_J_FLAGS},\
 \"definitions\":${V2_CPU_CONTRACTION_J_DEFINITIONS}},\"envelopes\":${V2_CPU_CONTRACTION_J_ENVELOPES},\
-\"codegen_source\":${V2_CPU_CONTRACTION_J_SOURCE},\"compile_database\":${V2_CPU_CONTRACTION_J_DATABASE},\
+\"codegen_source\":${V2_CPU_CONTRACTION_J_SOURCE},\"prefill_source\":${V2_CPU_CONTRACTION_J_PREFILL},\
+\"compile_database\":${V2_CPU_CONTRACTION_J_DATABASE},\
 \"objdump\":${V2_CPU_CONTRACTION_J_OBJDUMP},\"stricter_setting\":\"-ffp-contract=fast\"}\n")
     string(JSON V2_CPU_CONTRACTION_PLAN_SCHEMA ERROR_VARIABLE V2_CPU_CONTRACTION_PLAN_ERROR
         GET "${V2_CPU_CONTRACTION_PLAN_TEXT}" schema)
@@ -185,6 +199,8 @@ if(V2_CPU_CONTRACTION_QUALIFIED)
             "${V2_CPU_CONTRACTION_SCRIPTS}/check_cpu_contraction_witness.py"
             "${V2_CPU_CONTRACTION_ROOT}/tests/v2/cmake/CPUCodegenEnvelope.py"
             "${V2_CPU_CONTRACTION_ROOT}/tests/v2/unit/kernels/cpu/CPUContractionWitness.cpp"
+            "${V2_CPU_CONTRACTION_ROOT}/tests/v2/unit/kernels/cpu/CPUContractionAttributionControl.cpp"
+            "${V2_CPU_CONTRACTION_PREFILL_SOURCE}"
             "${CMAKE_CXX_COMPILER}" "${CMAKE_OBJDUMP}"
         VERBATIM)
     add_custom_target(v2_cpu_contraction_proof DEPENDS "${V2_CPU_CONTRACTION_PROOF}")

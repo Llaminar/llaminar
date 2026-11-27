@@ -12,6 +12,28 @@ real `accumulateSingleScaleBlock{AVX2,AVX512}` helpers in `extern "C"`
 fused instructions, the intentional backend-native policy one, and the
 deliberately unguarded negative control one under the same invocation.
 
+## Packed-prefill FMA attribution (X-C)
+
+`src/v2/kernels/cpu/gemm/CPUNativeX86PackedPrefill.cpp` compiles without
+`-ffp-contract=off`, so GCC's C++ default (`fast`) may contract a source
+`_mm256_mul_ps`/`_mm256_add_ps` pair. The same proof therefore covers that
+whole translation unit, not just its `no-tree-slp-vectorize` pins
+(`orderedPanel`, `stripeOrdered`, `run`, `pooledChunk`):
+
+- The TU's own database command is derived per envelope (as above). It is
+  compiled `canonical` and `contract-off` (with `-ffp-contract=off` appended).
+- Under `-ffp-contract=off` GCC forms no FMA from separate operations. Every
+  remaining fused instruction is an explicit source FMA (`_mm256_fmadd_ps`
+  etc.). A canonical function body containing a fused instruction is
+  attributed to source only when its instruction sequence (addresses
+  normalized) is identical under both settings. Any other body is reported by
+  symbol as a compiler-introduced contraction and fails the proof.
+- Each of the four named functions must have at least one disassembled
+  instantiation per envelope.
+- `tests/v2/unit/kernels/cpu/CPUContractionAttributionControl.cpp` is compiled
+  with the same commands. Its contracted mul/add pair must be flagged and its
+  explicit FMA kept, otherwise a clean TU result is not evidence.
+
 ## Production command derivation (F-1)
 
 - The command is the production core's actual ordered compile command for
@@ -70,7 +92,8 @@ deliberately unguarded negative control one under the same invocation.
 ## Scope
 
 This does NOT close B5 globally: corrected-scale helpers, coded leaves,
-planning copies and all per-TU/post-link production copies remain unwitnessed.
+planning copies and per-TU/post-link production copies outside the packed-prefill
+TU remain unwitnessed.
 D0 workspaceFloats COMDAT evidence is unrelated to this contraction proof.
 
 ## Local fixture evidence (2026-11-27)
@@ -99,3 +122,23 @@ x86_64-linux-gnu-g++-14 -DLLAMINAR_COMPILED_WITH_AVX2=1 -DLLAMINAR_COMPILED_WITH
   -I/s/src/v2 -I/s/src -msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt
   -O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS -std=gnu++23 -fPIC -fopenmp
 ```
+
+## Packed-prefill attribution evidence (2026-11-27)
+
+The run used the `pr73-x86-build` linux/amd64 container on a Mac, with
+`g++ (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0` and GNU objdump. The real
+`src/v2` configure covered configured AVX2 and AVX512 × Integration and
+Release (4 trees, `HAVE_CUDA=OFF`, `HAVE_ROCM=OFF`). Every tree built
+`v2_cpu_contraction_proof` and `v2_cpu_contraction_generated_commands`. In
+every tree, `V2_Integration_CPUContributionContraction` and both
+`V2_Unit_CPUContractionProof*` tests passed.
+
+| Envelope | Symbols | Fused (all source) | Unattributed | orderedPanel / stripeOrdered / run / pooledChunk symbols |
+|---|---|---|---|---|
+| AVX2 | 321 | 12 | none | 5 / 5 / 32 / 20 |
+| AVX512 | 653 | 163 | none | 40 / 15 / 120 / 40 |
+
+Results were identical across all four trees. The controls were flagged in
+every tree (`attributionContracted*` flagged, `attributionSource*` = 1 fused).
+A `_mm256_add_ps(_mm256_mul_ps(...))` function injected into a scratch copy of
+the TU was reported as `injectedPrefillContraction` in both envelopes.
