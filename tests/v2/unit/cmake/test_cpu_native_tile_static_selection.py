@@ -43,12 +43,12 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
             C._static_unit_fingerprint(unit)
         bodies["f"][0] = "ret"
         self.assertEqual(C._static_unit_fingerprint(unit), plain)
-        for name in ("TLSIEPage", "TLSIEOffsetLoad"):
-            marker = getattr(C, name, None)
-            if marker is not None:
-                bodies["f"][0] = marker("ret")
-                self.assertNotEqual(C._static_unit_fingerprint(unit), plain)
-                bodies["f"][0] = "ret"
+        for marker in (C.TLSIEPage, C.TLSIEOffsetLoad):
+            bodies["f"][0] = marker("ret")
+            typed = C._static_unit_fingerprint(unit)
+            self.assertNotEqual(typed, plain)
+            bodies["f"][0] = "ret"
+            self.assertNotEqual(C._static_unit_fingerprint(unit), typed)
         bodies.extra = True
         with self.assertRaisesRegex(ValueError, "container state"):
             C._static_unit_fingerprint(unit)
@@ -213,6 +213,18 @@ class StaticSelectionNativeTest(unittest.TestCase):
         authority = C.verify_static_executable_selection(args, root, root / "app", root / "valid", unit, obj, obj, target)
         model = C.CallModel({"winner": unit}, {target: authority})
         self.assertEqual(model.resolve(unit, target), ("helper", unit, target))
+        first = unit.bodies[target][0]
+        for marker in (C.TLSIEPage, C.TLSIEOffsetLoad):
+            unit.bodies[target][0] = marker(str(first))
+            with self.assertRaisesRegex(ValueError, "Unit/target changed"):
+                authority.check(unit, target)
+            self.assertEqual(model.resolve(unit, target)[0], "fail")
+            unit.bodies[target][0] = first
+            authority.check(unit, target)
+        unit.bodies.extra = True
+        with self.assertRaisesRegex(ValueError, "container state"):
+            authority.check(unit, target)
+        del unit.bodies.extra
         discarded, kept = C._static_map_records((root / "valid/native.map").read_text())
         self.assertTrue(any(r[0] == ".text." + target and "g.a(g.o)" in r[3] for r in discarded))
         self.assertTrue(any(r[0] == ".text." + target and "f.a(f.o)" in r[3] for r in kept))
