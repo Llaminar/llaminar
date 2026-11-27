@@ -1657,9 +1657,7 @@ namespace llaminar2::cpu::native_quantised
             else if constexpr (Physical == Encoding::Q6KNativeDualScale)
                 return !(pairs && Rows == 3 && ordered);
             else if constexpr (Physical == Encoding::NibbleLUTSourceScale)
-                // Three ordered rows leave too few scalar registers to carry both
-                // opaque strip addressing and partition bounds through the K walk.
-                return !(Rows == 3 && ordered && !pairs);
+                return true;
             else if constexpr (Physical == Encoding::Q5NativeSingleScale)
                 return Rows == 4 && WithMinimum && !ordered;
             else
