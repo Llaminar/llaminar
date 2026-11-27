@@ -7181,21 +7181,21 @@
   },
   "compact": {
    "source": "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h",
-   "file_sha256": "44a46bf7b36830996a9b93ec0961bb08d3d862babd9194c6353a34eba62485ed",
+   "file_sha256": "fd810ab34e3519811120af995eccbe5560150cdaa2c3b9a1429156d4f68000b8",
    "kernel_functions": [
     {
      "signature": "inline void rowsProgram("
     }
    ],
    "loops": {
-    "1093": {
+    "1094": {
      "role": "column",
      "variable": "column",
      "trip": "ceil(C / W)",
      "header": "int column = 0; column < columns; column += Lanes",
      "definitions": {}
     },
-    "1097": {
+    "1098": {
      "role": "partition",
      "variable": "partition",
      "trip": "P if T == 1 else 1",
@@ -7204,7 +7204,7 @@
       "partition_count": "Tree == Reduction::OrderedPartitions ? partitions : 1"
      }
     },
-    "1101": {
+    "1102": {
      "role": "row",
      "variable": "row",
      "trip": "R",
@@ -7212,7 +7212,7 @@
      "definitions": {},
      "unrolled": "True"
     },
-    "1117": {
+    "1118": {
      "role": "block",
      "variable": "kb",
      "trip": "K / P if T == 1 else K",
@@ -7222,7 +7222,7 @@
       "last": "Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end"
      }
     },
-    "1185": {
+    "1186": {
      "role": "row",
      "variable": "row",
      "trip": "R",
@@ -7230,7 +7230,7 @@
      "definitions": {},
      "unrolled": "True"
     },
-    "1315": {
+    "1316": {
      "role": "row",
      "variable": "row",
      "trip": "R",
@@ -7238,7 +7238,7 @@
      "definitions": {},
      "unrolled": "True"
     },
-    "1349": {
+    "1350": {
      "role": "row",
      "variable": "row",
      "trip": "R",
