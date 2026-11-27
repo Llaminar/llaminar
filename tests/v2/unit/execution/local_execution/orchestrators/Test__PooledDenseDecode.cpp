@@ -349,3 +349,124 @@ TEST(PooledDenseDecode, RunnerInPlacePrivateTailMatchesControl)
     // a rolled fresh tail frame took the next partial page.
     EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 12);
 }
+
+/** @test P2 multi-request on a SHARED pool: two live pooled requests use one
+ * PMA-backed pool+table instance (separate request records, separate
+ * repositories per request), interleaved decode, each byte-identical to its
+ * own uninterrupted ring control. The shared pool edits no logical request
+ * state across the two. */
+TEST(PooledDenseDecode, TwoRequestsShareOnePoolWithoutCrossTalk)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 2> prompt_a{1, 5};
+    const std::array<int32_t, 3> prompt_b{2, 3, 5};
+    const std::array<int32_t, 5> decode_a{2, 4, 6, 8, 10};
+    const std::array<int32_t, 4> decode_b{1, 3, 5, 7};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture ctl_a(device, KVCachePrecision::FP32);
+    ctl_a.config.mtp.enabled = false; ctl_a.config.mtp.graph_capacity_draft_tokens = 0;
+    ctl_a.config.max_seq_len = 16;
+    test::TinyQwenForwardFixture ctl_b(device, KVCachePrecision::FP32);
+    ctl_b.config.mtp.enabled = false; ctl_b.config.mtp.graph_capacity_draft_tokens = 0;
+    ctl_b.config.max_seq_len = 16;
+
+    std::unique_ptr<DeviceGraphOrchestrator> ctl_a_owner, ctl_b_owner;
+    PreparedWeightStore ctl_a_store, ctl_b_store;
+    std::shared_ptr<QwenStandardGraph> ctl_a_builder, ctl_b_builder;
+    make_runner(ctl_a, ctl_a_owner, ctl_a_store, ctl_a_builder);
+    make_runner(ctl_b, ctl_b_owner, ctl_b_store, ctl_b_builder);
+    ASSERT_OK("control A prefill", ctl_a_owner->forward(prompt_a.data(), 2, 1) != nullptr);
+    ASSERT_OK("control B prefill", ctl_b_owner->forward(prompt_b.data(), 3, 1) != nullptr);
+
+    // ONE shared instance seats both requests (2 records, banks for 2x2).
+    PagedKVPoolBudget budget;
+    budget.remaining_budget_bytes = 3 * 1024 * 1024;
+    budget.frame_bytes = 4 * 1024;
+    budget.request_records = 4;
+    budget.max_pages_per_request = 64;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+        /*layers=*/ctl_a.config.n_layers, /*admitted_issuances=*/8, /*readers_per_bank=*/4);
+    auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+    ASSERT_TRUE(plan);
+    // Table needs 2 bindings x 2 banks/layer; widen it explicitly.
+    auto table_geom = plan->table_geometry;
+    table_geom.bank_count = 2 * table_geom.bank_count;
+    table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+    table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+    auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+    widened->table_geometry = table_geom;
+    widened->total_bytes = PhysicalPagePool::physicalBytes(plan->pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+    PhysicalMemoryPlanBuilder mbuilder;
+    mbuilder.add({.world_rank=0, .device=device,
+        .total_bytes=widened->total_bytes,
+        .admission_available_bytes=widened->total_bytes},
+        PhysicalMemoryOwner::KVCache, widened->total_bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mbuilder.build()), 0);
+    auto created = PagedKVInstance::create(authority, *widened, device);
+    ASSERT_TRUE(created);
+    PagedKVInstance instance = std::move(*created);
+
+    std::unique_ptr<DeviceGraphOrchestrator> pooled_a_owner, pooled_b_owner;
+    PreparedWeightStore pooled_a_store, pooled_b_store;
+    std::shared_ptr<QwenStandardGraph> pooled_a_builder, pooled_b_builder;
+    make_runner(ctl_a, pooled_a_owner, pooled_a_store, pooled_a_builder);
+    make_runner(ctl_b, pooled_b_owner, pooled_b_store, pooled_b_builder);
+    PooledKVDecodeBinding binding_a(&instance.pool(), &instance.table(),
+        /*request_id=*/101, /*slot=*/0,
+        ctl_a.config.n_kv_heads, ctl_a.config.head_dim,
+        /*page_tokens=*/8, ctl_a.config.n_layers, /*admitted_issuances=*/8);
+    PooledKVDecodeBinding binding_b(&instance.pool(), &instance.table(),
+        /*request_id=*/102, /*slot=*/1,
+        ctl_b.config.n_kv_heads, ctl_b.config.head_dim,
+        /*page_tokens=*/8, ctl_b.config.n_layers, /*admitted_issuances=*/8);
+    pooled_a_owner->setPooledDecodeBinding(&binding_a);
+    pooled_b_owner->setPooledDecodeBinding(&binding_b);
+
+    ASSERT_OK("pooled A prefill", pooled_a_owner->forward(prompt_a.data(), 2, 1) != nullptr);
+    ASSERT_OK("pooled B prefill", pooled_b_owner->forward(prompt_b.data(), 3, 1) != nullptr);
+    const std::size_t vocab = static_cast<std::size_t>(ctl_a.config.vocab_size);
+    // Interleave decodes: A then B, A, B, ... — both live at once. Each pooled
+    // token is byte-compared against the control's matching token IMMEDIATELY
+    // (same position, same token), so a divergence is located exactly.
+    for (int step = 0; step < static_cast<int>(decode_a.size()); ++step)
+    {
+        const auto *ctl_a = ctl_a_owner->forward(&decode_a[step], 1, 1);
+        const auto *pooled_a = pooled_a_owner->forward(&decode_a[step], 1, 1);
+        ASSERT_NE(ctl_a, nullptr) << "control A forward " << step;
+        ASSERT_NE(pooled_a, nullptr) << "pooled A forward " << step;
+        EXPECT_EQ(std::memcmp(pooled_a, ctl_a, vocab * sizeof(float)), 0)
+            << "shared-pool request A diverged at step " << step;
+        if (step < static_cast<int>(decode_b.size()))
+        {
+            const auto *ctl_b = ctl_b_owner->forward(&decode_b[step], 1, 1);
+            const auto *pooled_b = pooled_b_owner->forward(&decode_b[step], 1, 1);
+            ASSERT_NE(ctl_b, nullptr) << "control B forward " << step;
+            ASSERT_NE(pooled_b, nullptr) << "pooled B forward " << step;
+            EXPECT_EQ(std::memcmp(pooled_b, ctl_b, vocab * sizeof(float)), 0)
+                << "shared-pool request B diverged at step " << step;
+        }
+    }
+    // Each request's publication is independent and grew exactly.
+    EXPECT_EQ(binding_a.priorFor(0)->snapshot.view().rows(), 2 + 5);
+    EXPECT_EQ(binding_b.priorFor(0)->snapshot.view().rows(), 3 + 4);
+}
