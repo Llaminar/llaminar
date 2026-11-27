@@ -45,6 +45,7 @@
 #ifdef HAVE_ONEDNN
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #endif
+#include "kernels/cpu/gemm/CPUNativeOrderedKTile.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"
