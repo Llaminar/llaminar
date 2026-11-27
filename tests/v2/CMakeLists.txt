@@ -6384,7 +6384,9 @@ if(HAVE_ROCM AND (NOT V2_PERF_TESTS_ONLY OR V2_ROCM_REGISTER_LIFETIME_OWNER_SELE
     # Superblock-coded metadata on ROCm: the production repack writes per-block
     # codes plus per-superblock d/dmin at file density, and the shared codec
     # reconstructs every per-block word, for all codable formats and a
-    # mid-superblock column slice.
+    # mid-superblock column slice. Its deadline is the preflight seal's 120 s
+    # per-test limit, as for the CUDA twin's identical workload
+    # (V2_Integration_CUDASuperblockCodedMetadata).
     add_executable(v2_integration_rocm_superblock_coded_metadata
         integration/kernels/rocm/Test__ROCmSuperblockCodedMetadata.cpp)
     target_include_directories(v2_integration_rocm_superblock_coded_metadata
@@ -6401,7 +6403,7 @@ if(HAVE_ROCM AND (NOT V2_PERF_TESTS_ONLY OR V2_ROCM_REGISTER_LIFETIME_OWNER_SELE
     add_v2_test(V2_Integration_ROCmSuperblockCodedMetadata
         COMMAND $<TARGET_FILE:v2_integration_rocm_superblock_coded_metadata>
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;ByteExact;AllFormats;NativeQuantised;Memory;GraphCapture;Replay;Regression"
-        MPI_PROCS 1 NO_MODELS TIMEOUT 300
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
     )
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmSuperblockCodedMetadata)
 endif()
