@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 PATH = Path(__file__).resolve().parents[2] / "cmake" / "CPUNativeTileRegisterEvidence.py"
 SPEC = importlib.util.spec_from_file_location("static_checker", PATH)
@@ -142,6 +143,92 @@ class StaticSelectionNativeTest(unittest.TestCase):
             # A forged map/manifest cannot be passed to the typed constructor.
             with self.assertRaisesRegex(ValueError, "native verifier"):
                 C.TypedStaticExecutableSelection(result, None, "f", {}, {})
+
+
+    def test_actual_aarch64_comdat_selection_and_negative_boundaries(self):
+        compiler = shutil.which(os.environ.get("LLAMINAR_STATIC_TEST_GXX", "g++-14"))
+        self.assertIsNotNone(compiler, "native selected-object test requires GNU14")
+        self.assertEqual(os.uname().machine, "aarch64", "selected-object native gate requires real AArch64")
+        base = os.environ.get("LLAMINAR_STATIC_TEST_ARTIFACTS")
+        if base:
+            Path(base).mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="static-comdat-", dir=base))
+        print(f"Retained native COMDAT selection: {root}", flush=True)
+        template = "template<int N> __attribute__((noinline)) int chosen(){return N;}\n"
+        for name, wrapper in (("f", "use"), ("g", "other")):
+            (root / (name + ".cpp")).write_text(template + f"int {wrapper}(){{return chosen<7>();}}\n")
+        (root / "main.cpp").write_text("extern int use(); int main(){return use();}\n")
+        for name in ("f", "g", "main"):
+            subprocess.run([compiler, "-O2", "-ffunction-sections", "-c", str(root / (name + ".cpp")),
+                            "-o", str(root / (name + ".o"))], check=True)
+        ar = subprocess.check_output([compiler, "-print-prog-name=ar"], text=True).strip()
+        for name in ("f", "g"):
+            subprocess.run([ar, "rcs", str(root / (name + ".a")), str(root / (name + ".o"))], check=True)
+        args = [compiler, "-fuse-ld=bfd", str(root / "main.o"), "-Wl,--whole-archive",
+                str(root / "f.a"), str(root / "g.a"), "-Wl,--no-whole-archive",
+                f"-Wl,--dependency-file={root / 'production.d'}", "-o", str(root / "app")]
+        subprocess.run(args, check=True)
+        obj = (root / "f.o").read_bytes()
+        objdump = subprocess.check_output([compiler, "-print-prog-name=objdump"], text=True).strip()
+        listing = subprocess.check_output([objdump, "-dr", str(root / "f.o")], text=True)
+        (root / "f.disassembly").write_text(listing)
+        image = C.read_object(obj)
+        unit = C.make_unit("winner", image, C.normalize_disassembly(listing, image))
+        target = "_Z6chosenILi7EEiv"
+        self.assertEqual(unit.functions[target], "weak")
+        # Original direct vocabulary rejects this actual default-visible winner.
+        self.assertIsNotNone(C.CallModel.select(unit, unit, target, dict(binding="direct")))
+        authority = C.verify_static_executable_selection(args, root, root / "app", root / "valid", unit, obj, obj, target)
+        model = C.CallModel({"winner": unit}, {target: authority})
+        self.assertEqual(model.resolve(unit, target), ("helper", unit, target))
+        discarded, kept = C._static_map_records((root / "valid/native.map").read_text())
+        self.assertTrue(any(r[0] == ".text." + target and "g.a(g.o)" in r[3] for r in discarded))
+        self.assertTrue(any(r[0] == ".text." + target and "f.a(f.o)" in r[3] for r in kept))
+        original_capture = C.capture_static_link
+        original_app = (root / "app").read_bytes()
+
+        def inject(label, edit, expected):
+            # Fault injection happens after a REAL native capture. No invented
+            # manifest, digest, boolean or direct-proof enum creates authority.
+            def captured(*a, **kw):
+                recipe = original_capture(*a, **kw)
+                edit(Path(a[3]))
+                return recipe
+            with mock.patch.object(C, "capture_static_link", captured):
+                with self.subTest(boundary=label), self.assertRaisesRegex(ValueError, expected):
+                    C.verify_static_executable_selection(args, root, root / "app", root / label, unit, obj, obj, target)
+            # Keep injected output bytes as evidence; restore only the test fixture
+            # executable for the next independent adversarial experiment.
+            (root / label / "injected.elf").write_bytes((root / "app").read_bytes())
+            (root / "app").write_bytes(original_app)
+
+        def map_edit(change):
+            def edit(directory):
+                p = directory / "native.map"
+                p.write_text(change(p.read_text()))
+            return edit
+        inject("wrong-winner", map_edit(lambda t: t.replace("f.a(f.o)", "g.a(g.o)")), "kept member/section")
+        inject("stale-map", map_edit(lambda t: t + "\nforged trailing observation\n"), "artifact changed")
+        inject("discarded-only", map_edit(lambda t: t.split("Linker script and memory map")[0] +
+               "Linker script and memory map\n"), "ambiguous/missing kept owner")
+        def elf_edit(change):
+            def edit(directory):
+                data = bytearray((root / "app").read_bytes())
+                change(data)
+                (root / "app").write_bytes(data)
+            return edit
+        inject("ordinary-dso", elf_edit(lambda d: d.__setitem__(slice(16,18), (1).to_bytes(2,"little"))),
+               "ET_EXEC or PIE")
+        inject("stale-elf", elf_edit(lambda d: d.__setitem__(-1, d[-1] ^ 1)), "artifact changed")
+        # Identity controls use the actual selected object, not synthetic booleans.
+        with self.assertRaisesRegex(ValueError, "audited Unit/B1"):
+            C.verify_static_executable_selection(args, root, root / "app", root / "wrong-replay", unit, obj,
+                                                (root / "g.o").read_bytes(), target)
+        with self.assertRaisesRegex(ValueError, "Unit/target"):
+            authority.check(unit._replace(copy="other"), target)
+        with mock.patch.dict(os.environ, {"LIBRARY_PATH": "/changed"}):
+            with self.assertRaisesRegex(ValueError, "environment"):
+                authority.check(unit, target)
 
 
 if __name__ == "__main__":
