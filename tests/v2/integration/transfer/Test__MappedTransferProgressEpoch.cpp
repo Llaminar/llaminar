@@ -1516,7 +1516,7 @@ namespace
             ASSERT_NE(terminal, nullptr);
             auto retire = [&](void *) { context.destroyEvent(terminal); };
             std::unique_ptr<void, decltype(retire)> event_owner(&context, retire);
-            for (std::uint64_t generation = 1u; generation <= 3u; ++generation)
+            for (std::uint64_t generation = 1u; generation <= 8u; ++generation)
             {
                 SCOPED_TRACE(generation);
                 std::memset(output->mutableHostData(), 0x5a, output->sizeBytes());
@@ -1531,11 +1531,20 @@ namespace
                     description.kind = static_cast<MappedTransferWorkKind>(99u);
                 else if (generation == 2u)
                     description.layout.gpu_codebook_id = 255u;
+                else if (generation == 4u)
+                    description.scales = 0u;
+                else if (generation == 5u)
+                    description.layout.direction = ExpertTierWeightConversionDirection::CpuToGpu;
+                else if (generation == 7u)
+                    description.layout.maximum_units_per_chunk = 0u;
+                else if (generation == 8u)
+                    description.layout.cpu_encoding = static_cast<cpu::native_quantised::CPUNativeQuantisedEncoding>(99u);
                 command->generation_magic = mappedTransferProgressGenerationMagic(generation);
                 command->generation_version = mappedTransferProgressGenerationVersion(generation);
                 command->source_address = reinterpret_cast<std::uintptr_t>(storage->deviceData());
                 command->destination_address = reinterpret_cast<std::uintptr_t>(output->deviceAlias(device));
                 command->bytes = description.layout.chunkBytes(1u);
+                if (generation == 6u) --command->bytes; // Interior bytes cannot close a native unit.
                 command->source_complement = ~command->source_address;
                 command->destination_complement = ~command->destination_address;
                 command->bytes_complement = ~command->bytes;
@@ -1550,8 +1559,17 @@ namespace
                 ASSERT_TRUE(context.synchronizeEventChecked(terminal));
                 EXPECT_EQ(std::atomic_ref<std::uint64_t>(receipt->completed_generation)
                     .load(std::memory_order_acquire), generation);
-                EXPECT_EQ(receipt->error, static_cast<unsigned>(generation == 3u
-                    ? MappedTransferProgressError::InvalidIdentity : MappedTransferProgressError::InvalidWork));
+                constexpr std::array expected_errors{
+                    MappedTransferProgressError::InvalidWork,
+                    MappedTransferProgressError::InvalidWork,
+                    MappedTransferProgressError::InvalidIdentity,
+                    MappedTransferProgressError::InvalidPackedPointers,
+                    MappedTransferProgressError::InvalidPackedGeometry,
+                    MappedTransferProgressError::InvalidPackedExtent,
+                    MappedTransferProgressError::InvalidPackedPopulation,
+                    MappedTransferProgressError::InvalidPackedDispatch};
+                EXPECT_EQ(receipt->error, static_cast<unsigned>(expected_errors[generation - 1u]))
+                    << mappedTransferProgressErrorName(static_cast<MappedTransferProgressError>(receipt->error));
                 EXPECT_EQ(receipt->completed_bytes, 0u);
                 const auto *bytes = static_cast<const unsigned char *>(output->mutableHostData());
                 EXPECT_TRUE(std::all_of(bytes, bytes + output->sizeBytes(),
