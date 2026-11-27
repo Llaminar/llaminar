@@ -6877,8 +6877,8 @@
    }
   }
  },
- "pr73-neon-stack-q6-block-column": {
-  "file_sha256": "735fc462c2ea2f798f57438d51c6f1aee88a27fc81f7bda76d3b14f62837e32b",
+ "pr73-neon-stack-q6-q5-row-local": {
+  "file_sha256": "69db3feeaf1ab997c5baacecd308c52b10e6d0149e06490b4c625584e8f97bfd",
   "kernel_functions": [
    {
     "signature": "inline void executeBlockProgram() const noexcept"
@@ -7016,163 +7016,163 @@
    }
   ],
   "loops": {
-   "580": {
+   "595": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "q5KBlock pairs: group += 2 over 8"
    },
-   "615": {
+   "630": {
     "role": "group",
     "variable": "group",
     "trip": "8",
     "source": "q5KBlock: group < 8"
    },
-   "625": {
+   "640": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "q5KBlock: group < 4 (two groups each)"
    },
-   "727": {
+   "742": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "iq3sBlock pairs: group += 2 over 8"
    },
-   "766": {
+   "781": {
     "role": "group",
     "variable": "group",
     "trip": "8",
     "source": "iq3sBlock: group < 8"
    },
-   "933": {
+   "948": {
     "role": "superblock",
     "variable": "block",
     "trip": "ceil((K / P - 1) / 8) + 1",
     "source": "forPartitionBlocks IQ4_XS: superblocks met by one partition (upper bound, 8 blocks each)"
    },
-   "938": {
+   "953": {
     "role": "block",
     "variable": "block",
     "trip": "(K / P) / (ceil((K / P - 1) / 8) + 1)",
     "source": "forPartitionBlocks IQ4_XS: blocks of one superblock (partition blocks / superblock bound)"
    },
-   "944": {
+   "959": {
     "role": "block",
     "variable": "block",
     "trip": "K / P",
     "source": "forPartitionBlocks Coded == 0: [first, last)"
    },
-   "969": {
+   "984": {
     "role": "block",
     "variable": "block",
     "trip": "K / P if G else K",
     "source": "forPartitionBlocks Q5_K: flat [first, last) walk; last = K when not ordered"
    },
-   "977": {
+   "992": {
     "role": "superblock",
     "variable": "block",
     "trip": "ceil(((K / P if G else K) - 1) / 8) + 1",
     "source": "forPartitionBlocks coded: superblocks met by [first, last) (upper bound); last = K when not ordered"
    },
-   "982": {
+   "997": {
     "role": "block",
     "variable": "block",
     "trip": "(K / P if G else K) / (ceil(((K / P if G else K) - 1) / 8) + 1)",
     "source": "forPartitionBlocks coded: blocks of one superblock"
    },
-   "1207": {
+   "1222": {
     "role": "column",
     "variable": "column0",
     "trip": "C / (4 * S)",
     "source": "runQ4K: column0 += 4 * S"
    },
-   "1222": {
+   "1237": {
     "role": "partition",
     "variable": "partition",
     "trip": "P if G else 1",
     "source": "runQ4K: partitions_ when ordered (GPU-aligned), else 1"
    },
-   "1228": {
+   "1243": {
     "role": "superblock",
     "variable": "block",
     "trip": "ceil(((K / P if G else K) - 1) / 8) + 1",
     "source": "runQ4K: superblocks met by [first, last) (upper bound, 8 blocks each); last = K when not ordered"
    },
-   "1237": {
+   "1252": {
     "role": "block",
     "variable": "block",
     "trip": "(K / P if G else K) / (ceil(((K / P if G else K) - 1) / 8) + 1)",
     "source": "runQ4K: blocks of one superblock"
    },
-   "1278": {
+   "1293": {
     "role": "group",
     "variable": "group",
     "trip": "8",
     "source": "runQ4K (ASIMD/DotProd strips): group < 8"
    },
-   "1288": {
+   "1303": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "runQ4K: group < 4 (two nibble groups each)"
    },
-   "1691": {
+   "1706": {
     "role": "column",
     "variable": "column",
     "trip": "C / (4 * S)",
     "source": "executeBlockProgram: panel walk"
    },
-   "1710": {
+   "1725": {
     "role": "column",
     "variable": "column",
     "trip": "C / 4",
     "source": "executeBlockProgram: strip walk"
    },
-   "1730": {
+   "1745": {
     "role": "partition",
     "variable": "partition",
     "trip": "P if (G or E != 3) else 1",
     "source": "executeBlockProgram: partitions_ when ordered or Coded == 0 (E != 3), else 1"
    },
-   "1792": {
+   "1807": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: low groups 0..3"
    },
-   "1795": {
+   "1810": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: high groups 4..7"
    },
-   "1805": {
+   "1820": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q5: Q5NativePayload::groups == 4"
    },
-   "1854": {
+   "1869": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run IQ4_XS grouped: group < 4 (two nibble groups each)"
    },
-   "1864": {
+   "1879": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run nibble: group < 4 (two nibble groups each)"
    },
-   "2075": {
+   "2092": {
     "role": "partition",
     "variable": "partition",
     "trip": "P",
     "source": "panel: partitions_"
    },
-   "2088": {
+   "2105": {
     "role": "group",
     "variable": "group",
     "trip": "8",

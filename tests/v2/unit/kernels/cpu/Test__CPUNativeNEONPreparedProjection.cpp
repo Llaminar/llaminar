@@ -950,6 +950,10 @@ TEST_F(CPUNativeNEONPreparedProjection, EveryHalfAndOpaqueWordHasExactBits)
         {
             EXPECT_EQ(std::bit_cast<std::uint32_t>(half[lane]),
                 std::bit_cast<std::uint32_t>(fp16_to_fp32(words[lane])));
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(q5KRowActivationScaleNEON(words[lane])),
+                std::bit_cast<std::uint32_t>(nativeQuantisedFP16ScaleToFP32(words[lane])));
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(q5KRowActivationScaleNEON(words[lane])),
+                std::bit_cast<std::uint32_t>(fp16_to_fp32(words[lane])));
             EXPECT_EQ(raw[lane], words[lane]);
             EXPECT_EQ(std::bit_cast<std::uint32_t>(low[lane]), std::bit_cast<std::uint32_t>(fp16_to_fp32(words[lane])));
             EXPECT_EQ(std::bit_cast<std::uint32_t>(high[lane]),
