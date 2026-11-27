@@ -32,7 +32,7 @@
     },
     "1:0:0:3:11:0": {
      "fused": {
-      "fmla": 1
+      "fmla": 2
      }
     },
     "1:0:0:3:7:1": {
@@ -42,7 +42,7 @@
     },
     "1:0:0:4:2:0": {
      "fused": {
-      "fmla": 1
+      "fmla": 2
      }
     },
     "1:0:0:6:1:1": {
@@ -126,7 +126,7 @@
     },
     "2:0:0:3:11:0": {
      "fused": {
-      "fmla": 2
+      "fmla": 3
      }
     },
     "2:0:0:3:7:1": {
@@ -136,7 +136,7 @@
     },
     "2:0:0:4:2:0": {
      "fused": {
-      "fmla": 2
+      "fmla": 4
      }
     },
     "2:0:0:6:1:1": {
@@ -230,7 +230,7 @@
     },
     "3:0:0:4:2:0": {
      "fused": {
-      "fmla": 3
+      "fmla": 5
      }
     },
     "3:0:0:6:1:1": {
@@ -314,7 +314,7 @@
     },
     "4:0:0:3:11:0": {
      "fused": {
-      "fmla": 7
+      "fmla": 6
      }
     },
     "4:0:0:3:7:1": {
@@ -324,7 +324,7 @@
     },
     "4:0:0:4:2:0": {
      "fused": {
-      "fmla": 4
+      "fmla": 5
      }
     },
     "4:0:0:6:1:1": {
@@ -378,9 +378,6 @@
     "4:0:1:7:1:1": {
      "fused": {}
     },
-    "_ZN9llaminar212fp16_to_fp32Et": {
-     "fused": {}
-    },
     "_ZN9llaminar23cpu16native_quantised14coded_metadata11reconstructILh10ENS1_11multi_scale17NEONMultiScaleOpsILNS4_11NEONByteDotE0EEEEENS2_7FactorsINT0_1FEEENS9_1IESC_": {
      "fused": {}
     },
@@ -403,9 +400,6 @@
      "fused": {}
     },
     "_ZN9llaminar23cpu16native_quantised14coded_metadata11reconstructILh9ENS1_11multi_scale17NEONMultiScaleOpsILNS4_11NEONByteDotE0EEEEENS2_7FactorsINT0_1FEEENS9_1IESC_": {
-     "fused": {}
-    },
-    "_ZN9llaminar23cpu16native_quantised14coded_metadata5LanesINS1_11multi_scale17NEONMultiScaleOpsILNS4_11NEONByteDotE0EEEE4codeILh17EEEDv4_iPKhi": {
      "fused": {}
     },
     "_ZN9llaminar23cpu16native_quantised28CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv": {
@@ -1253,7 +1247,7 @@
    "tile_chain": {
     "1:0:1:0:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:0:1:1": {
      "offchain": 1,
@@ -1261,15 +1255,15 @@
     },
     "1:0:1:0:2:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:0:3:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:1:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:2:0:0": {
      "offchain": 2,
@@ -1281,19 +1275,19 @@
     },
     "1:0:1:3:7:1": {
      "offchain": 1,
-     "sites": 2
+     "sites": 3
     },
     "1:0:1:4:2:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:6:1:1": {
      "offchain": 1,
-     "sites": 3
+     "sites": 2
     },
     "1:0:1:7:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:7:1:1": {
      "offchain": 1,
@@ -1313,19 +1307,19 @@
     },
     "2:0:1:0:3:0": {
      "offchain": 0,
-     "sites": 6
+     "sites": 8
     },
     "2:0:1:1:0:0": {
      "offchain": 0,
      "sites": 5
     },
     "2:0:1:2:0:0": {
-     "offchain": 2,
-     "sites": 4
+     "offchain": 3,
+     "sites": 5
     },
     "2:0:1:3:11:0": {
      "offchain": 0,
-     "sites": 4
+     "sites": 5
     },
     "2:0:1:3:7:1": {
      "offchain": 2,
@@ -1341,7 +1335,7 @@
     },
     "2:0:1:7:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:0:1:7:1:1": {
      "offchain": 2,
@@ -1368,8 +1362,8 @@
      "sites": 7
     },
     "3:0:1:2:0:0": {
-     "offchain": 3,
-     "sites": 6
+     "offchain": 4,
+     "sites": 7
     },
     "3:0:1:3:11:0": {
      "offchain": 0,
@@ -1429,7 +1423,7 @@
     },
     "4:0:1:4:2:0": {
      "offchain": 0,
-     "sites": 8
+     "sites": 9
     },
     "4:0:1:6:1:1": {
      "offchain": 4,
@@ -1477,7 +1471,7 @@
     },
     "1:0:0:3:11:0": {
      "fused": {
-      "fmla": 1
+      "fmla": 2
      }
     },
     "1:0:0:3:7:1": {
@@ -1487,7 +1481,7 @@
     },
     "1:0:0:4:2:0": {
      "fused": {
-      "fmla": 1
+      "fmla": 2
      }
     },
     "1:0:0:6:1:1": {
@@ -1665,7 +1659,7 @@
     },
     "2:0:0:3:11:0": {
      "fused": {
-      "fmla": 2
+      "fmla": 3
      }
     },
     "2:0:0:3:7:1": {
@@ -1675,7 +1669,7 @@
     },
     "2:0:0:4:2:0": {
      "fused": {
-      "fmla": 2
+      "fmla": 4
      }
     },
     "2:0:0:6:1:1": {
@@ -1751,7 +1745,7 @@
     },
     "2:1:0:1:0:0": {
      "fused": {
-      "fmla": 3
+      "fmla": 4
      }
     },
     "2:1:0:2:0:0": {
@@ -1759,7 +1753,7 @@
     },
     "2:1:0:3:11:0": {
      "fused": {
-      "fmla": 2
+      "fmla": 3
      }
     },
     "2:1:0:3:7:1": {
@@ -1863,7 +1857,7 @@
     },
     "3:0:0:4:2:0": {
      "fused": {
-      "fmla": 3
+      "fmla": 5
      }
     },
     "3:0:0:6:1:1": {
@@ -1947,7 +1941,7 @@
     },
     "3:1:0:3:11:0": {
      "fused": {
-      "fmla": 4
+      "fmla": 5
      }
     },
     "3:1:0:3:7:1": {
@@ -1957,7 +1951,7 @@
     },
     "3:1:0:4:2:0": {
      "fused": {
-      "fmla": 4
+      "fmla": 3
      }
     },
     "3:1:0:6:1:1": {
@@ -2041,7 +2035,7 @@
     },
     "4:0:0:3:11:0": {
      "fused": {
-      "fmla": 7
+      "fmla": 6
      }
     },
     "4:0:0:3:7:1": {
@@ -2051,7 +2045,7 @@
     },
     "4:0:0:4:2:0": {
      "fused": {
-      "fmla": 4
+      "fmla": 5
      }
     },
     "4:0:0:6:1:1": {
@@ -2135,7 +2129,7 @@
     },
     "4:1:0:3:11:0": {
      "fused": {
-      "fmla": 6
+      "fmla": 7
      }
     },
     "4:1:0:3:7:1": {
@@ -2197,9 +2191,6 @@
      "fused": {}
     },
     "4:1:1:7:1:1": {
-     "fused": {}
-    },
-    "_ZN9llaminar212fp16_to_fp32Et": {
      "fused": {}
     },
     "_ZN9llaminar23cpu16native_quantised14coded_metadata11reconstructILh10ENS1_11multi_scale17NEONMultiScaleOpsILNS4_11NEONByteDotE0EEEEENS2_7FactorsINT0_1FEEENS9_1IESC_": {
@@ -3927,7 +3918,7 @@
    "tile_chain": {
     "1:0:1:0:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:0:1:1": {
      "offchain": 1,
@@ -3935,15 +3926,15 @@
     },
     "1:0:1:0:2:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:0:3:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:1:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:2:0:0": {
      "offchain": 2,
@@ -3955,19 +3946,19 @@
     },
     "1:0:1:3:7:1": {
      "offchain": 1,
-     "sites": 2
+     "sites": 3
     },
     "1:0:1:4:2:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:6:1:1": {
      "offchain": 1,
-     "sites": 3
+     "sites": 2
     },
     "1:0:1:7:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:7:1:1": {
      "offchain": 1,
@@ -3987,7 +3978,7 @@
     },
     "1:1:1:0:3:0": {
      "offchain": 0,
-     "sites": 4
+     "sites": 6
     },
     "1:1:1:1:0:0": {
      "offchain": 0,
@@ -4011,11 +4002,11 @@
     },
     "1:1:1:6:1:1": {
      "offchain": 1,
-     "sites": 3
+     "sites": 2
     },
     "1:1:1:7:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:1:1:7:1:1": {
      "offchain": 1,
@@ -4035,19 +4026,19 @@
     },
     "2:0:1:0:3:0": {
      "offchain": 0,
-     "sites": 6
+     "sites": 8
     },
     "2:0:1:1:0:0": {
      "offchain": 0,
      "sites": 5
     },
     "2:0:1:2:0:0": {
-     "offchain": 2,
-     "sites": 4
+     "offchain": 3,
+     "sites": 5
     },
     "2:0:1:3:11:0": {
      "offchain": 0,
-     "sites": 4
+     "sites": 5
     },
     "2:0:1:3:7:1": {
      "offchain": 2,
@@ -4063,7 +4054,7 @@
     },
     "2:0:1:7:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:0:1:7:1:1": {
      "offchain": 2,
@@ -4083,19 +4074,19 @@
     },
     "2:1:1:0:3:0": {
      "offchain": 0,
-     "sites": 6
+     "sites": 8
     },
     "2:1:1:1:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:1:1:2:0:0": {
-     "offchain": 2,
-     "sites": 4
+     "offchain": 3,
+     "sites": 5
     },
     "2:1:1:3:11:0": {
      "offchain": 0,
-     "sites": 4
+     "sites": 5
     },
     "2:1:1:3:7:1": {
      "offchain": 2,
@@ -4111,7 +4102,7 @@
     },
     "2:1:1:7:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:1:1:7:1:1": {
      "offchain": 2,
@@ -4138,8 +4129,8 @@
      "sites": 7
     },
     "3:0:1:2:0:0": {
-     "offchain": 3,
-     "sites": 6
+     "offchain": 4,
+     "sites": 7
     },
     "3:0:1:3:11:0": {
      "offchain": 0,
@@ -4179,15 +4170,15 @@
     },
     "3:1:1:0:3:0": {
      "offchain": 0,
-     "sites": 8
+     "sites": 11
     },
     "3:1:1:1:0:0": {
      "offchain": 0,
      "sites": 7
     },
     "3:1:1:2:0:0": {
-     "offchain": 3,
-     "sites": 6
+     "offchain": 4,
+     "sites": 7
     },
     "3:1:1:3:11:0": {
      "offchain": 0,
@@ -4247,7 +4238,7 @@
     },
     "4:0:1:4:2:0": {
      "offchain": 0,
-     "sites": 8
+     "sites": 9
     },
     "4:0:1:6:1:1": {
      "offchain": 4,
@@ -4275,7 +4266,7 @@
     },
     "4:1:1:0:3:0": {
      "offchain": 0,
-     "sites": 10
+     "sites": 14
     },
     "4:1:1:1:0:0": {
      "offchain": 0,
@@ -4343,7 +4334,7 @@
     },
     "1:0:0:3:11:0": {
      "fused": {
-      "fmla": 1
+      "fmla": 2
      }
     },
     "1:0:0:3:7:1": {
@@ -4353,7 +4344,7 @@
     },
     "1:0:0:4:2:0": {
      "fused": {
-      "fmla": 1
+      "fmla": 2
      }
     },
     "1:0:0:6:1:1": {
@@ -4531,7 +4522,7 @@
     },
     "2:0:0:3:11:0": {
      "fused": {
-      "fmla": 2
+      "fmla": 3
      }
     },
     "2:0:0:3:7:1": {
@@ -4541,7 +4532,7 @@
     },
     "2:0:0:4:2:0": {
      "fused": {
-      "fmla": 2
+      "fmla": 4
      }
     },
     "2:0:0:6:1:1": {
@@ -4617,7 +4608,7 @@
     },
     "2:1:0:1:0:0": {
      "fused": {
-      "fmla": 3
+      "fmla": 4
      }
     },
     "2:1:0:2:0:0": {
@@ -4625,7 +4616,7 @@
     },
     "2:1:0:3:11:0": {
      "fused": {
-      "fmla": 2
+      "fmla": 3
      }
     },
     "2:1:0:3:7:1": {
@@ -4729,7 +4720,7 @@
     },
     "2:2:0:4:2:0": {
      "fused": {
-      "fmla": 4
+      "fmla": 3
      }
     },
     "2:2:0:6:1:1": {
@@ -4823,7 +4814,7 @@
     },
     "3:0:0:4:2:0": {
      "fused": {
-      "fmla": 3
+      "fmla": 5
      }
     },
     "3:0:0:6:1:1": {
@@ -4907,7 +4898,7 @@
     },
     "3:1:0:3:11:0": {
      "fused": {
-      "fmla": 4
+      "fmla": 5
      }
     },
     "3:1:0:3:7:1": {
@@ -4917,7 +4908,7 @@
     },
     "3:1:0:4:2:0": {
      "fused": {
-      "fmla": 4
+      "fmla": 3
      }
     },
     "3:1:0:6:1:1": {
@@ -5095,7 +5086,7 @@
     },
     "4:0:0:3:11:0": {
      "fused": {
-      "fmla": 7
+      "fmla": 6
      }
     },
     "4:0:0:3:7:1": {
@@ -5105,7 +5096,7 @@
     },
     "4:0:0:4:2:0": {
      "fused": {
-      "fmla": 4
+      "fmla": 5
      }
     },
     "4:0:0:6:1:1": {
@@ -5189,7 +5180,7 @@
     },
     "4:1:0:3:11:0": {
      "fused": {
-      "fmla": 6
+      "fmla": 7
      }
     },
     "4:1:0:3:7:1": {
@@ -5347,12 +5338,6 @@
     "4:2:1:7:1:1": {
      "fused": {}
     },
-    "_ZN9llaminar212fp16_to_fp32Et": {
-     "fused": {}
-    },
-    "_ZN9llaminar23cpu16native_quantised11multi_scale15dotHalfRowPairsILi10ELi1ELi4ELm4ENS2_17NEONMultiScaleOpsILNS2_11NEONByteDotE2EEEEEvPKhiRKSt5arrayIPKNS_9Q8_1BlockEXT2_EEiRAT2__NT3_1IE": {
-     "fused": {}
-    },
     "_ZN9llaminar23cpu16native_quantised11multi_scale15dotHalfRowPairsILi13ELi0ELi4ELm4ENS2_17NEONMultiScaleOpsILNS2_11NEONByteDotE2EEEEEvPKhiRKSt5arrayIPKNS_9Q8_1BlockEXT2_EEiRAT2__NT3_1IE": {
      "fused": {}
     },
@@ -5381,9 +5366,6 @@
      "fused": {}
     },
     "_ZN9llaminar23cpu16native_quantised11multi_scale15dotHalfRowPairsILi17ELi1ELi4ELm4ENS2_17NEONMultiScaleOpsILNS2_11NEONByteDotE2EEEEEvPKhiRKSt5arrayIPKNS_9Q8_1BlockEXT2_EEiRAT2__NT3_1IE": {
-     "fused": {}
-    },
-    "_ZN9llaminar23cpu16native_quantised11multi_scale15dotHalfRowPairsILi9ELi0ELi4ELm4ENS2_17NEONMultiScaleOpsILNS2_11NEONByteDotE2EEEEEvPKhiRKSt5arrayIPKNS_9Q8_1BlockEXT2_EEiRAT2__NT3_1IE": {
      "fused": {}
     },
     "_ZN9llaminar23cpu16native_quantised11multi_scale15dotHalfRowPairsILi9ELi1ELi4ELm4ENS2_17NEONMultiScaleOpsILNS2_11NEONByteDotE2EEEEEvPKhiRKSt5arrayIPKNS_9Q8_1BlockEXT2_EEiRAT2__NT3_1IE": {
@@ -7492,7 +7474,7 @@
    "tile_chain": {
     "1:0:1:0:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:0:1:1": {
      "offchain": 1,
@@ -7500,15 +7482,15 @@
     },
     "1:0:1:0:2:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:0:3:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:1:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:2:0:0": {
      "offchain": 2,
@@ -7520,19 +7502,19 @@
     },
     "1:0:1:3:7:1": {
      "offchain": 1,
-     "sites": 2
+     "sites": 3
     },
     "1:0:1:4:2:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:6:1:1": {
      "offchain": 1,
-     "sites": 3
+     "sites": 2
     },
     "1:0:1:7:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:0:1:7:1:1": {
      "offchain": 1,
@@ -7552,7 +7534,7 @@
     },
     "1:1:1:0:3:0": {
      "offchain": 0,
-     "sites": 4
+     "sites": 6
     },
     "1:1:1:1:0:0": {
      "offchain": 0,
@@ -7576,11 +7558,11 @@
     },
     "1:1:1:6:1:1": {
      "offchain": 1,
-     "sites": 3
+     "sites": 2
     },
     "1:1:1:7:0:0": {
      "offchain": 0,
-     "sites": 3
+     "sites": 4
     },
     "1:1:1:7:1:1": {
      "offchain": 1,
@@ -7600,19 +7582,19 @@
     },
     "2:0:1:0:3:0": {
      "offchain": 0,
-     "sites": 6
+     "sites": 8
     },
     "2:0:1:1:0:0": {
      "offchain": 0,
      "sites": 5
     },
     "2:0:1:2:0:0": {
-     "offchain": 2,
-     "sites": 4
+     "offchain": 3,
+     "sites": 5
     },
     "2:0:1:3:11:0": {
      "offchain": 0,
-     "sites": 4
+     "sites": 5
     },
     "2:0:1:3:7:1": {
      "offchain": 2,
@@ -7628,7 +7610,7 @@
     },
     "2:0:1:7:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:0:1:7:1:1": {
      "offchain": 2,
@@ -7648,19 +7630,19 @@
     },
     "2:1:1:0:3:0": {
      "offchain": 0,
-     "sites": 6
+     "sites": 8
     },
     "2:1:1:1:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:1:1:2:0:0": {
-     "offchain": 2,
-     "sites": 4
+     "offchain": 3,
+     "sites": 5
     },
     "2:1:1:3:11:0": {
      "offchain": 0,
-     "sites": 4
+     "sites": 5
     },
     "2:1:1:3:7:1": {
      "offchain": 2,
@@ -7676,7 +7658,7 @@
     },
     "2:1:1:7:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:1:1:7:1:1": {
      "offchain": 2,
@@ -7684,7 +7666,7 @@
     },
     "2:2:1:0:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:2:1:0:1:1": {
      "offchain": 2,
@@ -7692,19 +7674,19 @@
     },
     "2:2:1:0:2:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:2:1:0:3:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:2:1:1:0:0": {
      "offchain": 0,
-     "sites": 5
+     "sites": 7
     },
     "2:2:1:2:0:0": {
-     "offchain": 2,
-     "sites": 4
+     "offchain": 3,
+     "sites": 5
     },
     "2:2:1:3:11:0": {
      "offchain": 0,
@@ -7751,8 +7733,8 @@
      "sites": 7
     },
     "3:0:1:2:0:0": {
-     "offchain": 3,
-     "sites": 6
+     "offchain": 4,
+     "sites": 7
     },
     "3:0:1:3:11:0": {
      "offchain": 0,
@@ -7792,15 +7774,15 @@
     },
     "3:1:1:0:3:0": {
      "offchain": 0,
-     "sites": 8
+     "sites": 11
     },
     "3:1:1:1:0:0": {
      "offchain": 0,
      "sites": 7
     },
     "3:1:1:2:0:0": {
-     "offchain": 3,
-     "sites": 6
+     "offchain": 4,
+     "sites": 7
     },
     "3:1:1:3:11:0": {
      "offchain": 0,
@@ -7844,11 +7826,11 @@
     },
     "3:2:1:1:0:0": {
      "offchain": 0,
-     "sites": 7
+     "sites": 8
     },
     "3:2:1:2:0:0": {
-     "offchain": 4,
-     "sites": 7
+     "offchain": 3,
+     "sites": 6
     },
     "3:2:1:3:11:0": {
      "offchain": 0,
@@ -7860,7 +7842,7 @@
     },
     "3:2:1:4:2:0": {
      "offchain": 0,
-     "sites": 7
+     "sites": 8
     },
     "3:2:1:6:1:1": {
      "offchain": 3,
@@ -7908,7 +7890,7 @@
     },
     "4:0:1:4:2:0": {
      "offchain": 0,
-     "sites": 8
+     "sites": 9
     },
     "4:0:1:6:1:1": {
      "offchain": 4,
@@ -7936,7 +7918,7 @@
     },
     "4:1:1:0:3:0": {
      "offchain": 0,
-     "sites": 10
+     "sites": 14
     },
     "4:1:1:1:0:0": {
      "offchain": 0,
@@ -7984,11 +7966,11 @@
     },
     "4:2:1:0:3:0": {
      "offchain": 0,
-     "sites": 10
+     "sites": 14
     },
     "4:2:1:1:0:0": {
      "offchain": 0,
-     "sites": 9
+     "sites": 13
     },
     "4:2:1:2:0:0": {
      "offchain": 5,

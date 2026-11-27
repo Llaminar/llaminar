@@ -8,12 +8,14 @@
  * sequence. Llaminar's x86 build envelopes require F16C; AArch64 ASIMD
  * provides binary16-to-binary32 conversion. Finite scales use the native
  * conversion instruction on either architecture.
- * Non-finite encodings retain the portable conversion so signaling/quiet NaN
- * payload bits remain identical to the repository-wide scalar contract.
+ * Non-finite encodings retain the portable conversion's bits so signaling/quiet
+ * NaN payloads remain identical to the repository-wide scalar contract; on
+ * AArch64 that expansion is written inline (exponent 31 is its only input).
  */
 
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #if defined(__F16C__)
 #include <immintrin.h>
@@ -48,7 +50,13 @@ namespace llaminar2::cpu::native_quantised
             const float16x4_t half = vreinterpret_f16_u16(vdup_n_u16(value));
             return vgetq_lane_f32(vcvt_f32_f16(half), 0);
         }
-#endif
+        // Exponent 31 only: fp16_to_fp32()'s infinity/NaN expansion, by bit
+        // placement and without a call, so a large tile program never depends
+        // on GCC's inlining budget for this cold path.
+        return std::bit_cast<float>(((std::uint32_t{value} & 0x8000u) << 16) | 0x7F800000u |
+                                    ((std::uint32_t{value} & 0x03FFu) << 13));
+#else
         return llaminar2::fp16_to_fp32(value);
+#endif
     }
 } // namespace llaminar2::cpu::native_quantised
