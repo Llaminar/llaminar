@@ -41,6 +41,7 @@
 namespace
 {
     using namespace llaminar2;
+    namespace cpu_bf16 = llaminar2::gemm::cpu_bf16;
     using cpu_bf16::Engine;
 
     /** Restore the caller's OpenMP budget even after an assertion returns early. */
@@ -208,10 +209,18 @@ TEST(CPUBF16GemmPolicy, ExplicitUnionGeometriesThrowInsteadOfDegrading)
         EXPECT_THROW(cpu_bf16::selectEngine(3, 16, 64, false, Engine::AVX512BF16),
                      std::invalid_argument);
 
-    // AMX requires full 16×16×16 tiles; partial geometry is rejected.
+    // AMX requires full 16×16×16 tiles; partial geometry is rejected. On a
+    // host whose AMX tile data instructions are not functional the explicit
+    // engine is rejected before geometry evaluation instead.
     if (cpu_bf16::compiledWithAMXBF16())
-        EXPECT_THROW(cpu_bf16::selectEngine(3, 16, 64, true, Engine::AMXBF16),
-                     std::invalid_argument);
+    {
+        if (cpu_amx_data_instructions_usable())
+            EXPECT_THROW(cpu_bf16::selectEngine(3, 16, 64, true, Engine::AMXBF16),
+                         std::invalid_argument);
+        else
+            EXPECT_THROW(cpu_bf16::selectEngine(3, 16, 64, true, Engine::AMXBF16),
+                         std::runtime_error);
+    }
 }
 
 // ============================================================================
@@ -322,7 +331,7 @@ TEST(CPUBF16GemmAVX512, RouteProbeCountsOneAdmittedDispatch)
 #if defined(__AMX_TILE__) && defined(__AMX_BF16__)
 TEST(CPUBF16GemmAMX, TileDeterministicAcrossRunsAndThreadCounts)
 {
-    if (!cpu_supports_amx_bf16())
+    if (!cpu_amx_data_instructions_usable())
         GTEST_SKIP() << "host does not advertise AMX-BF16";
     std::mt19937 random(0xa3c16b16);
     for (int threads : {1, 3, 8})
@@ -349,7 +358,7 @@ TEST(CPUBF16GemmAMX, TileDeterministicAcrossRunsAndThreadCounts)
 
 TEST(CPUBF16GemmAMX, TileStaysWithinFp32AccumulationOfSerialOracle)
 {
-    if (!cpu_supports_amx_bf16())
+    if (!cpu_amx_data_instructions_usable())
         GTEST_SKIP() << "host does not advertise AMX-BF16";
     std::mt19937 random(0xd0b16bf);
     ThreadBudget budget(2);
@@ -372,7 +381,7 @@ TEST(CPUBF16GemmAMX, TileStaysWithinFp32AccumulationOfSerialOracle)
 
 TEST(CPUBF16GemmAMX, RouteProbeCountsOneAdmittedDispatch)
 {
-    if (!cpu_supports_amx_bf16())
+    if (!cpu_amx_data_instructions_usable())
         GTEST_SKIP() << "host does not advertise AMX-BF16";
     std::mt19937 random(0x9a3c16);
     const auto a = bf16Words(16 * 16, random);

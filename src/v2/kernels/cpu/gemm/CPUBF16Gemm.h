@@ -133,7 +133,8 @@ namespace llaminar2
                 case Engine::AVX512BF16:
                     return compiledWithAVX512BF16() && cpu_supports_avx512_bf16();
                 case Engine::AMXBF16:
-                    return compiledWithAMXBF16() && cpu_supports_amx_bf16();
+                    return compiledWithAMXBF16() && cpu_supports_amx_bf16()
+                        && cpu_amx_data_instructions_usable();
                 }
                 return false;
             }
@@ -441,25 +442,29 @@ namespace llaminar2
             /**
              * @brief AMX palette-1 tile configuration (BF16 tiles, FP32 tiles).
              *
-             * The layout matches the hardware 64-byte tile config consumed by
-             * tileloadconfig: palette 1 is the 16-bit floating-point palette
-             * (A/B tiles 16 rows × 32 bytes = 16 BF16; D tiles 16 rows × 64
-             * bytes = 16 FP32). The struct is declared here with the hardware
-             * layout; the GNU <immintrin.h> `_tile_loadconfig` accepts the
-             * config through a `const void *`, so the kernel does not depend
-             * on either compiler's header spelling.
+             * The layout is the 64-byte TILECFG memory operand consumed by
+             * tileloadconfig, packed exactly as oneDNN's `palette_config_t`:
+             * one palette byte, one start-row byte, 14 reserved bytes, then
+             * sixteen uint16 column-size words (offset 16) and sixteen uint8
+             * row counts (offset 48). Entry i (i = 0..7) is one tile's shape:
+             * `cols[i]` = column bytes, `rows[i]` = row count. The hardware
+             * parses this image directly, so the layout must be exact — a
+             * paired {rows, colsb} descriptor table faults ldtilecfg with #GP.
+             * Palette 1 is the 16-bit floating-point palette: A/B tiles 16
+             * rows × 32 bytes (16 BF16), D tiles 16 rows × 64 bytes (16 FP32).
              */
+#pragma pack(push, 1)
             struct alignas(64) AMXPalette1Config
             {
                 std::uint8_t palette_id = 1;
                 std::uint8_t start_row = 0;
                 std::uint8_t reserved[14] = {};
-                struct TileSpec
-                {
-                    std::uint16_t rows = 0;
-                    std::uint16_t colsb = 0;
-                } tile[8] = {};
+                std::uint16_t cols[16] = {};
+                std::uint8_t rows[16] = {};
             };
+#pragma pack(pop)
+            static_assert(sizeof(AMXPalette1Config) == 64,
+                "AMX TILECFG is exactly 64 bytes: 16-byte header + 16 uint16 cols + 16 uint8 rows");
 
             /** @brief Tile indices used by the AMX-BF16 GEMM program. */
             enum AMXTile : int { AMX_TILE_A = 0, AMX_TILE_B = 1, AMX_TILE_D = 2 };
@@ -488,9 +493,9 @@ namespace llaminar2
                 AMXTileScope() noexcept
                 {
                     AMXPalette1Config config{};
-                    config.tile[AMX_TILE_A] = {16, 32}; // 16 rows × 16 BF16
-                    config.tile[AMX_TILE_B] = {16, 32};
-                    config.tile[AMX_TILE_D] = {16, 64}; // 16 rows × 16 FP32
+                    config.cols[AMX_TILE_A] = 32; config.rows[AMX_TILE_A] = 16; // 16 rows × 16 BF16
+                    config.cols[AMX_TILE_B] = 32; config.rows[AMX_TILE_B] = 16;
+                    config.cols[AMX_TILE_D] = 64; config.rows[AMX_TILE_D] = 16; // 16 rows × 16 FP32
                     _tile_loadconfig(&config);
                 }
                 ~AMXTileScope() noexcept

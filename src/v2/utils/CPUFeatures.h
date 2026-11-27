@@ -3,11 +3,18 @@
 #include <cstdint>
 #include <cstdlib> // std::getenv for LLAMINAR_ISA_LEVEL
 #include <cstdio>
+#include <cstring>
 #include <algorithm> // For std::min, std::max in AttentionCacheConfig
 #include <stdexcept>
+#include <csignal>
+#include <csetjmp>
+#include <mutex>
 #include "CPUCacheObservation.h"
 #if defined(__aarch64__)
 #include "ARMCPUFeatures.h"
+#endif
+#if defined(__AMX_TILE__) && defined(__AMX_BF16__)
+#include <immintrin.h>
 #endif
 
 /**
@@ -264,6 +271,7 @@ namespace llaminar2
     inline bool cpu_supports_avx512();
     inline bool cpu_supports_avx512_bf16();
     inline bool cpu_supports_amx_bf16();
+    inline bool cpu_amx_data_instructions_usable() noexcept;
 
     /**
      * @brief Resolve a requested CPU ISA against the real compiled/native capabilities.
@@ -298,10 +306,12 @@ namespace llaminar2
 #endif
 #if LLAMINAR_COMPILED_WITH_AMX_BF16
         // The AMX-BF16 envelope carries tile instructions in the same binary;
-        // the machine must execute them (CPUID AMX-BF16 plus XCR0 tile state)
-        // before any BF16 GEMM tile path can run.
-        if (!cpu_supports_amx_bf16())
-            throw std::runtime_error("The AMXBF16 binary requires native AMX-BF16 support (Intel Sapphire Rapids or later with OS tile state)");
+        // the machine must execute them (CPUID AMX-BF16 plus XCR0 tile state,
+        // then a functional data-instruction probe, because some virtual
+        // machines backfill the AMX feature leaf without implementing the
+        // tile data opcodes).
+        if (!cpu_supports_amx_bf16() || !cpu_amx_data_instructions_usable())
+            throw std::runtime_error("The AMXBF16 binary requires functional AMX-BF16 support (Intel Sapphire Rapids or later with OS tile state)");
 #endif
 #if LLAMINAR_COMPILED_WITH_AVX512_BF16
         // AVX512-BF16 is an AVX512-state instruction; the compiled envelope
@@ -761,6 +771,19 @@ namespace llaminar2
             constexpr uint32_t AVX_MASK = 0x06;
             return (xcr0 & AVX_MASK) == AVX_MASK;
         }
+
+        /**
+         * @brief One-time AMX functional-probe jump buffer (startup admission only).
+         *
+         * Owned by the detail namespace so the SIGILL probe handler and the
+         * sigsetjmp site share one static; the buffer is touched only while
+         * the temporary handler is installed.
+         */
+        inline sigjmp_buf &amxProbeEnv()
+        {
+            static sigjmp_buf env;
+            return env;
+        }
     } // namespace detail
 
     /**
@@ -935,6 +958,66 @@ namespace llaminar2
             return (regs[3] & (1 << 25)) != 0; // EDX bit 25 = AMX_INT8
         }();
         return result;
+    }
+
+    /**
+     * @brief Whether the executing CPU actually implements AMX tile DATA instructions.
+     *
+     * CPUID and XCR0 advertise AMX on the host, but some virtual machines
+     * backfill the feature leaf without implementing tileloadd/tilezero/
+     * tdpbf16ps/tilestored (only ldtilecfg/tilerelease execute; the tile-data
+     * opcodes raise #UD). A compiled AMX envelope must reject such a machine
+     * before any tile instruction can run, so this one-time admission probe
+     * executes a real tilezero under a temporary SIGILL handler and reports
+     * the outcome. It runs once, before parallel AMX dispatch, and restores
+     * the previous SIGILL disposition on every path.
+     *
+     * @return True only when a tile data instruction executed successfully.
+     */
+    inline bool cpu_amx_data_instructions_usable() noexcept
+    {
+#if defined(__AMX_TILE__) && defined(__AMX_BF16__)
+        static const bool usable = []() noexcept
+        {
+            // One-time only: this reshapes process signal disposition and must
+            // never contend with concurrent AMX admission callers.
+            static std::once_flag once;
+            static bool result = false;
+            std::call_once(once, []() noexcept
+            {
+                // Valid palette-1 config (oneDNN layout): 64-byte header then
+                // 16 uint16 cols and 16 uint8 rows; a zeroed tile 0 config is
+                // enough for the probe because tile CFG must be loaded before
+                // any tile data instruction.
+                alignas(64) std::uint8_t cfg[64] = {};
+                cfg[0] = 1;              // palette_id = 1 (16-bit floating point)
+                cfg[16] = 32; cfg[17] = 0; // cols[0] = 32 bytes (16 BF16)
+                cfg[48] = 16;            // rows[0] = 16
+
+                struct sigaction old_action {};
+                struct sigaction probe_action {};
+                std::memset(&probe_action, 0, sizeof(probe_action));
+                probe_action.sa_handler = [](int) { siglongjmp(detail::amxProbeEnv(), 1); };
+                sigemptyset(&probe_action.sa_mask);
+                if (::sigaction(SIGILL, &probe_action, &old_action) != 0)
+                    return;
+                if (::sigsetjmp(detail::amxProbeEnv(), 1) == 0)
+                {
+                    _tile_loadconfig(cfg);
+                    _tile_zero(0);
+                    _tile_release();
+                    result = true;
+                }
+                ::sigaction(SIGILL, &old_action, nullptr);
+                if (result)
+                    _tile_release(); // clear tile state fully before leaving admission
+            });
+            return result;
+        }();
+        return usable;
+#else
+        return false;
+#endif
     }
 
     /**
@@ -1133,6 +1216,7 @@ namespace llaminar2
     inline bool cpu_supports_avx512_vnni() { return false; }
     inline bool cpu_supports_amx_bf16() { return false; }
     inline bool cpu_supports_amx_int8() { return false; }
+    inline bool cpu_amx_data_instructions_usable() noexcept { return false; }
     inline const char *cpu_vendor() { return "Unknown"; }
     inline bool cpu_is_intel() { return false; }
     inline bool cpu_is_amd() { return false; }
