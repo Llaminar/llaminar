@@ -7079,7 +7079,13 @@ namespace llaminar2::cpu::native_quantised
         if (has_pooled_panels)
         {
             if (bundle.panel_workers != num_threads || partial_storage.size() < fused_partial_sum_floats)
-                throw std::invalid_argument("CPU fused pooled prefill panels require their admitted per-worker projection slab");
+                throw std::invalid_argument(
+                    "CPU fused pooled prefill panels require their admitted per-worker projection slab: runtime_workers=" +
+                    std::to_string(num_threads) + " bundle_workers=" + std::to_string(bundle.panel_workers) +
+                    " required_floats=" + std::to_string(fused_partial_sum_floats) +
+                    " actual_floats=" + std::to_string(partial_storage.size()) +
+                    " panel_slot_floats=" + std::to_string(bundle.panel_slot_floats) +
+                    " projections=" + std::to_string(num_descs));
             const storage_proof::Bytes writes{partial_storage.data(), fused_partial_sum_floats * sizeof(float)};
             storage_proof::requireDisjoint(writes, {descs, static_cast<size_t>(num_descs) * sizeof(FusedVerifierRowsDesc)});
             for (int projection = 0; projection < num_descs; ++projection)
