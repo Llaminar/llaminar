@@ -718,11 +718,12 @@ namespace llaminar2::cpu::native_quantised
             if constexpr (multi_scale::usesRowPairs<Ops>)
             {
                 I columns01[Pairs]{}, columns23[Pairs]{};
-                if constexpr (Rows == 3)
+                if constexpr (Rows >= 3)
                 {
-                    // The odd row needs its own SDOT chain; retire each
-                    // pair before loading the next pair's grid indices.
-#pragma GCC unroll 1
+                    // The odd row needs its own SDOT chain. Four-row tiles
+                    // also bound decode live ranges with a two-pair unroll,
+                    // reducing spill pressure on the outer FP accumulators.
+#pragma GCC unroll 2
                     for (int group = 0; group < 8; group += 2)
                         consumePair<Ops>(std::bit_cast<int8x16_t>(multi_scale::decodeIQ3SGroup<4, Ops>(unit, column, group)),
                             std::bit_cast<int8x16_t>(multi_scale::decodeIQ3SGroup<4, Ops>(unit, column, group + 1)),
