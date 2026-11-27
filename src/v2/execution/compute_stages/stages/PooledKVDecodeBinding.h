@@ -918,30 +918,57 @@ public:
             }
             updates.push_back(std::move(*update));
         }
-        // Publish all layers: the bind calls are atomic per layer (a bind
-        // refusal leaves the earlier published bank superseded-but-live for
-        // readers of THIS request only — the destination was fresh, so a
-        // failed mid-way bind is surfaced as a hard refuse and the caller
-        // must not use this binding; no partial EXPOSURE exists).
+        // Publish ALL layers all-or-none: every update is committed first,
+        // every bank is bound and reffed, and NO cell becomes live until
+        // EVERY layer succeeded. On any mid-loop failure every committed
+        // snapshot is dropped (its release drops the bank reader count to
+        // zero and the bank returns to Free, fully unbound — the
+        // destination was fresh, so no reader or consumer ever saw a
+        // partial publication) and the COW grant falls out of scope. The
+        // invalid state is therefore UNREPRESENTABLE: a failed attach leaves
+        // this binding exactly as it was (no live publication, epoch
+        // unchanged, no private grant).
+        std::vector<CPUFP32PagedKVTable::Snapshot> snapshots;
+        snapshots.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+            snapshots.push_back(updates[static_cast<std::size_t>(layer)]->commit());
         std::vector<PagedKVSnapshotRef> refs;
         refs.reserve(cells_.size());
+        bool publish_ok = true;
         for (std::size_t layer = 0; layer < cells_.size(); ++layer)
         {
-            auto snapshot = updates[static_cast<std::size_t>(layer)]->commit();
-            if (!table_->bindPublication(snapshot, request_id_, slot_))
+            if (!table_->bindPublication(snapshots[static_cast<std::size_t>(layer)],
+                    request_id_, slot_))
             {
                 LOG_ERROR("[PooledKVDecodeBinding] Shared prefix bind refused at layer " << layer);
-                return false;
+                publish_ok = false;
+                break;
             }
-            refs.push_back(table_->refFor(snapshot, request_id_, slot_));
-            if (!refs.back().valid())
+            const auto ref = table_->refFor(snapshots[static_cast<std::size_t>(layer)],
+                request_id_, slot_);
+            if (!ref.valid())
             {
                 LOG_ERROR("[PooledKVDecodeBinding] Shared prefix ref refused at layer " << layer);
-                return false;
+                publish_ok = false;
+                break;
             }
+            refs.push_back(ref);
+        }
+        if (!publish_ok)
+        {
+            // Rollback: no cell was assigned yet, so dropping every snapshot
+            // here clears every published bank (readers 1 -> 0 -> clear ->
+            // Free/unbound). The COW grant local releases on return.
+            snapshots.clear();
+            return false;
+        }
+        // Every layer published and bound: now (and only now) make the
+        // cells live.
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
             auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
-            cell.ref = refs.back();
-            cell.snapshot = std::move(snapshot);
+            cell.ref = refs[static_cast<std::size_t>(layer)];
+            cell.snapshot = std::move(snapshots[static_cast<std::size_t>(layer)]);
         }
         // Retain the COW grant for the bank's lifetime (my private pages
         // stay owned by this binding, never retiring while read).

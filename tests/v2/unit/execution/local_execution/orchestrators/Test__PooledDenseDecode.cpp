@@ -1402,6 +1402,19 @@ TEST(PooledDenseDecode, SharedPrefixAttachDeduplicatesAndDiverges)
     EXPECT_TRUE(dst_pages[0].sharedBacked()) << "full prefix pages are deduplicated shared frames";
     EXPECT_FALSE(dst_pages[1].sharedBacked()) << "partial prefix remainder is a private COW clip";
     EXPECT_EQ(dst_pages[1].rows(), 1);
+    // F2: frame-identity proof. sharedBacked() only tells the kind; the
+    // exact same FRAME means the native K/V data pointer is identical to the
+    // source page's (both page entries resolve the same immutable bytes).
+    {
+        const auto src_view = src.priorFor(0)->snapshot.view();
+        const auto dst_view = dst.priorFor(0)->snapshot.view();
+        EXPECT_EQ(dst_view.key(0, 0), src_view.key(0, 0))
+            << "destination full page is NOT the source frame (different address)";
+        EXPECT_EQ(dst_view.value(0, 0), src_view.value(0, 0))
+            << "destination full page pointer differs from the source frame";
+        EXPECT_EQ(dst_view.key(7, 0), src_view.key(7, 0))
+            << "full-page tail row pointer differs (not one shared frame)";
+    }
     // Byte-identity of the attached prefix vs the source's matching rows.
     {
         const auto src_view = src.priorFor(0)->snapshot.view();
@@ -1500,4 +1513,190 @@ TEST(PooledDenseDecode, SharedPrefixAttachDeduplicatesAndDiverges)
                 static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
             << "shared full page mutated after source continued at row " << row;
     }
+}
+
+/** @test F3: a page-boundary shared-prefix attach copies NOTHING.
+ * rows == page_tokens (8, one full page) and rows == 2*page_tokens (16)
+ * attach every page as a shared frame; there is no private COW clip, the
+ * destination is byte-equal to the source, and the shared pages remain
+ * byte-identical after the source continues decoding. */
+TEST(PooledDenseDecode, SharedPrefixAttachPageBoundaryCopiesNothing)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 18> prompt_src{1, 3, 5, 7, 9, 11, 13, 15, 17,
+        19, 21, 23, 25, 27, 29, 31, 33, 35};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 32;
+
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 4 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 8;
+        budget.max_pages_per_request = 64;
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/fx.config.n_layers, /*admitted_issuances=*/10, /*readers_per_bank=*/4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        auto table_geom = plan->table_geometry;
+        table_geom.bank_count = 2 * table_geom.bank_count;
+        table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+        table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+        auto pool_geom = plan->pool_geometry;
+        pool_geom.frames = 64 + 8 * pool_geom.frames;
+        pool_geom.request_records = 8;
+        auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+        widened->pool_geometry = pool_geom;
+        widened->table_geometry = table_geom;
+        widened->total_bytes = PhysicalPagePool::physicalBytes(pool_geom, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=widened->total_bytes,
+            .admission_available_bytes=widened->total_bytes},
+            PhysicalMemoryOwner::KVCache, widened->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *widened, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    // SOURCE: 18 rows = 2 full pages (8+8) + 2 partial.
+    PagedKVInstance src_instance;
+    ASSERT_TRUE(make_instance(src_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> src_owner;
+    PreparedWeightStore src_store;
+    std::shared_ptr<QwenStandardGraph> src_builder;
+    make_runner(fx, src_owner, src_store, src_builder);
+    PooledKVDecodeBinding src(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/411, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    src_owner->setPooledDecodeBinding(&src);
+    ASSERT_OK("source prefill", src_owner->forward(prompt_src.data(), 18, 1) != nullptr);
+    EXPECT_EQ(src.priorFor(0)->snapshot.view().rows(), 18);
+    ASSERT_EQ(static_cast<int>(src.priorFor(0)->snapshot.view().pages().size()), 3);
+
+    // TWO boundary destinations: one 8-row (single page), one 16-row
+    // (two pages). Both attach with rows on an exact page boundary.
+    PagedKVInstance dst8_instance;
+    ASSERT_TRUE(make_instance(dst8_instance));
+    PagedKVInstance dst16_instance;
+    ASSERT_TRUE(make_instance(dst16_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> dst8_owner;
+    PreparedWeightStore dst8_store;
+    std::shared_ptr<QwenStandardGraph> dst8_builder;
+    std::unique_ptr<DeviceGraphOrchestrator> dst16_owner;
+    PreparedWeightStore dst16_store;
+    std::shared_ptr<QwenStandardGraph> dst16_builder;
+    make_runner(fx, dst8_owner, dst8_store, dst8_builder);
+    make_runner(fx, dst16_owner, dst16_store, dst16_builder);
+
+    PooledKVDecodeBinding dst8(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/412, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    ASSERT_TRUE(dst8.attachSharedPrefix(src, 8));
+    dst8_owner->setPooledDecodeBinding(&dst8);
+    const auto &dst8_pages = dst8.priorFor(0)->snapshot.view().pages();
+    ASSERT_EQ(static_cast<int>(dst8_pages.size()), 1);
+    EXPECT_TRUE(dst8_pages[0].sharedBacked())
+        << "boundary (8-row) attach: the page is a shared frame";
+    {
+        const auto src_view = src.priorFor(0)->snapshot.view();
+        const auto dst_view = dst8.priorFor(0)->snapshot.view();
+        EXPECT_EQ(dst_view.key(0, 0), src_view.key(0, 0))
+            << "8-row boundary attach is not the source frame";
+        for (int row = 0; row < 8; ++row)
+        {
+            EXPECT_EQ(std::memcmp(dst_view.key(row, 0), src_view.key(row, 0),
+                    static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                << "8-row boundary K diverged at row " << row;
+            EXPECT_EQ(std::memcmp(dst_view.value(row, 0), src_view.value(row, 0),
+                    static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                << "8-row boundary V diverged at row " << row;
+        }
+    }
+
+    PooledKVDecodeBinding dst16(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/413, /*slot=*/2,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    ASSERT_TRUE(dst16.attachSharedPrefix(src, 16));
+    dst16_owner->setPooledDecodeBinding(&dst16);
+    const auto &dst16_pages = dst16.priorFor(0)->snapshot.view().pages();
+    ASSERT_EQ(static_cast<int>(dst16_pages.size()), 2);
+    EXPECT_TRUE(dst16_pages[0].sharedBacked())
+        << "16-row boundary attach page 0 is a shared frame";
+    EXPECT_TRUE(dst16_pages[1].sharedBacked())
+        << "16-row boundary attach page 1 is a shared frame";
+    {
+        const auto src_view = src.priorFor(0)->snapshot.view();
+        const auto dst_view = dst16.priorFor(0)->snapshot.view();
+        EXPECT_EQ(dst_view.key(0, 0), src_view.key(0, 0))
+            << "16-row boundary attach page 0 is not the source frame";
+        EXPECT_EQ(dst_view.key(8, 0), src_view.key(8, 0))
+            << "16-row boundary attach page 1 is not the source frame";
+        for (int row = 0; row < 16; ++row)
+        {
+            EXPECT_EQ(std::memcmp(dst_view.key(row, 0), src_view.key(row, 0),
+                    static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                << "16-row boundary K diverged at row " << row;
+            EXPECT_EQ(std::memcmp(dst_view.value(row, 0), src_view.value(row, 0),
+                    static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                << "16-row boundary V diverged at row " << row;
+        }
+    }
+
+    // The source continues decoding: the boundary-attached pages stay shared
+    // and byte-identical (immutability after the source's next step).
+    const int32_t one = 2;
+    const int32_t two = 4;
+    ASSERT_OK("source decode", src_owner->forward(&one, 1, 1) != nullptr);
+    {
+        const auto src_after = src.priorFor(0)->snapshot.view();
+        const auto dst8_after = dst8.priorFor(0)->snapshot.view();
+        const auto dst16_after = dst16.priorFor(0)->snapshot.view();
+        for (int row = 0; row < 8; ++row)
+        {
+            EXPECT_EQ(std::memcmp(dst8_after.key(row, 0), src_after.key(row, 0),
+                    static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                << "8-row shared page mutated after source continued at row " << row;
+            EXPECT_EQ(std::memcmp(dst16_after.key(row, 0), src_after.key(row, 0),
+                    static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                << "16-row shared page 0 mutated after source continued at row " << row;
+            EXPECT_EQ(std::memcmp(dst16_after.key(row + 8, 0), src_after.key(row + 8, 0),
+                    static_cast<std::size_t>(fx.config.head_dim) * sizeof(float)), 0)
+                << "16-row shared page 1 mutated after source continued at row " << row + 8;
+        }
+    }
+    // Still live at exactly the attached row counts.
+    EXPECT_EQ(dst8.priorFor(0)->snapshot.view().rows(), 8);
+    EXPECT_EQ(dst16.priorFor(0)->snapshot.view().rows(), 16);
 }
