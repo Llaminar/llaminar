@@ -979,10 +979,14 @@ namespace llaminar2::cpu::native_quantised
                     if (first < last)
                     {
                         auto base = codedBase<Coded, Ops>(root + geometry.headerOffset(0, first), column);
+                        int next_header = (first / 8 + 1) * 8;
                         for (int block = first; block < last; ++block)
                         {
-                            if (block != first && block % 8 == 0)
+                            if (block == next_header)
+                            {
                                 base = codedBase<Coded, Ops>(root + geometry.headerOffset(0, block), column);
+                                next_header += 8;
+                            }
                             visit(block, root + geometry.blockOffset(0, block), base);
                         }
                     }
