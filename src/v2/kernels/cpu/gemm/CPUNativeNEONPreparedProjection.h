@@ -279,7 +279,7 @@ namespace llaminar2::cpu::native_quantised
          * @details No check can fail here: publication, policy, encoding and
          * geometry were admitted before the team, and metadata by the seal.
          */
-        template <Dot Instruction, int Strips = 0> void executeAdmitted() const noexcept
+        template <Dot Instruction, int Strips = 0> [[gnu::always_inline]] inline void executeAdmitted() const noexcept
         {
             executeWithAdmitted<multi_scale::NEONMultiScaleOps<leafInstruction<Instruction>()>, Strips>();
         }
@@ -308,7 +308,7 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /** @brief Run one admitted tile with an explicit operation set; cannot fail. */
-        template <typename Ops, int Strips = 0> void executeWithAdmitted() const noexcept
+        template <typename Ops, int Strips = 0> [[gnu::always_inline]] inline void executeWithAdmitted() const noexcept
         {
             if (weights_.usesCompactMultiScale() && weights_.codebook_id != 7 && weights_.codebook_id != 11)
             {
