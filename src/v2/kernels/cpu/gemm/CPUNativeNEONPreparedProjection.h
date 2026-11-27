@@ -1700,9 +1700,8 @@ namespace llaminar2::cpu::native_quantised
                 using I = typename Ops::I;
                 using F = typename Ops::F;
                 constexpr bool ordered = Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert;
-                // Q5_K SMMLA retires each row's scalar half conversion at its
-                // contribution. Widening four scales together keeps the portable
-                // conversion's masks live across the decode and spills two vectors.
+                // Q5_K SMMLA widens only the row being accumulated. Keeping
+                // four widened scales live across decode spills two vectors.
                 constexpr bool widen_activation_rows =
                     Coded != 0 && Rows == 4 && ordered && Ops::instruction != Dot::ASIMD &&
                     !(Coded == 7 && multi_scale::usesRowPairs<Ops>);
@@ -1937,6 +1936,10 @@ namespace llaminar2::cpu::native_quantised
                                 const float activation_scale = [&]() __attribute__((always_inline)) {
                                     if constexpr (widen_activation_rows)
                                         return activation_scales[row];
+                                    else if constexpr (Coded == 7 && Rows == 4 && ordered && multi_scale::usesRowPairs<Ops>)
+                                        // The shared vector expander restores nonfinite payloads
+                                        // without four copies of the scalar conversion branch.
+                                        return vgetq_lane_f32(neon_fp16::widen(vdup_n_u16(a.d)), 0);
                                     else
                                         return nativeQuantisedFP16ScaleToFP32(a.d);
                                 }();
