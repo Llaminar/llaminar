@@ -969,6 +969,24 @@ namespace llaminar2::cpu::native_quantised
                     for (int block = first; block < last; ++block)
                         visit(block, root + geometry.blockOffset(0, block), root + geometry.headerOffset(0, block));
                 }
+                else if constexpr (Coded == 11 && Rows == 3 && Ordered && !multi_scale::usesRowPairs<Ops>)
+                {
+                    // The three-row ordered IQ3_S decode saturates the scalar register
+                    // set as well as the vector set. Keep only the partition frontier:
+                    // deriving each unit from its block retires the nested walk's end
+                    // and streaming pointer. Refresh widened scales only at a source
+                    // superblock boundary; block visits and FP additions stay ordered.
+                    if (first < last)
+                    {
+                        auto base = codedBase<Coded, Ops>(root + geometry.headerOffset(0, first), column);
+                        for (int block = first; block < last; ++block)
+                        {
+                            if (block != first && block % 8 == 0)
+                                base = codedBase<Coded, Ops>(root + geometry.headerOffset(0, block), column);
+                            visit(block, root + geometry.blockOffset(0, block), base);
+                        }
+                    }
+                }
                 else
                 {
                     // IQ3_S: one header per superblock intersection, widened once outside
