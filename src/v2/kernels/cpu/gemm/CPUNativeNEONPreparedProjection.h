@@ -1828,8 +1828,13 @@ namespace llaminar2::cpu::native_quantised
                                 }
                             }
 #endif
-                            else if constexpr (nibble && kE8M0Scales<Map>)
+                            else if constexpr ((nibble && kE8M0Scales<Map>) ||
+                                (Physical == Encoding::NibbleLUTSourceScale && Rows == 3 && ordered &&
+                                 Ops::instruction == Dot::DotProd))
                             {
+                                // IQ4_XS's three ordered SDOT rows also retain activations in
+                                // SIMD lanes rather than three scalar pointers through the K walk.
+                                // This frees the scalar register used by partition induction.
                                 // Lane-indexed dots on each row's once-loaded block: broadcasting
                                 // every row/group activation word lets GCC hoist 24 broadcasts and
                                 // spill the row accumulators. Integer dots are exact in any order.
