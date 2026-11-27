@@ -79,21 +79,6 @@ namespace llaminar2::cpu::native_quantised
      */
     [[gnu::always_inline]] inline float32x4_t orderedPartitionSeedNEON() noexcept { return vdupq_n_f32(-0.0f); }
 
-    /**
-     * @brief Widen the current Q5_K SMMLA row's scale with a bounded scalar lifetime.
-     * @param value Original Q8_1 binary16 word.
-     * @return Exact portable FP32 bits, including nonfinite signs and payloads.
-     * @details Keep this row-local conversion independent of the shared compact
-     * metadata conversion program; only the current contribution needs its value.
-     */
-    [[gnu::always_inline]] inline float q5KRowActivationScaleNEON(std::uint16_t value) noexcept
-    {
-        if ((value & 0x7c00u) != 0x7c00u)
-            return static_cast<float>(std::bit_cast<float16_t>(value));
-        return std::bit_cast<float>(((std::uint32_t(value) & 0x8000u) << 16) |
-            0x7f800000u | ((std::uint32_t(value) & 0x03ffu) << 13));
-    }
-
     /** @brief Closed synchronous binding for up to four independently accumulated rows.
      * @tparam Rows Physical row tile in [1,4], independent of logical request depth.
      */
@@ -1954,8 +1939,6 @@ namespace llaminar2::cpu::native_quantised
                                 const float activation_scale = [&]() __attribute__((always_inline)) {
                                     if constexpr (widen_activation_rows)
                                         return activation_scales[row];
-                                    else if constexpr (Coded == 7 && Rows == 4 && ordered && multi_scale::usesRowPairs<Ops>)
-                                        return q5KRowActivationScaleNEON(a.d);
                                     else
                                         return nativeQuantisedFP16ScaleToFP32(a.d);
                                 }();

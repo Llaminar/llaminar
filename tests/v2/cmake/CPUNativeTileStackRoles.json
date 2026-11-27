@@ -6877,8 +6877,13 @@
    }
   }
  },
+<<<<<<< HEAD
  "pr73-neon-stack-iq4-ordered-address": {
   "file_sha256": "6a071d8fdba94d86e60cd01123b6fadc4d68a2b19d96c82b54fff76c873835e1",
+=======
+ "pr73-neon-stack-iq4-original-q5": {
+  "file_sha256": "3d536d7c9484cd4cc2631e48cc58ab21128cd619593d6cfbe8c3e29b226d4d51",
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
   "kernel_functions": [
    {
     "signature": "inline void executeBlockProgram() const noexcept"
@@ -7016,163 +7021,203 @@
    }
   ],
   "loops": {
-   "595": {
+   "580": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "q5KBlock pairs: group += 2 over 8"
    },
-   "630": {
+   "615": {
     "role": "group",
     "variable": "group",
     "trip": "8",
     "source": "q5KBlock: group < 8"
    },
-   "640": {
+   "625": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "q5KBlock: group < 4 (two groups each)"
    },
-   "742": {
+   "727": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "iq3sBlock pairs: group += 2 over 8"
    },
-   "781": {
+   "766": {
     "role": "group",
     "variable": "group",
     "trip": "8",
     "source": "iq3sBlock: group < 8"
    },
-   "948": {
+   "933": {
     "role": "superblock",
     "variable": "block",
     "trip": "ceil((K / P - 1) / 8) + 1",
     "source": "forPartitionBlocks IQ4_XS: superblocks met by one partition (upper bound, 8 blocks each)"
    },
-   "953": {
+   "938": {
     "role": "block",
     "variable": "block",
     "trip": "(K / P) / (ceil((K / P - 1) / 8) + 1)",
     "source": "forPartitionBlocks IQ4_XS: blocks of one superblock (partition blocks / superblock bound)"
    },
-   "959": {
+   "944": {
     "role": "block",
     "variable": "block",
     "trip": "K / P",
     "source": "forPartitionBlocks Coded == 0: [first, last)"
    },
-   "984": {
+   "969": {
     "role": "block",
     "variable": "block",
     "trip": "K / P if G else K",
     "source": "forPartitionBlocks Q5_K: flat [first, last) walk; last = K when not ordered"
    },
-   "992": {
+   "977": {
     "role": "superblock",
     "variable": "block",
     "trip": "ceil(((K / P if G else K) - 1) / 8) + 1",
     "source": "forPartitionBlocks coded: superblocks met by [first, last) (upper bound); last = K when not ordered"
    },
-   "997": {
+   "982": {
     "role": "block",
     "variable": "block",
     "trip": "(K / P if G else K) / (ceil(((K / P if G else K) - 1) / 8) + 1)",
     "source": "forPartitionBlocks coded: blocks of one superblock"
    },
-   "1222": {
+   "1207": {
     "role": "column",
     "variable": "column0",
     "trip": "C / (4 * S)",
     "source": "runQ4K: column0 += 4 * S"
    },
-   "1237": {
+   "1222": {
     "role": "partition",
     "variable": "partition",
     "trip": "P if G else 1",
     "source": "runQ4K: partitions_ when ordered (GPU-aligned), else 1"
    },
-   "1243": {
+   "1228": {
     "role": "superblock",
     "variable": "block",
     "trip": "ceil(((K / P if G else K) - 1) / 8) + 1",
     "source": "runQ4K: superblocks met by [first, last) (upper bound, 8 blocks each); last = K when not ordered"
    },
-   "1252": {
+   "1237": {
     "role": "block",
     "variable": "block",
     "trip": "(K / P if G else K) / (ceil(((K / P if G else K) - 1) / 8) + 1)",
     "source": "runQ4K: blocks of one superblock"
    },
-   "1293": {
+   "1278": {
     "role": "group",
     "variable": "group",
     "trip": "8",
     "source": "runQ4K (ASIMD/DotProd strips): group < 8"
    },
-   "1303": {
+   "1288": {
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "runQ4K: group < 4 (two nibble groups each)"
    },
+<<<<<<< HEAD
    "1708": {
+=======
+   "1691": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "column",
     "variable": "column",
     "trip": "C / (4 * S)",
     "source": "executeBlockProgram: panel walk"
    },
+<<<<<<< HEAD
    "1727": {
+=======
+   "1710": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "column",
     "variable": "column",
     "trip": "C / 4",
     "source": "executeBlockProgram: strip walk"
    },
+<<<<<<< HEAD
    "1747": {
+=======
+   "1730": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "partition",
     "variable": "partition",
     "trip": "P if (G or E != 3) else 1",
     "source": "executeBlockProgram: partitions_ when ordered or Coded == 0 (E != 3), else 1"
    },
+<<<<<<< HEAD
    "1807": {
+=======
+   "1790": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: low groups 0..3"
    },
+<<<<<<< HEAD
    "1810": {
+=======
+   "1793": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q6_K: high groups 4..7"
    },
+<<<<<<< HEAD
    "1820": {
+=======
+   "1803": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run Q5: Q5NativePayload::groups == 4"
    },
+<<<<<<< HEAD
    "1869": {
+=======
+   "1852": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run IQ4_XS grouped: group < 4 (two nibble groups each)"
    },
+<<<<<<< HEAD
    "1879": {
+=======
+   "1862": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "4",
     "source": "run nibble: group < 4 (two nibble groups each)"
    },
+<<<<<<< HEAD
    "2092": {
+=======
+   "2073": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "partition",
     "variable": "partition",
     "trip": "P",
     "source": "panel: partitions_"
    },
+<<<<<<< HEAD
    "2105": {
+=======
+   "2086": {
+>>>>>>> 30f7a0d2f (fix(cpu): restore admitted Q5 scalar row contribution program)
     "role": "group",
     "variable": "group",
     "trip": "8",
