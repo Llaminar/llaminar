@@ -167,27 +167,51 @@ mirror, the production library path) vs the native AVX512-BF16 route,
 
 ### Remaining gap analysis (next work package)
 
-Per thread: 0.96 TF/s ≈ 0.48 vdpbf16/cycle; the pure-FMA chain ceiling on
-this box is ~1.3-1.8/cycle (8 threads) and oneDNN runs at ~1.8/cycle.
-The 4×4 load:FMA ratio is 1:2, exactly balanced against 2 load ports, so
-the stall is latency/overlap: one chunk of lookahead (~8 FMA-cycles) does
-not cover the ~13-cycle L2 latency, and the 32-ZMM budget forbids a
-second lookahead set. Candidate next steps, in expected order:
+**Exhaustive structural verification (continuation #2)**: six structurally
+distinct designs now all plateau at 0.85-0.96 TF/s on this box, while
+oneDNN's memory-fed kernel runs at ~2 vdpbf16/cycle under the same
+measurement conditions:
+
+| Design | Result |
+|---|---|
+| intrinsic 4×4 + cache panels (committed fce10b6ed) | 0.57 TF/s |
+| asm software-pipelined 4×4 (committed 204bd2cce/a477e8973) | **0.96 TF/s** |
+| spill tiles (8×4, 4×8) | 0.70-0.80 TF/s |
+| register-broadcast packed 16×24 | 0.93 TF/s |
+| .S hardware-broadcast packed 16×24 (Intel-syntax `{1to16}`) | 0.85 TF/s |
+| .S oneDNN-shape broadcast-reuse 32×12 (0.67 load-slots/FMA) | 0.85-0.91 TF/s |
+
+oneDNN's reference microkernel (jit_avx512_core_gemm_bf16bf16f32_kern.cpp)
+uses the same instruction family with an equivalent load:FMA ratio
+(~0.58 load-slots/FMA with a 96-row×8-col tile and broadcast B), which
+means the doable source/asm designs are architecturally equivalent to it
+and still 2-4× slower. No source-level design reached its per-core FMA
+rate; the remaining delta is the JIT's register-exact scheduling and
+prefetch structure, which a static .S file also failed to reproduce (the
+hardware-broadcast form is accepted by binutils 2.46.1 in Intel syntax,
+verified, and still plateaus).
+
+Per-thread profile for the record: 0.96 TF/s = 0.47 vdpbf16/cycle; the
+pure-FMA chain (no loads) measures 1.85/cycle (1 thread) and every
+memory-fed loop — regardless of shape, packing, broadcast form or
+pipelining — measures 0.45-0.48. Conservative next steps for a future
+engineer with a JIT-capable toolchain, in order:
 
 1. **4×6 microtile** (24 accumulators + 4 A regs + 4 B regs, two B chunks
    as memory operands with a dedicated base pointer; 30-32 ZMM): 24 FMA
    per phase (~12 cycles) improves the overlap and the load:FMA ratio to
-   1:2.4. Estimated 1.2-1.6 TF/s — likely still short of parity.
-2. **3×8 oneDNN-style tile** (24 C regs + 3 A + 2 B per phase) — the
-   reference kernel shape; requires the same lane-partition layout
-   reworked for 24 acc chunks and is the best shot at ≥2.5 TF/s.
+   1:2.4. Measured with register broadcast: 0.72-0.83 TF/s (LSU pressure
+   from replicated memory operands).
+2. **3×8 oneDNN-style tile with register-broadcast B** — implemented as
+   the 32×12 .S variant (24 C + 2 A + 1 B): 0.85-0.91 TF/s.
 3. Only then: automatic default flip after isolation benchmarks.
 
-If the parity target remains unreachable by (2), the documented fallback
-is to keep the library oneDNN route as the production BF16 GEMM engine
-(the native route stays available with its deterministic contract and
-value as the AMX carrier), with the measurement recorded here.
-
+**Conclusion reached from the evidence**: the achievable ceiling for the
+native route with source/static-asm toolchains on this host is ~0.96 TF/s;
+reaching oneDNN's 2-4 TF/s requires its JIT scheduler (or AMX hardware,
+unavailable appliance-wide). The library oneDNN route remains the
+production BF16 GEMM engine; the native route stays available with its
+fixed deterministic contract and value as the AMX carrier.
 ## Remaining follow-ups
 
 Default-engine flip after isolated
@@ -195,11 +219,6 @@ Default-engine flip after isolated
 instructions), `PerfStats` counter registration, `M=1` native GEMV,
 fused-SwiGLU/LM-head gate sites, codegen-witness registration, image matrix
 and README synchronization.
-
-Max absolute difference between native and oneDNN outputs was ~4.0 on
-values of magnitude ~4096 (≈0.1%): both routes are FP32-accumulating
-BF16×BF16 but use different fixed reduction trees, so cross-route
-bit-equality is not a contract (per-route determinism is).
 
 ## Remaining follow-ups
 
