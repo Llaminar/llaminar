@@ -23,6 +23,29 @@ SPEC.loader.exec_module(C)
 class StaticSelectionBoundaryTest(unittest.TestCase):
     """Compiler-free controls for non-authority manifests and bounded input grammars."""
 
+    def test_compiler_alias_extent_contract(self):
+        """Exact directed weak aliases only; all other coincident extents fail."""
+        first = C.ObjectSymbol("body", ".text.body", 0, 4, "function", "weak")
+        second = first._replace(name="alias")
+        image = C.ObjectImage(False, {}, [first, second], {})
+        assembly = ".section .text.body,\"axG\",@progbits\n.set alias,body\n"
+        self.assertEqual(C._static_alias_extent(image, "alias", assembly), ("body", frozenset({"body", "alias"})))
+        self.assertEqual(C._static_alias_extent(image, "body", assembly.replace(".set alias,body", "alias = body"))[0], "body")
+        for changed in (second._replace(size=8), second._replace(section=".text.other"),
+                        second._replace(kind="indirect"), second._replace(kind="other"),
+                        second._replace(binding="global"), second._replace(visibility="hidden")):
+            with self.subTest(symbol=changed), self.assertRaises(ValueError):
+                C._static_alias_extent(image._replace(symbols=[first, changed]), "body", assembly)
+        for text in ("", assembly.replace("alias,body", "alias,wrong"),
+                     assembly + ".set alias,body\n", assembly + ".set third,body\n",
+                     assembly.replace(".text.body", ".text.other"),
+                     assembly.replace(".set alias,body", ".set alias,body+0")):
+            with self.subTest(assembly=text), self.assertRaises(ValueError):
+                C._static_alias_extent(image, "body", text)
+        with self.assertRaises(ValueError):
+            C._static_alias_extent(image._replace(symbols=[first, second, second._replace(name="third")]),
+                                   "body", assembly)
+
     def test_manifest_and_enum_cannot_construct_authority(self):
         for key in (None, {}, "static-executable", "0" * 64):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "native verifier"):
@@ -154,6 +177,66 @@ class StaticSelectionBoundaryTest(unittest.TestCase):
 
 
 class StaticSelectionNativeTest(unittest.TestCase):
+    def test_real_compiler_alias_selected_once(self):
+        """Replay GNU14's constructor alias through native selection and CallModel."""
+        compiler = shutil.which("g++-14")
+        self.assertIsNotNone(compiler, "native alias test requires GNU14")
+        self.assertEqual(os.uname().machine, "aarch64")
+        root = Path(tempfile.mkdtemp(prefix="static-alias-", dir=os.environ.get("LLAMINAR_STATIC_TEST_ARTIFACTS")))
+        print(f"Retained native compiler alias: {root}", flush=True)
+        source = ('template<int N> struct Chosen { __attribute__((noinline)) Chosen(); int value; };\n'
+                  'template<int N> Chosen<N>::Chosen():value(N){}\n')
+        for name, wrapper in (("f", "use"), ("g", "other")):
+            (root / (name + ".cpp")).write_text(source + f'int {wrapper}(){{Chosen<7> x; return x.value;}}\n')
+        (root / "main.cpp").write_text("extern int use(); int main(){return use();}\n")
+        commands = {}
+        for name in ("f", "g", "main"):
+            command = C.executed_command([compiler, "-ffunction-sections"], str(root / (name + ".cpp")),
+                                         root / (name + ".o"), root / (name + ".d"))
+            subprocess.run(command, cwd=root, check=True)
+            commands[name] = command
+        args = [compiler, "-fuse-ld=bfd", str(root / "main.o"), str(root / "f.o"), str(root / "g.o"),
+                f"-Wl,--dependency-file={root / 'production.d'}", "-o", str(root / "app")]
+        subprocess.run(args, cwd=root, check=True)
+        obj = (root / "f.o").read_bytes()
+        listing, _, _ = C.disassemble(subprocess.check_output([compiler, "-print-prog-name=objdump"], text=True).strip(), root / "f.o")
+        image = C.read_object(obj)
+        unit = C.make_unit("winner", image, C.normalize_disassembly(listing, image))
+        target, alias = "_ZN6ChosenILi7EEC2Ev", "_ZN6ChosenILi7EEC1Ev"
+        paths = C.JobPaths(str(root / "f.cpp"), str(root / "f.o"), str(root / "f.d"), str(root), None)
+        identity = C.compiler_identity(subprocess.check_output([compiler, "--version"], text=True))
+        plan = C.driver_plan(commands["f"], str(root), identity, paths)
+        replay = C.StaticB1Replay(commands["f"], str(root), paths.source, plan,
+                                  root / "f.o", root / "f.d", root / "replayed.s")
+        with self.assertRaisesRegex(ValueError, "without B1"):
+            C.verify_static_executable_selection(args, root, root / "app", root / "no-plan", unit, obj, obj, target)
+        authority = C.verify_static_executable_selection(args, root, root / "app", root / "valid", unit, obj, obj,
+                                                        target, b1=replay)
+        self.assertEqual(authority.aliases, frozenset({target, alias}))
+        model = C.CallModel({"winner": unit}, {alias: authority})
+        for name in (target, alias):
+            self.assertEqual(model.resolve(unit, name), ("helper", unit, authority.target))
+        # Both call spellings resolve before summary caching: exactly one body/context.
+        context = C.CallContext(tuple(), tuple(), tuple(), None, False, 0)
+        self.assertIs(model.summary(unit, model.resolve(unit, alias)[2], context),
+                      model.summary(unit, model.resolve(unit, target)[2], context))
+        self.assertEqual(len(model.cache), 1)
+        retained = root / "valid" / "production.s"
+        retained.write_text(retained.read_text() + "\n.set wrong,body\n")
+        self.assertEqual(model.resolve(unit, alias)[0], "fail")
+        with self.assertRaisesRegex(ValueError, "differs from selected"):
+            C._static_replay_b1(replay, obj + b"changed", root / "valid")
+        stale = dict(plan, jobs=[list(job) for job in plan["jobs"]])
+        stale["jobs"][0].append("-unknown-option")
+        with self.assertRaises(ValueError):
+            C._static_replay_b1(replay._replace(plan=stale), obj, root / "valid")
+        assembly = (root / "replayed.s").read_text()
+        for changed in (assembly.replace(f".set\t{alias},{target}", f".set\t{alias},wrong"),
+                        assembly + f"\n.set {alias},{target}\n"):
+            with self.assertRaises(ValueError):
+                C._static_alias_extent(image, target, changed)
+
+
     """Real linker acquisition; host acquisition is not AArch64 selection qualification."""
 
     def test_native_gnu14_capture_and_nonbfd_gc_controls(self):

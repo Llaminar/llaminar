@@ -1954,19 +1954,113 @@ def _static_unit_fingerprint(unit: "Unit") -> bytes:
     return hashlib.sha256(repr((tuple(lines), builtin(fields))).encode()).digest()
 
 
+class StaticB1Replay(NamedTuple):
+    """Exact validated production compile replay inputs; never an alias assertion.
+
+    Object/dependency paths are scratch B1 outputs, not production outputs.
+    The driver-observed plan and input closure are revalidated before execution.
+    """
+    command: list[str]
+    directory: str
+    source: str
+    plan: dict
+    obj: Path
+    dependencies: Path
+    assembly: Path
+
+
+def _static_replay_b1(replay: StaticB1Replay, selected: bytes, artifacts: Path) -> dict[str, str]:
+    """Bind the actual assembler input to whole selected-object bytes and tool/source closure."""
+    if type(replay) is not StaticB1Replay:
+        raise ValueError("static alias requires typed B1 replay inputs")
+    identity = compiler_identity(subprocess.check_output(
+        [replay.command[0], "--version"], cwd=replay.directory, text=True))
+    closure = read_depfile(replay.dependencies, replay.directory)
+    before = bind_inputs(closure)
+    paths = JobPaths(replay.source, str(replay.obj), str(replay.dependencies), replay.directory, frozenset(before))
+    validate_plan(replay.plan["jobs"], identity, paths)
+    programs = program_identities(replay.plan, replay.command)
+    observed = driver_plan(replay.command, replay.directory, identity, paths)
+    if plan_shape(observed) != plan_shape(replay.plan):
+        raise ValueError("static B1 plan differs from actual driver")
+    if replay.obj.read_bytes() != selected:
+        raise ValueError("static B1 object differs from selected object")
+    replay_plan(replay.plan, replay.directory, replay.obj, replay.dependencies, replay.assembly)
+    if replay.obj.read_bytes() != selected or bind_inputs(closure) != before or \
+            program_identities(replay.plan, replay.command) != programs or \
+            plan_shape(driver_plan(replay.command, replay.directory, identity, paths)) != plan_shape(replay.plan):
+        raise ValueError("static B1 replay inputs/programs/object changed")
+    retained = artifacts / "production.s"
+    retained.write_bytes(replay.assembly.read_bytes())
+    plan_file = artifacts / "b1-plan.json"
+    plan_file.write_text(json.dumps(dict(command=replay.command, directory=replay.directory,
+                                       plan=replay.plan, programs=programs, inputs=before), sort_keys=True))
+    files = {str(retained.resolve()): _static_hash(retained.read_bytes()),
+             str(plan_file.resolve()): _static_hash(plan_file.read_bytes())}
+    for path in [*closure, str(replay.obj), str(replay.dependencies), str(replay.assembly)]:
+        path = Path(path).resolve(strict=True)
+        files[str(path)] = _static_hash(path.read_bytes())
+    for program in programs.values():
+        path = Path(program["selected"]).resolve(strict=True)
+        files[str(path)] = _static_hash(path.read_bytes())
+    return files
+
+
+def _static_alias_extent(image: ObjectImage, target: str, assembly: str) -> tuple[str, frozenset[str]]:
+    """Prove exactly one directed compiler alias, not coincident bytes or linker folding."""
+    originals = [s for s in image.symbols if s.name == target]
+    if len(originals) != 1:
+        raise ValueError("ambiguous static input symbol")
+    original = originals[0]
+    overlaps = [s for s in image.symbols if s.section == original.section and s.size and
+                s.value < original.value + original.size and original.value < s.value + s.size and
+                s.kind in ("function", "indirect", "other")]
+    if len(overlaps) != 2 or any(s.kind != "function" or s.binding != "weak" or
+            s.visibility != "default" or (s.section, s.value, s.size) !=
+            (original.section, original.value, original.size) for s in overlaps):
+        raise ValueError("static input alias extent/binding is not an exact weak/default function pair")
+    names = frozenset(s.name for s in overlaps)
+    if len(names) != 2 or any(sum(s.name == name for s in image.symbols) != 1 for name in names):
+        raise ValueError("ambiguous static input alias names")
+    # Full statements only. Reject chains, repeated definitions, and references in
+    # a different section; the selected object's section owns both names.
+    definitions = []
+    section = None
+    for raw in assembly.splitlines():
+        line = raw.strip()
+        directive = re.fullmatch(r'\.section\s+([^,\s]+)(?:,.*)?', line)
+        if directive:
+            section = directive[1].strip('"')
+        elif line in (".text", ".data", ".bss"):
+            section = line
+        match = re.fullmatch(r'\.set\s+([^,\s]+)\s*,\s*([^,\s]+)|([^=\s]+)\s*=\s*([^=\s]+)', line)
+        if match:
+            alias, body = (match[1], match[2]) if match[1] else (match[3], match[4])
+            if alias in names or body in names:
+                definitions.append((alias, body, section))
+        elif any(re.search(r'(?<![\w.$])' + re.escape(name) + r'(?![\w.$])', line) for name in names) and \
+                (line.startswith((".set", ".equ", ".equiv")) or "=" in line):
+            raise ValueError("unsupported static alias assignment")
+    if len(definitions) != 1 or frozenset(definitions[0][:2]) != names or definitions[0][2] != original.section:
+        raise ValueError("static alias requires exactly one directed assignment in its input section")
+    return definitions[0][1], names
+
+
 class TypedStaticExecutableSelection:
     """Ephemeral authority for one audited Unit selected by a complete native link."""
 
-    def __init__(self, key, unit: "Unit", target: str, files: dict[str, str], environment: dict) -> None:
+    def __init__(self, key, unit: "Unit", target: str, files: dict[str, str], environment: dict,
+                 aliases: frozenset[str] | None = None) -> None:
         if key is not _STATIC_SELECTION_KEY:
             raise ValueError("static selection requires the native verifier")
         self.unit, self.target = unit, target
+        self.aliases = aliases or frozenset({target})
         self.files, self.environment = dict(files), dict(environment)
         self.unit_identity = _static_unit_fingerprint(unit)
 
     def check(self, unit: "Unit", target: str) -> None:
         """Recheck retained bytes and process environment at the call-model boundary."""
-        if unit != self.unit or target != self.target or _static_unit_fingerprint(unit) != self.unit_identity:
+        if unit != self.unit or target not in self.aliases or _static_unit_fingerprint(unit) != self.unit_identity:
             raise ValueError("static selected Unit/target changed")
         if dict(os.environ) != self.environment:
             raise ValueError("static link environment changed")
@@ -2523,7 +2617,8 @@ def capture_static_link(argv: list[str], cwd: Path, output: Path, artifacts: Pat
 
 def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path, artifacts: Path,
                                        unit: "Unit", object_bytes: bytes, replay_bytes: bytes,
-                                       target: str, ninja: Path | None = None) -> TypedStaticExecutableSelection:
+                                       target: str, ninja: Path | None = None,
+                                       b1: StaticB1Replay | None = None) -> TypedStaticExecutableSelection:
     """Reconstruct native closure and prove the kept input owns the actual AArch64 callee."""
     recipe = capture_static_link(argv, cwd, output, artifacts, ninja=ninja, target=target)
     # A capture recipe is never itself sufficient: the following proof uses bytes.
@@ -2553,9 +2648,30 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
     _, info, visibility, section, address, size = symbols[0]
     if info != 0x22 or visibility != 0 or not 0 < section < len(headers) or size == 0:
         raise ValueError("static final symbol is not unique weak/default STT_FUNC")
-    if any(s[0] != target and s[1] & 15 in (2, 10) and s[3] == section and
-           s[4] < address + size and address < s[4] + s[5] for s in final_symbols):
-        raise ValueError("static final function has overlapping aliases")
+    overlaps = [s for s in final_symbols if s[0] != target and s[1] & 15 in (2, 10) and
+                s[3] == section and s[4] < address + size and address < s[4] + s[5]]
+    aliases, canonical, b1_files = frozenset({target}), target, {}
+    input_targets = [s for s in image.symbols if s.name == target]
+    input_overlap = len(input_targets) == 1 and any(
+        s.name != target and s.section == input_targets[0].section and s.size and
+        s.value < input_targets[0].value + input_targets[0].size and
+        input_targets[0].value < s.value + s.size and s.kind in ("function", "indirect", "other")
+        for s in image.symbols)
+    if overlaps or input_overlap:
+        if b1 is None:
+            raise ValueError("static final function has overlapping aliases without B1 authority")
+        b1_files = _static_replay_b1(b1, object_bytes, artifacts)
+        canonical, aliases = _static_alias_extent(image, target, (artifacts / "production.s").read_text())
+        for name in aliases:
+            entries = [s for s in final_symbols if s[0] == name]
+            if len(entries) != 1 or entries[0][1:] != symbols[0][1:]:
+                raise ValueError("static final alias differs from unique weak/default extent")
+        if len(overlaps) != 1 or overlaps[0][0] not in aliases or any(
+                s[0] in aliases for s in _static_symbols(data, headers, 11)):
+            raise ValueError("static final aliases contain extra overlap or dynsym entry")
+        if any(name not in unit.bodies or unit.bodies[name] != unit.bodies[canonical] or
+               unit.bodies.eh.get(name, {}) != unit.bodies.eh.get(canonical, {}) for name in aliases):
+            raise ValueError("static alias bodies differ from audited canonical body")
     final = headers[section]
     if not final["flags"] & 4 or not final["address"] <= address < address+size <= final["address"]+final["size"]:
         raise ValueError("static final symbol outside executable section")
@@ -2603,13 +2719,14 @@ def verify_static_executable_selection(argv: list[str], cwd: Path, output: Path,
     if placed + original.value != address or original.size != size:
         raise ValueError("static input/final symbol extent mismatch")
     files = dict(recipe["files"])
+    files.update(b1_files)
     for path, digest in files.items():
         if _static_hash(Path(path).read_bytes()) != digest:
             raise ValueError(f"static artifact changed after capture: {path}")
     for p in artifacts.iterdir():
         if p.is_file():
             files[str(p.resolve())] = _static_hash(p.read_bytes())
-    return TypedStaticExecutableSelection(_STATIC_SELECTION_KEY, unit, target, files, recipe["env"])
+    return TypedStaticExecutableSelection(_STATIC_SELECTION_KEY, unit, canonical, files, recipe["env"], aliases)
 
 
 class Unit(NamedTuple):
@@ -2675,7 +2792,17 @@ class CallModel:
 
     def __init__(self, units: dict[str, Unit], selection: dict | None = None,
                  helper_roles: dict | None = None) -> None:
-        self.units, self.selection, self.helper_roles = units, selection or {}, helper_roles or {}
+        self.units, self.selection, self.helper_roles = units, dict(selection or {}), helper_roles or {}
+        # One native authority owns an alias extent. Register either name once;
+        # resolution canonicalizes before recursion detection and summary caching.
+        for name, record in list(self.selection.items()):
+            if isinstance(record, TypedStaticExecutableSelection):
+                if name not in record.aliases:
+                    raise ValueError("static authority registered under an unrelated name")
+                for alias in record.aliases:
+                    if alias in self.selection and self.selection[alias] is not record:
+                        raise ValueError("multiple static authorities for one alias extent")
+                    self.selection[alias] = record
         self.cache: dict[tuple, "Analysis"] = {}
         self.active: list[tuple[str, str]] = []
 
@@ -2699,7 +2826,7 @@ class CallModel:
                     return "fail", None, str(error)
                 if self.units.get(copy.copy) != copy:
                     return "fail", None, "static selected Unit is not registered"
-                return "helper", copy, target
+                return "helper", copy, record.target
             copy = self.units.get(record.get("copy"))
             if copy is None or target not in copy.bodies or copy.functions.get(target) is None:
                 return "fail", None, f"unsupported call boundary (the link-selected copy is not audited): {target}"
