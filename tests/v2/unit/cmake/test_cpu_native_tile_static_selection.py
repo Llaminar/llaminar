@@ -360,7 +360,7 @@ class StaticSelectionNativeTest(unittest.TestCase):
         shadow.mkdir()
         # These are real native tool/input copies, never changes to installed SDK
         # files. -B makes the fixture's production link actually select them.
-        for name in ("Scrt1.o", "crti.o", "crtbeginS.o", "crtendS.o", "crtn.o", "liblto_plugin.so"):
+        for name in ("Scrt1.o", "crti.o", "crtbeginS.o", "crtendS.o", "crtn.o", "liblto_plugin.so", "libm.so"):
             source = subprocess.check_output([compiler, "-print-file-name=" + name], text=True).strip()
             self.assertTrue(Path(source).is_file(), source)
             shutil.copy2(source, shadow / name)
@@ -368,10 +368,9 @@ class StaticSelectionNativeTest(unittest.TestCase):
         shutil.copy2(collect, shadow / "collect2")
         (root / "main.cpp").write_text("int main(){return 0;}\n")
         subprocess.run([compiler, "-c", str(root / "main.cpp"), "-o", str(root / "main.o")], check=True)
-        script = root / "extra.ld"
-        script.write_text("SECTIONS { .proof_note : { BYTE(0x73) } } INSERT AFTER .comment;\n")
+        script = shadow / "libm.so"
         options = ["-B" + str(shadow) + "/", "-fuse-ld=bfd", str(root / "main.o"),
-                   "-Wl,-T," + str(script), "-Wl,--dependency-file=" + str(root / "production.d"),
+                   "-Wl,--dependency-file=" + str(root / "production.d"),
                    "-o", str(root / "app")]
         response = root / "link.rsp"
         response.write_text(" ".join(options))
@@ -449,6 +448,15 @@ class StaticSelectionNativeTest(unittest.TestCase):
             C.capture_static_link(args, root, root / "app", root / "dropped-implicit-crt")
         (root / "dropped-implicit-crt/injected-production.d").write_bytes(dep.read_bytes())
         dep.write_bytes(originals[dep])
+        extra = root / "extra.ld"
+        extra.write_text("SECTIONS { .proof_note : { BYTE(0x73) } } INSERT AFTER .comment;\n")
+        explicit_args = [compiler, *options, "-Wl,-T," + str(extra)]
+        explicit_args[explicit_args.index("-o")+1] = str(root / "explicit-script-app")
+        explicit_args = ["-Wl,--dependency-file=" + str(root / "explicit-script.d")
+                         if a.startswith("-Wl,--dependency-file=") else a for a in explicit_args]
+        native_run(explicit_args, check=True)
+        with self.assertRaisesRegex(ValueError, "trace/dependency input set mismatch"):
+            C.capture_static_link(explicit_args, root, root / "explicit-script-app", root / "unsupported-explicit-script")
 
 
 if __name__ == "__main__":
