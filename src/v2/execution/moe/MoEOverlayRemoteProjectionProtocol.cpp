@@ -251,8 +251,17 @@ namespace llaminar2
                 throw std::invalid_argument("Coded GPU relay has no complete live unit");
             layout.maximum_units_per_chunk = static_cast<uint32_t>(std::min<uint64_t>(units,
                 manifest.maximum_chunk_bytes / maximum_unit_bytes));
+            if (!layout.maximum_units_per_chunk)
+                throw std::invalid_argument("Coded GPU relay staging cannot admit a complete live repack unit: capacity_bytes=" +
+                    std::to_string(manifest.maximum_chunk_bytes) + ", maximum_unit_bytes=" +
+                    std::to_string(maximum_unit_bytes) + ", units=" + std::to_string(units) +
+                    ", maximum_units_per_chunk=0");
             if (!layout.valid())
-                throw std::invalid_argument("Coded GPU relay staging cannot admit a complete live repack unit");
+                throw std::invalid_argument("Coded GPU relay has invalid endpoint geometry or native format: N=" +
+                    std::to_string(layout.N) + ", K=" + std::to_string(layout.K) +
+                    ", cpu_K=" + std::to_string(layout.cpu_K) + ", gpu_N=" +
+                    std::to_string(layout.gpu_N) + ", gpu_K=" + std::to_string(layout.gpu_K) +
+                    ", maximum_units_per_chunk=" + std::to_string(layout.maximum_units_per_chunk));
             return layout;
         }
 

@@ -20,6 +20,7 @@
 #include "execution/moe/ExpertTierMigrationOperations.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "transfer/TransferEngine.h"
 #include "utils/DebugEnv.h"
@@ -615,7 +616,25 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Could not create all explicit three-tier streams");
                     }
-                    constexpr std::size_t blob_staging_bytes = 1024u;
+                    const auto *source_format =
+                        native_quantised_formats::forSourceIdentity(5, true);
+                    if (!source_format)
+                        throw std::runtime_error(
+                            "Q4_K source format is absent from NativeQuantised catalog");
+                    // Use the same retained staging BOM input as production
+                    // planning, not a private raw-payload-sized relay budget.
+                    // The protocol still communicates only live chunk bytes.
+                    constexpr std::size_t blob_staging_bytes =
+                        MoEOverlayCapacityAdmissionPolicy::kProductionStagingBytes;
+                    for (const auto &spec : kProjections)
+                    {
+                        const auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
+                            *source_format, spec.n, spec.k, 2, 0, 0,
+                            spec.projection, 1).deviceLayout();
+                        if (blob_staging_bytes < layout.cpuStorage().maximumWireUnitBytes())
+                            throw std::runtime_error(
+                                "Production staging cannot hold a complete coded projection unit");
+                    }
                     constexpr std::size_t blob_slots_per_device =
                         kProjectionCount * 2u;
                     cuda_progress_epoch_ =
@@ -652,12 +671,6 @@ namespace llaminar2
                             .perf_device =
                                 "cuda-priority0/rocm-priority1/cpu-priority2",
                         });
-
-                    const auto *source_format =
-                        native_quantised_formats::forSourceIdentity(5, true);
-                    if (!source_format)
-                        throw std::runtime_error(
-                            "Q4_K source format is absent from NativeQuantised catalog");
 
                     for (int expert = 0; expert < 3; ++expert)
                     {

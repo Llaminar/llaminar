@@ -13,6 +13,7 @@
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "execution/moe/MoEOverlayRemoteProjectionProtocol.h"
 #include "execution/moe/MoEOverlayWireIO.h"
+#include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "../../../utils/CodedGpuRelayWireFixture.h"
 
@@ -569,6 +570,28 @@ namespace llaminar2::test
                 continue;
             ++covered;
             SCOPED_TRACE(entry.quant_type);
+            if (format.codebook_id == 5)
+            {
+                // The three-tier gate/up and down geometries must admit a
+                // complete coded unit, not only its raw payload plane.
+                for (const auto [n, k] : {std::pair{192, 256}, std::pair{256, 192}})
+                {
+                    const Fixture::Projection root{Fixture::Residence::ParticipantOutputSlice,
+                        n, k, 0, n, 0, k};
+                    Fixture full_source(format, root, 0u, 11u);
+                    Fixture full_destination(format, root, 0u, 27u);
+                    const auto full_overlap = ExpertTierWeightProjectionIntersection::between(root, root);
+                    EXPECT_THROW(makeCodedGpuProjectionRelayLayouts(full_source.descriptor(),
+                        full_destination.descriptor(), full_overlap, 1024u), std::invalid_argument);
+                    const auto layouts = makeCodedGpuProjectionRelayLayouts(full_source.descriptor(),
+                        full_destination.descriptor(), full_overlap,
+                        MoEOverlayCapacityAdmissionPolicy::kProductionStagingBytes);
+                    EXPECT_TRUE(layouts.pack.valid());
+                    EXPECT_TRUE(layouts.unpack.valid());
+                    EXPECT_EQ(layouts.pack.chunkBytes(1), layouts.unpack.chunkBytes(1));
+                    EXPECT_GT(layouts.pack.cpuStorage().maximumWireUnitBytes(), 1024u);
+                }
+            }
             Fixture source(format, Fixture::source_root, 3u, 11u);
             Fixture destination(format, Fixture::destination_root, 5u, 27u);
             const auto src = source.descriptor();
