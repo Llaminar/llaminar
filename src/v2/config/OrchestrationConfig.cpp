@@ -13,8 +13,10 @@
 #include "OrchestrationConfig.h"
 #include "config/ActivationPrecisionPolicy.h"
 #include "config/ConfigValidator.h"
+#include "execution/config/ServingCapacity.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include "utils/Logger.h"
+#include <stdexcept>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
@@ -1688,6 +1690,39 @@ namespace llaminar2
     OrchestrationConfig OrchestrationConfig::defaults()
     {
         return OrchestrationConfig{};
+    }
+
+    void OrchestrationConfig::bindServingCapacityToRunnerSlots(bool serving_consumer)
+    {
+        if (!serving_consumer)
+        {
+            if (hasServingCapacityIntent())
+                throw std::invalid_argument(
+                    "--serving-resident-slots/--serving-response-leases/--serving-queue-capacity apply only to serve");
+            return;
+        }
+        if (!hasServingCapacityIntent())
+        {
+            if (batch_size > 1)
+                throw std::invalid_argument(
+                    "serve: --batch-size is not a serving option; continuous batching capacity is "
+                    "--serving-resident-slots S with --serving-response-leases R and --serving-queue-capacity Q");
+            return;
+        }
+        const auto request = servingCapacityRequest();
+        if (batch_size != 1 && batch_size != request.residentSlots())
+            throw std::invalid_argument("--batch-size conflicts with --serving-resident-slots");
+        batch_size = request.residentSlots();
+    }
+
+    ServingCapacityRequest OrchestrationConfig::servingCapacityRequest() const
+    {
+        if (!hasServingCapacityIntent())
+            return ServingCapacityRequest::automatic();
+        if (!serving_resident_slots || !serving_response_leases || !serving_queue_capacity)
+            throw std::logic_error("Serving capacity axes must be authored together (all or none)");
+        return ServingCapacityRequest::authored(*serving_resident_slots, *serving_response_leases,
+                                                *serving_queue_capacity);
     }
 
 } // namespace llaminar2

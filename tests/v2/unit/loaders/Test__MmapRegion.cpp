@@ -8,6 +8,7 @@
  * tiny local/memfd files and never load a model or initialize a GPU runtime.
  */
 
+#include "utils/NUMATopology.h"
 #include <gtest/gtest.h>
 
 #include "loaders/MmapRegion.h"
@@ -346,6 +347,9 @@ namespace llaminar2::test
 
     TEST(Test__MmapRegion, RequestedNumaBindFailureFailsFastByDefault)
     {
+        // A NUMA kernel binds strictly on every host, including test hosts
+        // whose own kernel has no NUMA support.
+        ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
         ScopedEnvVar allow_fallback("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK", nullptr);
         TemporaryMmapFile file;
 
@@ -359,5 +363,15 @@ namespace llaminar2::test
 
         EXPECT_EQ(region, nullptr)
             << "Requested NUMA placement must not silently fall back when binding cannot be satisfied";
+    }
+
+    TEST(Test__MmapRegion, NonNUMAKernelMapsNodeZeroWithoutBinding)
+    {
+        // On a kernel without NUMA support node 0 is the whole machine, so a
+        // node-0 placement maps without any memory-policy call.
+        ScopedNonNUMAKernelEvidenceForTest no_numa(ScopedNonNUMAKernelEvidenceForTest::nonNUMAKernel());
+        ScopedEnvVar allow_fallback("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK", nullptr);
+        TemporaryMmapFile file;
+        EXPECT_NE(MmapRegion::create(file.path().string(), 0, false, MmapRegion::PrefaultPolicy::Auto), nullptr);
     }
 } // namespace llaminar2::test

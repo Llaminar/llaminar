@@ -3414,3 +3414,86 @@ TEST(Test__OrchestrationConfigParser, NgramLocalHotCacheHasIndependentExplicitAr
     ArgvHelper absent{"llaminar2", "--ngram-storage", "gpu-adaptive-vram-ram-ssd"};
     EXPECT_FALSE(parser.parseArgs(absent.argc(), absent.argv()).ngram_table_policy.gpu_adaptive.local_hot_cache);
 }
+
+// ============================================================================
+// Serving Capacity (§9.4) Configuration Tests
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ServingCapacityFlagsParseAllAxesExact)
+{
+    ArgvHelper args{"llaminar2", "--serving-resident-slots", "1",
+                    "--serving-response-leases", "2", "--serving-queue-capacity", "0"};
+    const auto config = OrchestrationConfigParser{}.parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.serving_resident_slots, 1);
+    EXPECT_EQ(config.serving_response_leases, 2);
+    EXPECT_EQ(config.serving_queue_capacity, 0);
+    EXPECT_TRUE(config.hasServingCapacityIntent());
+}
+
+TEST(Test__OrchestrationConfigParser, ServingCapacityFlagsAbsentIsAutomatic)
+{
+    ArgvHelper args{"llaminar2"};
+    const auto config = OrchestrationConfigParser{}.parseArgs(args.argc(), args.argv());
+    EXPECT_FALSE(config.serving_resident_slots.has_value());
+    EXPECT_FALSE(config.serving_response_leases.has_value());
+    EXPECT_FALSE(config.serving_queue_capacity.has_value());
+    EXPECT_FALSE(config.hasServingCapacityIntent());
+}
+
+TEST(Test__OrchestrationConfigParser, ServingCapacityFlagsAcceptEqualsForms)
+{
+    ArgvHelper args{"llaminar2", "--serving-resident-slots=1",
+                    "--serving-response-leases=4", "--serving-queue-capacity=3"};
+    const auto config = OrchestrationConfigParser{}.parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.serving_resident_slots, 1);
+    EXPECT_EQ(config.serving_response_leases, 4);
+    EXPECT_EQ(config.serving_queue_capacity, 3);
+}
+
+TEST(Test__OrchestrationConfigParser, ServingCapacityFlagRejectsNonpositive)
+{
+    ArgvHelper resident{"llaminar2", "--serving-resident-slots", "0"};
+    EXPECT_THROW((void)OrchestrationConfigParser{}.parseArgs(resident.argc(), resident.argv()),
+                 std::invalid_argument);
+    ArgvHelper leases{"llaminar2", "--serving-response-leases", "-1"};
+    EXPECT_THROW((void)OrchestrationConfigParser{}.parseArgs(leases.argc(), leases.argv()),
+                 std::invalid_argument);
+    ArgvHelper queue{"llaminar2", "--serving-queue-capacity", "0"};
+    const auto config = OrchestrationConfigParser{}.parseArgs(queue.argc(), queue.argv());
+    EXPECT_EQ(config.serving_queue_capacity, 0); // zero queue is a valid axis
+}
+
+TEST(Test__OrchestrationConfigParser, ServingCapacityYamlParsesAllAxes)
+{
+    OrchestrationConfigParser parser;
+    const std::string yaml = R"(
+serving_resident_slots: 1
+serving_response_leases: 3
+serving_queue_capacity: 2
+)";
+    const auto config = parser.parseYamlString(yaml);
+    EXPECT_EQ(config.serving_resident_slots, 1);
+    EXPECT_EQ(config.serving_response_leases, 3);
+    EXPECT_EQ(config.serving_queue_capacity, 2);
+}
+
+TEST(Test__OrchestrationConfigParser, ServingCapacityHelpMentionsAllFlags)
+{
+    const auto help = OrchestrationConfigParser::getHelpText();
+    for (const auto *flag : {"--serving-resident-slots", "--serving-response-leases",
+                             "--serving-queue-capacity"})
+    {
+        EXPECT_NE(help.find(flag), std::string::npos) << flag;
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ServingCapacityDocumentRoundTripPreservesAxes)
+{
+    ArgvHelper args{"llaminar2", "--serving-resident-slots", "1",
+                    "--serving-response-leases", "2", "--serving-queue-capacity", "1"};
+    const auto config = OrchestrationConfigParser{}.parseArgs(args.argc(), args.argv());
+    const auto restored = deserializeOrchestrationConfig(serializeOrchestrationConfig(config));
+    EXPECT_EQ(restored.serving_resident_slots, config.serving_resident_slots);
+    EXPECT_EQ(restored.serving_response_leases, config.serving_response_leases);
+    EXPECT_EQ(restored.serving_queue_capacity, config.serving_queue_capacity);
+}

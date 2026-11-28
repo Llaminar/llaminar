@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include "execution/serving/ServingSession.h"
+#include "execution/serving/PooledServingSlotOwner.h"
 #include "../../models/ModelGenerationPolicy.h"
 
 #include "IOrchestrationRunner.h"
@@ -62,6 +64,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <deque>
+#include <map>
 #include <vector>
 
 namespace llaminar2
@@ -305,6 +309,33 @@ namespace llaminar2
         GenerationResult forceDecodeToken(int32_t token) override;
         bool supportsDecodeStepBatch(int request_batch) const override;
         GenerationBatchResult decodeStepBatch(int request_batch) override;
+        int servingBatchCapacity() const override;
+        using IOrchestrationRunner::beginServingBatch;
+        bool beginServingBatch(int capacity,
+                               std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage) override;
+        bool setupPooledServing(int capacity, int supported, std::string &error);
+        bool submitServingRequest(ServingBatchRequest request) override;
+        void cancelServingRequest(std::uint64_t id) override;
+        void grantServingTokens(std::uint64_t id, int tokens) override;
+        void forceServingToken(std::uint64_t id, int32_t token) override;
+        std::vector<ServingBatchEvent> stepServingBatch() override;
+        bool servingBatchIdle() const override;
+        bool servingBatchHasRunnableWork() const override;
+        std::string servingBatchUnsupportedReason() const override;
+        std::string servingBatchFailure() const override
+        {
+            return serving_session_ ? serving_session_->failure() : std::string{};
+        }
+        ServingBatchOccupancy servingBatchOccupancy() const override
+        {
+            return serving_session_ ? serving_session_->occupancy() : ServingBatchOccupancy{};
+        }
+        void setServingTraceRecorder(std::shared_ptr<IServingTraceRecorder> recorder) override;
+        std::optional<ServingContinuationManifest> suspendServingRequest(
+            std::uint64_t id, std::string &error) override;
+        bool restoreServingRequest(
+            ServingContinuationManifest &&manifest, std::string &error) override;
+        void endServingBatch() override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,
             int max_new_tokens,
@@ -914,6 +945,8 @@ namespace llaminar2
          * @return True when the existing admission is consistently published.
          */
         bool publishPhysicalMemoryAuthority();
+        /** @brief Shared physical-memory authority (null when unbacked). */
+        std::shared_ptr<PhysicalMemoryAuthority> physicalMemoryAuthority() const override;
 
         /**
          * @brief Validate that the model fits in device memory
@@ -1921,6 +1954,33 @@ namespace llaminar2
         };
 
         /**
+         * @brief Typed per-slot handoff bank for the capacity-one serving lane.
+         *
+         * The runner is the sole lifecycle owner: this bank is the slot-owned
+         * handoff state that replaces the former runner-global scalars. One
+         * record covers the single resident slot. `admission_epoch` identifies
+         * the admission that opened it, stamped by the runner at the public
+         * request-admission edge from its own monotonic per-slot generation
+         * counter. `retired` marks a bank whose request was retired at an
+         * exact retirement boundary. The epoch is admission bookkeeping and
+         * diagnostics for the qualified capacity increase; it is not a
+         * producer/consumer authentication token in this slice. Bank states
+         * are exactly three: live (opened by the current admission),
+         * retired-empty (consumed by an exact retirement boundary), and
+         * corrupt (payload present while retired — a detected inconsistency,
+         * refused as a fatal request diagnostic, never auto-repaired). Decode
+         * entries on a non-live bank are rejected before any mutation with a
+         * precise inactive-slot diagnostic; that is an intentionally hardened
+         * invalid-input contract, distinct from supported-call parity.
+         */
+        struct ServingSlotHandoff
+        {
+            /** @brief Monotonic per-slot admission generation that opened this bank. */
+            std::uint64_t admission_epoch{0};
+            /** @brief True once an exact retirement boundary consumed this bank. */
+            bool retired{true};
+
+            /**
          * @brief Whether current terminal logits already own the next decode edge.
          *
          * A missing @ref ready_mtp_condition_ means the token still needs to be
@@ -1928,8 +1988,8 @@ namespace llaminar2
          * condition means sampling already happened under the explicitly typed
          * authority above and must never be repeated.
          */
-        bool prefill_logits_ready_{false};
-        std::optional<ReadyMTPCondition> ready_mtp_condition_;
+            bool prefill_logits_ready_{false};
+            std::optional<ReadyMTPCondition> ready_mtp_condition_;
         /**
          * @brief Already-emitted correction token that still needs a main verifier row.
          *
@@ -1984,6 +2044,100 @@ namespace llaminar2
          * hidden state, and publication metadata remain device-owned.
          */
         std::optional<int> decode_transaction_planning_position_;
+
+            /** @return Whether any handoff payload is present in this bank. */
+            [[nodiscard]] bool hasPayload() const noexcept
+            {
+                return prefill_logits_ready_ || ready_mtp_condition_.has_value() ||
+                       pending_mtp_condition_token_.has_value() ||
+                       pending_mtp_condition_params_.has_value() ||
+                       pending_mtp_condition_resident_state_.has_value() ||
+                       prelaunched_mtp_first_sidecar_resident_state_.has_value() ||
+                       prelaunched_mtp_first_sidecar_params_.has_value() ||
+                       decode_transaction_planning_position_.has_value();
+            }
+
+            /**
+             * @brief THE single clearing implementation, owning the order.
+             *
+             * Clears lease-bearing resident values before their host
+             * companions, in the documented order. retireMTPRequestContinuation
+             * State(), admission replacement, and openFor() all delegate here;
+             * no other code may duplicate this sequence.
+             */
+            void retire() noexcept
+            {
+                ready_mtp_condition_.reset();
+                pending_mtp_condition_resident_state_.reset();
+                prelaunched_mtp_first_sidecar_resident_state_.reset();
+
+                pending_mtp_condition_token_.reset();
+                pending_mtp_condition_params_.reset();
+                prelaunched_mtp_first_sidecar_params_.reset();
+                prefill_logits_ready_ = false;
+                decode_transaction_planning_position_.reset();
+                retired = true;
+            }
+
+            /**
+             * @brief Open a fresh bank for a newly admitted request generation.
+             *
+             * Delegates the clearing to retire() so exactly one implementation
+             * owns the lease-first order; then stamps the admission generation
+             * and marks the bank live.
+             */
+            void openFor(std::uint64_t generation) noexcept
+            {
+                retire();
+                admission_epoch = generation;
+                retired = false;
+            }
+        };
+
+        /** Slot-owned handoff bank for the single resident request. */
+        ServingSlotHandoff slot_handoff_;
+        /** Monotonic per-slot admission generation owned by this runner. */
+        std::uint64_t serving_slot_generation_{0};
+
+    protected:
+        /**
+         * @brief Narrow production seam for exhaustion/near-max testing.
+         *
+         * Stages the admission generation without public API surface. Only the
+         * derived lifecycle-test fixture uses this; production callers never
+         * see it, and the admission edge still validates the staged value at
+         * its pre-mutation check.
+         */
+        void stageServingSlotGenerationForTest(std::uint64_t value) noexcept
+        {
+            serving_slot_generation_ = value;
+        }
+
+        [[nodiscard]] std::uint64_t servingSlotGenerationForTest() const noexcept
+        {
+            return serving_slot_generation_;
+        }
+
+        /** Read-only observation of the slot bank state for lifecycle evidence. */
+        [[nodiscard]] const ServingSlotHandoff &servingSlotHandoffForTest() const noexcept
+        {
+            return slot_handoff_;
+        }
+
+        /**
+         * @brief Inject corrupt slot-handoff state (payload in a retired bank)
+         *        for death-test coverage of the five production entrypoints.
+         *        This is a narrow fault-injection fixture, not mutable bank
+         *        exposure: the test calls this, then exercises an entrypoint
+         *        and expects the fatal precondition.
+         */
+        void injectCorruptSlotHandoffStateForTest() noexcept
+        {
+            slot_handoff_.retired = true;
+            slot_handoff_.prefill_logits_ready_ = true;
+        }
+
+    private:
         /** One immutable CPU/composed response admission; never a progress counter. */
         std::optional<DeviceGenerationAdmissionRequest> host_sparse_query_admission_;
         /**
@@ -2220,6 +2374,21 @@ namespace llaminar2
             bool is_complete = false;
         };
         std::vector<BatchedDecodeRequestState> batched_request_states_;
+
+        /**
+         * @brief The continuous-batching session (runner-owned lifecycle).
+         *
+         * Exists while a serving batch is open; it drives slot-addressed rows
+         * of runner_ through serving_rows_adapter_.
+         */
+        std::unique_ptr<IServingRowExecutor> serving_rows_adapter_;
+        std::unique_ptr<ServingSession> serving_session_;
+        /** @brief R52 pooled serving: the composed instance + per-slot pool
+         * binding owner (present only when the operator configured an
+         * explicit paged-KV pool cap; the default ring path is untouched). */
+        std::unique_ptr<PagedKVInstance> pooled_instance_;
+        std::unique_ptr<PooledServingSlotOwner> pooled_slots_;
+        std::shared_ptr<IServingTraceRecorder> serving_trace_recorder_;
         bool batched_decode_active_{false};
         int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited
         bool mpi_coordinated_mode_{false};
@@ -2231,6 +2400,16 @@ namespace llaminar2
          * during plan construction and never changes during inference.
          */
         int mpi_coordinated_root_rank_{0};
+        /** @brief SEALED request/serving authority resolved BEFORE BOM
+         *  admission (the same vocabulary-head source the compute graph uses),
+         *  so the serving pool charge, the coordinated root and the public
+         *  frontend consume ONE authority — never a pre-graph default. */
+        /** @brief SEALED request authority (engaged only after the
+         *  sealRequestAuthority phase; nullopt = NOT YET SEALED — never a
+         *  valid-looking default 0). */
+        std::optional<int> sealed_request_authority_rank_;
+        /** @brief Resolve/seal the request authority before BOM admission. */
+        int resolveSealedRequestAuthority();
         /** Sole typed authority for coordinated command admission. */
         MPIWorkerCommandLifecycle mpi_worker_command_lifecycle_{
             MPIWorkerCommandLifecycle::AcceptingCommands};

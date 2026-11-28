@@ -34,6 +34,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "../../../mocks/MockMPIContext.h"
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -460,7 +461,7 @@ HostedResetPreparation prepareHostedResetCases(test::PreparedNativeLookupFixture
             constexpr std::size_t stride=5*sizeof(IQ4_NLBlock);
             const auto idCapacity=static_cast<std::size_t>(capacity)*16;
             const auto layout=ImmutableLookupLayout::create(idCapacity,stride);
-            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
 
             PhysicalMemoryPlanBuilder plan;
             plan.add(host,PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(file.source(),policy));
@@ -546,7 +547,7 @@ void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
             auto *live=storage.allocate<int>(1);auto *ids=storage.allocate<std::int64_t>(idCapacity);
             auto *scratch=storage.allocate<std::byte>(idCapacity*stride);auto *output=storage.allocate<float>(outputElements);
             const auto layout=ImmutableLookupLayout::create(idCapacity,stride);
-            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
             auto source=HostImmutableRowProvider::fromWholeTable(std::make_unique<ImmutableRowTable>(file.source(),policy,
                 DeviceId::cpu(),memory,ImmutableRowTableHostPlacement::taskPolicy()));
             const RetainedHostServiceInstance ioKey{0,device,RetainedHostServiceRole::ImmutableLookupIO,ioOrdinal++};RetainedHostServiceDeclarations::Builder declaration(0);declaration.add(ioKey,io);

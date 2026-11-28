@@ -56,6 +56,8 @@
 #include "execution/moe/MoEOverlayRowCandidateFinalization.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "planning/TensorParallelSourceDeclaration.h"
+#include "planning/PagedKVInstanceFactory.h"
+#include "planning/PagedKVInstancePlan.h"
 #include "planning/OriginalRankCapacityExchange.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
@@ -72,6 +74,8 @@
 #include "execution/moe/MoEOverlayCPUHostMaintenance.h"
 #include "execution/moe/ExpertHistogramServingRegime.h"
 #include "planning/ResolvedRankOrchestration.h"
+#include "execution/config/ServingCapacity.h"
+#include "execution/config/ServingPoolMemoryDemand.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
 #include "IOrchestrationRunnerFactory.h"
 #include "ModelContextRetirement.h"
@@ -96,6 +100,7 @@
 #include "../mtp/MTPSpecTransactionDriver.h"
 #include "../mtp/MTPVerifierPolicy.h"
 #include "../mtp/MTPWeightManifest.h"
+#include "../global_pp/GlobalPPTopology.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
 #include "../prefix_cache/PrefixCacheShutdown.h"
 #include "../local_execution/engine/PrefillBucketUtils.h"
@@ -632,7 +637,7 @@ namespace llaminar2
          * decode reaches it. The existing shared MTP distribution primitive
          * preserves the arithmetic order without adding another CDF algorithm.
          */
-        int sampleHostLogitsAtLogicalPosition(
+        int sampleHostLogitsAtLogicalPositionImpl(
             Sampler &sampler, const float *logits, size_t vocab_size,
             const SamplingParams &params, int logical_position)
         {
@@ -644,6 +649,13 @@ namespace llaminar2
                 sampler.compute_distribution(logits, vocab_size, params),
                 mtpSpecStochasticThresholdForPosition(
                     params, sampler, logical_position, MTPSpecStochasticDrawPurpose::Sample));
+        }
+
+        int sampleHostLogitsAtLogicalPosition(
+            Sampler &sampler, const float *logits, size_t vocab_size,
+            const SamplingParams &params, int logical_position)
+        {
+            return sampleHostLogitsAtLogicalPositionImpl(sampler, logits, vocab_size, params, logical_position);
         }
 
 
@@ -2415,6 +2427,23 @@ namespace llaminar2
                 return false;
             }
 
+            // Step 5a: RESOLVE AND SEAL the request authority BEFORE BOM
+            // admission (the compute graph's vocabulary-head source at plan
+            // time), so the serving pool charge and the graph frontend consume
+            // ONE authority — never a pre-graph default.
+            if (!run_phase(
+                    "sealRequestAuthority",
+                    [&] {
+                        sealed_request_authority_rank_.emplace(
+                            resolveSealedRequestAuthority());
+                        mpi_coordinated_root_rank_ =
+                            *sealed_request_authority_rank_;
+                        return true;
+                    }))
+            {
+                return false;
+            }
+
             // Step 5: Validate the frozen memory plan.
             if (!run_phase(
                     "validateMemoryPlan",
@@ -2858,6 +2887,16 @@ namespace llaminar2
                 [&]
                 {
                     return initializeContinuationRequestGroup();
+                }))
+            return false;
+        if (!run_phase(
+                "sealRequestAuthority",
+                [&] {
+                    sealed_request_authority_rank_.emplace(
+                        resolveSealedRequestAuthority());
+                    mpi_coordinated_root_rank_ =
+                        *sealed_request_authority_rank_;
+                    return true;
                 }))
             return false;
         if (!run_phase(
@@ -3787,14 +3826,30 @@ namespace llaminar2
         hosted_device_generation_decode_progress_retired_.store(
             0u, std::memory_order_release);
         device_generation_admission_.reset();
-        ready_mtp_condition_.reset();
+        if (slot_handoff_.hasPayload() && slot_handoff_.retired)
+        {
+            std::fprintf(stderr,
+                "[FATAL] OrchestrationRunner admission: corrupt slot handoff "
+                "state — payload in a retired bank. Refusing to open a new "
+                "bank over unretired state.\n");
+            std::abort();
+        }
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            return setError(
+                "Serving-slot admission generation exhausted before request "
+                "admission; refusing to wrap the monotonic counter or retire "
+                "the predecessor's handoff");
+        }
+        if (slot_handoff_.hasPayload())
+        {
+            LOG_WARN("[OrchestrationRunner] Direct admission retires the previous "
+                     "request's live handoff bank (generation "
+                     << slot_handoff_.admission_epoch
+                     << ") through the explicit lease-first retirement boundary");
+        }
+        slot_handoff_.retire();
         generation_request_seeds_.reset();
-        pending_mtp_condition_token_.reset();
-        pending_mtp_condition_params_.reset();
-        pending_mtp_condition_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_params_.reset();
-        decode_transaction_planning_position_.reset();
         clearBatchedDecodeState();
         last_token_ = prompt_tokens.back();
 
@@ -4100,14 +4155,14 @@ namespace llaminar2
                           << " blocks=" << coordinated_hit.blocks.size()
                           << " bypass_reason=" << coordinated_hit.bypass_reason);
 
-                prefill_logits_ready_ = false;
-                ready_mtp_condition_.reset();
-                pending_mtp_condition_token_.reset();
-                pending_mtp_condition_params_.reset();
-                pending_mtp_condition_resident_state_.reset();
-                prelaunched_mtp_first_sidecar_resident_state_.reset();
-                prelaunched_mtp_first_sidecar_params_.reset();
-                decode_transaction_planning_position_.reset();
+                slot_handoff_.prefill_logits_ready_ = false;
+                slot_handoff_.ready_mtp_condition_.reset();
+                slot_handoff_.pending_mtp_condition_token_.reset();
+                slot_handoff_.pending_mtp_condition_params_.reset();
+                slot_handoff_.pending_mtp_condition_resident_state_.reset();
+                slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+                slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
+                slot_handoff_.decode_transaction_planning_position_.reset();
 
                 auto make_common_hit = [&]()
                 {
@@ -4434,11 +4489,28 @@ namespace llaminar2
                         return setError("Prefix cache reusable-boundary harvest failed");
                 }
 
+                // The bank opens here, immediately before the first handoff
+                // publication (restored hit state must land in a live bank).
+                // Every later exit on this admission path retires explicitly:
+                // terminal-restore failure, post-restore harvest failure,
+                // planning-position failure, distributed completion, and the
+                // exception boundary below.
+                if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+                {
+                    return setError(
+                        "Serving-slot admission generation exhausted before the "
+                        "prefix-cache admission could be opened; refusing to wrap "
+                        "the monotonic counter");
+                }
+                slot_handoff_.openFor(++serving_slot_generation_);
                 if (suffix_start < static_cast<int>(prompt_tokens.size()))
                 {
                     if (!forward_prefix_interval(static_cast<int>(prompt_tokens.size())))
+                    {
+                        slot_handoff_.retire();
                         return false;
-                    prefill_logits_ready_ = true;
+                    }
+                    slot_handoff_.prefill_logits_ready_ = true;
                 }
                 else if ((!common_hit.requires_terminal_logits ||
                           common_hit.has_terminal_logits) &&
@@ -4447,7 +4519,7 @@ namespace llaminar2
                           common_hit.has_terminal_hidden) &&
                          runner_->restorePrefixTerminalState(common_hit))
                 {
-                    prefill_logits_ready_ = true;
+                    slot_handoff_.prefill_logits_ready_ = true;
                     terminal_state_restored = true;
                 }
                 else
@@ -4461,6 +4533,7 @@ namespace llaminar2
                           << (common_hit.has_terminal_hidden ? "yes" : "no")
                           << " mtp_requires_hidden="
                           << (mtp_full_hit_requires_terminal_hidden ? "yes" : "no");
+                    slot_handoff_.retire();
                     return setError(error.str());
                 }
 
@@ -4482,6 +4555,7 @@ namespace llaminar2
                         prompt_tokens,
                         static_cast<int>(prompt_tokens.size())))
                 {
+                    slot_handoff_.retire();
                     return setError(
                         "Prefix cache harvest failed after successful request execution");
                 }
@@ -4538,12 +4612,19 @@ namespace llaminar2
                                    ? "prefix_suffix_prefill"
                                    : "prefix_cache_miss_prefill")))
                 {
+                    slot_handoff_.retire();
                     return false;
                 }
-                return complete_distributed_prefill();
+                if (!complete_distributed_prefill())
+                {
+                    slot_handoff_.retire();
+                    return false;
+                }
+                return true;
             }
             catch (const std::exception &e)
             {
+                slot_handoff_.retire();
                 return setError(std::string("Prefill with prefix cache failed: ") + e.what());
             }
         }
@@ -4576,21 +4657,35 @@ namespace llaminar2
             return setError(std::string("Prefill failed: ") + e.what());
         }
 
-        // Signal that prefill logits are ready for sampling.
-        // The first decodeStep() will sample from these logits directly
-        // instead of re-feeding the last prompt token (which would cause
-        // the model to see it twice at consecutive positions, corrupting
-        // GDN recurrence state and KV cache entries).
-        prefill_logits_ready_ = true;
+        // The admission generation is minted only after the last failure-prone
+        // admission step: opening earlier would authorize decode/force against
+        // an admission that later failed. Post-open failures below retire
+        // explicitly instead of leaving a live bank for an admission that did
+        // not complete.
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            return setError(
+                "Serving-slot admission generation exhausted before the "
+                "admission could be opened; refusing to wrap the monotonic counter");
+        }
+        slot_handoff_.openFor(++serving_slot_generation_);
+        slot_handoff_.prefill_logits_ready_ = true;
 
         if (!initializeDecodeTransactionPlanningPositionAfterPrefill(
                 static_cast<int>(prompt_tokens.size()),
                 "ordinary_prefill"))
         {
+            slot_handoff_.retire();
             return false;
         }
 
-        return complete_distributed_prefill();
+        if (!complete_distributed_prefill())
+        {
+            slot_handoff_.retire();
+            return false;
+        }
+
+        return true;
     }
 
     bool OrchestrationRunner::supportsPrefillBatch(int request_batch) const
@@ -4721,14 +4816,29 @@ namespace llaminar2
             0u, std::memory_order_release);
         device_generation_admission_.reset();
         prefix_request_summary_ = {};
-        ready_mtp_condition_.reset();
-        prefill_logits_ready_ = false;
-        pending_mtp_condition_token_.reset();
-        pending_mtp_condition_params_.reset();
-        pending_mtp_condition_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_params_.reset();
-        decode_transaction_planning_position_.reset();
+        if (slot_handoff_.hasPayload() && slot_handoff_.retired)
+        {
+            std::fprintf(stderr,
+                "[FATAL] OrchestrationRunner admission: corrupt slot handoff "
+                "state — payload in a retired bank. Refusing to open a new "
+                "bank over unretired state.\n");
+            std::abort();
+        }
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            return setError(
+                "Serving-slot admission generation exhausted before request "
+                "admission; refusing to wrap the monotonic counter or retire "
+                "the predecessor's handoff");
+        }
+        if (slot_handoff_.hasPayload())
+        {
+            LOG_WARN("[OrchestrationRunner] Direct admission retires the previous "
+                     "request's live handoff bank (generation "
+                     << slot_handoff_.admission_epoch
+                     << ") through the explicit lease-first retirement boundary");
+        }
+        slot_handoff_.retire();
         last_token_ = next_states.front().last_token;
 
         if (!runner_->forward_batch(converted))
@@ -4757,11 +4867,21 @@ namespace llaminar2
         }
 
         /*
-         * From this point onward the scalar decode state is intentionally
-         * invalid. decodeStepBatch() is the only API allowed to consume this
-         * request set, because it must advance and publish every request slot
-         * under the same ownership transaction.
+         * The batched admission succeeded: mint the slot generation here —
+         * after every failure-prone batched step — and open the handoff bank
+         * for the admitted request set. From this point onward the scalar
+         * decode state is intentionally invalid. decodeStepBatch() is the only
+         * API allowed to consume this request set, because it must advance and
+         * publish every request slot under the same ownership transaction.
          */
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            return setError(
+                "Serving-slot admission generation exhausted before the "
+                "batched admission could be opened; refusing to wrap the "
+                "monotonic counter");
+        }
+        slot_handoff_.openFor(++serving_slot_generation_);
         batched_request_states_ = std::move(next_states);
         batched_decode_active_ = true;
         return true;
@@ -7323,13 +7443,13 @@ namespace llaminar2
     {
         if (!runner_ || !runner_->primaryDeviceId().is_gpu())
         {
-            decode_transaction_planning_position_.reset();
+            slot_handoff_.decode_transaction_planning_position_.reset();
             device_generation_admission_.reset();
             return true;
         }
         if (committed_tokens < 0)
         {
-            decode_transaction_planning_position_.reset();
+            slot_handoff_.decode_transaction_planning_position_.reset();
             return setError(
                 "GPU MTP prefill produced a negative transaction planning position");
         }
@@ -7342,7 +7462,7 @@ namespace llaminar2
          * same position that later device publications advance from compact
          * accepted-count metadata.
         */
-        decode_transaction_planning_position_ = committed_tokens;
+        slot_handoff_.decode_transaction_planning_position_ = committed_tokens;
         /*
          * Admission is a property of the successful GPU prefill boundary, not
          * of whichever decode policy happens to consume that boundary. The
@@ -7381,8 +7501,8 @@ namespace llaminar2
             return setError(
                 "GPU grouped MTP generation reached a decode boundary without an admission-ready controller lifecycle");
         }
-        if (!runner_ || !decode_transaction_planning_position_.has_value() ||
-            *decode_transaction_planning_position_ < 0)
+        if (!runner_ || !slot_handoff_.decode_transaction_planning_position_.has_value() ||
+            *slot_handoff_.decode_transaction_planning_position_ < 0)
         {
             return setError(
                 "GPU grouped MTP generation admission has no initialized prefill boundary");
@@ -7395,7 +7515,7 @@ namespace llaminar2
                     ? plan_.runtime.max_seq_len
                     : config_.max_seq_len;
             response_budget =
-                configured_context - *decode_transaction_planning_position_;
+                configured_context - *slot_handoff_.decode_transaction_planning_position_;
         }
         if (response_budget <= 0)
         {
@@ -7413,7 +7533,7 @@ namespace llaminar2
                 initial_leading_row_disposition,
             .sampling_seeds = generation_request_seeds_,
             .initial_target_counts = DeviceGenerationInitialTargetCounts(
-                std::vector<int>{*decode_transaction_planning_position_}),
+                std::vector<int>{*slot_handoff_.decode_transaction_planning_position_}),
         };
         if (!runner_->beginDeviceResidentGeneration(admission))
         {
@@ -7545,19 +7665,19 @@ namespace llaminar2
     {
         if (!runner_ || !runner_->primaryDeviceId().is_gpu())
             return true;
-        if (!decode_transaction_planning_position_.has_value() ||
-            *decode_transaction_planning_position_ < 0)
+        if (!slot_handoff_.decode_transaction_planning_position_.has_value() ||
+            *slot_handoff_.decode_transaction_planning_position_ < 0)
         {
             return setError(
                 "GPU decode forward has no initialized scheduler-owned transaction position");
         }
 
-        ++(*decode_transaction_planning_position_);
+        ++(*slot_handoff_.decode_transaction_planning_position_);
         PerfStatsCollector::addCounterWithSequence(
             "mtp",
             "gpu_decode_transaction_position_forward_advances",
             1.0,
-            {static_cast<uint64_t>(*decode_transaction_planning_position_)},
+            {static_cast<uint64_t>(*slot_handoff_.decode_transaction_planning_position_)},
             "decode",
             {},
             {{"source", source && source[0] != '\0' ? source : "unknown"},
@@ -7572,7 +7692,7 @@ namespace llaminar2
     {
         if (!runner_ || !runner_->primaryDeviceId().is_gpu())
         {
-            decode_transaction_planning_position_.reset();
+            slot_handoff_.decode_transaction_planning_position_.reset();
             return true;
         }
         if (transaction_base_tokens < 0 || committed_rows < 0)
@@ -7580,18 +7700,18 @@ namespace llaminar2
             return setError(
                 "GPU MTP commit produced a negative scheduler transaction coordinate");
         }
-        if (!decode_transaction_planning_position_.has_value() ||
-            *decode_transaction_planning_position_ < 0)
+        if (!slot_handoff_.decode_transaction_planning_position_.has_value() ||
+            *slot_handoff_.decode_transaction_planning_position_ < 0)
         {
             return setError(
                 "GPU MTP commit has no initialized scheduler-owned transaction position");
         }
-        if (*decode_transaction_planning_position_ != transaction_base_tokens)
+        if (*slot_handoff_.decode_transaction_planning_position_ != transaction_base_tokens)
         {
             std::ostringstream error;
             error << "GPU MTP commit transaction base does not match the "
                      "scheduler-owned position: scheduler="
-                  << *decode_transaction_planning_position_
+                  << *slot_handoff_.decode_transaction_planning_position_
                   << " transaction_base=" << transaction_base_tokens;
             return setError(error.str());
         }
@@ -7604,13 +7724,13 @@ namespace llaminar2
          * storage.  In particular, do not condition this publication on the
          * lifetime of a transient device outcome mailbox.
          */
-        decode_transaction_planning_position_ =
+        slot_handoff_.decode_transaction_planning_position_ =
             transaction_base_tokens + committed_rows;
         PerfStatsCollector::addCounterWithSequence(
             "mtp",
             "gpu_decode_transaction_position_publications",
             1.0,
-            {static_cast<uint64_t>(*decode_transaction_planning_position_)},
+            {static_cast<uint64_t>(*slot_handoff_.decode_transaction_planning_position_)},
             "decode",
             {},
             {{"path", source && source[0] != '\0' ? source : "unknown"},
@@ -7632,19 +7752,19 @@ namespace llaminar2
 
         if (runner_->primaryDeviceId().is_gpu())
         {
-            if (decode_transaction_planning_position_.has_value() &&
-                *decode_transaction_planning_position_ >= 0)
+            if (slot_handoff_.decode_transaction_planning_position_.has_value() &&
+                *slot_handoff_.decode_transaction_planning_position_ >= 0)
             {
                 PerfStatsCollector::addCounterWithSequence(
                     "mtp",
                     "gpu_decode_transaction_position_reads",
                     1.0,
-                    {static_cast<uint64_t>(*decode_transaction_planning_position_)},
+                    {static_cast<uint64_t>(*slot_handoff_.decode_transaction_planning_position_)},
                     "decode",
                     {},
                     {{"context", context ? context : "unknown"},
                      {"position_owner", "orchestration_transaction"}});
-                return *decode_transaction_planning_position_;
+                return *slot_handoff_.decode_transaction_planning_position_;
             }
 
             std::string message =
@@ -8272,13 +8392,13 @@ namespace llaminar2
             }
         }
 
-        pending_mtp_condition_token_.reset();
-        pending_mtp_condition_params_.reset();
-        pending_mtp_condition_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_params_.reset();
-        prefill_logits_ready_ = terminal_ready_condition.has_value();
-        ready_mtp_condition_ = std::move(terminal_ready_condition);
+        slot_handoff_.pending_mtp_condition_token_.reset();
+        slot_handoff_.pending_mtp_condition_params_.reset();
+        slot_handoff_.pending_mtp_condition_resident_state_.reset();
+        slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+        slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
+        slot_handoff_.prefill_logits_ready_ = terminal_ready_condition.has_value();
+        slot_handoff_.ready_mtp_condition_ = std::move(terminal_ready_condition);
 
         for (const int32_t token : request_result.tokens)
         {
@@ -8511,26 +8631,42 @@ namespace llaminar2
             result.error = "Invalid vocabulary size for MTP decode";
             return result;
         }
+        if (slot_handoff_.retired)
+        {
+            if (slot_handoff_.hasPayload())
+            {
+                std::fprintf(stderr,
+                    "[FATAL] OrchestrationRunner decodeStepMTP: corrupt slot "
+                    "handoff state — payload in a retired bank. "
+                    "Refusing to consume or auto-repair foreign request state.\n");
+                std::abort();
+            }
+            result.error =
+                "decodeStepMTP() requires an admitted request: the serving "
+                "slot has no live admission after the last request boundary; "
+                "call prefill() first";
+            return result;
+        }
 
-        const bool use_ready_logits = prefill_logits_ready_;
+        const bool use_ready_logits = slot_handoff_.prefill_logits_ready_;
         const std::optional<ReadyMTPCondition> ready_condition =
-            ready_mtp_condition_;
+            slot_handoff_.ready_mtp_condition_;
         const std::optional<int32_t> pending_condition_token =
-            pending_mtp_condition_token_;
+            slot_handoff_.pending_mtp_condition_token_;
         const std::optional<SamplingParams> pending_condition_params =
-            pending_mtp_condition_params_;
+            slot_handoff_.pending_mtp_condition_params_;
         const std::optional<DeviceResidentLogicalSequenceStateHandle>
             pending_condition_resident_state =
-                pending_mtp_condition_resident_state_;
+                slot_handoff_.pending_mtp_condition_resident_state_;
         const std::optional<DeviceResidentLogicalSequenceStateHandle>
             prelaunched_first_sidecar_resident_state =
-                prelaunched_mtp_first_sidecar_resident_state_;
+                slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_;
         const std::optional<SamplingParams> prelaunched_first_sidecar_params =
-            prelaunched_mtp_first_sidecar_params_;
-        prefill_logits_ready_ = false;
-        ready_mtp_condition_.reset();
-        prelaunched_mtp_first_sidecar_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_params_.reset();
+            slot_handoff_.prelaunched_mtp_first_sidecar_params_;
+        slot_handoff_.prefill_logits_ready_ = false;
+        slot_handoff_.ready_mtp_condition_.reset();
+        slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+        slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
         PrefixStateSnapshot rollback_checkpoint;
         bool rollback_checkpoint_captured = false;
         PrefixStateSnapshot verifier_base_checkpoint;
@@ -8560,14 +8696,14 @@ namespace llaminar2
         {
             PerfStatsCollector::addCounter("mtp", "decode_step_failures", 1.0, "decode",
                                            std::string{}, {{"reason", message}});
-            prefill_logits_ready_ = use_ready_logits;
-            ready_mtp_condition_ = ready_condition;
-            pending_mtp_condition_token_ = pending_condition_token;
-            pending_mtp_condition_params_ = pending_condition_params;
-            pending_mtp_condition_resident_state_ =
+            slot_handoff_.prefill_logits_ready_ = use_ready_logits;
+            slot_handoff_.ready_mtp_condition_ = ready_condition;
+            slot_handoff_.pending_mtp_condition_token_ = pending_condition_token;
+            slot_handoff_.pending_mtp_condition_params_ = pending_condition_params;
+            slot_handoff_.pending_mtp_condition_resident_state_ =
                 pending_condition_resident_state;
-            prelaunched_mtp_first_sidecar_resident_state_.reset();
-            prelaunched_mtp_first_sidecar_params_.reset();
+            slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+            slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
             result.error = message;
             return result;
         };
@@ -8660,14 +8796,14 @@ namespace llaminar2
             }
             PerfStatsCollector::addCounter("mtp", "decode_step_failures", 1.0, "decode",
                                            std::string{}, {{"reason", message}});
-            prefill_logits_ready_ = use_ready_logits;
-            ready_mtp_condition_ = ready_condition;
-            pending_mtp_condition_token_ = pending_condition_token;
-            pending_mtp_condition_params_ = pending_condition_params;
-            pending_mtp_condition_resident_state_ =
+            slot_handoff_.prefill_logits_ready_ = use_ready_logits;
+            slot_handoff_.ready_mtp_condition_ = ready_condition;
+            slot_handoff_.pending_mtp_condition_token_ = pending_condition_token;
+            slot_handoff_.pending_mtp_condition_params_ = pending_condition_params;
+            slot_handoff_.pending_mtp_condition_resident_state_ =
                 pending_condition_resident_state;
-            prelaunched_mtp_first_sidecar_resident_state_.reset();
-            prelaunched_mtp_first_sidecar_params_.reset();
+            slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+            slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
             result.error = message;
             return result;
         };
@@ -9403,18 +9539,18 @@ namespace llaminar2
                 }
             }
 
-            pending_mtp_condition_token_ = next_pending_condition_token;
-            pending_mtp_condition_params_ =
+            slot_handoff_.pending_mtp_condition_token_ = next_pending_condition_token;
+            slot_handoff_.pending_mtp_condition_params_ =
                 next_pending_condition_token.has_value()
                     ? std::optional<SamplingParams>{active_sampling_params_}
                     : std::optional<SamplingParams>{};
-            pending_mtp_condition_resident_state_ =
+            slot_handoff_.pending_mtp_condition_resident_state_ =
                 next_pending_condition_token.has_value()
                     ? next_pending_condition_resident_state
                     : std::nullopt;
 
-            prefill_logits_ready_ = terminal_logits_ready && !is_complete;
-            if (prefill_logits_ready_ && ready_token.has_value())
+            slot_handoff_.prefill_logits_ready_ = terminal_logits_ready && !is_complete;
+            if (slot_handoff_.prefill_logits_ready_ && ready_token.has_value())
             {
                 if (ready_condition_resident_state.has_value() &&
                     !ready_condition_resident_state->valid())
@@ -9422,22 +9558,22 @@ namespace llaminar2
                     return std::string(
                         "MTP transaction produced a stale ready-token resident logical-state handle");
                 }
-                ready_mtp_condition_ = ReadyMTPCondition::hostVisible(
+                slot_handoff_.ready_mtp_condition_ = ReadyMTPCondition::hostVisible(
                     *ready_token,
                     active_sampling_params_,
                     ready_condition_resident_state);
-                if (!ready_mtp_condition_->valid())
+                if (!slot_handoff_.ready_mtp_condition_->valid())
                 {
                     return std::string(
                         "MTP transaction produced an invalid host-visible ready condition");
                 }
-                pending_mtp_condition_token_.reset();
-                pending_mtp_condition_params_.reset();
-                pending_mtp_condition_resident_state_.reset();
+                slot_handoff_.pending_mtp_condition_token_.reset();
+                slot_handoff_.pending_mtp_condition_params_.reset();
+                slot_handoff_.pending_mtp_condition_resident_state_.reset();
             }
             else
             {
-                ready_mtp_condition_.reset();
+                slot_handoff_.ready_mtp_condition_.reset();
             }
 
             for (size_t i = static_cast<size_t>(emitted_token_start_index);
@@ -9459,7 +9595,7 @@ namespace llaminar2
                  * boundary, so a completed request must discard any sidecar
                  * that was queued before the compatibility response bridge.
                  */
-                if (prelaunched_mtp_first_sidecar_resident_state_.has_value())
+                if (slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.has_value())
                 {
                     PerfStatsCollector::addCounter(
                         "mtp",
@@ -9469,8 +9605,8 @@ namespace llaminar2
                         {},
                         {{"path", path}});
                 }
-                prelaunched_mtp_first_sidecar_resident_state_.reset();
-                prelaunched_mtp_first_sidecar_params_.reset();
+                slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+                slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
             }
 
             ++mtp_stats_.transaction_commits;
@@ -9915,9 +10051,9 @@ namespace llaminar2
                 return fail_after_checkpoint(
                     "MTP decode could not capture verifier base state after condition forward");
             }
-            pending_mtp_condition_token_.reset();
-            pending_mtp_condition_params_.reset();
-            pending_mtp_condition_resident_state_.reset();
+            slot_handoff_.pending_mtp_condition_token_.reset();
+            slot_handoff_.pending_mtp_condition_params_.reset();
+            slot_handoff_.pending_mtp_condition_resident_state_.reset();
             if (auto sequence_error = retire_overlay_graph_sequence(
                     "condition forward"))
             {
@@ -14960,23 +15096,23 @@ namespace llaminar2
         };
         if (!runner_ || !runner_->primaryDeviceId().is_gpu() ||
             !device_generation_admission_.awaitsAdmission() ||
-            !prefill_logits_ready_ || !decode_transaction_planning_position_)
+            !slot_handoff_.prefill_logits_ready_ || !slot_handoff_.decode_transaction_planning_position_)
             return fail("requires an admission-ready prefill or resident continuation");
 
         // A prior budget's last response has not entered KV. The existing
         // mailbox remains the token authority; returning it to the caller did
         // not make the host copy a valid input for another forward.
         Leading leading = Leading::PendingResponse;
-        if (ready_mtp_condition_)
+        if (slot_handoff_.ready_mtp_condition_)
         {
-            if (!ready_mtp_condition_->valid() ||
-                !ready_mtp_condition_->isDeviceResidentOnly() ||
-                !ready_mtp_condition_->wasAlreadyEmitted() ||
-                !samplingParamsEqual(ready_mtp_condition_->sampling_params, active_sampling_params_))
+            if (!slot_handoff_.ready_mtp_condition_->valid() ||
+                !slot_handoff_.ready_mtp_condition_->isDeviceResidentOnly() ||
+                !slot_handoff_.ready_mtp_condition_->wasAlreadyEmitted() ||
+                !samplingParamsEqual(slot_handoff_.ready_mtp_condition_->sampling_params, active_sampling_params_))
                 return fail("continuation is not the previously emitted resident condition under the same sampling law");
             leading = Leading::AlreadyEmitted;
         }
-        const int base = *decode_transaction_planning_position_;
+        const int base = *slot_handoff_.decode_transaction_planning_position_;
         const int capacity = plan_.runtime.max_seq_len > 0
             ? plan_.runtime.max_seq_len : config_.max_seq_len;
         const int budget = decode_step_token_budget_ > 0
@@ -15046,8 +15182,8 @@ namespace llaminar2
             !device_generation_admission_.retireController(row.model_stopped))
             return fail("could not retire the terminal scheduler boundary");
 
-        ready_mtp_condition_ = std::move(continuation);
-        prefill_logits_ready_ = ready_mtp_condition_.has_value();
+        slot_handoff_.ready_mtp_condition_ = std::move(continuation);
+        slot_handoff_.prefill_logits_ready_ = slot_handoff_.ready_mtp_condition_.has_value();
         result.tokens.assign(row.tokens.begin(), row.tokens.end());
         result.is_complete = row.model_stopped;
         last_token_ = result.tokens.back();
@@ -15082,6 +15218,22 @@ namespace llaminar2
             result.error =
                 "decodeStep() cannot consume request-batched prefill state; "
                 "use decodeStepBatch()";
+            return result;
+        }
+        if (slot_handoff_.retired)
+        {
+            if (slot_handoff_.hasPayload())
+            {
+                std::fprintf(stderr,
+                    "[FATAL] OrchestrationRunner decodeStep: corrupt slot "
+                    "handoff state — payload in a retired bank. "
+                    "Refusing to consume or auto-repair foreign request state.\n");
+                std::abort();
+            }
+            result.error =
+                "decodeStep() requires an admitted request: the serving slot "
+                "has no live admission after the last request boundary; call "
+                "prefill() first";
             return result;
         }
         const bool mpi_coordinated_world =
@@ -15220,8 +15372,8 @@ namespace llaminar2
                 if (result.error.empty()) result.error = "Original rank generation follower failed";
                 return result;
             }
-            if (!decode_transaction_planning_position_ ||
-                *decode_transaction_planning_position_ != terminal.admission_base ||
+            if (!slot_handoff_.decode_transaction_planning_position_ ||
+                *slot_handoff_.decode_transaction_planning_position_ != terminal.admission_base ||
                 !sampling_math::valid_device_generation_leading_row_disposition(terminal.next_leading_row_disposition) ||
                 !publishDecodeTransactionPlanningPositionAfterMTPCommit(terminal.admission_base,
                     terminal.published_state_commit_count, "original_rank_generation_terminal"))
@@ -15231,11 +15383,11 @@ namespace llaminar2
             }
             // Keep only completed scheduler/accounting observations. No source
             // outcome or remote logical-state handle becomes execution input.
-            ready_mtp_condition_.reset();
-            pending_mtp_condition_token_.reset();
-            pending_mtp_condition_params_.reset();
-            pending_mtp_condition_resident_state_.reset();
-            prefill_logits_ready_ = !terminal.model_stopped;
+            slot_handoff_.ready_mtp_condition_.reset();
+            slot_handoff_.pending_mtp_condition_token_.reset();
+            slot_handoff_.pending_mtp_condition_params_.reset();
+            slot_handoff_.pending_mtp_condition_resident_state_.reset();
+            slot_handoff_.prefill_logits_ready_ = !terminal.model_stopped;
             result.is_complete = terminal.model_stopped;
             decode_command_failure_abort.markCompleted();
             return result;
@@ -15257,11 +15409,11 @@ namespace llaminar2
         } original_command{original_global && original_global->originalRankGenerationSource() ? original_global : nullptr};
         if (original_command.owner)
         {
-            if (!decode_transaction_planning_position_ ||
+            if (!slot_handoff_.decode_transaction_planning_position_ ||
                 moe_overlay_inference_command_sequence_ == std::numeric_limits<uint64_t>::max() ||
                 !original_command.owner->beginOriginalRankGenerationCommand(
                     original_command.owner->originalRankCommandIdentity(++moe_overlay_inference_command_sequence_),
-                    *decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
+                    *slot_handoff_.decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
                         DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic))
             {
                 result.error = "Original rank generation source could not admit its exact request/command/placement identity";
@@ -15269,7 +15421,7 @@ namespace llaminar2
             }
         }
         const auto terminal_leading = [&] {
-            return ready_mtp_condition_ && ready_mtp_condition_->wasAlreadyEmitted() ?
+            return slot_handoff_.ready_mtp_condition_ && slot_handoff_.ready_mtp_condition_->wasAlreadyEmitted() ?
                 sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted :
                 sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
         };
@@ -15288,7 +15440,7 @@ namespace llaminar2
                      << (mpi_ctx_ ? mpi_ctx_->rank() : 0)
                      << " coordinated=" << (mpi_coordinated_world ? "true" : "false")
                      << " worker=" << (mpi_worker_rank ? "true" : "false")
-                     << " prefill_logits_ready=" << (prefill_logits_ready_ ? "true" : "false")
+                     << " prefill_logits_ready=" << (slot_handoff_.prefill_logits_ready_ ? "true" : "false")
                      << " position=" << trace_position("trace_decode_step_begin"));
         }
 
@@ -15406,22 +15558,22 @@ namespace llaminar2
                     result = std::move(mtp_result);
                     return result;
                 }
-                if (ready_mtp_condition_.has_value() &&
-                    ready_mtp_condition_->isDeviceResidentOnly())
+                if (slot_handoff_.ready_mtp_condition_.has_value() &&
+                    slot_handoff_.ready_mtp_condition_->isDeviceResidentOnly())
                 {
                     result.error =
                         "Device-resident MTP continuation cannot cross into a depth-zero serial decode transaction";
                     return result;
                 }
-                prelaunched_mtp_first_sidecar_resident_state_.reset();
-                prelaunched_mtp_first_sidecar_params_.reset();
+                slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+                slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
                 recordMTPDepthZeroBypass();
                 adaptive_depth_zero_step = true;
             }
             else
             {
-                prelaunched_mtp_first_sidecar_resident_state_.reset();
-                prelaunched_mtp_first_sidecar_params_.reset();
+                slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+                slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
                 recordMTPBypass(mtp_bypass_reason);
             }
         }
@@ -15434,44 +15586,44 @@ namespace llaminar2
              (active_sampling_params_.top_k > 0 &&
               active_sampling_params_.top_k <= 256));
         bool decode_sampling_sync_deferred = false;
-        if (prefill_logits_ready_)
+        if (slot_handoff_.prefill_logits_ready_)
         {
             // First decode step after prefill: sample from the already-computed
             // prefill logits instead of re-feeding the last prompt token.
             // This avoids processing the last token twice (which corrupts GDN
             // recurrence state and creates duplicate KV cache entries).
-            if (ready_mtp_condition_.has_value())
+            if (slot_handoff_.ready_mtp_condition_.has_value())
             {
-                if (!ready_mtp_condition_->valid())
+                if (!slot_handoff_.ready_mtp_condition_->valid())
                 {
                     result.error =
                         "Ready MTP condition has an invalid authority payload";
                     return result;
                 }
                 if (!samplingParamsEqual(
-                        ready_mtp_condition_->sampling_params,
+                        slot_handoff_.ready_mtp_condition_->sampling_params,
                         active_sampling_params_))
                 {
                     result.error =
                         "Ready MTP condition was sampled with different sampling parameters";
                     return result;
                 }
-                if (ready_mtp_condition_->isDeviceResidentOnly())
+                if (slot_handoff_.ready_mtp_condition_->isDeviceResidentOnly())
                 {
                     result.error =
                         "Device-resident MTP continuation reached the serial decode sampler";
                     return result;
                 }
                 ready_token_for_decode =
-                    ready_mtp_condition_->host_token;
-                ready_mtp_condition_.reset();
+                    slot_handoff_.ready_mtp_condition_->host_token;
+                slot_handoff_.ready_mtp_condition_.reset();
             }
-            prefill_logits_ready_ = false;
+            slot_handoff_.prefill_logits_ready_ = false;
             LOG_TRACE("[decodeStep] Using prefill logits (skipping forward)");
         }
         else
         {
-            if (ready_mtp_condition_.has_value())
+            if (slot_handoff_.ready_mtp_condition_.has_value())
             {
                 result.error =
                     "Ready MTP condition exists without a terminal-logits boundary";
@@ -15534,9 +15686,9 @@ namespace llaminar2
                          << " forward complete position="
                          << trace_position("trace_decode_step_forward_complete"));
             }
-            pending_mtp_condition_token_.reset();
-            pending_mtp_condition_params_.reset();
-            pending_mtp_condition_resident_state_.reset();
+            slot_handoff_.pending_mtp_condition_token_.reset();
+            slot_handoff_.pending_mtp_condition_params_.reset();
+            slot_handoff_.pending_mtp_condition_resident_state_.reset();
         }
 
         // Tail stage: keep GPU logits on the device sampling path.  CPU-only
@@ -15895,6 +16047,22 @@ namespace llaminar2
                 "forceDecodeToken() cannot consume request-batched prefill state";
             return result;
         }
+        if (slot_handoff_.retired)
+        {
+            if (slot_handoff_.hasPayload())
+            {
+                std::fprintf(stderr,
+                    "[FATAL] OrchestrationRunner forceDecodeToken: corrupt slot "
+                    "handoff state — payload in a retired bank. "
+                    "Refusing to consume or auto-repair foreign request state.\n");
+                std::abort();
+            }
+            result.error =
+                "forceDecodeToken() requires an admitted request: the serving "
+                "slot has no live admission after the last request boundary; "
+                "call prefill() first";
+            return result;
+        }
         const int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
         const bool coordinated_force_command =
             mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->world_size() > 1;
@@ -15925,7 +16093,7 @@ namespace llaminar2
                      << rank
                      << " token=" << token
                      << " last_token=" << last_token_
-                     << " prefill_logits_ready=" << (prefill_logits_ready_ ? "true" : "false")
+                     << " prefill_logits_ready=" << (slot_handoff_.prefill_logits_ready_ ? "true" : "false")
                      << " position=" << trace_position("trace_force_decode_begin"));
         }
 
@@ -16038,19 +16206,19 @@ namespace llaminar2
                 if (result.error.empty()) result.error = "Original forced-command follower failed";
                 return result;
             }
-            if (!decode_transaction_planning_position_ ||
-                *decode_transaction_planning_position_ != terminal.admission_base ||
+            if (!slot_handoff_.decode_transaction_planning_position_ ||
+                *slot_handoff_.decode_transaction_planning_position_ != terminal.admission_base ||
                 !publishDecodeTransactionPlanningPositionAfterMTPCommit(terminal.admission_base,
                     terminal.published_state_commit_count, "original_rank_forced_terminal"))
             {
                 result.error = "Original forced terminal differs from its admitted scheduler boundary";
                 return result;
             }
-            ready_mtp_condition_.reset();
-            pending_mtp_condition_token_.reset();
-            pending_mtp_condition_params_.reset();
-            pending_mtp_condition_resident_state_.reset();
-            prefill_logits_ready_ = !terminal.model_stopped;
+            slot_handoff_.ready_mtp_condition_.reset();
+            slot_handoff_.pending_mtp_condition_token_.reset();
+            slot_handoff_.pending_mtp_condition_params_.reset();
+            slot_handoff_.pending_mtp_condition_resident_state_.reset();
+            slot_handoff_.prefill_logits_ready_ = !terminal.model_stopped;
             result.is_complete = terminal.model_stopped;
             result.returned_token_commit = terminal.model_stopped ? ReturnedTokenCommitState::NoModelRow : ReturnedTokenCommitState::Pending;
             force_command_failure_abort.markCompleted();
@@ -16064,11 +16232,11 @@ namespace llaminar2
             /** @brief Cancel original directions before the outer MPI abort fence destroys owners. */
             ~OriginalRankForceCommandGuard() { if (owner && !completed) owner->abortOriginalRankGenerationCommand(); }
         } original_force{original_global && original_global->originalRankGenerationSource() ? original_global : nullptr};
-        if (original_force.owner && (!decode_transaction_planning_position_ ||
+        if (original_force.owner && (!slot_handoff_.decode_transaction_planning_position_ ||
             moe_overlay_inference_command_sequence_ == std::numeric_limits<uint64_t>::max() ||
             !original_force.owner->beginOriginalRankGenerationCommand(
                 original_force.owner->originalRankCommandIdentity(++moe_overlay_inference_command_sequence_),
-                *decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
+                *slot_handoff_.decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
                     DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic)))
         {
             result.error = "Original forced-command source lost its exact request/command admission";
@@ -16119,8 +16287,8 @@ namespace llaminar2
              * to the completed request and are retired without publishing,
              * committing, or forwarding the terminal token on any device.
              */
-            prefill_logits_ready_ = false;
-            ready_mtp_condition_.reset();
+            slot_handoff_.prefill_logits_ready_ = false;
+            slot_handoff_.ready_mtp_condition_.reset();
             result.returned_token_commit =
                 ReturnedTokenCommitState::NoModelRow;
             PerfStatsCollector::addCounter(
@@ -16143,28 +16311,28 @@ namespace llaminar2
              * then becomes the next row and recreates terminal logits for a
              * following policy token in a multi-token stop-thinking sequence.
              */
-            if (!prefill_logits_ready_)
+            if (!slot_handoff_.prefill_logits_ready_)
             {
                 result.error =
                     "GPU MTP forced decode requires a ready terminal-logits boundary";
                 return result;
             }
 
-            if (ready_mtp_condition_)
+            if (slot_handoff_.ready_mtp_condition_)
             {
-                if (!ready_mtp_condition_->valid() ||
-                    !ready_mtp_condition_->isDeviceResidentOnly() ||
+                if (!slot_handoff_.ready_mtp_condition_->valid() ||
+                    !slot_handoff_.ready_mtp_condition_->isDeviceResidentOnly() ||
                     !samplingParamsEqual(
-                        ready_mtp_condition_->sampling_params,
+                        slot_handoff_.ready_mtp_condition_->sampling_params,
                         active_sampling_params_))
                 {
                     result.error =
                         "GPU MTP forced decode received a stale or foreign resident condition";
                     return result;
                 }
-                if (ready_mtp_condition_->wasAlreadyEmitted())
+                if (slot_handoff_.ready_mtp_condition_->wasAlreadyEmitted())
                 {
-                    const auto resident = *ready_mtp_condition_->resident_state;
+                    const auto resident = *slot_handoff_.ready_mtp_condition_->resident_state;
                     // Preserve the original token before shifted commit consumes
                     // its one-shot mailbox/lease. AlreadyPublished closes this
                     // target event's history right without incrementing counts or
@@ -16227,8 +16395,8 @@ namespace llaminar2
                     }
                 }
             }
-            prefill_logits_ready_ = false;
-            ready_mtp_condition_.reset();
+            slot_handoff_.prefill_logits_ready_ = false;
+            slot_handoff_.ready_mtp_condition_.reset();
 
             /*
              * Request policy selected `token` on the host, but execution state
@@ -16298,7 +16466,7 @@ namespace llaminar2
                 return result;
             }
 
-            prefill_logits_ready_ = true;
+            slot_handoff_.prefill_logits_ready_ = true;
             result.returned_token_commit =
                 ReturnedTokenCommitState::Committed;
             PerfStatsCollector::addCounter(
@@ -16315,7 +16483,7 @@ namespace llaminar2
         {
             using Leading =
                 sampling_math::DeviceGenerationLeadingRowDisposition;
-            if (!prefill_logits_ready_ ||
+            if (!slot_handoff_.prefill_logits_ready_ ||
                 !device_generation_admission_.awaitsAdmission())
             {
                 result.error =
@@ -16329,13 +16497,13 @@ namespace llaminar2
              * retained ordinary graph consumes device token and position rows;
              * the host scalar is diagnostic identity only.
              */
-            if (ready_mtp_condition_)
+            if (slot_handoff_.ready_mtp_condition_)
             {
-                if (!ready_mtp_condition_->valid() ||
-                    !ready_mtp_condition_->isDeviceResidentOnly() ||
-                    !ready_mtp_condition_->wasAlreadyEmitted() ||
+                if (!slot_handoff_.ready_mtp_condition_->valid() ||
+                    !slot_handoff_.ready_mtp_condition_->isDeviceResidentOnly() ||
+                    !slot_handoff_.ready_mtp_condition_->wasAlreadyEmitted() ||
                     !samplingParamsEqual(
-                        ready_mtp_condition_->sampling_params,
+                        slot_handoff_.ready_mtp_condition_->sampling_params,
                         active_sampling_params_))
                 {
                     result.error =
@@ -16343,7 +16511,7 @@ namespace llaminar2
                     return result;
                 }
                 const auto resident =
-                    *ready_mtp_condition_->resident_state;
+                    *slot_handoff_.ready_mtp_condition_->resident_state;
                 if (!resident.coversRequest(0))
                 {
                     result.error =
@@ -16378,7 +16546,7 @@ namespace llaminar2
                         "GPU ordinary forced decode could not retire its completed ForwardOnly response boundary";
                     return result;
                 }
-                ready_mtp_condition_.reset();
+                slot_handoff_.ready_mtp_condition_.reset();
             }
 
             /*
@@ -16401,16 +16569,16 @@ namespace llaminar2
                     "GPU ordinary forced decode did not publish a live condition mailbox";
                 return result;
             }
-            ready_mtp_condition_ = ReadyMTPCondition::deviceResident(
+            slot_handoff_.ready_mtp_condition_ = ReadyMTPCondition::deviceResident(
                 active_sampling_params_, std::move(state),
                 Leading::AlreadyEmitted);
-            if (!ready_mtp_condition_->valid())
+            if (!slot_handoff_.ready_mtp_condition_->valid())
             {
                 result.error =
                     "GPU ordinary forced decode published an incomplete resident condition";
                 return result;
             }
-            prefill_logits_ready_ = true;
+            slot_handoff_.prefill_logits_ready_ = true;
             result.returned_token_commit = ReturnedTokenCommitState::Pending;
             PerfStatsCollector::addCounter(
                 "generation",
@@ -16434,10 +16602,10 @@ namespace llaminar2
              * present; otherwise the previous token must first advance ordinary
              * serial decode state.
              */
-            if (prefill_logits_ready_)
+            if (slot_handoff_.prefill_logits_ready_)
             {
-                prefill_logits_ready_ = false;
-                ready_mtp_condition_.reset();
+                slot_handoff_.prefill_logits_ready_ = false;
+                slot_handoff_.ready_mtp_condition_.reset();
             }
             else if (!token_is_stop)
             {
@@ -16519,11 +16687,11 @@ namespace llaminar2
             }
         }
 
-        pending_mtp_condition_token_.reset();
-        pending_mtp_condition_params_.reset();
-        pending_mtp_condition_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_params_.reset();
+        slot_handoff_.pending_mtp_condition_token_.reset();
+        slot_handoff_.pending_mtp_condition_params_.reset();
+        slot_handoff_.pending_mtp_condition_resident_state_.reset();
+        slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
+        slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
 
         sampler_.record_token(token);
         last_token_ = token;
@@ -16547,7 +16715,7 @@ namespace llaminar2
         }
         if (original_force.owner)
         {
-            const auto leading = ready_mtp_condition_ && ready_mtp_condition_->wasAlreadyEmitted() ?
+            const auto leading = slot_handoff_.ready_mtp_condition_ && slot_handoff_.ready_mtp_condition_->wasAlreadyEmitted() ?
                 sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted :
                 sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
             if (!original_force.owner->completeOriginalRankGenerationCommand(token_is_stop, leading))
@@ -16635,7 +16803,7 @@ namespace llaminar2
 
         // Prefill
         // After prefill, the first decodeStep() samples from the prefill logits
-        // directly (via prefill_logits_ready_ flag) instead of re-feeding the
+        // directly (via slot_handoff_.prefill_logits_ready_ flag) instead of re-feeding the
         // last prompt token. GPU-side sampling (sampleGreedyOnDevice) works on
         // device logits without D2H, so no gather is needed for GPU models.
         // For CPU models, logits are already on host.
@@ -17228,12 +17396,12 @@ namespace llaminar2
          * prefix archive, prepared weights, and ExpertOverlay placement epoch
          * intentionally do not participate in this admission decision. */
         return initialization_lifecycle_.readyForInference() && runner_ && runner_->get_position() == 0 &&
-               !prefill_logits_ready_ && !ready_mtp_condition_ &&
-               !pending_mtp_condition_token_ &&
-               !pending_mtp_condition_params_ &&
-               !pending_mtp_condition_resident_state_ &&
-               !prelaunched_mtp_first_sidecar_resident_state_ &&
-               !prelaunched_mtp_first_sidecar_params_ &&
+               !slot_handoff_.prefill_logits_ready_ && !slot_handoff_.ready_mtp_condition_ &&
+               !slot_handoff_.pending_mtp_condition_token_ &&
+               !slot_handoff_.pending_mtp_condition_params_ &&
+               !slot_handoff_.pending_mtp_condition_resident_state_ &&
+               !slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_ &&
+               !slot_handoff_.prelaunched_mtp_first_sidecar_params_ &&
                batched_request_states_.empty();
     }
 
@@ -17597,20 +17765,20 @@ namespace llaminar2
         PrefixRuntimeStateSnapshot snapshot = runner_ ? runner_->prefixStateProbe(capture_policy)
                                                       : PrefixRuntimeStateSnapshot{};
         snapshot.initialized = initialization_lifecycle_.readyForInference();
-        snapshot.prefill_logits_ready = prefill_logits_ready_;
+        snapshot.prefill_logits_ready = slot_handoff_.prefill_logits_ready_;
         if (capture_policy.capture_device_logical_state && snapshot.resident_condition &&
-            ready_mtp_condition_ && ready_mtp_condition_->isDeviceResidentOnly())
+            slot_handoff_.ready_mtp_condition_ && slot_handoff_.ready_mtp_condition_->isDeviceResidentOnly())
         {
             const auto current = runner_->deviceResidentLogicalSequenceState();
             const auto &observed = *snapshot.resident_condition;
-            if (!ready_mtp_condition_->valid() ||
-                !samplingParamsEqual(ready_mtp_condition_->sampling_params, active_sampling_params_) ||
-                !ready_mtp_condition_->resident_state->sameMailboxAs(current) ||
+            if (!slot_handoff_.ready_mtp_condition_->valid() ||
+                !samplingParamsEqual(slot_handoff_.ready_mtp_condition_->sampling_params, active_sampling_params_) ||
+                !slot_handoff_.ready_mtp_condition_->resident_state->sameMailboxAs(current) ||
                 observed.device != current.device ||
                 observed.publication_generation != current.publication_generation ||
                 observed.live_state_epoch != current.live_state_epoch)
                 throw std::logic_error("Continuation diagnostics rejected a stale or foreign original ready condition");
-            snapshot.resident_condition->response_disposition = ready_mtp_condition_->response_disposition;
+            snapshot.resident_condition->response_disposition = slot_handoff_.ready_mtp_condition_->response_disposition;
         }
         /*
          * The heterogeneous controller's mapped durable word is the only
@@ -17654,7 +17822,7 @@ namespace llaminar2
              */
             snapshot.mtp_next_condition_position =
                 runner_->primaryDeviceId().is_gpu()
-                    ? decode_transaction_planning_position_.value_or(-1)
+                    ? slot_handoff_.decode_transaction_planning_position_.value_or(-1)
                     : runner_->get_position();
         }
         snapshot.mtp_stochastic_accept_tests = mtp_stats_.stochastic_accept_tests;
@@ -17829,7 +17997,33 @@ namespace llaminar2
         requested_routed_weight_authority_identity_ = std::move(identity);
     }
 
-    bool OrchestrationRunner::buildExecutionPlan()
+    int OrchestrationRunner::resolveSealedRequestAuthority()
+{
+    if (requiresNamedDomainGlobalGraph(config_) && plan_builder_)
+    {
+        ModelConfig model;
+        model.n_layers = mainLayerCountExcludingMTP(
+            model_ctx_->concreteLoader(), model_ctx_->architecture(),
+            model_ctx_->totalBlockCount());
+        model.n_heads = model_ctx_->headCount();
+        model.n_kv_heads = model_ctx_->headCountKV();
+        model.hidden_size = model_ctx_->embeddingLength();
+        model.vocab_size = model_ctx_->vocabSize();
+        const auto topology = plan_builder_->buildGlobalPPTopology(
+            config_, model, cluster_inventory_);
+        const auto errors = topology.validate();
+        if (!errors.empty())
+            throw std::runtime_error(
+                "Invalid admitted named-domain topology: " + errors.front());
+        return requestAuthorityRank(topology);
+    }
+    const auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
+        config_.moe_routed_expert_plan,
+        moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
+    return overlay_execution_plan ? overlay_execution_plan->continuation_root_rank : 0;
+}
+
+bool OrchestrationRunner::buildExecutionPlan()
     {
         if (plan_built_)
             return true;
@@ -22236,7 +22430,12 @@ namespace llaminar2
         }
     }
 
-    bool OrchestrationRunner::publishPhysicalMemoryAuthority()
+    std::shared_ptr<PhysicalMemoryAuthority> OrchestrationRunner::physicalMemoryAuthority() const
+{
+    return physical_memory_authority_;
+}
+
+bool OrchestrationRunner::publishPhysicalMemoryAuthority()
     {
         if (!model_ctx_ || !physical_memory_admission_)
         {
@@ -22482,6 +22681,14 @@ namespace llaminar2
             .captured_prefill_buckets = std::move(captured_prefill_buckets),
             .max_gpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CUDA),
             .max_cpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CPU),
+            // SERVING POOL CHARGE IS BOUND TO THE RESOLVED REQUEST AUTHORITY:
+            // only the authority rank constructs the HTTP serving executor
+            // (ServerMode is_authority); members run the worker loop, so only
+            // the authority's rank-local host BOM carries the owner line.
+            .serving_pool_demand_bytes = servingPoolDemandForRank(
+                config_.serve_mode, sealed_request_authority_rank_, plan_.rank,
+                config_.servingCapacityRequest(),
+                ServingSlotDecisionGeometry::forVocabulary(profile.vocab_size)),
         });
 
         // CPU threads are not needed to observe GPUs. Only immutable role/BOM
@@ -23391,11 +23598,15 @@ namespace llaminar2
             runner_ = buildNamedDomainGlobalGraph(
                 config_, plan_, cluster_inventory_, *plan_builder_, model_ctx_, mpi_ctx_,
                 moe_pipeline_stage_bindings_);
-            // Resolve before readiness, while every rank still follows the
-            // common initialization schedule. The public frontend then runs
-            // on the same tail that owns logits, with no vocabulary transfer.
-            mpi_coordinated_root_rank_ = coordinatedRootRankForRunner(
-                config_.moe_routed_expert_plan, mpi_ctx_, runner_.get());
+            // The graph MUST agree with the sealed request authority (one
+            // ownership source; divergence is fatal). The public frontend then
+            // runs on the same tail that owns logits.
+            // UNCONDITIONAL authority requirement (shared guard): the graph MUST
+            // publish its request authority and it MUST equal the sealed one.
+            const auto graph_authority = runner_->requestAuthorityRank();
+            requireRequestAuthorityAgreement(sealed_request_authority_rank_,
+                                             graph_authority);
+            mpi_coordinated_root_rank_ = *graph_authority;
             return static_cast<bool>(runner_);
         }
 
@@ -25382,17 +25593,11 @@ namespace llaminar2
          * Clear lease-bearing values before their host companions. Although no
          * caller can observe this synchronous transition halfway through, this
          * order makes the performance-critical backend event lifetime explicit
-         * to readers and to custom shared-pointer deleters.
+         * to readers and to custom shared-pointer deleters. The clearing order
+         * is owned by ServingSlotHandoff::retire(); this boundary delegates to
+         * it and marks the bank retired.
          */
-        ready_mtp_condition_.reset();
-        pending_mtp_condition_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_resident_state_.reset();
-
-        pending_mtp_condition_token_.reset();
-        pending_mtp_condition_params_.reset();
-        prelaunched_mtp_first_sidecar_params_.reset();
-        prefill_logits_ready_ = false;
-        decode_transaction_planning_position_.reset();
+        slot_handoff_.retire();
     }
 
     /**
@@ -26549,4 +26754,345 @@ namespace llaminar2
         return runner_ ? runner_->prefixCacheTelemetrySources() : PrefixCacheTelemetrySources{};
     }
 
+    // =========================================================================
+    // Continuous-batching serving session
+    // =========================================================================
+
+    int OrchestrationRunner::servingBatchCapacity() const
+    {
+        return servingBatchUnsupportedReason().empty() ? runner_->batch_size() : 0;
+    }
+
+    std::string OrchestrationRunner::servingBatchUnsupportedReason() const
+    {
+        if (!initialization_lifecycle_.readyForInference() || !runner_)
+            return "the runner is not ready for inference";
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+            return "multi-rank continuous batching is not implemented yet";
+        return runner_->servingRowsUnsupportedReason();
+    }
+
+    namespace
+    {
+        /** @brief The session's row-execution seam over the inference runner. */
+        class InferenceRunnerServingRows final : public IServingRowExecutor
+        {
+        public:
+            InferenceRunnerServingRows(IInferenceRunner &runner,
+                                       PooledServingSlotOwner *pooled)
+                : runner_(runner), pooled_(pooled) {}
+            bool forwardServingRows(const std::vector<int> &slots,
+                                    const std::vector<std::vector<int>> &rows) override
+            {
+                if (pooled_ && !rows.empty())
+                {
+                    // R52 phase wiring: the DGO gets the pooled shape the
+                    // session's phase-split work implies — ONE GROUP for the
+                    // decode phase (every row one token) or ONE SINGLE
+                    // binding for the prefill phase (exactly one row-batch).
+                    if (rows.size() == 1 && rows[0].size() > 1)
+                    {
+                        runner_.setPooledServingBinding(pooled_->bindingFor(slots[0]));
+                    }
+                    else
+                    {
+                        std::vector<PooledKVDecodeBinding *> group;
+                        group.reserve(slots.size());
+                        for (const int slot : slots)
+                        {
+                            auto *b = pooled_->bindingFor(slot);
+                            if (!b)
+                                return false;
+                            group.push_back(b);
+                        }
+                        runner_.setPooledServingGroup(group);
+                    }
+                }
+                const bool ok = runner_.forwardServingRows(slots, rows);
+                runner_.setPooledServingGroup({});
+                runner_.setPooledServingBinding(nullptr);
+                return ok;
+            }
+            bool pooledConfigured() const override { return pooled_ != nullptr; }
+            bool pooledAdmit(int slot, std::uint64_t request_id,
+                             std::string_view retention, std::string_view key,
+                             const std::vector<int32_t> &prompt,
+                             int &restored_tokens) override
+            {
+                pooled_error_.clear();
+                if (!pooled_)
+                    return false;
+                return pooled_->admitSlot(slot, request_id, retention, key,
+                    prompt, restored_tokens, pooled_error_);
+            }
+            bool pooledDemote(int slot) override
+            {
+                pooled_error_.clear();
+                if (!pooled_)
+                    return true;
+                return pooled_->demoteSlot(slot, pooled_error_);
+            }
+            const float *servingRowLogits(int row) const override
+            {
+                return runner_.servingRowLogits(row);
+            }
+            bool resetServingRow(int slot) override
+            {
+                return runner_.resetServingRow(slot);
+            }
+            int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
+                                        PrefixLookupResult &admission) override
+            {
+                return runner_.restoreServingRowPrefix(slot, prompt, admission);
+            }
+            bool harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
+                                         const std::vector<int32_t> &prompt) override
+            {
+                return runner_.harvestServingRowPrefix(slot, admission, prompt);
+            }
+            std::string servingRowError() const override
+            {
+                return pooled_error_.empty() ? runner_.servingRowError() : pooled_error_;
+            }
+        private:
+            IInferenceRunner &runner_;
+            PooledServingSlotOwner *pooled_;
+            std::string pooled_error_;
+        };
+    } // namespace
+
+    namespace
+    {
+        /** @brief The local CPU route's authenticated trust domain (the
+         * demotion stamps it; the restore expects the same — a different
+         * route's values never match a record written here). */
+        constexpr std::uint64_t kLocalCPURouteTrustDomain = 1;
+        /** @brief Pooled page granularity: ONE authority for the instance
+         * plan, the binding policy and the geometry probe (F4). */
+        constexpr int kPooledPageTokens = 8;
+    } // namespace
+
+    bool OrchestrationRunner::setupPooledServing(int capacity, int supported,
+        std::string &error)
+    {
+        const auto &tiers = plan_.runtime.paged_kv_tiers;
+        // The typed intent gate: an EXPLICIT finite pool cap opts into pooled
+        // serving; the default (Auto) keeps the production ring path. The
+        // pooled replacement of the ring is never implicit.
+        if (tiers.pool_budget_mode != PagedKVPoolBudgetMode::Cap)
+            return true;
+        int kv_heads = 0, head_dim = 0, layers = 0;
+        if (!runner_ ||
+            !runner_->pooledKVCacheGeometry(kv_heads, head_dim, layers))
+        {
+            error = "pooled serving requires a CPU dense runner with an "
+                    "admitted KV geometry (CPU paged pooling only)";
+            return false;
+        }
+        const int context = plan_.runtime.max_seq_len > 0
+            ? plan_.runtime.max_seq_len
+            : config_.max_seq_len;
+        const int kPageTokens = kPooledPageTokens; // Single-sourced (F4).
+        // The accepted-work envelope covers the request's forwards: prefill
+        // chunks (context / kPrefillChunk rounded up) + decode steps
+        // (context) + margin.
+        const int issuances =
+            context + (context + 63) / 64 + 8;
+        // The instance plan seats the WHOLE serving capacity: every slot's
+        // accepted-work envelope (banks = max(capacity * issuances, the
+        // two-banks-per-layer floor)) and enough pool request records for
+        // the live grants (import + demotion truncate).
+        const std::size_t banks = std::max<std::size_t>(
+            static_cast<std::size_t>(capacity) *
+                static_cast<std::size_t>(issuances),
+            2 * static_cast<std::size_t>(layers));
+        const auto policy = PagedKVInstancePolicy{kPageTokens,
+            banks, /*readers_per_bank=*/4,
+            /*request_records=*/capacity + 2};
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = tiers.pool_cap_bytes;
+        budget.frame_bytes = static_cast<std::size_t>(kPageTokens) * 2 *
+            static_cast<std::size_t>(kv_heads) * static_cast<std::size_t>(head_dim) *
+            sizeof(float);
+        budget.request_records = capacity;
+        budget.max_pages_per_request =
+            (context + kPageTokens - 1) / kPageTokens + 4;
+        auto plan = planPagedKVInstance(tiers, budget, policy, DeviceId::cpu());
+        if (!plan)
+        {
+            error = "pooled serving plan refused (paged KV geometry does not "
+                    "admit the configured pool cap)";
+            return false;
+        }
+        auto outcome = admitConfiguredPagedKVInstance(
+            physical_memory_authority_, tiers, budget, policy, DeviceId::cpu());
+        if (!outcome.ok())
+        {
+            error = "pooled serving memory admission refused: " + outcome.refusal;
+            return false;
+        }
+        if (!outcome.instance)
+        {
+            error = "pooled serving instance outcome is empty after a success receipt";
+            return false;
+        }
+        pooled_instance_ = std::make_unique<PagedKVInstance>(
+            std::move(*outcome.instance));
+        pooled_slots_ = std::make_unique<PooledServingSlotOwner>(
+            *pooled_instance_, capacity, kv_heads, head_dim, layers,
+            kPageTokens, issuances, /*readers_per_bank=*/4,
+            tiers.retention_classes_ceiling,
+            /*trust_domain=*/kLocalCPURouteTrustDomain,
+            static_cast<std::size_t>(capacity), static_cast<std::size_t>(capacity));
+        // Re-create the row adapter with the pooled owner (the DGO per-phase
+        // wiring and the flow hooks are active for the whole session).
+        serving_rows_adapter_ = std::make_unique<InferenceRunnerServingRows>(
+            *runner_, pooled_slots_.get());
+        return true;
+    }
+
+    bool OrchestrationRunner::beginServingBatch(
+        int capacity, std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage)
+    {
+        if (serving_session_ && serving_session_->active())
+            return setError("Serving batch session is already open");
+        if (batched_decode_active_)
+            return setError("Serving batch cannot open over a fixed request batch");
+        const int supported = servingBatchCapacity();
+        if (supported <= 0)
+            return setError("Continuous-batching serving is unsupported on this runner");
+        if (capacity <= 0 || capacity > supported)
+            return setError("Serving batch capacity " + std::to_string(capacity) +
+                            " outside the runner's admitted " + std::to_string(supported) + " slots");
+        // Every slot starts empty; the scalar request path is retired for the
+        // session's lifetime because the slots own all live sequence state.
+        runner_->clear_cache();
+        const int context = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len : config_.max_seq_len;
+        serving_rows_adapter_ = std::make_unique<InferenceRunnerServingRows>(
+            *runner_, pooled_slots_.get());
+        serving_session_ = std::make_unique<ServingSession>(*serving_rows_adapter_, context, vocabSize());
+        serving_session_->setTraceRecorder(serving_trace_recorder_);
+        std::string error;
+        // The admitted queue depth Q is the running capacity's authored
+        // preparing-or-queued bound; until the capacity object is threaded
+        // through the runner, the queue remains bounded by the SAME admitted
+        // slot count (the response pool cannot exceed R = S + Q, and the
+        // serving layer imposes its own external intake bound on top).
+        const int queue_depth = capacity;
+        if (!serving_session_->begin(capacity, supported, error, std::move(decision_storage),
+                queue_depth))
+        {
+            serving_session_.reset();
+            serving_rows_adapter_.reset();
+            return setError(error);
+        }
+        // R52 POOLED serving: an EXPLICIT finite paged-KV pool cap is the
+        // typed intent (the default Auto/Off config keeps the production
+        // ring path — no implicit mode change). The composed instance is
+        // admitted under the runner's OWN physical memory authority, the
+        // per-slot binding owner is created, and the row adapter wires the
+        // DGO per phase. Any refusal fails the whole batch open (typeless
+        // partial pooled serving is not a state).
+        if (!setupPooledServing(capacity, supported, error))
+        {
+            serving_session_->end();
+            serving_session_.reset();
+            serving_rows_adapter_.reset();
+            pooled_slots_.reset();
+            pooled_instance_.reset();
+            return setError(error);
+        }
+        return true;
+    }
+
+    bool OrchestrationRunner::submitServingRequest(ServingBatchRequest request)
+    {
+        if (!serving_session_)
+            return setError("Serving batch session is not open");
+        std::string error;
+        const auto outcome = serving_session_->submit(std::move(request), error);
+        if (outcome == ServingSubmissionOutcome::Refused)
+            return setError(error);
+        return true; // Direct and Queued both accept the request.
+    }
+
+    void OrchestrationRunner::cancelServingRequest(std::uint64_t id)
+    {
+        if (serving_session_)
+            serving_session_->cancel(id);
+    }
+
+    void OrchestrationRunner::grantServingTokens(std::uint64_t id, int tokens)
+    {
+        if (serving_session_)
+            serving_session_->grant(id, tokens);
+    }
+
+    void OrchestrationRunner::forceServingToken(std::uint64_t id, int32_t token)
+    {
+        if (serving_session_)
+            serving_session_->force(id, token);
+    }
+
+    bool OrchestrationRunner::servingBatchIdle() const
+    {
+        return !serving_session_ || serving_session_->idle();
+    }
+
+    bool OrchestrationRunner::servingBatchHasRunnableWork() const
+    {
+        return serving_session_ && serving_session_->hasRunnableWork();
+    }
+
+    std::optional<ServingContinuationManifest> OrchestrationRunner::suspendServingRequest(
+        std::uint64_t id, std::string &error)
+    {
+        if (!serving_session_)
+        {
+            error = "Serving batch session is not open";
+            return std::nullopt;
+        }
+        return serving_session_->suspend(id, error);
+    }
+
+    bool OrchestrationRunner::restoreServingRequest(
+        ServingContinuationManifest &&manifest, std::string &error)
+    {
+        if (!serving_session_)
+        {
+            error = "Serving batch session is not open";
+            return false;
+        }
+        return serving_session_->restore(std::move(manifest), error);
+    }
+
+    void OrchestrationRunner::endServingBatch()
+    {
+        if (serving_session_)
+            serving_session_->end();
+        serving_session_.reset();
+        serving_rows_adapter_.reset();
+        pooled_slots_.reset();
+        pooled_instance_.reset();
+    }
+
+    void OrchestrationRunner::setServingTraceRecorder(std::shared_ptr<IServingTraceRecorder> recorder)
+    {
+        serving_trace_recorder_ = std::move(recorder);
+        if (serving_session_)
+            serving_session_->setTraceRecorder(serving_trace_recorder_);
+    }
+
+    int sampleServingDecision(Sampler &sampler, const float *logits, std::size_t vocab_size,
+                              const SamplingParams &params, int logical_position)
+    {
+        return sampleHostLogitsAtLogicalPositionImpl(sampler, logits, vocab_size, params, logical_position);
+    }
+
+    std::vector<ServingBatchEvent> OrchestrationRunner::stepServingBatch()
+    {
+        return serving_session_ ? serving_session_->step() : std::vector<ServingBatchEvent>{};
+    }
+
 } // namespace llaminar2
+#include "execution/mpi_orchestration/IExecutionPlanBuilder.h"

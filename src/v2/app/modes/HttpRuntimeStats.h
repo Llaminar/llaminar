@@ -11,6 +11,7 @@
 
 #include "execution/prefix_cache/PrefixCacheStats.h"
 #include "app/modes/HttpPrefixCacheStats.h"
+#include <map>
 #include <nlohmann/json.hpp>
 #include <array>
 #include <chrono>
@@ -154,18 +155,25 @@ namespace llaminar2
         /** @brief Atomically retire a scope, publishing only validated terminal observations. */
         void retire(const Request &request, Terminal terminal, Clock::time_point at);
         /** @brief Publish a host phase boundary, never a model execution decision. */
-        void setPhase(const char *phase);
+        void setPhase(uint64_t sequence, const char *phase);
 
         const Clock::time_point started_ = Clock::now();
         mutable std::mutex mutex_;
         Counters counters_;
         HttpPrefixCacheStats prefix_storage_stats_; ///< Same mutex and epoch as HTTP counters.
-        uint64_t epoch_ = 0, request_sequence_ = 0, active_epoch_ = 0;
+        uint64_t epoch_ = 0, request_sequence_ = 0;
         Clock::time_point reset_at_ = started_;
         double reset_unix_seconds_ = std::chrono::duration<double>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        std::optional<Clock::time_point> active_since_;
-        const char *active_phase_ = "idle";
+        /** @brief One active (begun, not yet retired) request. */
+        struct Active
+        {
+            Clock::time_point since;
+            const char *phase = "setup";
+            uint64_t epoch = 0; ///< Measurement epoch the request started in.
+        };
+        /** @brief Every concurrently active request, keyed by its arrival sequence. */
+        std::map<uint64_t, Active> active_;
         std::optional<Terminal> last_;
     };
 }

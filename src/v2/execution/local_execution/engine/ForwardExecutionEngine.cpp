@@ -2341,13 +2341,18 @@ namespace llaminar2
             }
         }
 
+        // A CPU serving forward bakes its slot map, real row lengths and
+        // terminal-row plan into the graph, none of which the signature keys:
+        // it is built per transaction and never replayed from the cache.
+        const bool serving_rows_forward = effective_input.request_kv_slots != nullptr;
         const bool forward_cache_eligible =
-            (config_.cache_config.enabled &&
-             is_decode &&
-             has_stable_forward_inputs &&
-             (is_standard_path || is_partial_pp_path)) ||
-            cpu_exact_prefill_cache_eligible ||
-            prefill_cache_eligible;
+            !serving_rows_forward &&
+            ((config_.cache_config.enabled &&
+              is_decode &&
+              has_stable_forward_inputs &&
+              (is_standard_path || is_partial_pp_path)) ||
+             cpu_exact_prefill_cache_eligible ||
+             prefill_cache_eligible);
 
         ForwardGraphSignature forward_signature;
         ForwardGraphCache *active_forward_cache = nullptr;

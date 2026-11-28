@@ -358,6 +358,12 @@ namespace llaminar2
           cpu_grouped_kv_logical_views_(
               static_cast<size_t>(std::max(0, params_.batch_size)))
     {
+        if (params_.device_id.is_cpu() && params_.kv_cache)
+            for (int row = 0; row < params_.batch_size; ++row)
+            {
+                cpu_cache_k_dump_names_.push_back(params_.batch_size == 1 ? "K" : "K_request_" + std::to_string(row));
+                cpu_cache_v_dump_names_.push_back(params_.batch_size == 1 ? "V" : "V_request_" + std::to_string(row));
+            }
         const auto &key_cache_policy = params_.execution_policy.key_cache;
         if (key_cache_policy.transformsOnRead())
         {
@@ -1058,14 +1064,21 @@ namespace llaminar2
                             ITensor *request_k = nullptr;
                             ITensor *request_v = nullptr;
                             int request_kv_len = 0;
+                            const int request_sequence =
+                                params_.request_kv_slots_host.empty()
+                                    ? request
+                                    : params_.request_kv_slots_host[static_cast<size_t>(request)];
                             if (!params_.kv_cache->get_kv(
                                     params_.layer_idx,
-                                    request,
+                                    request_sequence,
                                     &request_k,
                                     &request_v,
                                     &request_kv_len) ||
                                 !request_k || !request_v ||
-                                request_kv_len < params_.seq_len)
+                                request_kv_len <
+                                    (params_.request_real_lengths_host.empty()
+                                         ? params_.seq_len
+                                         : params_.request_real_lengths_host[static_cast<size_t>(request)]))
                             {
                                 LOG_ERROR("[AttentionComputeStage] Native CPU grouped cache retrieval failed"
                                           << " layer=" << params_.layer_idx
@@ -1088,7 +1101,7 @@ namespace llaminar2
                             const IKVCache::KVCacheSequenceState state =
                                 params_.kv_cache->sequenceState(
                                     params_.layer_idx,
-                                    request);
+                                    request_sequence);
                             if (state.cached_tokens != request_kv_len ||
                                 request_kv_len > physical_capacity ||
                                 state.implementation_head < 0 ||
@@ -1120,15 +1133,19 @@ namespace llaminar2
                         effective_K = const_cast<ITensor *>(cpu_grouped_k_views_.front());
                         effective_V = const_cast<ITensor *>(cpu_grouped_v_views_.front());
                         effective_kv_len = max_request_kv_len;
-                        cpu_grouped_request_cache = true;
+                        cpu_grouped_request_cache = params_.pooled_table == nullptr;
                     }
 
                     else
                     {
                         int kv_len_out = 0;
+                        const int single_sequence =
+                            params_.request_kv_slots_host.size() == 1
+                                ? params_.request_kv_slots_host.front()
+                                : 0;
                         if (!params_.kv_cache->get_kv(
                                 params_.layer_idx,
-                                /*seq_idx=*/0,
+                                single_sequence,
                                 &cache_k,
                                 &cache_v,
                                 &kv_len_out) ||
@@ -1152,7 +1169,7 @@ namespace llaminar2
                         const IKVCache::KVCacheSequenceState sequence_state =
                             params_.kv_cache->sequenceState(
                                 params_.layer_idx,
-                                /*seq_idx=*/0);
+                                single_sequence);
                         const int physical_capacity =
                             params_.kv_cache->max_seq_len();
                         /*
@@ -1296,6 +1313,7 @@ namespace llaminar2
         }
 
         const bool is_decode_mode = (mode == AttentionMode::DECODE ||
+                                     mode == AttentionMode::BATCHED_DECODE ||
                                      (params_.seq_len < effective_kv_len && params_.batch_size == 1));
 
         LOG_TRACE("[AttentionComputeStage] Execute: batch=" << params_.batch_size
@@ -1311,8 +1329,38 @@ namespace llaminar2
                                                             << " V_type=" << (effective_V ? effective_V->dtype_name() : "null")
                                                             << " output=" << (void *)params_.output);
 
-        // Validate inputs
-        if (!ensureRequiredPointers("AttentionComputeStage", {
+        // Validate inputs. P2 pooled mode: K/V come from the pooled snapshot
+        // (borrowed below), so only Q/output and the owning table are required
+        // there; the ring K/V pointers are undefined and must NOT be validated
+        // (the pooled branch fails closed if the snapshot cannot be produced).
+        if (params_.pooled_table != nullptr)
+        {
+            // A production caller reads the ref from the live cell (published by
+            // the pooled append stage during this graph); a direct test supplies
+            // it in Params. Either source must be a valid exact ref.
+            // GROUPED: every per-request cell must be valid and DISTINCT.
+            bool ref_valid = params_.pooled_ref_cell
+                ? params_.pooled_ref_cell->valid()
+                : params_.pooled_ref.valid();
+            if (!params_.pooled_ref_cells.empty())
+            {
+                ref_valid = true;
+                for (const auto *cell : params_.pooled_ref_cells)
+                {
+                    if (!cell || !cell->valid())
+                    {
+                        ref_valid = false;
+                        break;
+                    }
+                }
+            }
+            if (!params_.Q || !params_.output || !ref_valid)
+            {
+                LOG_ERROR("[AttentionComputeStage] Pooled mode requires Q, output and an exact typed reference");
+                return false;
+            }
+        }
+        else if (!ensureRequiredPointers("AttentionComputeStage", {
                                                                  {"Q", params_.Q},
                                                                  {"K", effective_K},
                                                                  {"V", effective_V},
@@ -1369,7 +1417,129 @@ namespace llaminar2
          * grown-prefix replay, making the regime choice graph-stable and fully
          * device-owned.
          */
+        // J2: pooled mode is decided FIRST, before ANY ring branch. The pooled
+        // path supports ONLY CPU decode with one query row and an exact typed
+        // ref; every other combination (prefill, grouped, verifier, non-CPU)
+        // is rejected with an explicit diagnostic — it can never fall through
+        // to a ring compute with unvalidated null ring K/V.
+        const bool pooled_mode = params_.pooled_table != nullptr;
+        // GROUPED pooled decode: N refs, one graph (design §13.2 ordinary
+        // grouped decode remains genuinely grouped). Selected BEFORE the
+        // single-ref branch: when per-request cells are present the stage
+        // computes all rows through ONE grouped pooled kernel entry.
+        const bool pooled_grouped_mode =
+            pooled_mode && !params_.pooled_ref_cells.empty();
+        // Production caller: the ref is published by the pooled append stage
+        // into a stable cell DURING this graph. Read it at execute time once;
+        // a stale/empty cell fails closed exactly like an invalid Params ref.
+        const PagedKVSnapshotRef current_ref =
+            params_.pooled_ref_cell ? *params_.pooled_ref_cell : params_.pooled_ref;
+        bool pooled_ok = true;
+        std::optional<CPUFP32PagedKVTable::Snapshot> pooled_borrow;
+        if (pooled_grouped_mode)
+        {
+            if (!params_.device_id.is_cpu())
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled grouped decode requires a CPU device");
+            }
+            else if (!is_decode_mode || params_.seq_len != 1 ||
+                     static_cast<int>(params_.pooled_ref_cells.size()) !=
+                         params_.batch_size)
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled grouped decode requires one ref cell per decode row"
+                          << " (cells=" << params_.pooled_ref_cells.size()
+                          << " batch=" << params_.batch_size
+                          << " seq=" << params_.seq_len << ")");
+            }
+            else
+            {
+                // R1: distinct-publication validation. Each cell must name
+                // the exact publication of a DISTINCT request; two rows
+                // sharing one publication would double-attend the same
+                // rows (silent cross-request aliasing) and a cell also
+                // named by the single ref is a caller error. Duplicates are
+                // refused BEFORE any resolve or borrow — no row ever runs
+                // under ambiguous identity.
+                bool refs_distinct = true;
+                for (std::size_t r = 0; r < params_.pooled_ref_cells.size() && refs_distinct; ++r)
+                {
+                    const auto *cell = params_.pooled_ref_cells[r];
+                    if (!cell || !cell->valid())
+                    {
+                        refs_distinct = false;
+                        LOG_ERROR("[AttentionComputeStage] Pooled grouped ref cell " << r
+                                  << " is null or invalid");
+                        break;
+                    }
+                    if (params_.pooled_ref_cell && *cell == *params_.pooled_ref_cell)
+                    {
+                        refs_distinct = false;
+                        LOG_ERROR("[AttentionComputeStage] Pooled grouped ref cell " << r
+                                  << " duplicates the single pooled ref");
+                        break;
+                    }
+                    for (std::size_t q = r + 1; q < params_.pooled_ref_cells.size(); ++q)
+                    {
+                        const auto *other = params_.pooled_ref_cells[q];
+                        if (other && *cell == *other)
+                        {
+                            refs_distinct = false;
+                            LOG_ERROR("[AttentionComputeStage] Pooled grouped ref cells " << r
+                                      << " and " << q << " name the same publication");
+                            break;
+                        }
+                    }
+                }
+                if (!refs_distinct)
+                    pooled_ok = false;
+            }
+        }
+        else if (pooled_mode)
+        {
+            if (!params_.device_id.is_cpu())
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode requires a CPU device");
+            }
+            else if (params_.batch_size != 1 || params_.seq_len < 1)
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode requires one CPU request row-batch"
+                          << " (batch=" << params_.batch_size << " seq=" << params_.seq_len << ")");
+            }
+            else if (is_decode_mode && params_.seq_len != 1)
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot decode supports only a single row");
+            }
+            else if (!current_ref.valid())
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode requires an exact typed reference");
+            }
+            else if (params_.pooled_table->authorityIdentity() != current_ref.authority_id)
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot reference belongs to another table");
+            }
+            else if (params_.kv_rotation != nullptr)
+            {
+                // K2: rotating Q without rotating the pooled K/V pages would
+                // multiply unrotated references and silently corrupt attention.
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode does not support KV rotation");
+            }
+            else if (params_.active_query_rows_device != nullptr)
+            {
+                // Any device-owned row-transform is unsupported for pooled pages.
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode does not support device query-row transforms");
+            }
+        }
         const bool gpu_grouped_request_decode =
+            !pooled_mode &&
             gpu_stage &&
             params_.kv_cache &&
             params_.layer_idx >= 0 &&
@@ -1502,7 +1672,10 @@ namespace llaminar2
         // Since compute_tensor() now takes ITensor*, we can pass Q/K/V directly without casting.
         // This allows GPU tensor wrappers (like GpuTensorView from CUDA KV cache) to work.
 
-        if (!ensureRequiredPointers("AttentionComputeStage", {
+        // P2 pooled mode: K/V are the pooled snapshot, never ring tensors —
+        // skip the ring pointer validation there (the pooled branch fails closed).
+        if (params_.pooled_table == nullptr &&
+            !ensureRequiredPointers("AttentionComputeStage", {
                                                                  {"Q", params_.Q},
                                                                  {"K", effective_K},
                                                                  {"V", effective_V},
@@ -1665,6 +1838,18 @@ namespace llaminar2
         }
 #endif
 
+        // L1: pooled mode with a rejected combination must return NOW, before
+        // ANY transform, dump or ring work — a rejected pooled combination
+        // (rotation, device row transform, wrong device, non-decode) would
+        // otherwise rotate Q in place against unrotated pooled K pages and
+        // dereference NULL ring K/V.
+        if (pooled_mode && !pooled_ok)
+        {
+            LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode rejected an unsupported combination; "
+                      "no transform or ring work ran");
+            return false;
+        }
+
         // =================================================================
         // KV rotation: rotate Q before attention, inverse-rotate output after.
         // When K/V were rotated by ActivationRotation before Q16_1 quantization
@@ -1771,6 +1956,7 @@ namespace llaminar2
         }
 
         const bool small_verifier_decode =
+            !pooled_mode &&
             is_decode_mode &&
             params_.batch_size == 1 &&
             params_.causal &&
@@ -1802,7 +1988,11 @@ namespace llaminar2
                 params_.head_start,
                 params_.gqa_n_rep,
                 params_.execution_policy,
-                cpu_grouped_kv_logical_views_.data());
+                cpu_grouped_kv_logical_views_.data(),
+                params_.request_real_lengths_host.size() ==
+                        static_cast<size_t>(params_.batch_size)
+                    ? params_.request_real_lengths_host.data()
+                    : nullptr);
             if (!success)
             {
                 LOG_ERROR("[AttentionComputeStage] Backend lacks grouped request-cache decode attention"
@@ -1891,6 +2081,152 @@ namespace llaminar2
                           << " rows=" << params_.seq_len
                           << " effective_kv_len=" << effective_kv_len
                           << " device=" << params_.device_id.to_string());
+            }
+        }
+        else if (pooled_grouped_mode)
+        {
+            if (!pooled_ok)
+            {
+                success = false; // J2: an unsupported pooled combination was rejected
+                                 // above BEFORE any ring branch ran.
+            }
+            else
+            {
+                // ONE grouped invocation, N exact per-request publications.
+                // Resolve every ref against the owning table FIRST (the
+                // borrows stay alive for the single kernel call), then run
+                // the grouped pooled kernel — no stage-level row loop, no
+                // ring fallback, no per-request dispatch crossing.
+                std::vector<PagedKVReadView> views(params_.pooled_ref_cells.size());
+                // The Snapshot owns the native view storage; keep the views in
+                // a STABLE buffer (Snapshots reallocate on push_back, and
+                // Snapshot::view() returns BY VALUE, so handles must point at
+                // stable storage owned by this call, never at temporaries).
+                std::vector<CPUFP32PagedKVView> stable_views;
+                stable_views.reserve(params_.pooled_ref_cells.size());
+                std::vector<CPUFP32PagedKVTable::Snapshot> borrows;
+                borrows.reserve(params_.pooled_ref_cells.size());
+                std::vector<int> positions(params_.pooled_ref_cells.size(), 0);
+                bool grouped_ok = true;
+                for (std::size_t r = 0; r < params_.pooled_ref_cells.size(); ++r)
+                {
+                    auto borrowed = params_.pooled_table->resolveSnapshotRef(
+                        *params_.pooled_ref_cells[r]);
+                    if (!borrowed)
+                    {
+                        grouped_ok = false;
+                        LOG_ERROR("[AttentionComputeStage] Pooled grouped resolve refused for request "
+                                  << r << " version "
+                                  << params_.pooled_ref_cells[r]->publication_version);
+                        break;
+                    }
+                    borrows.push_back(std::move(*borrowed));
+                    stable_views.push_back(borrows.back().view());
+                    const auto &borrowed_view = stable_views.back();
+                    PagedKVReadView view;
+                    view.native_handle = &borrowed_view;
+                    view.rows = borrowed_view.rows();
+                    view.heads = params_.n_kv_heads;
+                    view.dimension = params_.head_dim;
+                    view.page_tokens = params_.pooled_table->tableGeometry().page_tokens;
+                    views[r] = view;
+                    // The publication is the decode-position authority: a
+                    // decode row at row N attends with position N-1.
+                    positions[r] = borrowed_view.rows() - 1;
+                }
+                if (grouped_ok)
+                {
+                    std::vector<const PagedKVReadView *> view_ptrs;
+                    view_ptrs.reserve(views.size());
+                    for (const auto &view : views)
+                        view_ptrs.push_back(&view);
+                    success = kernel->compute_pooled_request_batch_decoder(
+                        params_.Q, view_ptrs.data(), positions.data(),
+                        params_.output, static_cast<int>(views.size()),
+                        params_.n_heads, params_.n_kv_heads, params_.head_dim,
+                        kernel_causal, params_.window_size,
+                        params_.head_start, params_.gqa_n_rep,
+                        params_.execution_policy);
+                    if (!success)
+                        LOG_ERROR("[AttentionComputeStage] Pooled grouped decode refused"
+                                  << " layer=" << params_.layer_idx
+                                  << " requests=" << views.size());
+                }
+                else
+                    success = false;
+            }
+        }
+        else if (pooled_mode)
+        {
+            if (!pooled_ok)
+            {
+                success = false; // J2: an unsupported pooled combination was rejected
+                                 // above BEFORE any ring branch ran (never fall through
+                                 // to a ring compute with null K/V).
+            }
+            else
+            {
+                // P2 stage-level pooled consumption: resolve the EXACT typed
+                // reference against the owning table (identity + monotonic
+                // version; a reused bank or superseded version refuses) and
+                // compute through the production pooled kernel. A resolution
+                // refusal fails the step (never a silent ring path).
+                auto borrowed = params_.pooled_table->resolveSnapshotRef(current_ref);
+                if (!borrowed)
+                {
+                    success = false;
+                    LOG_ERROR("[AttentionComputeStage] Pooled snapshot resolve refused for version "
+                              << current_ref.publication_version);
+                }
+                else
+                {
+                    // Retain the Snapshot for the call; its view() is stable for
+                    // the Snapshot's lifetime (we hold it in pooled_borrow), so
+                    // the native handle is its address and the CPU kernel
+                    // resolves it exactly (backend-neutral seam).
+                    pooled_borrow = std::move(*borrowed);
+                    const auto &borrowed_view = pooled_borrow->view();
+                    PagedKVReadView view;
+                    view.native_handle = &borrowed_view;
+                    view.rows = borrowed_view.rows();
+                    view.heads = params_.n_kv_heads;
+                    view.dimension = params_.head_dim;
+                    view.page_tokens = params_.pooled_table->tableGeometry().page_tokens;
+                    // Pooled position: DECODE uses the publication's row
+                    // count as the authority (the host cursor may not have
+                    // advanced). CONTINUED PREFILL is a row batch whose first
+                    // query position P is the publication row count — the
+                    // graph supplies it through position_offset (causal
+                    // masking then covers rows [0 .. P + r] per query row).
+                    const int pooled_position =
+                        params_.pooled_position_from_publication
+                            ? borrowed_view.rows() - 1
+                            : params_.position_offset;
+                    // N1 (R52): the stage itself bounds the query window to
+                    // the publication — a misuse (negative offset or a query
+                    // batch reaching past the borrowed view) is structurally
+                    // impossible, never a silent partial mask.
+                    const int pooled_query_span =
+                        is_decode_mode ? 1 : params_.seq_len;
+                    if (pooled_position < 0 ||
+                        pooled_position + pooled_query_span > borrowed_view.rows())
+                    {
+                        pooled_ok = false;
+                        LOG_ERROR("[AttentionComputeStage] Pooled query window outside the publication"
+                                  << " position=" << pooled_position
+                                  << " rows=" << pooled_query_span
+                                  << " publication=" << borrowed_view.rows());
+                    }
+                    if (pooled_ok)
+                        success = kernel->compute_pooled_snapshot_decoder(
+                            params_.Q, view, params_.output,
+                            params_.n_heads, params_.n_kv_heads, params_.head_dim,
+                            kernel_causal, params_.window_size, pooled_position,
+                            params_.head_start, params_.gqa_n_rep, params_.execution_policy);
+                    if (!success)
+                        LOG_ERROR("[AttentionComputeStage] Pooled snapshot decode refused"
+                                  << " layer=" << params_.layer_idx);
+                }
             }
         }
         else
@@ -2088,37 +2424,34 @@ namespace llaminar2
             debugEnv().attention.debug_effective_kv_snapshot &&
             debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
             prepareEffectiveKVDumpStorage();
-        if (debug_effective_k_tensor_ && debug_effective_v_tensor_)
+        if (params_.kv_cache && params_.layer_idx >= 0 && params_.device_id.is_cpu())
+        {
+            // A cache view owns one sequence, not batch_size sequences.
+            // Describe every actual owner separately, including noncontiguous
+            // serving slots and unequal live cache lengths.
+            dump_K = nullptr;
+            dump_V = nullptr;
+            total_kv_tokens = 0;
+            for (int row = 0; row < params_.batch_size; ++row)
+            {
+                const int slot = params_.request_kv_slots_host.empty() ? row : params_.request_kv_slots_host.at(row);
+                if (params_.kv_cache->get_cached_tokens(params_.layer_idx, slot) == 0)
+                    continue;
+                ITensor *cache_k = nullptr;
+                ITensor *cache_v = nullptr;
+                int length = 0;
+                if (!params_.kv_cache->get_kv(params_.layer_idx, slot, &cache_k, &cache_v, &length) ||
+                    !cache_k || !cache_v || length <= 0)
+                    throw std::logic_error("CPU attention diagnostic cache owner has no live view");
+                info.addInput(cpu_cache_k_dump_names_.at(row).c_str(), cache_k, length, params_.n_kv_heads * params_.head_dim);
+                info.addInput(cpu_cache_v_dump_names_.at(row).c_str(), cache_v, length, params_.n_kv_heads * params_.head_dim);
+            }
+        }
+        else if (debug_effective_k_tensor_ && debug_effective_v_tensor_)
         {
             dump_K = debug_effective_k_tensor_;
             dump_V = debug_effective_v_tensor_;
             total_kv_tokens = debug_effective_k_rows_;
-        }
-        else if (params_.kv_cache && params_.layer_idx >= 0 &&
-                 !params_.device_id.is_gpu())
-        {
-            const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-            const bool should_read_cache = cached_tokens > 0;
-
-            if (should_read_cache)
-            {
-                ITensor *cache_k = nullptr;
-                ITensor *cache_v = nullptr;
-                int cache_kv_len = 0;
-                if (params_.kv_cache->get_kv(params_.layer_idx, 0, &cache_k, &cache_v, &cache_kv_len) &&
-                    cache_k && cache_v && cache_kv_len > 0)
-                {
-                    dump_K = cache_k;
-                    dump_V = cache_v;
-                    total_kv_tokens = static_cast<size_t>(params_.batch_size * cache_kv_len);
-                }
-                else if (cache_kv_len == 0)
-                {
-                    dump_K = nullptr;
-                    dump_V = nullptr;
-                    total_kv_tokens = 0;
-                }
-            }
         }
 
         if (params_.Q)

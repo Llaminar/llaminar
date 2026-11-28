@@ -9,40 +9,15 @@
 
 #pragma once
 #include "backends/DeviceId.h"
+#include "kernels/kvcache/KVStorageLayout.h"
 #include "tensors/TensorType.h"
 #include <cstddef>
 #include <string>
 
 namespace llaminar2
 {
-    /**
-     * @brief Concrete cache construction family, independent of storage precision.
-     *
-     * GPU hybrid caches currently store linear Q8_1 K/V, whereas attention-only
-     * Q8 caches store anchored AQ8 keys. CPU caches use anchored keys in both
-     * families. Every admission caller must name the family explicitly: a dtype
-     * alone is not a complete physical allocation or serialization contract.
-     */
-    enum class KVCacheFamily
-    {
-        AttentionOnly, ///< Ordinary attention and the shifted MTP sidecar.
-        Hybrid,        ///< Main cache with the model's FA/GDN layer mapping.
-    };
-
-    /** @brief Native packed bytes for one logical CPU/GPU cache layer. */
-    struct LogicalKVPayload
-    {
-        /** Key payload, including the immutable AQ8 anchor when compressed. */
-        std::size_t k_bytes = 0;
-        /** Value payload in the configured native cache codec. */
-        std::size_t v_bytes = 0;
-
-        /** @return Combined K/V payload bytes. */
-        [[nodiscard]] std::size_t totalBytes() const noexcept
-        {
-            return k_bytes + v_bytes;
-        }
-    };
+    // Cache-family and native payload types live at the kernel/storage seam.
+    // Planning consumes that canonical geometry rather than defining codecs.
 
     /** @brief Exact backend-aware persistent KV-cache memory estimator. */
     class KVCacheMemoryEstimator

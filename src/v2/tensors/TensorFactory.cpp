@@ -8,6 +8,7 @@
  * @author David Sanftenberg
  */
 
+#include "utils/NUMATopology.h"
 #include "TensorFactory.h"
 #include "../utils/OpenMPUtils.h"
 #include "BlockStructures.h"
@@ -514,7 +515,7 @@ namespace llaminar2
 
     void TensorFactory::bindToNumaNode()
     {
-        if (numa_node_ < 0)
+        if (numa_node_ < 0 || nonNUMAKernelSingleNode(numa_node_))
         {
             return;
         }

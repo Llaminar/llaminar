@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "execution/config/ServingPoolMemoryDemand.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
@@ -48,6 +49,17 @@ struct MoEOverlayPrefillMemoryPolicy
  * may be wider than the current request, exactly as in production runner reuse.
  * Graph-family identity comes from the model manifest, never a guessed count.
  */
+/** @brief MANDATORY pipeline contribution plan (typed pipeline entry).
+ *  Derived by the pipeline admission from the parent topology + stage ownership
+ *  (the vocabulary-head stage on the parent authority contributes); the
+ *  pipeline-only entry function REQUIRES it — no self-declared boolean on the
+ *  request, no possible default-to-child-root path. */
+struct MoEOverlayPipelineStageContribution
+{
+    int parent_authority = -1;
+    bool contributes = false;
+};
+
 struct MoEOverlayMemoryPlanInputRequest
 {
     const ModelMemoryProfile &model;
@@ -71,6 +83,8 @@ struct MoEOverlayMemoryPlanInputRequest
     std::optional<CPUStoragePlacement> native_source_placement;
     /** Original local pipeline demand, resolved across every authored stage before per-stage solves. */
     bool native_pipeline_maintenance_budget = false;
+
+
     /** Original checked CPU pipeline program; borrowed through this complete planning transaction only. */
     const OriginalCPUPipelineProgram* original_cpu_stage_program=nullptr;
 };
@@ -98,4 +112,21 @@ struct MoEOverlayMemoryPlanInputs
 [[nodiscard]] MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
     const MoEOverlayMemoryPlanInputRequest &request,
     int resident_prefill_rows);
+
+[[nodiscard]] MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
+    const MoEOverlayMemoryPlanInputRequest &request,
+    int resident_prefill_rows);
+
+/** @brief PIPELINE-ONLY typed entry (out-of-line): REQUIRES a VALIDATED
+ *  contribution plan (negative or non-member parent authority is REJECTED —
+ *  the checked entry is the ONLY pipeline path; the shared assembly is
+ *  file-local, so no unchecked public Impl exists). */
+[[nodiscard]] MoEOverlayMemoryPlanInputs buildMoEOverlayPipelineStageInputs(
+    const MoEOverlayMemoryPlanInputRequest &request,
+    int resident_prefill_rows,
+    const MoEOverlayPipelineStageContribution &contribution);
+
+
+
+
 } // namespace llaminar2

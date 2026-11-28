@@ -83,7 +83,8 @@ inline GraphArenaStorageLayout cpuFixtureGraphRoots(const IGraphBuilder &graph,i
     return GraphArenaStorageLayout::resolve(graph.getSchema(),graph.getResolverConfig(rows),{
         .full_prefill_kv_handoff=config.dense_tp_enabled&&config.dense_tp_decode_replicated&&config.qkv_column_parallel,
         .terminal_hidden_rows=retained?size_t(resolveMTPTerminalHiddenRowCapacity(batch,config.mtp)):0,
-        .terminal_hidden_columns=retained?size_t(config.residualWidth()):0});
+        .terminal_hidden_columns=retained?size_t(config.residualWidth()):0,
+        .cpu_mtp_resident_slots=retained?size_t(batch):0});
 }
 /** @return Empty test dependency bundle with explicit graph and rank identity. */
 inline DeviceGraphOrchestrator::Dependencies cpuFixtureDependencies(

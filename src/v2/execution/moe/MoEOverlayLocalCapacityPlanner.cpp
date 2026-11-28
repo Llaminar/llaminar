@@ -1215,6 +1215,26 @@ namespace llaminar2
             result.device_inputs = std::move(prepared.device_inputs);
 
             PhysicalMemoryPlanBuilder physical_plan_builder;
+            // SERVING POOL (host owner line, exact typed demand, added ONCE for
+            // this rank when the fail-closed owner decision produced it).
+            if (input.serving_pool_demand_bytes)
+            {
+                // CANONICAL host-resource authority (same as every other host
+                // contributor): inventory observation + usableMemory (explicit
+                // CPU ceiling honored), not raw free bytes.
+                const auto inventory = input.cluster_inventory
+                    ? &input.cluster_inventory->ranks.at(input.rank_plan->rank)
+                    : input.rank_inventory;
+                const auto [total, available] = inventoryMemory(*inventory, DeviceId::cpu());
+                const PhysicalMemoryResource host_res{
+                    .world_rank = input.rank_plan->rank,
+                    .device = DeviceId::cpu(),
+                    .total_bytes = total,
+                    .admission_available_bytes = usableMemory(available, DeviceId::cpu(), input)};
+                physical_plan_builder.add(
+                    host_res, PhysicalMemoryOwner::ServingResponsePool,
+                    *input.serving_pool_demand_bytes);
+            }
             for (const auto &device_plan : result.fixed_memory_plan.devices)
             {
                 resource_devices.insert(device_plan.device());

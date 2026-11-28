@@ -11,6 +11,7 @@
  * weights or mutating the canonical registry and prepared-store ownership.
  */
 
+#include "utils/NUMATopology.h"
 #include "MoEExpertWeightService.h"
 #include "ExpertWeightPayloadProvider.h"
 #include "GPUExpertTransfer.h"
@@ -987,7 +988,8 @@ namespace llaminar2
         const int target_numa_node = ctx.cpu_numa_placement.node();
         const bool enforce_numa_placement =
             ctx.cpu_numa_placement.requiresNodeBinding();
-        if (enforce_numa_placement && numa_available() < 0)
+        if (enforce_numa_placement && numa_available() < 0 &&
+            !nonNUMAKernelSingleNode(target_numa_node))
         {
             LOG_ERROR("[MoEWeightService][NUMA] Cannot enforce CPU expert packing on NUMA node "
                       << target_numa_node << ": libnuma policy APIs are unavailable");
@@ -1573,7 +1575,8 @@ namespace llaminar2
         const int target_numa_node = ctx.cpu_numa_placement.node();
         const bool enforce_numa_placement =
             ctx.cpu_numa_placement.requiresNodeBinding();
-        if (enforce_numa_placement && numa_available() < 0)
+        if (enforce_numa_placement && numa_available() < 0 &&
+            !nonNUMAKernelSingleNode(target_numa_node))
         {
             LOG_ERROR("[MoEWeightService][NUMA] Cannot enforce CPU expert arrivals on NUMA node "
                       << target_numa_node << ": libnuma policy APIs are unavailable");

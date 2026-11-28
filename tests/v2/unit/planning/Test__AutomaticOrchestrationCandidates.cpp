@@ -18,6 +18,8 @@
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "planning/WeightShardGeometry.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
+#include "execution/config/ServingCapacity.h"
+#include "execution/config/ServingPoolMemoryDemand.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "planning/ResolvedRankOrchestration.h"
@@ -35,6 +37,7 @@
 #include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "../../fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
+#include <limits>
 #include <gtest/gtest.h>
 #include <array>
 #include <map>
@@ -1169,6 +1172,230 @@ TEST(AutomaticOrchestrationCandidates, InvalidIntentOrObservationFailsBeforePubl
 }
 
 /** @test Automatic candidates retain exact query coverage; independent expert-column constraints remain explicit. */
+
+
+/** @brief SERVING POOL OVERLAY WIRING: with serve_mode selected the overlay
+ *  inputs compute the exact demand for the continuation (authority) rank, the
+ *  planner admits the ServingResponsePool host owner line, and a NON-authority
+ *  rank gets no demand. */
+TEST(AutomaticOrchestrationCandidates, OverlayServingPoolAdmitsOwnerLineForContinuation)
+{
+    test::Qwen4ExpPlanningGGUFFixture file; PlanningModelSource source(file.path());
+    auto inventory = hosts(1); cards(inventory, 0, DeviceType::CUDA, 2);
+    auto &observed = inventory.ranks.front();
+    observed.cpu.memory_bytes = observed.cpu.free_memory_bytes = observed.cpu_memory_bytes = 256ull << 30;
+    observed.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    for (auto &gpu : observed.gpus) gpu.memory_bytes = gpu.free_memory_bytes = 256ull << 30;
+    observed.p2p_cuda_count = 2;
+    observed.p2p_cuda.assign(4, false);
+    auto config = request({DeviceType::CUDA}, {OrchestrationStrategy::TensorParallel});
+    config.serve_mode = true;
+    // AUTOMATIC serving capacity (the deny rule rejects authored intake until
+    // the A-3 detached-response-lease lifetime lands; automatic is the valid
+    // production intent here).
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = 0;
+    config.automatic_planning.device_counts = {{DeviceType::CUDA, 2}};
+    config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+    config.ngram_table_policy.storage = ImmutableRowStoragePreference::RAM;
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+    bool found = false;
+    visitAutomaticOrchestrationCandidates(config, source.metadata(), inventory,
+        [&](const auto &proposal)
+        {
+            if (!proposal.config.moe_routed_expert_plan) return;
+            ExecutionPlanBuilder builder;
+            const auto compiled = ResolvedRankOrchestration::resolve(
+                proposal.config, source.metadata(), proposal.membership.inventory(), builder, 0);
+            if (!compiled.overlayExecution()) return;
+            const auto &plan = compiled.rankPlan();
+            const auto policy = resolveMoEOverlayCapacityAdmissionPolicy(
+                *compiled.config().moe_routed_expert_plan, compiled.config(), 1, 48, 512);
+            const MoEOverlayInferenceGraphFamilyIdentity family{
+                .graph_family_generation = 1, .main_layer_count = 48,
+                .mtp_source_layers = {}, .max_graph_rows = 32, .max_decode_rows = 1,
+                .max_request_count = 1, .max_mtp_draft_depth = 0};
+            const std::vector<int> buckets{1, 8, 32};
+            auto input = buildMoEOverlayMemoryPlanInputs(
+                {.model = source.metadata().memoryProfile(), .rank_plan = plan,
+                 .config = compiled.config(), .inventory = proposal.membership.inventory(),
+                 .execution = *compiled.overlayExecution(), .capacity_policy = policy,
+                 .retained_mtp = plan.runtime.mtp, .graph_family = family,
+                 .prefill = {.bucket_rows = buckets, .minimum_sequence_rows = 1,
+                             .maximum_cached_buckets = 16},
+                 .gpu_weight_load = {.maximum_source_bytes = 4096}},
+                32);
+            const int authority = compiled.overlayExecution()->continuation_root_rank;
+            const auto demand = servingPoolDemandForRank(
+                true, authority, plan.rank,
+                compiled.config().servingCapacityRequest(),
+                ServingSlotDecisionGeometry::forVocabulary(source.metadata().memoryProfile().vocab_size));
+            if (plan.rank == authority)
+            {
+                ASSERT_TRUE(demand.has_value());
+                EXPECT_EQ(input.local_capacity.serving_pool_demand_bytes, demand);
+                input.local_capacity.retained_host_services = test::planningHostServiceProjection();
+                const auto fixed = MoEOverlayLocalCapacityPlanner::plan(input.local_capacity);
+                ASSERT_NE(fixed.physical_memory_admission, nullptr);
+                std::size_t serving_total = 0;
+                for (const auto &bom : fixed.physical_memory_admission->plan().resources())
+                    serving_total += bom.bytes(PhysicalMemoryOwner::ServingResponsePool);
+                EXPECT_EQ(serving_total, *demand);
+                // CAP BOUNDARY: an explicit CPU ceiling BELOW observed free
+                // memory must go through the canonical usableMemory observation
+                // everywhere (no PMA same-allocator conflict).
+                auto capped = input.local_capacity;
+                capped.max_cpu_memory_bytes = 32ull << 30; // 32 GiB < 256 GiB
+                const auto capped_fixed = MoEOverlayLocalCapacityPlanner::plan(capped);
+                ASSERT_NE(capped_fixed.physical_memory_admission, nullptr);
+                std::size_t capped_serving = 0;
+                for (const auto &bom : capped_fixed.physical_memory_admission->plan().resources())
+                    capped_serving += bom.bytes(PhysicalMemoryOwner::ServingResponsePool);
+                EXPECT_EQ(capped_serving, *demand);
+            }
+            else
+            {
+                EXPECT_FALSE(input.local_capacity.serving_pool_demand_bytes.has_value());
+            }
+            found = true;
+        });
+    EXPECT_TRUE(found);
+}
+
+
+
+
+
+/** @brief SERVING-POOL PIPELINE ENTRY (typed, decide-once): the mandatory
+ *  contribution plan drives the charge (serving contributing stage = exact
+ *  demand; non-contributing stage = none; non-serving = none; non-member
+ *  parent authority = REJECTED); the demand is read from the builder result
+ *  with store+ASSERT (never an unchecked optional dereference). */
+TEST(AutomaticOrchestrationCandidates, ServingPoolOwnershipTypedDecision)
+{
+    test::Qwen4ExpPlanningGGUFFixture file; PlanningModelSource source(file.path());
+    auto inventory = hosts(1); cards(inventory, 0, DeviceType::CUDA, 2);
+    auto &observed = inventory.ranks.front();
+    observed.cpu.memory_bytes = observed.cpu.free_memory_bytes = observed.cpu_memory_bytes = 256ull << 30;
+    observed.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    for (auto &gpu : observed.gpus) gpu.memory_bytes = gpu.free_memory_bytes = 256ull << 30;
+    auto config = request({DeviceType::CUDA}, {OrchestrationStrategy::TensorParallel});
+    config.serve_mode = true;
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = 0;
+    config.automatic_planning.device_counts = {{DeviceType::CUDA, 2}};
+    config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+    config.ngram_table_policy.storage = ImmutableRowStoragePreference::RAM;
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+    const auto proposals = candidates(config, inventory, true);
+    ASSERT_FALSE(proposals.empty());
+    bool entry_checked = false;
+    for (const auto &proposal : proposals)
+    {
+        if (!proposal.config.moe_routed_expert_plan) continue;
+        ExecutionPlanBuilder builder;
+        const auto compiled = ResolvedRankOrchestration::resolve(
+            proposal.config, source.metadata(), proposal.membership.inventory(), builder, 0);
+        if (!compiled.overlayExecution()) continue;
+        const auto &plan = compiled.rankPlan();
+        const auto policy = resolveMoEOverlayCapacityAdmissionPolicy(
+            *compiled.config().moe_routed_expert_plan, compiled.config(), 1, 48, 512);
+        const MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 1, .main_layer_count = 48,
+            .mtp_source_layers = {}, .max_graph_rows = 32, .max_decode_rows = 1,
+            .max_request_count = 1, .max_mtp_draft_depth = 0};
+        const std::vector<int> buckets{1, 8, 32};
+        const MoEOverlayMemoryPlanInputRequest request{
+            .model = source.metadata().memoryProfile(), .rank_plan = plan,
+            .config = compiled.config(), .inventory = proposal.membership.inventory(),
+            .execution = *compiled.overlayExecution(), .capacity_policy = policy,
+            .retained_mtp = plan.runtime.mtp, .graph_family = family,
+            .prefill = {.bucket_rows = buckets, .minimum_sequence_rows = 1,
+                        .maximum_cached_buckets = 16},
+            .gpu_weight_load = {.maximum_source_bytes = 4096}};
+        // CONTRIBUTING STAGE (serving): exact demand (store + ASSERT first).
+        {
+            const auto inputs = buildMoEOverlayPipelineStageInputs(
+                request, 32, MoEOverlayPipelineStageContribution{
+                                 .parent_authority = 0, .contributes = true});
+            const auto &demand = inputs.local_capacity.serving_pool_demand_bytes;
+            ASSERT_TRUE(demand.has_value());
+            // Exact expected demand from the SAME source (automatic capacity:
+            // installed envelope R x the default per-response policy).
+            const auto expected = servingPoolMemoryDemand(
+                resolveInstalledServingCapacity(request.config.servingCapacityRequest()),
+                ServingPoolPerResponseBudget::defaultPolicy(),
+                ServingSlotDecisionGeometry::forVocabulary(request.model.vocab_size));
+            EXPECT_EQ(*demand, expected);
+        }
+        // NON-CONTRIBUTING STAGE: none.
+        {
+            const auto inputs = buildMoEOverlayPipelineStageInputs(
+                request, 32, MoEOverlayPipelineStageContribution{
+                                 .parent_authority = 0, .contributes = false});
+            EXPECT_FALSE(inputs.local_capacity.serving_pool_demand_bytes.has_value());
+        }
+        // NON-SERVING: no charge even on a contributing stage (a separate
+        // second request bound to a mutable non-serving config copy).
+        {
+            auto non_serving_config = compiled.config();
+            non_serving_config.serve_mode = false;
+            MoEOverlayMemoryPlanInputRequest non_serving{
+                .model = request.model, .rank_plan = request.rank_plan,
+                .config = non_serving_config, .inventory = request.inventory,
+                .execution = request.execution, .capacity_policy = request.capacity_policy,
+                .retained_mtp = request.retained_mtp, .graph_family = request.graph_family,
+                .prefill = request.prefill, .gpu_weight_load = request.gpu_weight_load,
+                .native_source_placement = request.native_source_placement};
+            const auto inputs = buildMoEOverlayPipelineStageInputs(
+                non_serving, 32, MoEOverlayPipelineStageContribution{
+                                     .parent_authority = 0, .contributes = true});
+            EXPECT_FALSE(inputs.local_capacity.serving_pool_demand_bytes.has_value());
+        }
+        // NON-MEMBER parent authority: REJECTED.
+        EXPECT_THROW(buildMoEOverlayPipelineStageInputs(
+                         request, 32, MoEOverlayPipelineStageContribution{
+                                            .parent_authority = 1, .contributes = true}),
+                     std::logic_error);
+        // NEGATIVE/DEFAULT parent: REJECTED through the ACTUAL entry.
+        EXPECT_THROW(buildMoEOverlayPipelineStageInputs(
+                         request, 32, MoEOverlayPipelineStageContribution{
+                                            .parent_authority = -1, .contributes = true}),
+                     std::logic_error);
+        // DISCRIMINATING INADMISSIBLE CAPACITY (against compute-then-overwrite):
+        // a VALID authored intent that exceeds the qualified envelope is rejected
+        // when the demand is RESOLVED (contributing stage throws), while a
+        // NON-CONTRIBUTING stage with the SAME intent must NOT resolve at all
+        // (no throw, no demand) — v81's wrapper would have thrown on both.
+        {
+            auto inadmissible_config = compiled.config();
+            inadmissible_config.serve_mode = true;
+            inadmissible_config.serving_resident_slots = 1;
+            // Beyond the continuous-batching envelope (R stays representable
+            // with S + Q); smaller counts resolve and are priced by PMA.
+            inadmissible_config.serving_response_leases = std::numeric_limits<int>::max();
+            inadmissible_config.serving_queue_capacity = 0;
+            MoEOverlayMemoryPlanInputRequest inadmissible{
+                .model = request.model, .rank_plan = request.rank_plan,
+                .config = inadmissible_config, .inventory = request.inventory,
+                .execution = request.execution, .capacity_policy = request.capacity_policy,
+                .retained_mtp = request.retained_mtp, .graph_family = request.graph_family,
+                .prefill = request.prefill, .gpu_weight_load = request.gpu_weight_load,
+                .native_source_placement = request.native_source_placement};
+            EXPECT_THROW(buildMoEOverlayPipelineStageInputs(
+                             inadmissible, 32, MoEOverlayPipelineStageContribution{
+                                                    .parent_authority = 0, .contributes = true}),
+                         std::exception);
+            const auto no_contrib = buildMoEOverlayPipelineStageInputs(
+                inadmissible, 32, MoEOverlayPipelineStageContribution{
+                                       .parent_authority = 0, .contributes = false});
+            EXPECT_FALSE(no_contrib.local_capacity.serving_pool_demand_bytes.has_value());
+        }
+        entry_checked = true;
+    }
+    EXPECT_TRUE(entry_checked);
+}
+
 TEST(AutomaticOrchestrationCandidates, QueryConsumerSourceUsesCanonicalAssignmentsAndPreservesExpertLimits)
 {
     test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());

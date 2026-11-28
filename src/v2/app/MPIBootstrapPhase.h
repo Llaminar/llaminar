@@ -102,24 +102,9 @@ namespace llaminar2
         static int detectCpuNumaNode(int cpu);
         /** @return First sibling representing the physical core containing a CPU. */
         static int physicalRepresentativeForCpu(int cpu);
-        /**
-         * @brief Relative compute capacity of one CPU for worker ordering.
-         * @param cpu Logical CPU id.
-         * @param sysfs_root Linux CPU sysfs root (a device-free fixture seam).
-         * @return Kernel `cpu_capacity` (ARM big.LITTLE/hybrid), otherwise
-         *         `cpufreq/cpuinfo_max_freq`, otherwise zero (unknown/uniform).
-         */
+        /** @return Kernel CPU capacity, maximum frequency, or zero when both are unknown. */
         static long cpuCapacity(int cpu, const std::string &sysfs_root = "/sys/devices/system/cpu");
-        /**
-         * @brief Order physical-core representatives fastest first.
-         * @param cpus Allowed representative CPUs in any order.
-         * @param sysfs_root Linux CPU sysfs root (a device-free fixture seam).
-         * @return Descending capacity, CPU id ascending within one capacity.
-         *
-         * Heterogeneous hosts (GB10: X925 + A725) place OpenMP worker 0, which
-         * also runs serial sections, and the low worker ids on the fast cores.
-         * Homogeneous hosts keep plain CPU-id order.
-         */
+        /** @return Native rank CPUs in capacity order. */
         static std::vector<int> capacityOrderedCpus(
             std::vector<int> cpus, const std::string &sysfs_root = "/sys/devices/system/cpu");
         /**
@@ -134,6 +119,7 @@ namespace llaminar2
          */
         static std::vector<std::vector<int>> capacityOrderedCorePlaces(
             const std::vector<int> &allowed_cpus, const std::string &sysfs_root = "/sys/devices/system/cpu");
+
         /** @return Whether current thread affinity meets the requested socket/core policy. */
         static bool verifyStartupThreadAffinity(int required_numa,
                                                 bool require_physical_only,

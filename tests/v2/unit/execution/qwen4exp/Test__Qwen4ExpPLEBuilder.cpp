@@ -14,6 +14,7 @@
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
 #include "utils/OpenMPUtils.h"
+#include "utils/HostPageSize.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "loaders/HostImmutableRowProvider.h"
 #include "fixtures/qwen4exp/OwnerChainBackend.h"
@@ -74,7 +75,9 @@ struct Source
     {
         ImmutableRowTableSource source{.path=path,.tensor_name="per_layer_token_embd.weight",
             .rows=tableRows,.row_elements=1,.format=GGUFTensorType::F32};
-        auto policy=ImmutableRowTableStoragePolicy::forStorage(storage,4096,2);
+        // Physical mapping granularity changes with the host, not the logical
+        // table rows or the independent numerical equations below.
+        auto policy=ImmutableRowTableStoragePolicy::forStorage(storage,hostPageBytes(),2);
         PhysicalMemoryPlanBuilder plan;
         plan.add({.world_rank=0,.device=DeviceId::cpu(),.total_bytes=1u<<20,.admission_available_bytes=1u<<20},
             PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(source,policy));

@@ -18,6 +18,8 @@
 #include "loaders/HostImmutableRowProvider.h"
 #include "loaders/CpuAdaptiveImmutableRowCache.h"
 #include <fstream>
+#include "utils/HostPageSize.h"
+#include "PooledImmutableFixtureSourceGeometry.h"
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -83,7 +85,7 @@ private:
 q::PooledImmutablePhysicalOwnerGeometry chainGeometry(uint32_t capacity){
     const PhysicalMemoryAllocatorIdentity coordinator{0,DeviceId::cuda(0)},owner{0,DeviceId::rocm(0)};
     const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::MemoryMapped};
-    const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,1000,90),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
+    const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(test::PooledImmutableFixtureSourceGeometry::kFormat,static_cast<std::uint64_t>(test::PooledImmutableFixtureSourceGeometry::kRows),static_cast<std::uint64_t>(test::PooledImmutableFixtureSourceGeometry::kRowBytes)),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
         {{{owner,ImmutableRowStorage::VRAM},0,capacity,{}}},{{0,DeviceId::cpu()},coordinator},{},{{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},{},capacity?std::optional(coordinator):std::nullopt,16);
     const std::array order{owner};return q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,order,coordinator);
 }
@@ -202,7 +204,7 @@ struct VictimMultiCoordinatorCase {
         std::vector<PhysicalMemoryAllocatorIdentity> order;std::vector<ImmutableRowTableLayoutOwner> owners;bool positive=false;
         for(size_t i=0;i<capacities.size();++i){const PhysicalMemoryAllocatorIdentity id=localCoordinate && i==*localCoordinate?coordinator:PhysicalMemoryAllocatorIdentity{0,DeviceId::rocm(static_cast<int>(reversed?capacities.size()-1-i:i))};order.push_back(id);owners.push_back({{id,ImmutableRowStorage::VRAM},0,capacities[i],{}});positive|=capacities[i]!=0;}
         const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::MemoryMapped};
-        const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,1000,90),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,owners,{{0,DeviceId::cpu()},coordinator},{},{{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},{},positive?std::optional(coordinator):std::nullopt,16);
+        const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(test::PooledImmutableFixtureSourceGeometry::kFormat,static_cast<std::uint64_t>(test::PooledImmutableFixtureSourceGeometry::kRows),static_cast<std::uint64_t>(test::PooledImmutableFixtureSourceGeometry::kRowBytes)),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,owners,{{0,DeviceId::cpu()},coordinator},{},{{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},{},positive?std::optional(coordinator):std::nullopt,16);
         return q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,order,coordinator);
     }
     /** @brief Price each original physical root and each original forward/reverse channel exactly once in one PMA. */
@@ -272,9 +274,9 @@ private:
 /** @brief Small authored native file; no real model/corpus payload is read. */
 struct SourceGraphFile {
     std::string path;
-    SourceGraphFile(){char name[]="/tmp/qfn-source-fill-replay-XXXXXX";const int fd=mkstemp(name);if(fd<0)throw std::runtime_error("Source fixture file creation failed");close(fd);path=name;std::vector<char> bytes(37+1000*90);for(size_t i=37;i<bytes.size();++i)bytes[i]=static_cast<char>((i-37)%251);std::ofstream f(path,std::ios::binary);f.write(bytes.data(),bytes.size());if(!f)throw std::runtime_error("Source fixture file write failed");}
+    SourceGraphFile(){char name[]="/tmp/qfn-source-fill-replay-XXXXXX";const int fd=mkstemp(name);if(fd<0)throw std::runtime_error("Source fixture file creation failed");close(fd);path=name;std::vector<char> bytes(test::PooledImmutableFixtureSourceGeometry::kPrefixBytes+test::PooledImmutableFixtureSourceGeometry::kRows*test::PooledImmutableFixtureSourceGeometry::kRowBytes);for(size_t i=test::PooledImmutableFixtureSourceGeometry::kPrefixBytes;i<bytes.size();++i)bytes[i]=static_cast<char>((i-test::PooledImmutableFixtureSourceGeometry::kPrefixBytes)%251);std::ofstream f(path,std::ios::binary);f.write(bytes.data(),bytes.size());if(!f)throw std::runtime_error("Source fixture file write failed");}
     ~SourceGraphFile(){if(!path.empty() && std::remove(path.c_str()))std::terminate();}
-    ImmutableRowTableSource descriptor()const{return {.path=path,.tensor_name="per_layer_token_embd.weight",.file_offset=37,.rows=1000,.row_elements=160,.format=GGUFTensorType::IQ4_NL};}
+    ImmutableRowTableSource descriptor()const{return {.path=path,.tensor_name="per_layer_token_embd.weight",.file_offset=37,.rows=test::PooledImmutableFixtureSourceGeometry::kRows,.row_elements=test::PooledImmutableFixtureSourceGeometry::kRowElements,.format=GGUFTensorType(test::PooledImmutableFixtureSourceGeometry::kFormat)};}
 };
 /** @brief Actual original root/provider/worker/channel factories over exact admitted declarations, with no native execution. */
 /** @brief Explicit pure-declaration pass versus original fixture materialization. */
@@ -317,7 +319,7 @@ struct SourceGraphCase {
         const PhysicalMemoryAllocatorIdentity host{0,DeviceId::cpu()},coord{0,DeviceId{sourceType,0}};std::vector<ImmutableRowTableLayoutOwner> owners;
         for(size_t i=0;i<capacities.size();++i)owners.push_back({{{0,i==local?DeviceId{sourceType,0}:DeviceId{sourceType==DeviceType::CUDA?DeviceType::ROCm:DeviceType::CUDA,static_cast<int>(reverse?capacities.size()-1-i:i)}},ImmutableRowStorage::VRAM},0,capacities[i],{}});
         owners.push_back({{host,ImmutableRowStorage::RAM},0,2,{}});const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};const bool positive=std::any_of(capacities.begin(),capacities.end(),[](auto c){return c!=0;});
-        return ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,owners,{coord},{},{{host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},positive?std::optional(coord):std::nullopt,16);
+        return ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,owners,{coord},{},{{host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),test::PooledImmutableFixtureSourceGeometry::kWindowSlots)}},{},positive?std::optional(coord):std::nullopt,16);
     }
     /** @brief Original caller order, never sorted by device or cache capacity. */
     static q::PooledImmutablePhysicalOwnerGeometry project(const ImmutableRowTableLayoutGeometry& layout,const std::vector<uint32_t>& capacities,bool reverse,uint32_t local=q::adaptive_lookup::None,DeviceType sourceType=DeviceType::CUDA){std::vector<PhysicalMemoryAllocatorIdentity> order;for(size_t i=0;i<capacities.size();++i)order.push_back({0,i==local?DeviceId{sourceType,0}:DeviceId{sourceType==DeviceType::CUDA?DeviceType::ROCm:DeviceType::CUDA,static_cast<int>(reverse?capacities.size()-1-i:i)}});return q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,order,{0,DeviceId{sourceType,0}});}

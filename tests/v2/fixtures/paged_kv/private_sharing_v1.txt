@@ -1,0 +1,34 @@
+pma-private-pages-v1 3 128 4 3 empty-zero-generations
+admit Exporter 1 | accepted
+assign Exporter | 0:1
+plan W Exporter 0 9 | ready
+copy W 010203040506070809 | copied
+commit W P0 | published
+share SH0 P0 | 1:9
+read P0 | 1:010203040506070809
+adopt P0A Exporter SH0 | accepted
+drop-adopted P0A | released
+admit Writer1 1 | accepted
+cow C1 Writer1 SH0 7 | ready
+cow-source C1 | copied-source
+cow-next C1 0a0b0c0d0e0f10 | copied-fresh
+cow-commit C1 PW1 | published
+read PW1 | 1:0102030405060708090a0b0c0d0e0f10
+read P0 | 1:010203040506070809
+admit Writer2 1 | accepted
+cow C2 Writer2 SH0 7 | ready
+cow-source C2 | copied-source
+cow-next C2 11121314151617 | copied-fresh
+cow-commit C2 PW2 | published
+read PW2 | 1:01020304050607080911121314151617
+read P0 | 1:010203040506070809
+adopt P0B Exporter SH0 | accepted
+drop-adopted P0B | released
+drop-shared SH0 | released
+drop-page P0 | released
+drop-page PW1 | released
+drop-page PW2 | released
+drop-request Exporter | retired
+drop-request Writer1 | retired
+drop-request Writer2 | retired
+end | idle

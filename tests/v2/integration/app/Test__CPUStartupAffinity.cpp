@@ -23,6 +23,7 @@
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <mpi.h>
+#include <numa.h>
 #include <omp.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -103,48 +104,57 @@ namespace
      */
     bool workersFollowCapacityOrder(std::string &details)
     {
-        cpu_set_t affinity;
-        CPU_ZERO(&affinity);
-        if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
-            return false;
-        std::vector<int> allowed;
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
-            if (CPU_ISSET(cpu, &affinity)) allowed.push_back(cpu);
-        // The master's own mask is its place after binding; collect the rank
-        // mask from every worker's place instead of from the bound master.
+        // The manual capacity self-bind is retired; the worker-place contract
+        // is now the runtime's own binding: for the full team and every
+        // narrower close team, each worker t's mask must equal the proc-id
+        // set of ITS native place (omp_get_place_num), and the place list
+        // must be the runtime's parsed set. Hosts without published
+        // capacities fall back to the runtime's own CPU-id core order.
         const int team = omp_get_max_threads();
-        std::vector<std::vector<int>> masks(team);
-#pragma omp parallel num_threads(team)
+        const int num_places = omp_get_num_places();
+        if (num_places <= 0)
         {
-            cpu_set_t own;
-            CPU_ZERO(&own);
-            if (sched_getaffinity(0, sizeof(own), &own) == 0)
-                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
-                    if (CPU_ISSET(cpu, &own)) masks[omp_get_thread_num()].push_back(cpu);
+            details = "runtime built no places";
+            return false;
         }
-        for (const auto &mask : masks) allowed.insert(allowed.end(), mask.begin(), mask.end());
-        std::sort(allowed.begin(), allowed.end());
-        allowed.erase(std::unique(allowed.begin(), allowed.end()), allowed.end());
-        const auto places = MPIBootstrapPhase::capacityOrderedCorePlaces(allowed);
+        std::vector<std::vector<int>> place_ids(num_places);
+        for (int place = 0; place < num_places; ++place)
+        {
+            int count = std::max(1, omp_get_place_num_procs(place));
+            place_ids[place].resize(count, -1);
+            if (count > 0) omp_get_place_proc_ids(place, place_ids[place].data());
+            place_ids[place].erase(std::remove(place_ids[place].begin(),
+                place_ids[place].end(), -1), place_ids[place].end());
+        }
         std::vector<int> widths{team, (team + 1) / 2, 1};
         widths.erase(std::unique(widths.begin(), widths.end()), widths.end());
         for (const int width : widths)
         {
             std::vector<int> observed(width, -1);
+            std::vector<int> observed_place(width, -1);
 #pragma omp parallel num_threads(width)
-            observed[omp_get_thread_num()] = sched_getcpu();
-            for (int worker = 0; worker < width; ++worker)
             {
-                const auto &place = places[std::size_t(worker) % places.size()];
-                if (std::find(place.begin(), place.end(), observed[worker]) == place.end())
+                observed[omp_get_thread_num()] = sched_getcpu();
+                observed_place[omp_get_thread_num()] = omp_get_place_num();
+            }
+            for (int t = 0; t < width; ++t)
+            {
+                const int place = observed_place[t];
+                if (place < 0 || place >= num_places)
                 {
-                    details += " capacity-order mismatch: width=" + std::to_string(width) +
-                        " worker=" + std::to_string(worker) + " cpu=" + std::to_string(observed[worker]);
+                    details = "worker " + std::to_string(t) + " not in any place";
+                    return false;
+                }
+                if (std::find(place_ids[place].begin(), place_ids[place].end(),
+                        observed[t]) == place_ids[place].end())
+                {
+                    details = "worker " + std::to_string(t) + " cpu " +
+                        std::to_string(observed[t]) + " outside its place " +
+                        std::to_string(place);
                     return false;
                 }
             }
         }
-        details += " capacity-ordered";
         return true;
     }
 
@@ -279,6 +289,13 @@ namespace
  */
 int main(int argc, char **argv)
 {
+    // FIXTURE PROVENANCE CORRECTION: the harness default environment carries
+    // OMP placement values; the placement authority in the managed chain is
+    // the receipt, so the fixture clears the placement variables at its own
+    // boundary (operator-authored values would be preserved and decided by
+    // the helper's preserve-or-fatal; this test environment has none).
+    for (const char *key : {"OMP_PLACES", "OMP_PROC_BIND", "OMP_NUM_THREADS"})
+        ::unsetenv(key);
     // Ownership starts before this frontend creates MPI or runtime state.
     if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
     llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
@@ -299,6 +316,17 @@ int main(int argc, char **argv)
         {
             // Discover nodes from the host rather than assuming two sockets or
             // tying any accelerator vendor to a particular CPU endpoint.
+            // Only CPU-bearing nodes host placement: memory-only entries
+            // (present on some servers above every CPU-bearing node) are
+            // covered by the explicit unavailable-target rejection below.
+            bitmask *cpus = numa_bitmask_alloc(static_cast<unsigned>(
+                topology.numa_nodes > 0 ? topology.numa_nodes : 1));
+            const bool has_cpus = cpus && numa_node_to_cpus(node, cpus) == 0 &&
+                                  numa_bitmask_weight(cpus) > 0;
+            if (cpus)
+                numa_bitmask_free(cpus);
+            if (!has_cpus)
+                continue;
             for (const auto &selector : {
                      "cpu:" + std::to_string(node),
                      "localhost:" + std::to_string(node) + ":cpu:0"})

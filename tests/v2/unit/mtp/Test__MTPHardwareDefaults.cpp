@@ -67,12 +67,17 @@ namespace
     }
 
     /**
-     * @brief Select a visible ordinal; the original planner binds its observed NUMA.
-     * Explicit domain owner ranks disambiguate repeated rank-local ordinals.
+     * @brief Construct a fixture GPU address with optional explicit locality.
+     * @param type Backend family of the fake GPU.
+     * @param ordinal Rank-local GPU ordinal.
+     * @param numa_node Exact fixture node when authored; otherwise the planner
+     *        binds the visible ordinal from the original observation.
+     * @return The requested address; explicit domain owner ranks still
+     *         disambiguate repeated rank-local ordinals.
      */
-    GlobalDeviceAddress address(DeviceType type, int ordinal)
+    GlobalDeviceAddress address(DeviceType type, int ordinal, int numa_node = -1)
     {
-        return GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, ordinal), "node", -1);
+        return GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, ordinal), "node", numa_node);
     }
 
     /** @brief Run the real planner without a model file or a backend. */
@@ -189,7 +194,7 @@ TEST(MTPHardwareDefaults, DenseQwenGPUHeadDefaultsRequireMeasuredNativeLocalFami
         config.tp_devices.clear();
         config.domain_definitions = {domain("terminal", {address(type, 0), address(type, 1)}, {0, 0})};
         EXPECT_EQ(selected(), expected);
-        config.domain_definitions = {domain("terminal", {address(type, 0), address(type, 0)}, {0, 1})};
+        config.domain_definitions = {domain("terminal", {address(type, 0), address(type, 0, 1)}, {0, 1})};
         cluster = inventory({{card(type, 0)}, {card(type, 0)}});
         for (const auto &plan : builder.buildAllPlans(config, model, cluster))
             EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary);
@@ -378,8 +383,8 @@ TEST(MTPHardwareDefaults, QFNOrdinaryHeadDefaultsRejectOtherTopologyAndOwnership
     config.domain_definitions.front().devices.back() = config.domain_definitions.front().devices.front();
     expectOrdinaryQFNPolicy(config, model, observed, expected);
     config.domain_definitions = {domain("terminal",
-        {address(DeviceType::ROCm, 0), address(DeviceType::ROCm, 0),
-         address(DeviceType::ROCm, 0), address(DeviceType::ROCm, 0)}, {0, 1, 2, 3})};
+        {address(DeviceType::ROCm, 0), address(DeviceType::ROCm, 0, 1),
+         address(DeviceType::ROCm, 0, 2), address(DeviceType::ROCm, 0, 3)}, {0, 1, 2, 3})};
     expectOrdinaryQFNPolicy(config, model,
         inventory({{card(DeviceType::ROCm, 0)}, {card(DeviceType::ROCm, 0)},
                    {card(DeviceType::ROCm, 0)}, {card(DeviceType::ROCm, 0)}}), expected);
@@ -478,8 +483,8 @@ TEST(MTPHardwareDefaults, ContinuationProfileDoesNotIncludeOtherExpertTiers)
         const auto other = type == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA;
         config.domain_definitions = {
             domain("cpu-tier", {GlobalDeviceAddress::cpu(0, "node")}, {0}),
-            domain("other-gpu-tier", {address(other, 0)}, {1}),
-            domain("continuation", {address(type, 0), address(type, 1)}, {1, 1}),
+            domain("other-gpu-tier", {address(other, 0, 1)}, {1}),
+            domain("continuation", {address(type, 0, 1), address(type, 1, 1)}, {1, 1}),
         };
         config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         config.moe_routed_expert_plan->enabled = true;
@@ -500,7 +505,7 @@ TEST(MTPHardwareDefaults, RepeatedLocalOrdinalsHonorDeclaredRankOwners)
 {
     OrchestrationConfig config;
     config.domain_definitions = {domain("continuation",
-        {address(DeviceType::ROCm, 0), address(DeviceType::ROCm, 0)}, {0, 1})};
+        {address(DeviceType::ROCm, 0), address(DeviceType::ROCm, 0, 1)}, {0, 1})};
     auto cluster = inventory({{card(DeviceType::ROCm, 0)}, {card(DeviceType::ROCm, 0)}});
     auto result = plans(config, cluster);
     ASSERT_EQ(result.size(), 2u);
@@ -532,7 +537,7 @@ TEST(MTPHardwareDefaults, UnusedNamedDomainsDoNotAffectTheExecutingDomain)
 TEST(MTPHardwareDefaults, RankLocalExplicitOwnerSelectsThatRanksCard)
 {
     OrchestrationConfig config;
-    auto selected = domain("continuation", {address(DeviceType::ROCm, 0)}, {});
+    auto selected = domain("continuation", {address(DeviceType::ROCm, 0, 1)}, {});
     selected.owner_rank = 1;
     selected.scope = TPScope::RANK_LOCAL;
     config.domain_definitions = {selected};
@@ -648,7 +653,7 @@ TEST(MTPHardwareDefaults, TerminalHeadPipelineDefaultsUseTheFinalDomain)
             OrchestrationConfig config;
             config.domain_definitions = {
                 domain("cpu", {GlobalDeviceAddress::cpu(0, "node")}, {0}),
-                domain("gpu", {address(gpu, 0)}, {1}),
+                domain("gpu", {address(gpu, 0, 1)}, {1}),
             };
             config.pp_stage_definitions = {
                 {.stage_id = 0, .domain_name = cpu_last ? "gpu" : "cpu", .first_layer = 0, .last_layer = 15},

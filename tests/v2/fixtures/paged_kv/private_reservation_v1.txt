@@ -1,0 +1,21 @@
+pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 10 4 2 10 8 empty-zero-versions fp32-le
+table-reserve A 8 | ready
+table-begin-reserved U A | ready
+table-abort U | aborted
+table-begin-reserved U2 A | ready
+table-abort U2 | aborted
+table-begin-reserved U3 A | ready
+table-abort U3 | aborted
+table-begin-reserved U4 A | ready
+table-abort U4 | aborted
+table-begin-reserved U5 A | ready
+table-abort U5 | aborted
+table-begin-reserved U6 A | ready
+table-abort U6 | aborted
+table-reserve B 4 | refused
+table-reserve C 2 | ready
+table-begin-reserved V C | ready
+table-abort V | aborted
+table-drop-reserved C | released
+table-drop-reserved A | released
+end | idle

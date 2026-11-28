@@ -15,6 +15,7 @@
 #include "stages/RoPEStage.h"
 #include "stages/ResidualAddStage.h"
 #include "stages/KVCacheAppendStage.h"
+#include "stages/PooledKVAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/TPKVCacheStateAllGatherStage.h"
 #include "stages/AttentionComputeStage.h"
@@ -188,6 +189,10 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createKVCacheAppend(
             const KVCacheAppendStage::Params &params);
+
+        /** @brief P2 production caller: one pooled-page decode append (CPU single row). */
+        static std::unique_ptr<IComputeStage> createPooledKVAppend(
+            const PooledKVAppendStage::Params &params);
 
         /**
          * @brief Create a KV cache gather stage for batched decode

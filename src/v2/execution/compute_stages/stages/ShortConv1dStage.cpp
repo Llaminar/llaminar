@@ -929,6 +929,25 @@ namespace llaminar2
                 LOG_ERROR("[ShortConv1dStage] CPU backend lacks request-owned live conv-state storage");
                 return false;
             }
+            // Serving rows address persistent per-slot states for this call only.
+            struct ServingRowStateBinding
+            {
+                ITensorShortConvolution *kernel = nullptr;
+                ~ServingRowStateBinding()
+                {
+                    if (kernel)
+                        (void)kernel->bindServingRowStates(nullptr);
+                }
+            } serving_row_binding;
+            if (params_.serving_row_states)
+            {
+                if (!params_.kernel->bindServingRowStates(params_.serving_row_states))
+                {
+                    LOG_ERROR("[ShortConv1dStage] CPU kernel cannot address serving-row states");
+                    return false;
+                }
+                serving_row_binding.kernel = params_.kernel;
+            }
             const bool ok =
                 params_.kernel->forwardBatchedRequestsWithHostSeqLens(
                     input_data, weight_data, bias_data,

@@ -49,6 +49,7 @@ allowed_exception_files=(
     "src/v2/app/RuntimeInitPhase.cpp"
     "src/v2/utils/NativeCPUPlacement.cpp"
     "src/v2/utils/CPUFeatures.h"
+    "src/v2/planning/PlacementHelper.cpp"
 )
 
 is_allowed_file()

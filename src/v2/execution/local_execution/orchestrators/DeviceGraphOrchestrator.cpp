@@ -83,6 +83,7 @@
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/RoutedExpertOwnerAssignment.h"
 #include "../../mtp/MTPCheckpointPolicy.h"
+#include "../../mtp/MTPForwardConstruction.h"
 #include "../../mtp/MTPDeviceGenerationPolicy.h"
 #include "../../mtp/MTPServingForwardCaptureGeometry.h"
 #include "../../mtp/MTPSpecKVPublisher.h"
@@ -152,6 +153,15 @@ namespace llaminar2
 
     namespace
     {
+        // The export packer serializes per-layer fields as explicit uint64/uint32
+        // words (see exportSlotKV/importSlotKV) — never a struct byte copy, so
+        // no padding leaks into the manifest (deterministic replay).
+        /** @brief Append one byte span to a packed continuation. */
+        void appendBytes(std::vector<std::byte> &out, std::span<const std::byte> bytes)
+        {
+            out.insert(out.end(), bytes.begin(), bytes.end());
+        }
+
         /**
          * @brief Persistent backend event closing one calibration sample.
          *
@@ -6395,6 +6405,8 @@ namespace llaminar2
         mtp_verifier_position_ids_dev_ = nullptr;
         mtp_verifier_request_lengths_dev_ = nullptr;
 
+        // Retire borrowed publication metadata before replacing its arena owner.
+        cpu_resident_mtp_hidden_.reset();
         // Create BufferArena with config
         arena_ = std::make_unique<BufferArena>(arena_config);
 
@@ -6407,7 +6419,9 @@ namespace llaminar2
                 config.dense_tp_decode_replicated && config.qkv_column_parallel,
             .terminal_hidden_rows = retained_mtp
                 ? static_cast<size_t>(resolveMTPTerminalHiddenRowCapacity(state_.batch_size, config.mtp)) : 0,
-            .terminal_hidden_columns = retained_mtp ? static_cast<size_t>(config.residualWidth()) : 0});
+            .terminal_hidden_columns = retained_mtp ? static_cast<size_t>(config.residualWidth()) : 0,
+            .cpu_mtp_resident_slots = retained_mtp && state_.device_id.is_cpu()
+                ? static_cast<size_t>(state_.batch_size) : 0});
         for (const auto &entry : arena_layout.entries())
         {
             if (!arena_->registerBuffer(entry.id, entry.descriptor))
@@ -7008,6 +7022,16 @@ namespace llaminar2
          */
         if (retainsMTPGraphCapacity(graph_builder_->config().mtp))
         {
+            if (state_.device_id.is_cpu())
+            {
+                const auto root = arena_->getSharedTensor(BufferId::MTP_SERVING_HIDDEN);
+                if (!root || !root->mutable_data())
+                    throw std::logic_error("CPU MTP resident hidden root is absent after arena materialization");
+                cpu_resident_mtp_hidden_ = std::make_unique<CPUResidentMTPHidden>(
+                    std::span<float>(root->mutable_data(), root->numel()),
+                    static_cast<size_t>(state_.batch_size),
+                    static_cast<size_t>(graph_builder_->config().residualWidth()));
+            }
             if (!arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] MTP requires an arena-owned terminal-hidden archive");
@@ -8469,6 +8493,7 @@ namespace llaminar2
         moe_overlay_external_sequence_identity_.reset();
         moe_overlay_epoch_forward_submission_stream_ = nullptr;
         moe_overlay_epoch_execution_binding_ = {};
+        cpu_resident_mtp_hidden_.reset();
         if (arena_)
         {
             arena_.reset();
@@ -14400,6 +14425,14 @@ namespace llaminar2
             !executableForwardSubmissionIntent(input.graph_submission_intent))
             throw std::invalid_argument("DGO has an unknown forward graph construction intent");
         ForwardInput build_input = input;
+        // P2 pooled decode: the runner attached a pooled binding (or a
+        // GROUPED binding set); every forward graph built while attached
+        // consumes pooled pages (the graph builder refuses combinations it
+        // cannot support).
+        if (pooled_kv_binding_)
+            build_input.pooled_kv = pooled_kv_binding_;
+        if (!pooled_kv_binding_group_.empty())
+            build_input.pooled_kv_group = &pooled_kv_binding_group_;
         if(build_input.graph_submission_intent!=ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
             build_input.device.is_gpu() && build_input.batch_size==1 &&
             build_input.execution_role==ForwardExecutionRole::MainInference &&
@@ -17970,10 +18003,22 @@ namespace llaminar2
          * a bounded multi-row continuation with established history is decode.
          */
         const int decode_max_seq_len = std::max(1, cache_config_.decode_seq_len);
+        // POOLED shapes are phase-unambiguous by contract: the GROUP is a
+        // decode batch (one row per member); a single binding is DECODE for
+        // exactly one row and PREFILL for any multi-row row-batch (including
+        // a continued prefill over a live publication — never a heuristic
+        // decode-continuation). Resolve explicitly so the step-guard row
+        // count and the graph topology agree under the serving path too.
+        ForwardInvocationKind effective_invocation = invocation;
+        if (pooled_kv_binding_ || !pooled_kv_binding_group_.empty())
+            effective_invocation =
+                (seq_len == 1 || !pooled_kv_binding_group_.empty())
+                    ? ForwardInvocationKind::ExplicitDecode
+                    : ForwardInvocationKind::ExplicitPrefill;
         const ForwardExecutionPhase resolved_phase =
             resolveForwardExecutionPhase({
                 .role = execution_role,
-                .invocation = invocation,
+                .invocation = effective_invocation,
                 .seq_len = seq_len,
                 .batch_size = batch_size,
                 .decode_max_seq_len = decode_max_seq_len,
@@ -17984,6 +18029,42 @@ namespace llaminar2
                 ? InferencePhase::DECODE
                 : InferencePhase::PREFILL;
         transitionToPhase(new_phase);
+
+        // Typed cursor lifecycle (adopted EARLY, before any position/RoPE row
+        // is derived from state_.positions): when a pooled binding's
+        // publication epoch advanced (truncate/import changed the row counts
+        // OUTSIDE a forward), the orchestrator re-seats the host cursor to the
+        // publication's authoritative row count. The publication is the single
+        // position authority (M1); the host cursor is a mirror, never an
+        // independent one, and never a test-only raw setter.
+        if (pooled_kv_binding_)
+        {
+            const std::uint64_t epoch = pooled_kv_binding_->cursorEpoch();
+            if (epoch != pooled_cursor_epoch_seen_single_)
+            {
+                pooled_cursor_epoch_seen_single_ = epoch;
+                if (!state_.positions.empty())
+                    state_.positions[0] = pooled_kv_binding_->nextPosition();
+            }
+        }
+        if (!pooled_kv_binding_group_.empty())
+        {
+            if (pooled_cursor_epochs_seen_group_.size() !=
+                pooled_kv_binding_group_.size())
+                pooled_cursor_epochs_seen_group_.assign(
+                    pooled_kv_binding_group_.size(), 0);
+            for (std::size_t r = 0; r < pooled_kv_binding_group_.size(); ++r)
+            {
+                auto *member = pooled_kv_binding_group_[r];
+                const std::uint64_t epoch = member->cursorEpoch();
+                if (epoch != pooled_cursor_epochs_seen_group_[r])
+                {
+                    pooled_cursor_epochs_seen_group_[r] = epoch;
+                    if (r < state_.positions.size())
+                        state_.positions[r] = member->nextPosition();
+                }
+            }
+        }
 
         /*
          * A GPU grouped verifier executes after accepted-state publication has
@@ -18200,8 +18281,15 @@ namespace llaminar2
 
         TensorBase *logits_output = state_.logits.get();
         TensorBase *logits_local_output = state_.logits_local.get();
+        // P2 pooled GROUPED decode: N decode rows in one graph — every row
+        // must project terminal logits, so the all-position output bank is
+        // required exactly like live request-batch conditions (no last-row
+        // shortcut).
+        const bool pooled_group_logits =
+            !pooled_kv_binding_group_.empty();
         if (compute_all_position_logits_ ||
-            live_mtp_request_batch_condition_)
+            live_mtp_request_batch_condition_ ||
+            pooled_group_logits)
         {
             const auto &config = graph_builder_->config();
             size_t rows = static_cast<size_t>(total_tokens);
@@ -18343,7 +18431,167 @@ namespace llaminar2
                 "device-state publication stream");
         }
         input.device = state_.device_id;
-        input.kv_cache = state_.kv_cache.get();
+        const bool pooled_attached = pooled_kv_binding_ ||
+            !pooled_kv_binding_group_.empty();
+        input.kv_cache = pooled_attached ? nullptr : state_.kv_cache.get();
+        // P2 pooled decode: the runner attached a pooled binding (or GROUPED
+        // set); the pooled graph consumes pooled pages and must NOT use the
+        // ring cache (the graph builder refuses ring+pooled combinations).
+        input.pooled_kv = pooled_kv_binding_;
+        if (!pooled_kv_binding_group_.empty())
+            input.pooled_kv_group = &pooled_kv_binding_group_;
+        /*
+         * R24 M6: admit the step's COMPLETE page demand (all layers, one pool
+         * grant) BEFORE the graph builds or runs. A page shortage refuses the
+         * forward here; no graph node ever admids mid-execution and no layer
+         * publishes alone. The binding's publication row count is ALSO the
+         * single decode-position authority (M1/R24): the graph's position
+         * offset comes from the pooled publication, and the host cursor must
+         * agree or the forward is refused (a shifted origin or prefix attach
+         * that would break rows-1 is rejected, not silently mis-attended).
+         */
+        if (!pooled_kv_binding_group_.empty())
+        {
+            // P2 GROUPED pooled decode: N bindings, one graph. Every member is
+            // admitted for THIS step before graph execution (all-or-none):
+            // a single member's refusal cancels the whole group's step and
+            // refuses the forward. Positions are checked per request against
+            // the host cursor row state_.
+            if (pooled_kv_binding_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Pooled single and grouped bindings are mutually exclusive");
+                return std::nullopt;
+            }
+            if (static_cast<int>(pooled_kv_binding_group_.size()) != batch_size)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Pooled grouped decode requires one binding per decode row"
+                          << " (group=" << pooled_kv_binding_group_.size()
+                          << " batch=" << batch_size << ")");
+                return std::nullopt;
+            }
+            for (const auto *member : pooled_kv_binding_group_)
+            {
+                if (!member)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Pooled grouped decode member is null");
+                    return std::nullopt;
+                }
+            }
+            // One authority: all members share one pool+table (a mixed pair
+            // would batch publications from different authorities).
+            const auto *first = pooled_kv_binding_group_.front();
+            for (const auto *member : pooled_kv_binding_group_)
+            {
+                if (member->pool() != first->pool() ||
+                    member->table() != first->table())
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Pooled grouped decode members must share one pool/table");
+                    return std::nullopt;
+                }
+            }
+            for (int r = 0; r < batch_size; ++r)
+            {
+                auto *member = pooled_kv_binding_group_[static_cast<std::size_t>(r)];
+                // R2: the host cursor vector must seat every grouped row.
+                // The adoption loop only re-seats indices STATE ALREADY SEATS;
+                // this gate indexes positions[r] directly, so refuse BEFORE
+                // any out-of-range access if the cursor vector is shorter
+                // than the batch.
+                if (static_cast<std::size_t>(r) >= state_.positions.size())
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Pooled grouped host cursor vector is too small "
+                        "(positions=" << state_.positions.size()
+                        << " request=" << r << "); refusing pooled forward");
+                    return std::nullopt;
+                }
+                // M4: a continued/chunked prefill with live pooled history is
+                // refused (decode-only; per-request gate).
+                if (input.execution_phase == ForwardExecutionPhase::Prefill &&
+                    member->hasLivePublication())
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Continued pooled prefill refused "
+                        "(live pooled history; pooled attention is decode-only)");
+                    return std::nullopt;
+                }
+                const int pooled_next_position = member->nextPosition();
+                if (pooled_next_position != state_.positions[static_cast<std::size_t>(r)])
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Pooled grouped decode position authority "
+                        "disagrees with the host cursor (request=" << r
+                        << " publication=" << pooled_next_position
+                        << " cursor=" << state_.positions[static_cast<std::size_t>(r)]
+                        << "); refusing pooled forward");
+                    return std::nullopt;
+                }
+            }
+            // N1: every member gets its own StepGuard; any later throw
+            // unwinds through all guards (each cancels its own grant) and no
+            // layer publication becomes visible. Only a complete, successful
+            // forward completes ALL of them.
+            pooled_step_guards_.clear();
+            pooled_step_guards_.reserve(static_cast<std::size_t>(batch_size));
+            for (auto *member : pooled_kv_binding_group_)
+            {
+                auto guard = member->prepareStep(1);
+                if (!guard)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Pooled grouped step admission "
+                        "refused (page/version/bank headroom); refusing forward before graph execution");
+                    pooled_step_guards_.clear();
+                    return std::nullopt;
+                }
+                pooled_step_guards_.push_back(std::move(guard));
+            }
+        }
+        else if (pooled_kv_binding_)
+        {
+            // M4 (amended): a continued/chunked prefill with live pooled
+            // history is LEGAL — the append stage extends the publication
+            // with this chunk's rows and the pooled attention consumes the
+            // full publication causally from the publication row count (the
+            // shared-prefix + private-divergence vertical). The graph builder
+            // refuses the combination it cannot support; the DGO only checks
+            // the position authority below.
+            // (Grouped pooled prefill remains decode-only: each group member
+            // is a one-row decode participant by contract.)
+            // F5 (R52): the pooled publication is the position authority —
+            // the host check below is a CONSISTENCY guard, not a fail-closed
+            // cursor mirror. The serving path seats state_.positions FROM
+            // nextPosition() (R30's host-cursor-fail-closed rule is
+            // superseded: the mirror can never disagree because it is
+            // derived); the forward() shape still re-seats on epoch change.
+            const int pooled_next_position = pooled_kv_binding_->nextPosition();
+            if (pooled_next_position != state_.positions[0])
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Pooled decode position authority "
+                    "disagrees with the host cursor (publication="
+                    << pooled_next_position << " cursor=" << state_.positions[0]
+                    << "); refusing pooled forward");
+                return std::nullopt;
+            }
+            const int live_rows =
+                input.execution_phase == ForwardExecutionPhase::Prefill
+                    ? seq_len
+                    : 1;
+            // N1: the StepGuard owns the step. Any throw after this point
+            // (graph construction, stage execution) unwinds through the guard
+            // and cancels the step: the grant returns and no layer publication
+            // becomes visible. Only a complete, successful forward may
+            // completeAndAdvance.
+            pooled_step_guard_ = pooled_kv_binding_->prepareStep(live_rows);
+            if (!pooled_step_guard_)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Pooled decode step admission "
+                    "refused (page/version/bank headroom); refusing forward before graph execution");
+                return std::nullopt;
+            }
+        }
 
         /*
          * Pipeline prefill binds each non-embedding participant's persistent
@@ -18413,6 +18661,9 @@ namespace llaminar2
         {
             input.sequence_lengths = nullptr;
         }
+        // A serving forward addresses arbitrary resident slots.
+        input.request_kv_slots =
+            serving_row_slots_.empty() ? nullptr : &serving_row_slots_;
         if (execution_role == ForwardExecutionRole::GroupedMTPVerifier &&
             state_.device_id.is_gpu())
         {
@@ -18650,6 +18901,38 @@ namespace llaminar2
 
         // Execute forward pass
         bool success = executeForward(input, output);
+
+        // R25 N1: pooled step publication. Only a completely successful
+        // forward advances next→current for EVERY layer (row-count check);
+        // any failure or missing layer cancels every not-yet-visible
+        // publication, so layers never disagree or lose history.
+        if (success && !pooled_step_guards_.empty())
+        {
+            // Grouped: advance EVERY member or cancel ALL (all-or-none).
+            for (auto &guard : pooled_step_guards_)
+            {
+                if (!guard.completeAndAdvance())
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Pooled grouped forward succeeded but a "
+                        "step publication is incomplete; cancelling every step");
+                    success = false;
+                    break;
+                }
+            }
+        }
+        if (success && pooled_step_guard_)
+        {
+            if (!pooled_step_guard_.completeAndAdvance())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Pooled forward succeeded but the "
+                    "step publication is incomplete; cancelling the step");
+                success = false;
+            }
+        }
+        pooled_step_guard_ = PooledKVDecodeBinding::StepGuard{};
+        pooled_step_guards_.clear();
 
         std::string overlay_finish_error;
         if (!overlay_graph_scope.finish(
@@ -21599,6 +21882,29 @@ namespace llaminar2
                 seq_len);
         }
         state_.last_forward_request_lengths = std::move(request_lengths);
+        if (cpu_resident_mtp_hidden_)
+        {
+            if (!state_.hidden || seq_len <= 0 || batch_size <= 0 ||
+                state_.last_forward_request_lengths.size() != static_cast<size_t>(batch_size) ||
+                (!serving_row_slots_.empty() && serving_row_slots_.size() != static_cast<size_t>(batch_size)))
+                throw std::logic_error("CPU resident MTP main publication lacks exact request geometry");
+            const size_t width = static_cast<size_t>(graph_builder_->config().residualWidth());
+            const float *source = state_.hidden->fp32_data();
+            if (!source || state_.hidden->numel() / width < static_cast<size_t>(batch_size) * seq_len)
+                throw std::logic_error("CPU resident MTP main publication exceeds its hidden producer");
+            // Copy the actual terminal row, never the padded row or compact
+            // batch index. Existing slots not participating keep their state.
+            for (int row = 0; row < batch_size; ++row)
+            {
+                const int length = state_.last_forward_request_lengths[static_cast<size_t>(row)];
+                if (length <= 0 || length > seq_len)
+                    throw std::logic_error("CPU resident MTP main publication has invalid live length");
+                const int slot = serving_row_slots_.empty() ? row : serving_row_slots_[static_cast<size_t>(row)];
+                const size_t offset = (static_cast<size_t>(row) * seq_len + length - 1) * width;
+                cpu_resident_mtp_hidden_->publish(slot, CPUResidentMTPHidden::Bank::Main,
+                    std::span<const float>(source + offset, width));
+            }
+        }
         if (terminal_hidden_source ==
             MTPTerminalHiddenPublication::Source::MainForward)
             state_.mtp_terminal_hidden_publication.publishMainForward();
@@ -25071,6 +25377,57 @@ namespace llaminar2
             defer_final_sync);
     }
 
+    bool DeviceGraphOrchestrator::executeCPUResidentMTPDraft(
+        const std::vector<int> &slots, std::span<const int32_t> tokens,
+        std::span<const int> positions, CPUResidentMTPHidden::Bank source)
+    {
+        if (!state_.device_id.is_cpu() || !cpu_resident_mtp_hidden_ ||
+            !state_.prefix_terminal_hidden || state_.mtp_kv_caches.empty() ||
+            slots.empty() || slots.size() != tokens.size() || slots.size() != positions.size() ||
+            slots.size() > static_cast<size_t>(state_.batch_size))
+            throw std::logic_error("CPU resident MTP draft lacks admitted slot/token/position state");
+        MTPForwardInput admission;
+        admission.device = state_.device_id;
+        admission.kv_cache = state_.mtp_kv_caches[0].get();
+        admission.batch_size = static_cast<int>(slots.size());
+        admission.request_kv_slots = &slots;
+        validateMTPRequestKVSlots(admission);
+        const size_t width = static_cast<size_t>(graph_builder_->config().residualWidth());
+        if (state_.prefix_terminal_hidden->numel() / width < slots.size())
+            throw std::logic_error("CPU resident MTP compact input exceeds its retained mailbox");
+        // Authenticate the complete transaction before copying any publication.
+        for (size_t row = 0; row < slots.size(); ++row)
+        {
+            if (positions[row] < 0 || positions[row] >= state_.max_seq_len ||
+                tokens[row] < 0 || tokens[row] >= state_.vocab_size)
+                throw std::invalid_argument("CPU resident MTP draft token or position is invalid");
+            (void)cpu_resident_mtp_hidden_->acquire(slots[row], source);
+        }
+        float *compact = state_.prefix_terminal_hidden->mutable_data();
+        for (size_t row = 0; row < slots.size(); ++row)
+        {
+            const auto lease = cpu_resident_mtp_hidden_->acquire(slots[row], source);
+            const auto hidden = cpu_resident_mtp_hidden_->read(lease);
+            std::copy(hidden.begin(), hidden.end(), compact + row * width);
+        }
+        state_.mtp_terminal_hidden_publication.publishResidentRows(source);
+        if (!executeMTPDepth0Batched(tokens.data(), 1, state_.prefix_terminal_hidden.get(),
+                positions.front(), "cpu_resident_draft", false, BufferId::PREFIX_TERMINAL_HIDDEN,
+                false, nullptr, -1, false, static_cast<int>(slots.size()), positions.data(),
+                nullptr, nullptr, 0, nullptr, 0, -1, 0, nullptr, 1, 1, 1, 0, 0,
+                DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch, &slots))
+            return false;
+        const auto found = state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+        if (found == state_.extension_buffers.end() || !found->second ||
+            found->second->numel() / width < slots.size() || !found->second->fp32_data())
+            throw std::logic_error("CPU resident MTP draft did not produce its exact hidden rows");
+        const float *draft = found->second->fp32_data();
+        for (size_t row = 0; row < slots.size(); ++row)
+            cpu_resident_mtp_hidden_->publish(slots[row], CPUResidentMTPHidden::Bank::Draft,
+                std::span<const float>(draft + row * width, width));
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::executeMTPDepth0Batched(
         const int32_t *draft_condition_tokens,
         int token_count,
@@ -25098,7 +25455,8 @@ namespace llaminar2
         int draft_condition_ready_stride,
         int device_position_offset,
         int first_seq_idx,
-        DeviceGraphExecutor::GraphInitialSubmissionPolicy submission)
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy submission,
+        const std::vector<int> *request_kv_slots)
     {
         if (state_.device_id.is_gpu() && !mtp_graph_owner_plan_.ownsControllerExecutables())
         {
@@ -25548,6 +25906,7 @@ namespace llaminar2
         input.batch_size = request_batch;
         input.seq_len = token_count;
         input.first_sequence_index = first_seq_idx;
+        input.request_kv_slots = request_kv_slots;
         input.device_state_publication_stream =
             state_.device_id.is_gpu()
                 ? explicitGPUStreamForOperation(
@@ -25564,6 +25923,7 @@ namespace llaminar2
         input.device = state_.device_id;
         input.terminal_hidden_buffer_id = terminal_hidden_buffer_id;
         input.kv_cache_only = kv_cache_only;
+        validateMTPRequestKVSlots(input);
 
         const uint64_t current_moe_placement_epoch = moePlacementEpoch();
         const bool sidecar_moe_epoch_sensitive = mtp_moe_sidecar && !kv_cache_only;
@@ -25576,7 +25936,9 @@ namespace llaminar2
         const bool graph_shape_changed =
             sidecar_cache.seq_len != token_count ||
             sidecar_cache.batch_size != request_batch ||
-            sidecar_cache.first_seq_idx != first_seq_idx;
+            sidecar_cache.first_seq_idx != first_seq_idx ||
+            (request_kv_slots ? sidecar_cache.request_kv_slots != *request_kv_slots
+                              : !sidecar_cache.request_kv_slots.empty());
         const bool token_binding_changed =
             sidecar_cache.uses_device_token_ids != use_device_condition_tokens ||
             sidecar_cache.condition_token_slot != condition_token_slot ||
@@ -25637,6 +25999,7 @@ namespace llaminar2
             sidecar_cache.seq_len = token_count;
             sidecar_cache.batch_size = request_batch;
             sidecar_cache.first_seq_idx = first_seq_idx;
+            sidecar_cache.request_kv_slots = request_kv_slots ? *request_kv_slots : std::vector<int>{};
             sidecar_cache.uses_device_token_ids = use_device_condition_tokens;
             sidecar_cache.uses_device_position_ids = use_device_position_ids;
             sidecar_cache.condition_token_slot = condition_token_slot;
@@ -48559,6 +48922,21 @@ namespace llaminar2
         const std::vector<int32_t> &tokens,
         int prompt_token_count)
     {
+        return harvestPrefixFromSequence(admission, tokens, prompt_token_count, 0, false);
+    }
+
+    bool DeviceGraphOrchestrator::harvestPrefixFromSequence(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        int prompt_token_count,
+        int seq_idx,
+        bool serving_row)
+    {
+        if (seq_idx < 0 || seq_idx >= state_.batch_size || (seq_idx != 0 && !serving_row))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest sequence " << seq_idx << " is out of range");
+            return false;
+        }
         if (!admission.cache_enabled ||
             !admission.supported ||
             admission.fingerprint_key == 0)
@@ -48676,6 +49054,10 @@ namespace llaminar2
             parent_hash = key.stableHash();
             const bool terminal_block =
                 (key.token_start + key.token_count) == prompt_token_count;
+            // A serving row shares the forward with other rows, so the graph's
+            // terminal logits/hidden/runtime state are not this row's. Serving
+            // rows archive KV only; their restores always recompute >= 1 token.
+            const bool capture_terminal = terminal_block && !serving_row;
             if (!terminal_block && prefix_layout_.organization() ==
                     PrefixPayloadOrganization::RecurrentCheckpoint)
             {
@@ -48693,7 +49075,7 @@ namespace llaminar2
                     prompt_token_count) ==
                     PrefixTerminalHarvestDisposition::ReuseAdmittedArchive;
             if (key_already_installed &&
-                (!terminal_block || reuse_admitted_terminal))
+                (serving_row || !terminal_block || reuse_admitted_terminal))
             {
                 if (reuse_admitted_terminal)
                 {
@@ -48729,7 +49111,7 @@ namespace llaminar2
             }
 
             PrefixPayloadLayout block_layout = prefix_layout_;
-            if (!terminal_block)
+            if (!capture_terminal)
             {
                 block_layout.includes_hybrid_state = false;
                 block_layout.includes_terminal_hidden = false;
@@ -48737,13 +49119,13 @@ namespace llaminar2
             }
 
             applyPrefixAuxiliaryLayout(block_layout,*state_.kv_cache,
-                state_.mtp_kv_caches.empty()?nullptr:state_.mtp_kv_caches[0].get(),0,
-                key.token_start,key.token_count,key.token_start+key.token_count,terminal_block);
+                state_.mtp_kv_caches.empty()?nullptr:state_.mtp_kv_caches[0].get(),seq_idx,
+                key.token_start,key.token_count,key.token_start+key.token_count,capture_terminal);
 
-            applyHybridPrefixPayloadExtent(block_layout, *state_.kv_cache, 0);
+            applyHybridPrefixPayloadExtent(block_layout, *state_.kv_cache, seq_idx);
 
             std::shared_ptr<std::vector<uint8_t>> model_runtime_state;
-            if (terminal_block && graph_builder_)
+            if (capture_terminal && graph_builder_)
             {
                 auto captured = std::make_shared<std::vector<uint8_t>>();
                 if (!graph_builder_->capturePrefixCacheRuntimeState(*captured, stream))
@@ -48903,7 +49285,7 @@ namespace llaminar2
                                  static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_v;
                 IKVCache::KVCacheLogicalBlockDescriptor desc;
                 desc.layer = global_layer;
-                desc.seq_idx = 0;
+                desc.seq_idx = seq_idx;
                 desc.logical_token_start = key.token_start;
                 desc.token_count = key.token_count;
                 desc.stream = stream;
@@ -49027,17 +49409,17 @@ namespace llaminar2
             }
 
             if(ok) {
-                exportPrefixAuxiliaryState(*state_.kv_cache,0,PrefixAuxiliaryLane::Main,handle,stream);
+                exportPrefixAuxiliaryState(*state_.kv_cache,seq_idx,PrefixAuxiliaryLane::Main,handle,stream);
                 if(device_hot_handle.valid())
-                    exportPrefixAuxiliaryState(*state_.kv_cache,0,PrefixAuxiliaryLane::Main,device_hot_handle,stream);
+                    exportPrefixAuxiliaryState(*state_.kv_cache,seq_idx,PrefixAuxiliaryLane::Main,device_hot_handle,stream);
                 if(block_layout.includes_mtp_state && !state_.mtp_kv_caches.empty()) {
-                    exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],0,PrefixAuxiliaryLane::ShiftedMTP,handle,stream);
+                    exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],seq_idx,PrefixAuxiliaryLane::ShiftedMTP,handle,stream);
                     if(device_hot_handle.valid())
-                        exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],0,PrefixAuxiliaryLane::ShiftedMTP,device_hot_handle,stream);
+                        exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],seq_idx,PrefixAuxiliaryLane::ShiftedMTP,device_hot_handle,stream);
                 }
             }
 
-            if (ok && terminal_block && prefix_layout_.includes_hybrid_state)
+            if (ok && capture_terminal && prefix_layout_.includes_hybrid_state)
             {
                 if (state_.device_id.is_gpu())
                 {
@@ -49059,7 +49441,7 @@ namespace llaminar2
                         desc.host_recurrence_layout = block_layout.hybrid_host_recurrence_layout;
                         desc.device_recurrence_layout =
                             block_layout.hybrid_device_recurrence_layout;
-                        desc.seq_idx = 0;
+                        desc.seq_idx = seq_idx;
                         desc.logical_token_count =
                             key.token_start + key.token_count;
                         desc.stream = stream;
@@ -49105,7 +49487,7 @@ namespace llaminar2
                 }
             }
 
-            if (ok && terminal_block && prefix_layout_.includes_terminal_hidden &&
+            if (ok && capture_terminal && prefix_layout_.includes_terminal_hidden &&
                 !state_.mtp_terminal_hidden_publication.current())
             {
                 /*
@@ -49141,7 +49523,7 @@ namespace llaminar2
             }
 
             const auto terminal_logits = currentPrefixArchiveLogits();
-            if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
+            if (ok && capture_terminal && prefix_layout_.includes_terminal_logits &&
                 !terminal_logits)
             {
                 LOG_ERROR(
@@ -49149,7 +49531,7 @@ namespace llaminar2
                     "scalar main-logits publication");
                 ok = false;
             }
-            if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
+            if (ok && capture_terminal && prefix_layout_.includes_terminal_logits &&
                 terminal_logits && handle.terminal_logits)
             {
                 // Slice the actual producer, not a dormant local allocation.
@@ -49206,7 +49588,7 @@ namespace llaminar2
                 }
             }
 
-            if (ok && terminal_block && prefix_layout_.includes_terminal_hidden &&
+            if (ok && capture_terminal && prefix_layout_.includes_terminal_hidden &&
                 state_.prefix_terminal_hidden &&
                 state_.mtp_terminal_hidden_publication.current() &&
                 handle.terminal_hidden)
@@ -49259,7 +49641,7 @@ namespace llaminar2
             }
 
             if (terminal_hidden_archival_refresh &&
-                terminal_block &&
+                capture_terminal &&
                 prefix_layout_.includes_terminal_hidden &&
                 handle.has_terminal_hidden)
             {
@@ -61429,6 +61811,436 @@ namespace llaminar2
             state_.sequence_lengths[i] = old_len + actual_lengths[i];
         }
 
+        return true;
+    }
+
+    std::string DeviceGraphOrchestrator::servingRowsUnsupportedReason() const
+    {
+        // Each resident slot owns one KV sequence addressed by slot index.
+        // Missing per-slot state (GPU retained execution, recurrent hybrid
+        // state, MTP draft caches) fails closed with its precise reason.
+        if (!state_.isInitialized() || state_.kv_cache == nullptr)
+            return "the runner is not initialized";
+        if (!state_.device_id.is_cpu())
+            return "continuous batching on " + state_.device_id.toString() +
+                   " requires GPU retained serving execution, which is not implemented yet";
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr &&
+            graph_builder_ && graph_builder_->config().prefix_cache.enabled)
+            return "prefix caching of hybrid recurrent state has no per-slot serving rows yet "
+                   "(use --no-prefix-cache)";
+        if ((graph_builder_ && graph_builder_->config().isMoE()) || isPrefixCacheMoEModel())
+            return "routed-expert (MoE) models have no qualified serving rows yet";
+        if (!state_.mtp_kv_caches.empty() || (graph_builder_ && graph_builder_->config().mtp.enabled))
+            return "MTP speculative decoding has no per-slot serving rows yet (use --no-mtp)";
+        if (graph_builder_ && graph_builder_->config().prefix_cache.enabled &&
+            graph_builder_->prefixCacheRuntimeStateCapacity() > 0)
+            return "prefix caching of model runtime state has no per-slot serving rows yet "
+                   "(use --no-prefix-cache)";
+        return {};
+    }
+
+    int DeviceGraphOrchestrator::restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
+                                                         PrefixLookupResult &admission)
+    {
+        admission = {};
+        if (!supportsServingRows() || slot < 0 || slot >= state_.batch_size)
+            return -1;
+        if (!graph_builder_ || !graph_builder_->config().prefix_cache.enabled)
+            return 0;
+        PrefixLookupResult hit = lookupPrefix(prompt);
+        if (!hit.cache_enabled || !hit.supported)
+            return 0;
+        // Leave at least one prompt token: its forward produces the row's
+        // first logits, so no terminal state is needed.
+        const int limit = static_cast<int>(prompt.size()) - 1;
+        PrefixLookupResult clamped = limit > 0 ? hit.clampedTo(limit) : PrefixLookupResult{};
+        if (!clamped.hit())
+        {
+            admission = hit.forHarvest(0);
+            return 0;
+        }
+
+        const std::vector<PrefixBlockHandle> blocks = clamped.materializeRestoreBlocks();
+        for (const PrefixBlockHandle &handle : blocks)
+        {
+            if (!handle.valid() || (prefix_layout_.fa_layers > 0 && (!handle.kvKData() || !handle.kvVData())))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Serving prefix block is invalid");
+                return -1;
+            }
+            for (int local_layer = 0; local_layer < prefix_layout_.fa_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(*state_.kv_cache, local_layer);
+                if (global_layer < 0)
+                    return -1;
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = slot;
+                desc.logical_token_start = handle.key.token_start;
+                desc.token_count = handle.key.token_count;
+                const uint8_t *k_src = handle.kvKData() +
+                    static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_k;
+                const uint8_t *v_src = handle.kvVData() +
+                    static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_v;
+                if (!state_.kv_cache->importLogicalBlock(desc, k_src, v_src))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Serving prefix KV import failed (slot " << slot << ")");
+                    return -1;
+                }
+            }
+        }
+        serving_slot_positions_.resize(static_cast<size_t>(state_.batch_size), 0);
+        serving_slot_positions_[static_cast<size_t>(slot)] = clamped.cached_tokens;
+        admission = clamped.forHarvest(clamped.cached_tokens);
+        PerfStatsCollector::addCounter("prefix_cache", "serving_row_restored_tokens",
+                                       static_cast<double>(clamped.cached_tokens), "restore",
+                                       state_.device_id.toString());
+        return clamped.cached_tokens;
+    }
+
+    bool DeviceGraphOrchestrator::harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
+                                                          const std::vector<int32_t> &prompt)
+    {
+        if (!admission.cache_enabled || !admission.supported || prompt.empty())
+            return true;
+        return harvestPrefixFromSequence(admission, prompt, static_cast<int>(prompt.size()), slot, true);
+    }
+
+    bool DeviceGraphOrchestrator::forwardServingRows(
+        const std::vector<int> &slots,
+        const std::vector<std::vector<int>> &rows)
+    {
+        serving_row_error_.clear();
+        auto fail = [&](const std::string &reason) {
+            serving_row_error_ = reason;
+            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
+            return false;
+        };
+        if (!supportsServingRows())
+            return fail("Serving rows are unsupported on this runner: " + servingRowsUnsupportedReason());
+        if (rows.empty() || rows.size() != slots.size() ||
+            static_cast<int>(rows.size()) > state_.batch_size)
+        {
+            return fail("Serving rows " + std::to_string(rows.size()) + " outside capacity " +
+                        std::to_string(state_.batch_size));
+        }
+        serving_slot_positions_.resize(static_cast<size_t>(state_.batch_size), 0);
+        std::vector<bool> used(static_cast<size_t>(state_.batch_size), false);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            const int slot = slots[row];
+            if (slot < 0 || slot >= state_.batch_size || used[static_cast<size_t>(slot)] ||
+                rows[row].empty() ||
+                serving_slot_positions_[static_cast<size_t>(slot)] +
+                        static_cast<int>(rows[row].size()) > state_.max_seq_len)
+            {
+                return fail("Serving row " + std::to_string(row) + " (slot " + std::to_string(slot) +
+                            ") is invalid or exceeds the context");
+            }
+            used[static_cast<size_t>(slot)] = true;
+        }
+
+        // POOLED serving (R52b): the pooled publication is the position
+        // authority — never the serving host mirror. The adapter sets ONE
+        // pooled shape per call: the GROUP (every row = one decode token,
+        // one binding per row — the phase-split decode batch) or the SINGLE
+        // binding (one prefill row-batch — a prefill phase, including a
+        // continued prefill over a live publication). Both shapes refuse the
+        // other's boundary rather than mis-addressing pooled pages.
+        const bool pooled_group_serving = !pooled_kv_binding_group_.empty();
+        const bool pooled_single_serving = pooled_kv_binding_ != nullptr;
+        if (pooled_group_serving && pooled_single_serving)
+            return fail("Pooled serving refuses a single binding and a group in one forward");
+        if (pooled_group_serving)
+        {
+            if (rows.size() != pooled_kv_binding_group_.size())
+                return fail("Pooled group serving requires one binding per serving row");
+            for (size_t row = 0; row < rows.size(); ++row)
+                if (rows[row].size() != 1)
+                    return fail("Pooled group serving is decode-only (prefill participants use one pooled single forward per row-batch)");
+        }
+        else if (pooled_single_serving && rows.size() != 1)
+            return fail("Pooled single serving prefill requires exactly one row-batch per forward");
+
+        // The LM head ordinarily computes one row (the last physical row of
+        // the whole batch). Serving needs each row's own last real token, so
+        // select exactly those terminal rows: row r is padded to the widest
+        // row, hence its terminal is r*width + len_r - 1.
+        int width = 0;
+        for (const auto &row : rows)
+            width = std::max(width, static_cast<int>(row.size()));
+        std::vector<int> terminal_rows;
+        terminal_rows.reserve(rows.size());
+        for (size_t row = 0; row < rows.size(); ++row)
+            terminal_rows.push_back(static_cast<int>(row) * width +
+                                    static_cast<int>(rows[row].size()) - 1);
+        const int row_count = static_cast<int>(rows.size());
+        if (!graph_builder_ || !setComputeAllPositionLogits(true) ||
+            !setComputeRowIndexedAllPositionLogits(true, row_count) ||
+            !graph_builder_->setRowIndexedAllPositionLogitRows(terminal_rows))
+        {
+            return fail("Serving rows could not select terminal logits rows");
+        }
+        request_batched_prefill_logits_row_count_ = row_count;
+
+        // Rows address arbitrary slots: positions are presented in row order
+        // for this transaction and written back to each slot afterwards. In
+        // POOLED serving the publication row count is the single authority:
+        // state_.positions is seated from each member's nextPosition() (the
+        // graph-time pooled checks compare against exactly this), and the host
+        // mirror is refreshed FROM the publication after the forward.
+        state_.positions.assign(rows.size(), 0);
+        state_.sequence_lengths.assign(rows.size(), 0);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            if (pooled_group_serving)
+                state_.positions[row] = pooled_kv_binding_group_[row]->nextPosition();
+            else if (pooled_single_serving)
+                state_.positions[row] = pooled_kv_binding_->nextPosition();
+            else
+                state_.positions[row] =
+                    serving_slot_positions_[static_cast<size_t>(slots[row])];
+            state_.sequence_lengths[row] = state_.positions[row];
+        }
+        serving_row_slots_ = slots;
+        const bool ok = forwardHostTokenBatchImpl(rows, ForwardExecutionRole::MainInference);
+        serving_row_slots_.clear();
+        graph_builder_->setRowIndexedAllPositionLogitRows({});
+        setComputeRowIndexedAllPositionLogits(false, 0);
+        setComputeAllPositionLogits(false);
+        request_batched_prefill_logits_row_count_ = 0;
+        serving_logits_rows_ = ok ? row_count : 0;
+        if (!ok)
+            serving_row_error_ = "Serving forward failed in the graph executor (see the preceding error)";
+        if (ok)
+            for (size_t row = 0; row < rows.size(); ++row)
+            {
+                if (pooled_group_serving)
+                    serving_slot_positions_[static_cast<size_t>(slots[row])] =
+                        pooled_kv_binding_group_[row]->nextPosition();
+                else if (pooled_single_serving)
+                    serving_slot_positions_[static_cast<size_t>(slots[row])] =
+                        pooled_kv_binding_->nextPosition();
+                else
+                    serving_slot_positions_[static_cast<size_t>(slots[row])] +=
+                        static_cast<int>(rows[row].size());
+            }
+        return ok;
+    }
+
+const float *DeviceGraphOrchestrator::servingRowLogits(int row) const
+    {
+        if (row < 0 || row >= serving_logits_rows_)
+            return nullptr;
+        const float *base = getAllPositionLogits();
+        return base ? base + static_cast<size_t>(row) * static_cast<size_t>(state_.vocab_size) : nullptr;
+    }
+
+    std::optional<std::vector<std::byte>> DeviceGraphOrchestrator::exportSlotKV(int slot) const
+    {
+        // Export is a slot-KV authority operation, independent of the serving
+        // row policy: the CPU ring cache owns the bytes. MTP draft caches and
+        // hybrid recurrent state are NOT carried (G2: recurrent state would be
+        // silently dropped and the restored row numerically wrong — refuse
+        // before mutation); a non-CPU or uninitialized runner cannot export.
+        if (!state_.isInitialized() || !state_.kv_cache ||
+            !state_.device_id.is_cpu() ||
+            slot < 0 || slot >= state_.batch_size)
+            return std::nullopt;
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+            return std::nullopt; // G2: recurrent/checkpoint state not carried.
+        if (!state_.mtp_kv_caches.empty() ||
+            (graph_builder_ && graph_builder_->config().mtp.enabled))
+            return std::nullopt; // MTP continuation not carried (honest refusal).
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+            return std::nullopt; // G2: recurrent/checkpoint state not carried.
+        const int layers = state_.kv_cache->n_layers();
+        const int first_layer = state_.kv_cache->first_layer_index();
+        std::vector<std::byte> packed;
+        // Typed per-layer header + native payload bytes. The RING CACHE is the
+        // byte authority (exportLogicalBlock reads its canonical storage); no
+        // host shadow exists — payloads are copied exactly as the cache exposes
+        // them, then re-imported through the same API. Header bytes are
+        // serialized FIELD-WISE (no uninitialized padding; deterministic).
+        for (int layer = 0; layer < layers; ++layer)
+        {
+            const int global_layer = first_layer + layer;
+            const auto state = state_.kv_cache->sequenceState(global_layer, slot);
+            if (state.cached_tokens <= 0)
+                continue; // No KV for this layer: skipped (not empty-padded).
+            const auto layout = state_.kv_cache->logicalBlockLayout(global_layer, state.cached_tokens);
+            if (layout.k_bytes == 0 || layout.v_bytes == 0)
+                return std::nullopt;
+            // Deterministic fixed-width fields; uint64 for byte sizes (no
+            // narrowing: a >4GiB layer must never silently wrap).
+            const std::uint64_t header_fields[6] = {
+                static_cast<std::uint64_t>(global_layer),
+                static_cast<std::uint64_t>(state.cached_tokens),
+                layout.k_bytes,
+                layout.v_bytes,
+                static_cast<std::uint64_t>(layout.k_precision),
+                static_cast<std::uint64_t>(layout.v_precision)};
+            appendBytes(packed, std::as_bytes(std::span(header_fields)));
+            const std::size_t k_at = packed.size();
+            packed.resize(k_at + layout.k_bytes + layout.v_bytes);
+            IKVCache::KVCacheLogicalBlockDescriptor desc;
+            desc.layer = global_layer;
+            desc.seq_idx = slot;
+            desc.logical_token_start = 0;
+            desc.token_count = state.cached_tokens;
+            desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
+            if (!state_.kv_cache->exportLogicalBlock(desc,
+                    packed.data() + k_at, packed.data() + k_at + layout.k_bytes))
+                return std::nullopt;
+        }
+        return packed;
+    }
+
+    bool DeviceGraphOrchestrator::importSlotKV(int slot, std::span<const std::byte> bytes)
+    {
+        if (!state_.isInitialized() || !state_.kv_cache ||
+            !state_.device_id.is_cpu() ||
+            slot < 0 || slot >= state_.batch_size)
+            return false;
+        if (!state_.mtp_kv_caches.empty() ||
+            (graph_builder_ && graph_builder_->config().mtp.enabled))
+            return false; // MTP continuation not carried (honest refusal).
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+            return false; // G2: recurrent/checkpoint state not carried.
+        // G3: VALIDATE THE COMPLETE PAYLOAD BEFORE WRITING ANYTHING. Every
+        // header is checked against the cache's own layout (k_bytes/v_bytes
+        // must equal logicalBlockLayout(layer, token_count) exactly), the
+        // layer set must be the exact owned range in order (no duplicates,
+        // no gaps, no foreign layers), the precision must match, and every
+        // layer must carry the SAME length. A malformed or foreign payload
+        // refuses with the slot untouched.
+        struct ParsedLayer
+        {
+            int global_layer = 0;
+            int token_count = 0;
+            std::size_t k_bytes = 0;
+            std::size_t v_bytes = 0;
+            std::uint8_t k_precision = 0;
+            std::uint8_t v_precision = 0;
+            std::span<const std::byte> k;
+            std::span<const std::byte> v;
+        };
+        std::vector<ParsedLayer> parsed;
+        const int layers = state_.kv_cache->n_layers();
+        const int first_layer = state_.kv_cache->first_layer_index();
+        std::size_t at = 0;
+        int expected_length = -1;
+        int next_expected_layer = first_layer;
+        while (at < bytes.size())
+        {
+            if (at + 6 * sizeof(std::uint64_t) > bytes.size())
+                return false; // Truncated header.
+            ParsedLayer entry;
+            std::uint64_t fields[6];
+            std::memcpy(fields, bytes.data() + at, sizeof(fields)); // No unaligned read.
+            at += sizeof(fields);
+            entry.global_layer = static_cast<int>(fields[0]);
+            entry.token_count = static_cast<int>(fields[1]);
+            entry.k_bytes = static_cast<std::size_t>(fields[2]);
+            entry.v_bytes = static_cast<std::size_t>(fields[3]);
+            entry.k_precision = static_cast<std::uint8_t>(fields[4]);
+            entry.v_precision = static_cast<std::uint8_t>(fields[5]);
+            // Exact ordered owned layer set: no gap, no duplicate, no foreign.
+            if (entry.global_layer != next_expected_layer)
+                return false;
+            ++next_expected_layer;
+            if (entry.global_layer < first_layer || entry.global_layer >= first_layer + layers)
+                return false;
+            if (entry.token_count <= 0 || (expected_length >= 0 && entry.token_count != expected_length))
+                return false;
+            expected_length = entry.token_count;
+            // Precision must equal the cache's native precision.
+            const auto layout = state_.kv_cache->logicalBlockLayout(entry.global_layer, entry.token_count);
+            // Full precision comparison (no uint8 truncation of an enum).
+            if (layout.k_bytes != entry.k_bytes || layout.v_bytes != entry.v_bytes ||
+                static_cast<std::uint64_t>(layout.k_precision) != fields[4] ||
+                static_cast<std::uint64_t>(layout.v_precision) != fields[5])
+                return false;
+            if (at + entry.k_bytes + entry.v_bytes > bytes.size())
+                return false; // Payload extent beyond the span: refuse (G3).
+            entry.k = bytes.subspan(at, entry.k_bytes);
+            at += entry.k_bytes;
+            entry.v = bytes.subspan(at, entry.v_bytes);
+            at += entry.v_bytes;
+            parsed.push_back(entry);
+        }
+        if (parsed.empty() || next_expected_layer != first_layer + layers)
+            return false; // Missing layers: the export set must be complete.
+        // G3: the TARGET SLOT must be empty before install (reset first, then
+        // import). A stale slot would silently mix old and new state.
+        for (const auto &entry : parsed)
+        {
+            if (state_.kv_cache->sequenceState(entry.global_layer, slot).cached_tokens != 0)
+                return false;
+        }
+        // Commit: install every layer. Each import is the same validated
+        // extent, so a failure here is a backend defect (fail closed, reset).
+        for (const auto &entry : parsed)
+        {
+            IKVCache::KVCacheLogicalBlockDescriptor desc;
+            desc.layer = entry.global_layer;
+            desc.seq_idx = slot;
+            desc.logical_token_start = 0;
+            desc.token_count = entry.token_count;
+            desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
+            if (!state_.kv_cache->importLogicalBlock(desc, entry.k.data(), entry.v.data()))
+            {
+                // Fully validated; a backend refusal resets to keep the slot
+                // empty and honest (no partial install).
+                IKVCache::StateResetContext reset;
+                reset.boundary = IKVCache::StateResetBoundary::SequenceRetirement;
+                reset.reason = "import failure rollback";
+                (void)state_.kv_cache->resetSequenceState(slot, reset);
+                return false;
+            }
+        }
+        // G1: the slot's logical position follows the imported KV length under
+        // the SAME authority (never left at 0 against non-empty KV).
+        serving_slot_positions_.resize(static_cast<std::size_t>(state_.batch_size), 0);
+        serving_slot_positions_[static_cast<std::size_t>(slot)] = expected_length;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::resumedSlotKVLength(int slot, int expected) const
+    {
+        if (!state_.isInitialized() || !state_.kv_cache ||
+            slot < 0 || slot >= state_.batch_size || expected <= 0)
+            return false;
+        if (!state_.mtp_kv_caches.empty() ||
+            (graph_builder_ && graph_builder_->config().mtp.enabled))
+            return false; // MTP rows cannot be resumed (honest refusal).
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+            return false; // Hybrid rows cannot be resumed.
+        // EXACT match across every layer: the imported length is one
+        // authority, the session must resume from the same number.
+        const int layers = state_.kv_cache->n_layers();
+        const int first_layer = state_.kv_cache->first_layer_index();
+        for (int layer = 0; layer < layers; ++layer)
+        {
+            if (state_.kv_cache->sequenceState(first_layer + layer, slot).cached_tokens != expected)
+                return false;
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::resetServingRow(int slot)
+    {
+        if (!supportsServingRows() || slot < 0 || slot >= state_.batch_size)
+            return false;
+        IKVCache::StateResetContext context;
+        context.boundary = IKVCache::StateResetBoundary::SequenceRetirement;
+        context.reason = "serving slot retirement";
+        if (!state_.kv_cache->resetSequenceState(slot, context))
+            return false;
+        serving_slot_positions_.resize(static_cast<size_t>(state_.batch_size), 0);
+        serving_slot_positions_[static_cast<size_t>(slot)] = 0;
+        if (cpu_resident_mtp_hidden_)
+            cpu_resident_mtp_hidden_->retire(slot);
         return true;
     }
 

@@ -1,0 +1,52 @@
+pma-private-pages-v2 3 128 4 3 empty-zero-generations table 1 2 2 2 64 0 empty-zero-versions fp32-le
+admit A 2 | accepted
+assign A | 0:1
+plan W A 0 32 | ready
+copy W 0000803f00000040000030410000404100004040000080400000504100006041 | copied
+commit W P | published
+table-begin U | ready
+table-append U P 1 2 | attached
+table-commit U S | 1
+table-borrow B S | accepted
+table-begin U2 | ready
+assign A | 1:1
+plan W2 A 1 32 | ready
+copy W2 0000a0400000c04000007041000080410000e040000000410000884100009041 | copied
+commit W2 P2 | published
+table-append U2 P2 1 2 | attached
+table-commit U2 T | 2
+table-begin Busy | busy
+table-close S | closed
+table-drop S | retired
+table-borrow C B | refused
+table-read B | 1:2:1.000000:11.000000
+table-drop B | retired
+table-begin Abort | ready
+table-abort Abort | aborted
+table-begin U3 | ready
+discard A 0 | 1
+remaining A | 1
+assign A | 0:2
+plan W3 A 1 32 | ready
+copy W3 0000803f00000040000030410000404100004040000080400000504100006041 | copied
+commit W3 P3 | published
+table-append U3 P3 1 2 | attached
+table-commit U3 New | 4
+table-read New | 4:2:1.000000:11.000000
+table-read T | 2:2:5.000000:15.000000
+table-drop T | retired
+table-drop New | retired
+drop-request A | retired
+admit Hold 1 | accepted
+assign Hold | 0:3
+pin H Hold 0 | pinned
+discard Hold 0 | 0
+remaining Hold | 0
+drop-request Hold | retired
+admit Replace 1 | accepted
+remaining Replace | 1
+drop-pin H | released
+remaining Replace | 1
+assign Replace | 0:4
+drop-request Replace | retired
+end | idle

@@ -54,6 +54,7 @@ namespace
     ENUM(PPSplitMode, VALUE(EQUAL), VALUE(WEIGHTED), VALUE(MANUAL))
     ENUM(MPIProfile, VALUE(AUTO), VALUE(TUNED))
     ENUM(CollectiveBackendType, VALUE(AUTO), VALUE(NCCL), VALUE(RCCL), VALUE(HETEROGENEOUS), VALUE(UPI), VALUE(MPI), VALUE(HOST))
+    ENUM(RetentionClass, VALUE(InMemory), VALUE(Default), VALUE(TieredDay))
     ENUM(ExecutionDomainScope, VALUE(AUTO), VALUE(SINGLE), VALUE(RANK_LOCAL), VALUE(NODE_LOCAL), VALUE(GLOBAL))
     ENUM(FusedAttentionBackend, VALUE(JIT), VALUE(REFERENCE), VALUE(TILED), VALUE(Q16_INTEGER))
     ENUM(RoutedExpertComputePolicy, VALUE(Unspecified), VALUE(Replicated), VALUE(Apportioned), VALUE(TensorSharded), VALUE(GateUpOwnedDownColumns), VALUE(Automatic))
@@ -63,6 +64,8 @@ namespace
     ENUM(MoEHotExpertCacheConfig::Kind, VALUE(Percent), VALUE(Count), VALUE(Off))
     ENUM(MoERebalanceRuntimeMode, VALUE(Off), VALUE(Observe), VALUE(Dynamic))
     ENUM(PrefixCacheStorageMode, VALUE(Disabled), VALUE(Ram), VALUE(Device), VALUE(Tiered))
+    ENUM(PagedKVPoolBudgetMode, VALUE(Auto), VALUE(Cap))
+    ENUM(PagedKVHostTierMode, VALUE(Off), VALUE(Auto), VALUE(Cap))
     ENUM(AdaptiveGPUCachePlacementMode, VALUE(ConsumerLocal), VALUE(DeclaredRankLocal))
     ENUM(ImmutableRowTableDistribution, VALUE(Replicated), VALUE(FixedHeadSharded))
     ENUM(AdaptiveImmutableRowBacking, VALUE(SSD), VALUE(RAM))
@@ -143,6 +146,11 @@ namespace
 #define MEMBERS(X) X(storage_mode) X(block_size) X(ram_budget_bytes) X(device_budget_bytes) \
     X(disk_budget_bytes) X(disk_dir) X(terminal_state) X(moe_policy)
     RECORD(PrefixCacheRuntimeConfig, enabled, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(pool_cap_bytes) X(host_tier_mode) X(host_cap_bytes) \
+    X(disk_enabled) X(disk_cap_bytes) X(disk_journal_membership) X(disk_dir) \
+    X(retention_classes_ceiling)
+    RECORD(PagedKVTierConfig, pool_budget_mode, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(protected_numerator) X(protected_denominator)
     RECORD(CpuImmutableRowCachePolicy, aging_accesses, MEMBERS)
@@ -232,7 +240,8 @@ namespace
     X(tp_global_degree) X(pp_degree) X(pp_split) X(cpu_layers) X(cpu_layers_first) X(default_backend) \
     X(config_file_path) X(topology_string) X(topology_file_path) X(topology_tree) X(model_path) X(shared_predictor) \
     X(max_seq_len) X(prefill_max_bucket_size) X(use_mmap) X(prompt) X(prompt_was_explicitly_provided) X(n_predict) X(batch_size) \
-    X(n_threads) X(seed) X(temperature) X(top_k) X(top_p) X(deterministic) X(chat_mode) \
+    X(n_threads) X(seed) X(serving_resident_slots) X(serving_response_leases) X(serving_queue_capacity) \
+    X(temperature) X(top_k) X(top_p) X(deterministic) X(chat_mode) \
     X(single_shot_chat) X(system_prompt) X(chat_template_override) X(benchmark_mode) \
     X(benchmark_campaign_path) X(benchmark_campaign_was_provided) X(benchmark_json_output_path) X(benchmark_prompt_file_path) X(benchmark_prompt_file_was_provided) \
     X(serve_mode) X(serve_port) X(serve_host) X(use_fused_attention) X(fused_attention_backend) \
@@ -241,7 +250,7 @@ namespace
     X(max_cpu_memory_mb) X(moe_shared_experts_gpu) X(moe_sparse_experts_cpu) X(routed_expert_compute_policy) \
     X(routed_expert_owner_order) X(moe_hot_expert_cache) X(moe_routed_prefill) X(moe_rebalance) \
     X(moe_routed_expert_plan) X(activation_precision) X(kv_cache_precision) X(tp_allreduce_precision_override) \
-    X(prefix_cache) X(ngram_table_policy) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
+    X(prefix_cache) X(paged_kv_tiers) X(ngram_table_policy) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
     X(cpu_compute_fraction) X(disable_gpu_tp) X(disable_cpu_tp) X(min_layers_per_domain)
     RECORD(OrchestrationConfig, planning_mode, MEMBERS)
 #undef MEMBERS

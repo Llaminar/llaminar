@@ -38,10 +38,16 @@
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include <string>
 #include <vector>
-#include <cstdint>
 #include <optional>
+#include <cstdint>
 #include <utility>
 #include <memory>
+
+namespace llaminar2
+{
+    /** @brief Typed §9.4 intent; definition owned by execution/config/ServingCapacity.h. */
+    class ServingCapacityRequest;
+}
 
 namespace llaminar2
 {
@@ -393,6 +399,53 @@ namespace llaminar2
         int seed = -1;      ///< RNG seed (-1 = random)
 
         // =========================================================================
+        // Serving Capacity (adopted §9.4)
+        // =========================================================================
+
+        /** @brief Authored resident execution slots (--serving-resident-slots). */
+        std::optional<int> serving_resident_slots;
+        /** @brief Authored response/output leases (--serving-response-leases). */
+        std::optional<int> serving_response_leases;
+        /** @brief Authored queue/preparing capacity (--serving-queue-capacity). */
+        std::optional<int> serving_queue_capacity;
+
+        /**
+         * @brief Whether any serving-capacity axis is authored.
+         * @return True when at least one of the three §9.4 axes was supplied.
+         */
+        [[nodiscard]] bool hasServingCapacityIntent() const noexcept
+        {
+            return serving_resident_slots.has_value() || serving_response_leases.has_value() ||
+                   serving_queue_capacity.has_value();
+        }
+
+        /**
+         * @brief Typed §9.4 intent from the authored axes.
+         * @return Automatic intent when no axis was authored; exact authored
+         *         intent otherwise (completeness is enforced by the validator).
+         */
+        /**
+         * @brief Typed §9.4 intent from the authored axes.
+         * @return Automatic intent when no axis was authored; exact authored
+         *         intent otherwise (completeness is enforced by the validator).
+         */
+        [[nodiscard]] ServingCapacityRequest servingCapacityRequest() const;
+
+        /**
+         * @brief Bind serve-mode capacity to the runner before it is built.
+         *
+         * Authored resident slots S become the runner's request slots
+         * (batch_size), so PMA admits KV for every slot. Outside serve mode
+         * authored capacity has no consumer and is rejected; in serve mode a
+         * --batch-size above one without §9.4 intent is rejected because
+         * serving slots have exactly one authority.
+         * @param serving_consumer True for serve and for plan (whose document
+         *        serve applies); false for modes without a serving pool.
+         * @throws std::invalid_argument For the rejected combinations.
+         */
+        void bindServingCapacityToRunnerSlots(bool serving_consumer);
+
+        // =========================================================================
         // Sampling Configuration
         // =========================================================================
 
@@ -511,6 +564,7 @@ namespace llaminar2
         // =========================================================================
 
         PrefixCacheRuntimeConfig prefix_cache; ///< Enabled bounded tiered prefix-state cache settings
+        PagedKVTierConfig paged_kv_tiers; ///< Typed pooled paged-KV tier intents (design §4.3).
         ImmutableRowTablePolicy ngram_table_policy; ///< Requested native PLE storage preference and bounded mmap windows; resolved only by final PMA admission.
         /**
          * @brief GGUF-selected dynamic MTP with an explicit serial opt-out.

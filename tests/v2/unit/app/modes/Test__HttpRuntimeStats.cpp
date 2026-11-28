@@ -225,7 +225,45 @@ TEST(Test__HttpRuntimeStats, EmptySnapshotAndActiveRequest)
     EXPECT_EQ(active["requests"]["active"], 1);
     EXPECT_EQ(active["requests"]["started"], 1);
     EXPECT_GE(active["requests"]["active_seconds"].get<double>(), 0.0);
-    EXPECT_THROW((void)stats.beginRequest(), std::logic_error);
+}
+
+/** @brief Continuous batching: concurrent requests are counted, each retires once. */
+TEST(Test__HttpRuntimeStats, ConcurrentRequestsAreCountedAndRetireIndependently)
+{
+    HttpRuntimeStats stats;
+    {
+        auto first = stats.beginRequest();
+        {
+            auto second = stats.beginRequest();
+            second.prefillStarted();
+            const auto both = stats.snapshot()["requests"];
+            EXPECT_EQ(both["active"], 2);
+            EXPECT_EQ(both["started"], 2);
+            // Scalar fields describe the oldest request; each request keeps
+            // its own phase instead of the last writer's.
+            EXPECT_EQ(both["active_sequence"], 1);
+            EXPECT_EQ(both["active_phase"], "setup");
+            ASSERT_EQ(both["active_requests"].size(), 2u);
+            EXPECT_EQ(both["active_requests"][0]["phase"], "setup");
+            EXPECT_EQ(both["active_requests"][1]["phase"], "prefill");
+            EXPECT_EQ(both["active_in_current_epoch"], 2);
+            second.prefillFinished();
+            second.complete(10, 3, prefix(10, 0), HttpRuntimeStats::Delivery::Completed);
+        }
+        const auto one_left = stats.snapshot();
+        EXPECT_EQ(one_left["requests"]["active"], 1);
+        EXPECT_EQ(one_left["requests"]["completed"], 1);
+        EXPECT_FALSE(one_left["requests"]["active_seconds"].is_null());
+        EXPECT_EQ(one_left["requests"]["active_sequence"], 1);
+        first.complete(20, 4, prefix(20, 0), HttpRuntimeStats::Delivery::Completed);
+    }
+    const auto idle = stats.snapshot();
+    EXPECT_EQ(idle["requests"]["active"], 0);
+    EXPECT_EQ(idle["requests"]["completed"], 2);
+    EXPECT_EQ(idle["tokens"]["prompt"], 30);
+    EXPECT_TRUE(idle["requests"]["active_seconds"].is_null());
+    EXPECT_EQ(idle["requests"]["active_phase"], "idle");
+    EXPECT_TRUE(idle["requests"]["active_requests"].empty());
 }
 
 /** @brief Aggregate token reuse is weighted by prompt length and includes cold requests. */
@@ -358,7 +396,7 @@ TEST(Test__HttpRuntimeStats, ConcurrentReadersSeeWholePublications)
 TEST(Test__SerializedInferenceExecutor, BoundedAdmissionAndUnpublishedStreamRetirement)
 {
     EXPECT_THROW(SerializedInferenceExecutor(0), std::invalid_argument);
-    SerializedInferenceExecutor executor(2);
+    SerializedInferenceExecutor executor(2, 1);
     auto first = executor.tryReserve();
     auto second = executor.tryReserve();
     ASSERT_TRUE(first);
@@ -375,7 +413,7 @@ TEST(Test__SerializedInferenceExecutor, BoundedAdmissionAndUnpublishedStreamReti
 /** @brief Exceptions and subsequent jobs retain one stable worker and exactly one result. */
 TEST(Test__SerializedInferenceExecutor, StableWorkerSurvivesExceptionsAndRejectsReentry)
 {
-    SerializedInferenceExecutor executor(2);
+    SerializedInferenceExecutor executor(2, 1);
     const auto worker = executor.tryReserve()->run([] { return std::this_thread::get_id(); });
     EXPECT_NE(worker, std::this_thread::get_id());
     EXPECT_THROW(executor.tryReserve()->run([] { throw std::runtime_error("fixture"); }), std::runtime_error);
@@ -392,7 +430,7 @@ TEST(Test__SerializedInferenceExecutor, StableWorkerSurvivesExceptionsAndRejects
 /** @brief A held generation cannot retain the host snapshot mutex or admit concurrent work. */
 TEST(Test__SerializedInferenceExecutor, ActiveWorkDoesNotBlockSnapshotAndQueuedWork)
 {
-    SerializedInferenceExecutor executor(2);
+    SerializedInferenceExecutor executor(2, 1);
     std::promise<void> entered, release;
     const auto released = release.get_future().share();
     auto first = std::async(std::launch::async, [&] {

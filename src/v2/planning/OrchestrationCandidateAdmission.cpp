@@ -8,6 +8,8 @@
  * exhaustion permits another graph-row candidate; invalid geometry, overflow
  * and unsupported codebooks remain their original errors.
  */
+#include "execution/config/ServingCapacity.h"
+#include "execution/config/ServingPoolMemoryDemand.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "planning/ResolvedRankOrchestration.h"
@@ -229,7 +231,13 @@ namespace llaminar2
                     .native_source_placement = loader.nativeWeightSourcePlacement(),
                     .captured_prefill_buckets = policy.prefill_bucket_rows,
                     .max_gpu_memory_bytes = config.memoryLimitBytes(DeviceType::CUDA),
-                    .max_cpu_memory_bytes = config.memoryLimitBytes(DeviceType::CPU)});
+                    .max_cpu_memory_bytes = config.memoryLimitBytes(DeviceType::CPU),
+                    .serving_pool_demand_bytes = config.serve_mode
+                        ? std::optional<std::uint64_t>{servingPoolMemoryDemand(
+                              resolveInstalledServingCapacity(config.servingCapacityRequest()),
+                              ServingPoolPerResponseBudget::defaultPolicy(),
+                              ServingSlotDecisionGeometry::forVocabulary(profile.vocab_size))}
+                        : std::nullopt});
                 const auto found=policy.native_context_budgets.find(candidate.membership.discoveryRanks().at(rank.rank));
                 for(auto& cfg:local)if(cfg.device.is_gpu()){
                     const auto* keys=found==policy.native_context_budgets.end()?nullptr:&found->second;

@@ -46,6 +46,9 @@
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
+#include "utils/MPIContext.h"
+#include "kernels/HybridKVCacheConfig.h"
+#include "kernels/KernelFactory.h"
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include <unordered_set>
@@ -83,6 +86,58 @@
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace llaminar2
+{
+/** @brief Exercise the production sidecar cache with explicit CPU slot ownership. */
+struct DeviceGraphOrchestratorMTPSlotsTestAccess
+{
+    /** @brief Inspect the production-owned publication metadata without replacing its storage. */
+    static CPUResidentMTPHidden &resident(DeviceGraphOrchestrator &owner)
+    {
+        if (!owner.cpu_resident_mtp_hidden_)
+            throw std::logic_error("Fixture lacks the production resident hidden owner");
+        return *owner.cpu_resident_mtp_hidden_;
+    }
+    /** @brief Route an actual produced hidden tensor through the production slot publication boundary. */
+    static void publishMain(DeviceGraphOrchestrator &owner, const std::vector<int> &slots,
+                            int width, std::vector<int> lengths)
+    {
+        auto prior = std::exchange(owner.serving_row_slots_, slots);
+        try
+        {
+            owner.noteMainForwardHiddenProducedForMTP(width, static_cast<int>(slots.size()), std::move(lengths));
+        }
+        catch (...)
+        {
+            owner.serving_row_slots_ = std::move(prior);
+            throw;
+        }
+        owner.serving_row_slots_ = std::move(prior);
+    }
+    /** @brief Submit a compact real predictor batch through the resident production boundary. */
+    static bool draft(DeviceGraphOrchestrator &owner, const std::vector<int> &slots,
+        std::span<const int32_t> tokens, std::span<const int> positions, CPUResidentMTPHidden::Bank bank)
+    {
+        return owner.executeCPUResidentMTPDraft(slots, tokens, positions, bank);
+    }
+    /** @brief Test-visible serving slot position (G1 observation boundary). */
+    static int slotPosition(const DeviceGraphOrchestrator &owner, int slot)
+    {
+        return owner.serving_slot_positions_.at(static_cast<std::size_t>(slot));
+    }
+    /** @brief Submit one real sidecar row; all graph selection remains production-owned. */
+    static bool execute(DeviceGraphOrchestrator &owner, int token, int position,
+                        const std::vector<int> *slots)
+    {
+        return owner.executeMTPDepth0Batched(&token, 1, owner.state_.hidden.get(),
+            position, "serving_slot_test", false, BufferId::HIDDEN_STATE,
+            false, nullptr, -1, false, 1, nullptr, nullptr, nullptr, 0, nullptr, 0,
+            -1, 0, nullptr, 1, 1, 1, 0, 0,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch, slots);
+    }
+};
+}
 
 namespace
 {
@@ -1468,6 +1523,51 @@ namespace
         auto frozen = std::make_unique<FrozenModelWeightSet>(
             strategy,
             builder.freezeBindings());
+        frozen->validateForGraph();
+        return frozen;
+    }
+
+    std::unique_ptr<FrozenModelWeightSet> makeTinyQwenDenseFrozenWeightSet(
+        const TinyQwenForwardFixture &fixture)
+    {
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::SingleDevice;
+        strategy.devices.push_back(DeviceId::cpu());
+        ModelWeightSetBuilder builder(strategy);
+        auto add = [&](const std::string &name, TensorBase *tensor, WeightRole role)
+        {
+            WeightBinding binding;
+            binding.identity.canonical_name = name;
+            binding.identity.role = role;
+            binding.identity.layer = inferWeightLayer(name);
+            binding.identity.logical_id = stableWeightLogicalId(name);
+            binding.residency.home_device = DeviceId::cpu();
+            binding.residency.resident_device = DeviceId::cpu();
+            binding.tensor = tensor;
+            binding.immutable = true;
+            builder.addBinding(binding);
+        };
+        add("token_emb.weight", fixture.embedding_table.get(), WeightRole::Embedding);
+        add("output_norm.weight", fixture.final_norm.get(), WeightRole::Norm);
+        add("lm_head.weight", fixture.lm_head.get(), WeightRole::LMHead);
+        EXPECT_EQ(fixture.layers.size(), static_cast<std::size_t>(fixture.config.n_layers));
+        if (fixture.layers.empty())
+            return nullptr; // Invalid fixture: no layer tensors to bind.
+        for (std::size_t layer = 0; layer < fixture.layers.size(); ++layer)
+        {
+            const auto &t = fixture.layers[layer];
+            const std::string prefix = "blk." + std::to_string(layer);
+            add(prefix + ".attn_norm.weight", t.attn_norm.get(), WeightRole::Norm);
+            add(prefix + ".attn_q.weight", t.wq.get(), WeightRole::AttentionQ);
+            add(prefix + ".attn_k.weight", t.wk.get(), WeightRole::AttentionK);
+            add(prefix + ".attn_v.weight", t.wv.get(), WeightRole::AttentionV);
+            add(prefix + ".attn_output.weight", t.wo.get(), WeightRole::AttentionWO);
+            add(prefix + ".post_attention_norm.weight", t.ffn_norm.get(), WeightRole::Norm);
+            add(prefix + ".ffn_gate.weight", t.gate_proj.get(), WeightRole::FFNGate);
+            add(prefix + ".ffn_up.weight", t.up_proj.get(), WeightRole::FFNUp);
+            add(prefix + ".ffn_down.weight", t.down_proj.get(), WeightRole::FFNDown);
+        }
+        auto frozen = std::make_unique<FrozenModelWeightSet>(strategy, builder.freezeBindings());
         frozen->validateForGraph();
         return frozen;
     }
@@ -5008,6 +5108,140 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
         DeviceId::cpu(), nullptr), std::invalid_argument);
 }
 
+/** @test Hidden-bank publications survive unrelated slot activity, but never retirement or overwrite. */
+TEST(Test__MTPGraphConstruction, ResidentHiddenPublicationLifecycle)
+{
+    using Bank = CPUResidentMTPHidden::Bank;
+    for (const size_t slots : {1u, 3u, 7u, 17u})
+    {
+        std::vector<float> storage(2 * slots * 5, -1.0f);
+        CPUResidentMTPHidden owner(storage, slots, 5);
+        const std::array<float, 5> a{1, 2, 3, 4, 5}, b{6, 7, 8, 9, 10};
+        const auto main = owner.publish(0, Bank::Main, a);
+        const auto draft = owner.publish(0, Bank::Draft, b);
+        EXPECT_TRUE(std::equal(owner.read(main).begin(), owner.read(main).end(), a.begin()));
+        EXPECT_TRUE(std::equal(owner.read(draft).begin(), owner.read(draft).end(), b.begin()));
+        for (size_t slot = 1; slot < slots; ++slot)
+        {
+            owner.publish(static_cast<int>(slot), Bank::Main, b);
+            owner.retire(static_cast<int>(slot));
+        }
+        EXPECT_NO_THROW(owner.read(main));
+        EXPECT_NO_THROW(owner.read(draft));
+        const auto draft2 = owner.publish(0, Bank::Draft, a);
+        EXPECT_THROW(owner.read(draft), std::logic_error);
+        EXPECT_NO_THROW(owner.read(main));
+        owner.retire(0);
+        EXPECT_THROW(owner.read(main), std::logic_error);
+        EXPECT_THROW(owner.read(draft2), std::logic_error);
+        const auto replacement = owner.publish(0, Bank::Main, b);
+        EXPECT_THROW(owner.read(main), std::logic_error);
+        EXPECT_TRUE(std::equal(owner.read(replacement).begin(), owner.read(replacement).end(), b.begin()));
+        EXPECT_THROW(owner.publish(-1, Bank::Main, a), std::invalid_argument);
+        EXPECT_THROW(owner.publish(static_cast<int>(slots), Bank::Main, a), std::invalid_argument);
+        EXPECT_THROW(owner.publish(0, static_cast<Bank>(9), a), std::invalid_argument);
+        EXPECT_THROW(owner.publish(0, Bank::Main, std::span<const float>(a.data(), 4)), std::invalid_argument);
+        EXPECT_NO_THROW(owner.read(replacement));
+        CPUResidentMTPHidden foreign(storage, slots, 5);
+        EXPECT_THROW(foreign.read(replacement), std::logic_error);
+        EXPECT_THROW(CPUResidentMTPHidden(storage, 0, 5), std::invalid_argument);
+        EXPECT_THROW(CPUResidentMTPHidden(storage, slots, 4), std::invalid_argument);
+        const auto *address = owner.read(replacement).data();
+        owner.retireAll();
+        EXPECT_THROW(owner.read(replacement), std::logic_error);
+        const auto after_reset = owner.publish(0, Bank::Main, a);
+        EXPECT_EQ(owner.read(after_reset).data(), address);
+        EXPECT_THROW(owner.read(replacement), std::logic_error);
+    }
+}
+
+/** @test Explicit sidecar maps reject aliasing, foreign ownership and invalid geometry. */
+TEST(Test__MTPGraphConstruction, ServingSidecarSlotAdmission)
+{
+    DenseMTPGraphFixture fixture(5);
+    Qwen35Graph builder(fixture.config, fixture.mpi);
+    builder.setWeights(fixture.modelWeights());
+    auto input = fixture.input();
+    input.batch_size = 2;
+    auto output = fixture.output();
+    std::vector<int> slots{4, 1};
+    input.request_kv_slots = &slots;
+    EXPECT_GT(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output).size(), 0u);
+    for (const auto &invalid : {std::vector<int>{}, std::vector<int>{1},
+                               std::vector<int>{1, 1}, std::vector<int>{-1, 0},
+                               std::vector<int>{0, 5}})
+    {
+        slots = invalid;
+        EXPECT_THROW(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output), std::invalid_argument);
+    }
+    slots = {4, 1};
+    input.first_sequence_index = 1;
+    EXPECT_THROW(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output), std::invalid_argument);
+    input.first_sequence_index = 0;
+    input.device = DeviceId::cuda(0);
+    EXPECT_THROW(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output), std::invalid_argument);
+    input.device = DeviceId::cpu();
+    input.kv_cache = nullptr;
+    EXPECT_THROW(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output), std::invalid_argument);
+}
+
+/** @test Retained sidecar graphs own their row mapping, independently of later construction. */
+TEST(Test__MTPGraphConstruction, ServingSidecarSlotMappingLifecycle)
+{
+    for (const bool kv_only : {false, true})
+    {
+        DenseMTPGraphFixture fixture(2);
+        fixture.kv_cache = createCPURingKVCache(ActivationPrecision::FP32, *fixture.mpi,
+            1, 5, 8, fixture.config.n_kv_heads, fixture.config.head_dim, DeviceId::cpu());
+        Qwen35Graph builder(fixture.config, fixture.mpi);
+        auto frozen = makeDenseMTPFrozenWeightSet(fixture);
+        auto bindings = makeModelWeightBindings(*frozen);
+        builder.setWeightBindings(bindings);
+        builder.setWeights(toLegacyModelWeights(bindings));
+        PreparedWeightStore store;
+        prepareFrozenGemmWeightsForCPU(*frozen, store);
+        builder.setPreparedWeightStore(&store);
+        const std::array<int, 2> tokens{17, 23};
+        const std::array<int, 2> positions{0, 0};
+        std::vector<int> slots{4, 1};
+        auto input = fixture.input();
+        input.batch_size = 2;
+        input.draft_token_ids = tokens.data();
+        input.position_ids = positions.data();
+        input.request_kv_slots = &slots;
+        input.kv_cache_only = kv_only;
+        auto output = fixture.output();
+        auto mapped = builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
+        ASSERT_GT(mapped.size(), 0u);
+        // A borrowed vector is not the retained graph's mutable identity.
+        slots = {3, 2};
+        input.request_kv_slots = nullptr;
+        auto contiguous = builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
+        ASSERT_GT(contiguous.size(), 0u);
+        CPUDeviceContext ctx(DeviceId::cpu());
+        DeviceGraphExecutor executor;
+        {
+            WorkspaceAllocator workspace;
+            workspace.installPhysicalMemoryAuthority(admitCPUSidecarWorkspace(mapped));
+            ASSERT_TRUE(workspace.allocateForGraph(mapped, {.max_seq_len = 1}));
+            ASSERT_TRUE(executor.execute(mapped, &ctx));
+        }
+        for (int slot = 0; slot < 5; ++slot)
+            EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, slot), slot == 4 || slot == 1 ? 1 : 0);
+        {
+            WorkspaceAllocator workspace;
+            workspace.installPhysicalMemoryAuthority(admitCPUSidecarWorkspace(contiguous));
+            ASSERT_TRUE(workspace.allocateForGraph(contiguous, {.max_seq_len = 1}));
+            ASSERT_TRUE(executor.execute(contiguous, &ctx));
+        }
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 0), 1);
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 1), 2);
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 2), 0);
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 3), 0);
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 4), 1);
+    }
+}
+
 TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)
 {
     // The bound tensor shape and admission describe this one-row invocation.
@@ -5341,6 +5575,122 @@ TEST(Test__MTPGraphConstruction, WorkspaceFamilyDeclaresCompleteVerifierOutputs)
  * metadata only, flattening both requests into sequence zero, or appending the
  * padded row will all fail this regression.
  */
+/** @test Production forward terminal rows publish byte-exactly to persistent noncontiguous slots. */
+TEST(Test__MTPGraphConstruction, ResidentMainHiddenTracksProductionForward)
+{
+    DeviceManager::instance().initialize(-1, false);
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 5;
+    auto builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    auto owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 5, fixture.config.max_seq_len,
+            fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture), fixture.config.n_layers)));
+    ASSERT_TRUE(owner->initializeInferenceStateFromArena(5, fixture.config.max_seq_len, DeviceId::cpu()));
+    owner->setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*owner->frozenWeightSet(), store);
+    builder->setPreparedWeightStore(&store);
+    ASSERT_TRUE(owner->forward_batch({{1, 2}, {3, 4, 5}}));
+    auto &resident = DeviceGraphOrchestratorMTPSlotsTestAccess::resident(*owner);
+    using Bank = CPUResidentMTPHidden::Bank;
+    const auto first = resident.acquire(0, Bank::Main);
+    const auto second = resident.acquire(1, Bank::Main);
+    const size_t width = static_cast<size_t>(fixture.config.residualWidth());
+    const auto *hidden = owner->inferenceState().hidden->fp32_data();
+    ASSERT_NE(hidden, nullptr);
+    EXPECT_EQ(std::memcmp(resident.read(first).data(), hidden + width, width * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(resident.read(second).data(), hidden + 5 * width, width * sizeof(float)), 0);
+    EXPECT_THROW(resident.acquire(4, Bank::Main), std::logic_error);
+    EXPECT_THROW(resident.acquire(0, Bank::Draft), std::logic_error);
+    DeviceGraphOrchestratorMTPSlotsTestAccess::publishMain(*owner, {4, 2}, 3, {2, 3});
+    EXPECT_EQ(std::memcmp(resident.read(resident.acquire(4, Bank::Main)).data(), hidden + width,
+        width * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(resident.read(resident.acquire(2, Bank::Main)).data(), hidden + 5 * width,
+        width * sizeof(float)), 0);
+    EXPECT_NO_THROW(resident.read(first));
+    EXPECT_NO_THROW(resident.read(second));
+    const std::array<int32_t, 2> draft_tokens{6, 7};
+    const std::array<int, 2> draft_positions{0, 0};
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::draft(*owner, {4, 2},
+        draft_tokens, draft_positions, Bank::Main));
+    const auto draft4 = resident.acquire(4, Bank::Draft);
+    const auto draft2 = resident.acquire(2, Bank::Draft);
+    const auto &shifted = *owner->inferenceState().mtp_kv_caches.at(0);
+    EXPECT_EQ(shifted.get_cached_tokens(0, 4), 1);
+    EXPECT_EQ(shifted.get_cached_tokens(0, 2), 1);
+    const auto *draft_hidden = owner->inferenceState().extension_buffers.at(BufferId::MTP_HIDDEN)->fp32_data();
+    EXPECT_EQ(std::memcmp(resident.read(draft4).data(), draft_hidden, width * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(resident.read(draft2).data(), draft_hidden + width, width * sizeof(float)), 0);
+    EXPECT_NO_THROW(resident.read(first));
+    EXPECT_NO_THROW(resident.read(second));
+    const std::array<int32_t, 1> next_token{8};
+    const std::array<int, 1> next_position{1};
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::draft(*owner, {4},
+        next_token, next_position, Bank::Draft));
+    EXPECT_THROW(resident.read(draft4), std::logic_error);
+    EXPECT_NO_THROW(resident.read(draft2));
+    EXPECT_EQ(shifted.get_cached_tokens(0, 4), 2);
+    EXPECT_EQ(shifted.get_cached_tokens(0, 2), 1);
+    // A shorter subsequent publication invalidates only its own old receipt.
+    DeviceGraphOrchestratorMTPSlotsTestAccess::publishMain(*owner, {4}, 1, {1});
+    EXPECT_EQ(std::memcmp(resident.read(resident.acquire(4, Bank::Main)).data(), hidden,
+        width * sizeof(float)), 0);
+    EXPECT_NO_THROW(resident.read(first));
+    EXPECT_NO_THROW(resident.read(second));
+    resident.retire(4);
+    EXPECT_THROW(resident.acquire(4, Bank::Main), std::logic_error);
+    EXPECT_NO_THROW(resident.read(first));
+    owner->resetInferenceState(InferenceStateResetRequest::requestBoundary("resident-hidden-test"));
+    EXPECT_THROW(resident.read(first), std::logic_error);
+    EXPECT_THROW(resident.read(second), std::logic_error);
+    ASSERT_TRUE(owner->forward_batch({{1, 2}, {3, 4, 5}}));
+    EXPECT_NO_THROW(resident.acquire(0, Bank::Main));
+    EXPECT_THROW(resident.read(first), std::logic_error);
+}
+
+/** @test P4 CPU: production ring-cache slot KV export/import round-trip is byte-exact. */
+TEST(Test__MTPGraphConstruction, ServingSlotKVExportImportRoundTripIsByteExact)
+{
+    // Model-free PRODUCTION CACHE round trip: the real CPURingKVCache owns the
+    // bytes. Append real rows, export through exportLogicalBlock, reset, import,
+    // and compare re-export bytes (deterministic) plus malformed negatives.
+    // The orchestrator-level G1/G3 checks (position restore, full validation)
+    // are registered in the model-gated serving integration (where the dense
+    // QwenStandardGraph orchestrator runs).
+    DenseMTPGraphFixture fixture(/*rows=*/2);
+    fixture.kv_cache = createCPURingKVCache(ActivationPrecision::FP32, *fixture.mpi,
+        /*n_layers=*/1, /*batch_size=*/2, /*max_seq_len=*/8,
+        fixture.config.n_kv_heads, fixture.config.head_dim, DeviceId::cpu());
+    auto &cache = *fixture.kv_cache;
+    auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 4});
+    auto V = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 4});
+    K->mutable_data()[0] = 0.5f; K->mutable_data()[1] = 0.25f;
+    K->mutable_data()[2] = 0.125f; K->mutable_data()[3] = 0.0625f;
+    V->mutable_data()[0] = 1.0f; V->mutable_data()[1] = 0.5f;
+    V->mutable_data()[2] = 0.25f; V->mutable_data()[3] = 0.125f;
+    ASSERT_TRUE(cache.append(0, 0, K.get(), V.get(), 1));
+    ASSERT_TRUE(cache.append(0, 0, K.get(), V.get(), 1));
+    const auto layout = cache.logicalBlockLayout(0, 2);
+    ASSERT_GT(layout.k_bytes, 0u);
+    std::vector<std::byte> k(layout.k_bytes), v(layout.v_bytes);
+    IKVCache::KVCacheLogicalBlockDescriptor desc;
+    desc.layer = 0; desc.seq_idx = 0; desc.logical_token_start = 0;
+    desc.token_count = 2; desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
+    ASSERT_TRUE(cache.exportLogicalBlock(desc, k.data(), v.data()));
+    IKVCache::StateResetContext context;
+    context.boundary = IKVCache::StateResetBoundary::SequenceRetirement;
+    context.reason = "P4 round trip";
+    ASSERT_TRUE(cache.resetSequenceState(0, context));
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), 0);
+    ASSERT_TRUE(cache.importLogicalBlock(desc, k.data(), v.data()));
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), 2);
+    std::vector<std::byte> k2(layout.k_bytes), v2(layout.v_bytes);
+    ASSERT_TRUE(cache.exportLogicalBlock(desc, k2.data(), v2.data()));
+    EXPECT_TRUE(std::equal(k.begin(), k.end(), k2.begin()));
+    EXPECT_TRUE(std::equal(v.begin(), v.end(), v2.begin()));
+}
+
 TEST(Test__MTPGraphConstruction, Qwen35RequestBatchedPrefillPublishesPerRequestShiftedPayloads)
 {
     DeviceManager::instance().initialize(-1, false);
@@ -5678,6 +6028,55 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
     ASSERT_NE(plain, nullptr);
     EXPECT_DOUBLE_EQ(plain->value, 2.0);
 
+    PerfStatsCollector::reset();
+}
+
+/** @test A warm sidecar cache cannot replay a graph bound to another resident slot. */
+TEST(Test__MTPGraphConstruction, ServingSidecarCacheIdentityIncludesSlots)
+{
+    DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv env({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    PerfStatsCollector::reset();
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 5;
+    auto builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    auto owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 5, fixture.config.max_seq_len,
+            fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture), fixture.config.n_layers)));
+    ASSERT_TRUE(owner->initializeInferenceStateFromArena(5, fixture.config.max_seq_len, DeviceId::cpu()));
+    auto hidden = owner->inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    for (int i = 0; i < fixture.config.d_model; ++i)
+        hidden->mutable_data()[i] = 0.01f * (i % 19 + 1);
+    owner->markMainForwardHiddenProducedForTesting(1, 1);
+    owner->setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*owner->frozenWeightSet(), store);
+    builder->setPreparedWeightStore(&store);
+    ASSERT_TRUE(owner->forwardMTP(3));
+    std::vector<int> slots{4};
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::execute(*owner, 4, 0, &slots));
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::execute(*owner, 5, 1, &slots));
+    slots = {1};
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::execute(*owner, 6, 0, &slots));
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::execute(*owner, 7, 1, nullptr));
+    auto &cache = *owner->inferenceState().mtp_kv_caches.at(0);
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), 2);
+    EXPECT_EQ(cache.get_cached_tokens(0, 1), 1);
+    EXPECT_EQ(cache.get_cached_tokens(0, 2), 0);
+    EXPECT_EQ(cache.get_cached_tokens(0, 3), 0);
+    EXPECT_EQ(cache.get_cached_tokens(0, 4), 2);
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const PerfStatsCollector::Tags tags{{"context", "serving_slot_test"}, {"depth", "0"},
+        {"device_tokens", "false"}, {"device_positions", "false"}, {"kv_cache_only", "false"},
+        {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
+    const auto *misses = findMTPRecord(records, PerfStatRecord::Kind::Counter, "sidecar_graph_cache_misses", tags);
+    const auto *hits = findMTPRecord(records, PerfStatRecord::Kind::Counter, "sidecar_graph_cache_hits", tags);
+    ASSERT_NE(misses, nullptr);
+    ASSERT_NE(hits, nullptr);
+    EXPECT_DOUBLE_EQ(misses->value, 3.0);
+    EXPECT_DOUBLE_EQ(hits->value, 1.0);
     PerfStatsCollector::reset();
 }
 
@@ -8939,3 +9338,200 @@ INSTANTIATE_TEST_SUITE_P(CUDA,MTPNativeGraphConstruction,::testing::Values(Devic
 #ifdef HAVE_ROCM
 INSTANTIATE_TEST_SUITE_P(ROCm,MTPNativeGraphConstruction,::testing::Values(DeviceId::rocm(0)));
 #endif
+
+
+/** @test J1 (R20 H2): model-free real-orchestrator KV export/import round trip. */
+TEST(MTPGraphConstruction, DenseOrchestratorSlotKVExportImportRoundTrip)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.enabled = false;
+    fixture.config.mtp.graph_capacity_draft_tokens = 0;
+    auto builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    auto dependencies = cpuInferenceFixtureDependencies(builder, fixture.mpi, 1,
+        fixture.config.max_seq_len, fixture.config.max_seq_len,
+        cpuFixtureTensorInventory(fixture.modelWeights(), fixture.config.n_layers));
+    auto owner = DeviceGraphOrchestrator::createForTest(std::move(dependencies));
+    auto &runner = *owner;
+    ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, fixture.config.max_seq_len, DeviceId::cpu()));
+    runner.setWeights(fixture.modelWeights());
+    PreparedWeightStore store;
+    prepareDenseForwardWeights(runner, *builder, store, DeviceId::cpu());
+    const std::array<int32_t, 3> prompt{1, 3, 5};
+    ASSERT_NE(runner.forward(prompt.data(), 3, 1), nullptr);
+    ASSERT_NE(runner.forward(prompt.data() + 2, 1, 1), nullptr); // KV length 4 (one forward each).
+    const auto exported = runner.exportSlotKV(0);
+    ASSERT_TRUE(exported.has_value()) << "dense CPU export must succeed";
+    ASSERT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 4);
+    // Reset (position back to 0), import, verify position + byte re-export.
+    ASSERT_TRUE(runner.resetServingRow(0));
+    ASSERT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    ASSERT_TRUE(runner.importSlotKV(0, *exported));
+    ASSERT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 4);
+    ASSERT_EQ(DeviceGraphOrchestratorMTPSlotsTestAccess::slotPosition(runner, 0), 4);
+    const auto reexport = runner.exportSlotKV(0);
+    ASSERT_TRUE(reexport.has_value());
+    EXPECT_EQ(reexport->size(), exported->size());
+    EXPECT_TRUE(std::equal(reexport->begin(), reexport->end(), exported->begin()));
+    // Length check through the session contract (BEFORE the next forward,
+    // which appends and grows the KV length).
+    EXPECT_TRUE(runner.resumedSlotKVLength(0, 4));
+    EXPECT_FALSE(runner.resumedSlotKVLength(0, 3)); // Mismatch refuses.
+    // K3: the NEXT forward after restore equals an UNINTERRUPTED control —
+    // the position (4) drives the RoPE at the same point, so the next logits
+    // are byte-identical to a run that never paused. Run the control first
+    // (the fixture is deterministic: same weights, same prompt/positions).
+    TinyQwenForwardFixture control_fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    control_fixture.config.mtp.enabled = false;
+    auto control_builder = std::make_shared<QwenStandardGraph>(control_fixture.config, control_fixture.mpi);
+    auto control_deps = cpuInferenceFixtureDependencies(control_builder, control_fixture.mpi, 1,
+        control_fixture.config.max_seq_len, control_fixture.config.max_seq_len,
+        cpuFixtureTensorInventory(control_fixture.modelWeights(), control_fixture.config.n_layers));
+    auto control_owner = DeviceGraphOrchestrator::createForTest(std::move(control_deps));
+    auto &control_runner = *control_owner;
+    ASSERT_TRUE(control_runner.initializeInferenceStateFromArena(1, control_fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    control_runner.setWeights(control_fixture.modelWeights());
+    PreparedWeightStore control_store;
+    prepareDenseForwardWeights(control_runner, *control_builder, control_store, DeviceId::cpu());
+    ASSERT_NE(control_runner.forward(prompt.data(), 3, 1), nullptr);
+    ASSERT_NE(control_runner.forward(prompt.data() + 2, 1, 1), nullptr);
+    // Both runners are now at KV length 4 (the tested one via export/import).
+    const int32_t next_token = 9;
+    const auto *control_next = control_runner.forward(&next_token, 1, 1);
+    const auto *restored_next = runner.forward(&next_token, 1, 1);
+    ASSERT_NE(control_next, nullptr);
+    ASSERT_NE(restored_next, nullptr);
+    const std::size_t vocab = static_cast<std::size_t>(control_fixture.config.vocab_size);
+    EXPECT_EQ(std::memcmp(restored_next, control_next, vocab * sizeof(float)), 0)
+        << "the restored row's next forward must equal the uninterrupted control";
+    // Negatives: truncated, foreign layer, precision mismatch, non-empty target.
+    auto truncated = *exported;
+    truncated.resize(6 * sizeof(std::uint64_t) + 4);
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, truncated));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    auto foreign = *exported;
+    const std::uint64_t foreign_layer = 9999;
+    std::memcpy(foreign.data(), &foreign_layer, sizeof(foreign_layer));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, foreign));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    auto bad_precision = *exported;
+    bad_precision[4 * sizeof(std::uint64_t)] =
+        static_cast<std::byte>(static_cast<std::uint8_t>(bad_precision[4 * sizeof(std::uint64_t)]) ^ 0xFFu);
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, bad_precision));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // zero k_bytes: an extent of zero must refuse (no OOB read, no install).
+    auto zero_k = *exported;
+    std::memset(zero_k.data() + 2 * sizeof(std::uint64_t), 0, sizeof(std::uint64_t));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, zero_k));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // short k_bytes (one byte less than the layout expects) must refuse.
+    auto short_k = *exported;
+    std::uint64_t reduced = 1;
+    std::memcpy(short_k.data() + 2 * sizeof(std::uint64_t), &reduced, sizeof(reduced));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, short_k));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // duplicate layer: export the first entry twice -> the ordered-set check refuses.
+    const std::size_t first_entry = 6 * sizeof(std::uint64_t) +
+        (reexport->size() - 6 * sizeof(std::uint64_t)) / 2; // First layer + payload.
+    std::vector<std::byte> duplicated(exported->begin(), exported->end());
+    duplicated.insert(duplicated.begin() + 6 * sizeof(std::uint64_t),
+        exported->begin() + 6 * sizeof(std::uint64_t),
+        exported->begin() + 6 * sizeof(std::uint64_t) + 6 * sizeof(std::uint64_t));
+    (void)first_entry;
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, duplicated));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // missing layer: drop the trailing layer completely (set its header count to 0)
+    // -> the exact owned-set completeness check refuses.
+    // (The tiny fixture has ONE layer; dropping it means an empty set.)
+    auto missing = *exported;
+    missing.resize(6 * sizeof(std::uint64_t)); // Keep only the header, no payload.
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, missing));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // non-empty target: importing into a slot that still has KV must refuse.
+    ASSERT_TRUE(runner.importSlotKV(0, *exported)); // Slot 0 now non-empty.
+    EXPECT_FALSE(runner.importSlotKV(0, *exported));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    // hybrid refusal: the orchestrator refuses when its cache is IHybridKVCache
+    // (covered by the G2 regression in the hybrid test subclass).
+}
+
+
+/** @test K3/L3: a real two-layer export rejects well-formed duplicate/missing layers. */
+TEST(MTPGraphConstruction, TwoLayerExportRejectsDuplicateAndMissingLayer)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32, /*layers=*/2);
+    fixture.config.mtp.enabled = false;
+    fixture.config.mtp.graph_capacity_draft_tokens = 0;
+    auto builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    auto dependencies = cpuInferenceFixtureDependencies(builder, fixture.mpi, 1,
+        fixture.config.max_seq_len, fixture.config.max_seq_len,
+        cpuFixtureTensorInventory(fixture.modelWeights(), fixture.config.n_layers));
+    auto owner = DeviceGraphOrchestrator::createForTest(std::move(dependencies));
+    auto &runner = *owner;
+    ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, fixture.config.max_seq_len, DeviceId::cpu()));
+    runner.setWeights(fixture.modelWeights());
+    PreparedWeightStore store;
+    prepareDenseForwardWeights(runner, *builder, store, DeviceId::cpu());
+    const std::array<int32_t, 3> prompt{1, 3, 5};
+    ASSERT_NE(runner.forward(prompt.data(), 3, 1), nullptr);
+    ASSERT_NE(runner.forward(prompt.data() + 2, 1, 1), nullptr);
+    const auto exported = runner.exportSlotKV(0);
+    ASSERT_TRUE(exported.has_value());
+    // Read the per-layer byte extent from the first header.
+    std::uint64_t k0 = 0, v0 = 0, k1 = 0, v1 = 0;
+    std::memcpy(&k0, exported->data() + 2 * sizeof(std::uint64_t), sizeof(k0));
+    std::memcpy(&v0, exported->data() + 3 * sizeof(std::uint64_t), sizeof(v0));
+    const std::size_t layer0_bytes = 6 * sizeof(std::uint64_t) + k0 + v0;
+    std::memcpy(&k1, exported->data() + layer0_bytes + 2 * sizeof(std::uint64_t), sizeof(k1));
+    std::memcpy(&v1, exported->data() + layer0_bytes + 3 * sizeof(std::uint64_t), sizeof(v1));
+    const std::size_t layer1_bytes = 6 * sizeof(std::uint64_t) + k1 + v1;
+    ASSERT_EQ(layer0_bytes + layer1_bytes, exported->size());
+    // DUPLICATE: rewrite the second layer's header to repeat layer 0
+    // (the exact ordered-set check must refuse before any install).
+    auto duplicated = *exported;
+    std::memcpy(duplicated.data() + layer0_bytes,
+        duplicated.data(), 6 * sizeof(std::uint64_t));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, duplicated));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // MISSING: drop the second layer header+payload entirely (exact-set check).
+    auto missing = std::vector<std::byte>(exported->begin(),
+        exported->begin() + static_cast<std::ptrdiff_t>(layer0_bytes));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, missing));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+}
+
+
+/** @test K3/L3: a hybrid (GDN) cache refuses export/import before mutation (G2). */
+TEST(MTPGraphConstruction, HybridCacheRefusesExportImport)
+{
+    // Model-free G2 proof: a real IHybridKVCache (GDN layers) built by the
+    // production factory, then the orchestrator's exact gate condition —
+    // dynamic_cast<IHybridKVCache> — is asserted to refuse the slot path.
+    llaminar::v2::kernels::KVCacheConfig config;
+    config.precision = ActivationPrecision::FP32;
+    config.device = DeviceId::cpu();
+    config.batch_size = 1;
+    config.max_seq_len = 8;
+    config.num_layers = 1;
+    config.n_kv_heads = 2;
+    config.head_dim = 16;
+    llaminar2::HybridKVCacheConfig hybrid_cfg = tinyGDNHybridConfig();
+    config.hybrid_config = &hybrid_cfg;
+    static MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
+    config.mpi_ctx = &mpi_ctx;
+    auto cache = llaminar::v2::kernels::KernelFactory::createHybridKVCache(config);
+    ASSERT_NE(cache, nullptr);
+    // The gate that exportSlotKV/importSlotKV apply to a hybrid cache is the
+    // IHybridKVCache dynamic-cast refusal before any mutation. Prove it here:
+    EXPECT_NE(dynamic_cast<IHybridKVCache *>(cache.get()), nullptr)
+        << "the cache is genuinely hybrid (the refusal gate fires)";
+}

@@ -524,16 +524,26 @@ namespace llaminar2
         }
         const int state_floats = static_cast<int>(state_floats_wide);
         const int total_state_floats = request_count * state_floats;
-        if (!ensureRequestStateBank(request_count, state_floats, conv_state))
-        {
-            return false;
-        }
-
         const bool capture_active =
             verifier_state_capture_ != nullptr &&
             verifier_state_capture_rows_ >= seq_len &&
             verifier_state_capture_size_ >= state_floats;
-        float *effective_states = request_state_bank_.data();
+        // Serving rows: each request advances its own persistent slot state in
+        // place; there is no request bank and no request-zero mirror.
+        const std::vector<float *> *row_states = serving_row_states_;
+        if (row_states)
+        {
+            if (capture_active || static_cast<int>(row_states->size()) != request_count)
+                return false;
+            for (float *slot_state : *row_states)
+                if (!slot_state)
+                    return false;
+        }
+        else if (!ensureRequestStateBank(request_count, state_floats, conv_state))
+        {
+            return false;
+        }
+        float *effective_states = row_states ? nullptr : request_state_bank_.data();
         if (capture_active)
         {
             if (speculative_state_work_)
@@ -611,8 +621,8 @@ namespace llaminar2
                 const int real_rows = std::clamp(
                     host_request_seq_lens[request], 0, request_seq_len);
                 float *request_state =
-                    effective_states +
-                    static_cast<size_t>(request) * state_floats;
+                    row_states ? (*row_states)[static_cast<size_t>(request)]
+                               : effective_states + static_cast<size_t>(request) * state_floats;
                 alignas(64) float sums[16];
 
                 for (int row = 0; row < real_rows; ++row)
@@ -676,7 +686,7 @@ namespace llaminar2
         };
         OMP_WORKSHARE_REGION(grouped_requests);
 
-        if (!capture_active)
+        if (!capture_active && !row_states)
         {
             std::memcpy(
                 conv_state,

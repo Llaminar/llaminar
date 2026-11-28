@@ -8,6 +8,7 @@
  * points in a rapidly changing model-load lifecycle.
  */
 
+#include "utils/NUMATopology.h"
 #include "HostMemoryCapacity.h"
 
 #include <algorithm>
@@ -152,6 +153,11 @@ namespace llaminar2
         auto observation = parseLinuxHostMemoryInfo(readTextFile(path));
         if (observation.valid())
             return observation;
+
+        // A kernel without NUMA support exposes no node directory at all: the
+        // single implicit node 0 owns the whole machine's memory.
+        if (nonNUMAKernelSingleNode(numa_node))
+            return observeSystemMemoryCapacity();
 
         if (numa_available() < 0)
             return {};

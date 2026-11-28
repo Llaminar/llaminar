@@ -37,6 +37,7 @@ namespace llaminar2
      * Contains the subset of model architecture information needed
      * to compute layer assignments and weight sharding.
      */
+    class GlobalPPTopology;
     struct ModelConfig
     {
         std::string name = "unknown";      ///< Model name (e.g., "Qwen2-7B")
@@ -184,6 +185,12 @@ namespace llaminar2
          * @param cluster_inventory Cluster device inventory
          * @return Empty vector if valid, otherwise list of error messages
          */
+        /** @brief Resolve the named-domain GlobalPP topology (authority source). */
+        virtual GlobalPPTopology buildGlobalPPTopology(
+            const OrchestrationConfig &config,
+            const ModelConfig &model_config,
+            const ClusterInventory &cluster_inventory) = 0;
+
         virtual std::vector<std::string> validateConfig(
             const OrchestrationConfig &config,
             const ModelConfig &model_config,

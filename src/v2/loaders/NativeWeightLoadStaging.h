@@ -78,7 +78,13 @@ inline NativeWeightLoadStagingGeometry resolveNativeWeightLoadStaging(
         catch(const std::overflow_error&) { /* An overflowing candidate cannot fit a finite cap. */ }
         if(fits)low=mid;else high=mid-1;
     }
-    if(!low)throw std::invalid_argument("Native source cap cannot hold one encoded unit and simultaneous consumer scratch");
+    if(!low)throw std::invalid_argument(
+        "Native source cap cannot hold one encoded unit and simultaneous consumer scratch "
+        "(native_bytes_per_unit=" + std::to_string(request.native_bytes_per_unit) +
+        ", scratch_bytes_per_unit=" + std::to_string(request.scratch_bytes_per_unit) +
+        ", fixed_scratch_bytes=" + std::to_string(request.fixed_scratch_bytes) +
+        ", maximum_units=" + std::to_string(request.maximum_units) +
+        ", cap=" + std::to_string(*budget) + ")");
     return quote(low);
 }
 } // namespace llaminar2

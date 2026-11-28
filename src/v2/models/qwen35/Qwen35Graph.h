@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include <map>
 #include "../qwen/QwenGraphBase.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include <memory>
@@ -479,6 +480,10 @@ namespace llaminar2
         bool mtp_graph_context_active_ = false;
         /** Recursive depth paired with @ref mtp_graph_context_active_. */
         int mtp_graph_depth_idx_ = -1;
+    private:
+        /// Per-layer serving-row slot state tables of the CPU serving forward being built.
+        std::map<int, std::vector<float *>> serving_row_recurrence_states_;
+        std::map<int, std::vector<float *>> serving_row_conv_states_;
     };
 
 } // namespace llaminar2

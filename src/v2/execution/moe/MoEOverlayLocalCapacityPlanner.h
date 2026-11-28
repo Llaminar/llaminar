@@ -155,6 +155,10 @@ namespace llaminar2
         std::optional<MoEOverlayInferenceOriginalSlotGeometry> original_native_slots;
         /** Exact CPU evidence owners when the frozen Dynamic authority is host-resident. */
         std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;
+        /** @brief Exact serving-pool demand for THIS rank (already bounded by
+         *  the fail-closed owner decision; nullopt = follower/no serving). The
+         *  planner admits the ServingResponsePool host owner line once. */
+        std::optional<std::uint64_t> serving_pool_demand_bytes;
         /** Complete frozen execution boundary, including parent PP and remote experts. */
         DeviceGenerationExecutionDomain generation_domain = DeviceGenerationExecutionDomain::NativeDomain;
         /** Authored common stage ownership; standalone partial graphs remain controllers. */

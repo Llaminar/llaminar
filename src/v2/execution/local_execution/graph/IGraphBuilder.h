@@ -17,6 +17,7 @@
 #pragma once
 
 #include "DeviceGraphExecutor.h"
+#include "execution/compute_stages/stages/PooledKVDecodeBinding.h"
 #include "ForwardGraphSubmissionIntent.h"
 #include "execution/mtp/MTPSidecarCaptureLayout.h"
 #include "DeviceDecodePositionBinding.h"
@@ -757,6 +758,28 @@ namespace llaminar2
         void *device_state_publication_stream = nullptr;
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
+        /**
+         * @brief P2 pooled decode binding (CPU single-row, production caller).
+         *
+         * When non-null the graph uses pooled append+attention pages for this
+         * forward instead of the ring cache. The binding is owned by the
+         * runner and must outlive the graph. It supports only dense CPU
+         * single-row decode; any other combination refuses during
+         * construction (never falls back to the ring).
+         */
+        PooledKVDecodeBinding *pooled_kv = nullptr;
+        /**
+         * @brief P2 GROUPED pooled decode: N bindings, one graph (CPU decode).
+         *
+         * When non-empty and @p pooled_kv is null, the graph builds N
+         * per-request pooled append stages per layer (each with its own ref
+         * cell, prior and step grant) and ONE attention stage that consumes
+         * all N publications through the grouped pooled kernel entry. This is
+         * the genuine grouped-decode contract (design §13.2): one graph, N
+         * refs — never N separate graphs or a stage-level row-replay loop.
+         * All bindings must share the SAME pool and table (one PMA instance).
+         */
+        const std::vector<PooledKVDecodeBinding *> *pooled_kv_group = nullptr;
 
         // ----- Pipeline Parallelism -----
 
@@ -775,6 +798,12 @@ namespace llaminar2
         /// When set, enables proper batch-separating attention masks that
         /// prevent cross-sequence attention in batched execution.
         const std::vector<int> *sequence_lengths = nullptr;
+
+        /**
+         * @brief Host KV sequence (slot) of each request row of a CPU serving
+         *        forward; nullptr means row b owns sequence b.
+         */
+        const std::vector<int> *request_kv_slots = nullptr;
 
         /**
          * @brief Device owner for per-request valid row counts in a padded batch.

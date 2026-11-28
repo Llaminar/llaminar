@@ -21,6 +21,9 @@
 
 #pragma once
 #include "snapshots/SnapshotInfo.h"
+#include "execution/serving/ServingWindowDecode.h"
+#include "execution/serving/ServingBatch.h"
+#include "execution/serving/ServingContinuationManifest.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "../../backends/DeviceId.h"
@@ -47,6 +50,8 @@
 
 namespace llaminar2
 {
+    class IServingTraceRecorder;
+    class PhysicalMemorySuballocationLease;
     class ITokenizer;          // Forward declaration
     class IMPIContext;         // Forward declaration
     class IModelContext;       // Forward declaration
@@ -634,11 +639,239 @@ namespace llaminar2
          *
          * @param request_batch Number of active logical requests.
          */
+        /** @brief Shared physical-memory authority (null when unbacked). */
+        virtual std::shared_ptr<PhysicalMemoryAuthority> physicalMemoryAuthority() const = 0;
+
         virtual GenerationBatchResult decodeStepBatch(int request_batch)
         {
             (void)request_batch;
             return GenerationBatchResult{{}, "decodeStepBatch unsupported"};
         }
+
+        /**
+         * @brief Whether the per-row serving-window decode is implemented.
+         *
+         * Continuous batching advances each admitted row by exactly its
+         * intrinsic window under the request's own sampling law, seed and
+         * response budget (design SS5.2/SS6/SS7). Explicit capability, like
+         * request batching: stricter per-row ownership than a loop around
+         * decodeStep().
+         */
+        virtual bool supportsServingWindowDecode() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Decode one admitted row by exactly its intrinsic window.
+         *
+         * Must honor the row's immutable window geometry and resolved seed;
+         * per-row sampling laws are runtime data (SS6.1), never a recapture
+         * trigger; the result must be row-invariant (identical to the serial
+         * decode of that row under the same law/geometry). Fail-closed: the
+         * base implementation returns the explicit diagnostic; no silent
+         * approximation or automatic alternate path.
+         */
+        /**
+         * @brief Decode one admitted row by exactly its intrinsic window.
+         *
+         * PUBLIC NON-VIRTUAL ENTRY: the ingress checks are MANDATORY for every
+         * implementation - they run before the private virtual dispatch, so an
+         * override can never bypass validation. The implementation must honor
+         * the row's immutable window geometry and resolved seed; per-row
+         * sampling laws are runtime data (SS6.1), never a recapture trigger; the
+         * result must be row-invariant (identical to the serial decode of that
+         * row under the same law/geometry). Fail-closed: the base
+         * implementation returns the explicit diagnostic; no silent
+         * approximation or automatic alternate path.
+         */
+        ServingWindowDecodeResult decodeServingWindow(const ServingWindowDecodeInput &request)
+        {
+            const auto err = servingWindowIngressError(request);
+            if (!err.empty())
+                return ServingWindowDecodeResult::failure(
+                    "invalid serving-window input: " + err);
+            return decodeServingWindowImpl(request);
+        }
+
+    private:
+        /** @brief MANDATORY ingress check (exact named diagnostics). */
+        [[nodiscard]] std::string servingWindowIngressError(
+            const ServingWindowDecodeInput &request) const
+        {
+            const auto &g = request.authority.current();
+            if (!request.authority.mayExecute())
+                return "grant not outstanding/backed";
+            if (g.generation == 0)
+                return "generation zero";
+            if (request.lawNode() == nullptr ||
+                request.lawNode()->admissionIdentity() == 0 ||
+                !request.lawNode()->authenticated() ||
+                request.lawNode()->issueIdentity() == 0 ||
+                request.lawNode()->epoch() == 0 || request.lawNode()->tableToken() == 0 ||
+                request.lawNode()->schemaVersion() == 0 ||
+                request.lawNode()->tableCapacity() == 0)
+                return "admitted law binding not live";
+            if (request.seed == 0)
+                return "resolved seed zero";
+            if (request.transaction_epoch == 0)
+                return "transaction epoch zero";
+            if (request.expected_authority == 0)
+                return "authority identity zero (dead authority)";
+            if (request.authority.authorityIdentity() != request.expected_authority ||
+                g.generation != request.expected_generation ||
+                g.grant_id != request.expected_grant_id ||
+                request.authority.issuanceNonce() != request.expected_nonce)
+                return "stale issuance (authority/generation/grant/nonce pin mismatch)";
+            if (request.window_start >= g.window.response_limit)
+                return "window start at/after response limit";
+            const bool terminal_geometry = servingWindowIsTerminal(
+                request.window_start, g.window.quantum, g.window.response_limit);
+            if (request.final_partial && !terminal_geometry)
+                return "final_partial requires the terminal window";
+            if (request.first_prefill_carry && request.window_start != 0)
+                return "first_prefill_carry requires the first window (start == 0)";
+            return std::string{};
+        }
+
+        /** @brief FAIL-CLOSED implementation seam (subclasses override; the base
+         *         is explicitly unsupported).
+         *
+         *  UNIMPLEMENTED IN PRODUCTION: no runner overrides this yet. It is the
+         *  reserved DecodeWindow seam for GPU retained continuous execution;
+         *  CPU continuous batching executes through the serving session below
+         *  (beginServingBatch/stepServingBatch). */
+        virtual ServingWindowDecodeResult decodeServingWindowImpl(
+            const ServingWindowDecodeInput &request)
+        {
+            (void)request;
+            return ServingWindowDecodeResult::failure("serving-window decode unsupported");
+        }
+
+    public:
+        // =================================================================
+        // Continuous-batching serving session (runner-owned lifecycle)
+        // =================================================================
+
+        /**
+         * @brief Maximum resident requests of a serving session, or 0 when
+         *        this runner cannot serve continuous batches.
+         */
+        virtual int servingBatchCapacity() const { return 0; }
+
+        /**
+         * @brief Open the serving session with @p capacity resident slots.
+         *
+         * @param decision_storage PMA claim (ServingResponsePool) that backs the
+         *        session's per-slot decision-logits store; HTTP serving always
+         *        supplies it. Callers without an admitted serving pool (direct
+         *        runner use, tests) pass null and the store is unadmitted heap.
+         * @return false (with lastError()) when unsupported, over capacity or
+         *         when the claim does not cover the store.
+         */
+        bool beginServingBatch(int capacity) { return beginServingBatch(capacity, nullptr); }
+
+        virtual bool beginServingBatch(int capacity,
+                                       std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage)
+        {
+            (void)capacity;
+            (void)decision_storage;
+            return false;
+        }
+
+        /** @brief Queue one immutable prepared request for admission. */
+        virtual bool submitServingRequest(ServingBatchRequest request)
+        {
+            (void)request;
+            return false;
+        }
+
+        /** @brief Request cancellation; the request retires at the next step. */
+        virtual void cancelServingRequest(std::uint64_t id) { (void)id; }
+
+        /** @brief Allow a paced request to produce @p tokens more tokens. */
+        virtual void grantServingTokens(std::uint64_t id, int tokens)
+        {
+            (void)id;
+            (void)tokens;
+        }
+
+        /**
+         * @brief Commit @p token as the request's next output token instead of
+         *        sampling (reasoning-budget injection). Forced tokens advance
+         *        model and history state exactly like a sampled token.
+         */
+        virtual void forceServingToken(std::uint64_t id, int32_t token)
+        {
+            (void)id;
+            (void)token;
+        }
+
+        /**
+         * @brief Run one shared execution step over every resident request.
+         *
+         * Admits queued requests into free slots, advances all resident
+         * rows in one forward, and retires finished/cancelled rows. Events
+         * carry each request's newly committed tokens and terminal outcome.
+         */
+        virtual std::vector<ServingBatchEvent> stepServingBatch() { return {}; }
+
+        /** @brief Why the serving session sealed after a failed shared forward; empty while healthy. */
+        virtual std::string servingBatchFailure() const { return {}; }
+
+        /**
+         * @brief Diagnostic: observe the serving session (trace recording for
+         *        recorded-input replay). Applies to the open and later sessions.
+         */
+        virtual void setServingTraceRecorder(std::shared_ptr<IServingTraceRecorder> /*recorder*/) {}
+
+        /** @brief Current session occupancy (owning thread only). */
+        virtual ServingBatchOccupancy servingBatchOccupancy() const { return {}; }
+
+        /** @brief Why servingBatchCapacity() is zero; empty when serving is supported. */
+        virtual std::string servingBatchUnsupportedReason() const { return "unsupported runner"; }
+
+        /** @brief True when no request is resident or queued. */
+        virtual bool servingBatchIdle() const { return true; }
+
+        /**
+         * @brief True when the next step would make progress: a queued
+         *        request can enter, a prompt is streaming in, or a resident
+         *        request may decide/feed (unpaced, granted, forced, cancelled).
+         *        False means every request is waiting for a grant.
+         */
+        virtual bool servingBatchHasRunnableWork() const { return false; }
+
+        /**
+         * @brief Suspend one resident request at a settled decision boundary.
+         * @param id Resident request id.
+         * @return The sealed single-use continuation (P4), or empty with a
+         * precise refusal (unsupported executor, pending decision, sealed
+         * session, prefix HIT, hybrid/MTP row). The caller owns the manifest
+         * until restore; a suspension the caller drops stays tracked and gets
+         * its defined terminal on end() (never silently lost).
+         */
+        virtual std::optional<ServingContinuationManifest> suspendServingRequest(std::uint64_t /*id*/,
+            std::string & /*error*/)
+        {
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Restore a suspended continuation into a free slot.
+         * @param manifest The continuation returned by suspendServingRequest
+         * (rvalue). On success its single-use seal is consumed; on refusal the
+         * caller keeps it. Foreign-session manifests refuse.
+         * @return True on success; false with @p error and the manifest intact.
+         */
+        virtual bool restoreServingRequest(ServingContinuationManifest && /*manifest*/,
+            std::string & /*error*/)
+        {
+            return false;
+        }
+
+        /** @brief Close the session; every resident row must already be retired. */
+        virtual void endServingBatch() {}
 
         /**
          * @brief Full generation loop

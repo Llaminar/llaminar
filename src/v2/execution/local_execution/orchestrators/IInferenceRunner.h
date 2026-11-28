@@ -20,6 +20,7 @@
 #include <optional>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -1283,6 +1284,7 @@ namespace llaminar2
      *
      * Implemented by DeviceGraphOrchestrator for transformer model inference.
      */
+    class PooledKVDecodeBinding;
     class IInferenceRunner
     {
     public:
@@ -3173,6 +3175,141 @@ namespace llaminar2
         }
 
         /**
+         * @brief Whether this runner executes continuous-batching serving rows.
+         *
+         * A serving forward advances any subset of resident request slots:
+         * row `r` continues KV sequence `slots[r]` from that slot's own cached
+         * position, so one forward can mix decode rows (one token) with a
+         * prompt chunk of a newly entering request.
+         */
+        virtual bool supportsServingRows() const { return servingRowsUnsupportedReason().empty(); }
+
+        /**
+         * @brief Why serving rows are unavailable; empty when supported.
+         *
+         * Lets serving fail closed with the precise missing capability instead
+         * of silently serializing requests.
+         */
+        /** @brief Why the last forwardServingRows() failed (empty after success). */
+        virtual std::string servingRowError() const { return {}; }
+
+        virtual std::string servingRowsUnsupportedReason() const
+        {
+            return "this execution topology has no slot-addressed serving rows";
+        }
+
+        /**
+         * @brief Restore the longest cached prefix of @p prompt into a fresh slot.
+         *
+         * At least one prompt token is always left to compute, so the row's
+         * first logits come from its own forward (serving rows never import
+         * terminal logits). Other slots are untouched.
+         *
+         * @param slot Freshly reset resident slot.
+         * @param prompt Complete prompt of the entering request.
+         * @param admission Receives the immutable prefix identity for the
+         *        later harvest (cache_enabled=false when no cache applies).
+         * @return Restored tokens (0 on miss/disabled), or -1 on failure.
+         */
+        virtual int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
+                                            PrefixLookupResult &admission)
+        {
+            (void)slot;
+            (void)prompt;
+            admission = {};
+            return 0;
+        }
+
+        /**
+         * @brief Archive a slot's consumed prompt KV under its admission identity.
+         * @return false on archival failure; true when archived or not applicable.
+         */
+        virtual bool harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
+                                             const std::vector<int32_t> &prompt)
+        {
+            (void)slot;
+            (void)admission;
+            (void)prompt;
+            return true;
+        }
+
+        /**
+         * @brief One shared forward over the given resident slots.
+         * @param slots Distinct slot (KV sequence) of each row.
+         * @param rows Tokens row `r` appends to `slots[r]`; none empty.
+         * @return true when the complete forward succeeded; then
+         *         servingRowLogits(r) is row `r`'s last-token logits.
+         */
+        virtual bool forwardServingRows(const std::vector<int> &slots,
+                                        const std::vector<std::vector<int>> &rows)
+        {
+            (void)slots;
+            (void)rows;
+            return false;
+        }
+
+        /**
+         * @brief Logits of row @p row's last token from the latest
+         *        forwardServingRows() call (vocabulary-wide host row).
+         */
+        virtual const float *servingRowLogits(int row) const
+        {
+            (void)row;
+            return nullptr;
+        }
+
+        /**
+         * @brief Retire one serving slot: its KV/state becomes empty.
+         * @param slot Slot index below the runner's batch capacity.
+         */
+        virtual bool resetServingRow(int slot)
+        {
+            (void)slot;
+            return false;
+        }
+
+        /**
+         * @brief Export the ACTUAL executor KV continuation of one serving slot.
+         * @param slot Slot index below the runner's batch capacity.
+         * @return The exact serialized KV continuation, or empty when this
+         * runner cannot export it (suspension must then refuse; the session
+         * never fabricates a continuation from host metadata).
+         *
+         * Production CPU export serializes the ring cache's native-precision
+         * logical blocks through the cache's own exportLogicalBlock API — the
+         * cache bytes are the single authority; no host shadow is created.
+         */
+        virtual std::optional<std::vector<std::byte>> exportSlotKV(int slot) const
+        {
+            (void)slot;
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Import an exported KV continuation back into its slot.
+         * @param slot Slot index below the runner's batch capacity.
+         * @return True when the exact exported bytes were reinstalled through
+         * the cache's own importLogicalBlock API; false on refusal (the
+         * session then refuses restore; no fabricated continuity).
+         */
+        virtual bool importSlotKV(int slot, std::span<const std::byte> bytes)
+        {
+            (void)slot;
+            (void)bytes;
+            return false;
+        }
+
+        /**
+         * @brief Verify the imported slot KV length equals the expected value.
+         * @return True on exact match; false (hard refusal) when the runner
+         * cannot report it or the length differs (H2; no fabrication).
+         */
+        virtual bool resumedSlotKVLength(int /*slot*/, int /*expected*/) const
+        {
+            return false;
+        }
+
+        /**
          * @brief Whether this runner can initialize a benchmark request batch.
          *
          * Request-batched MTP decode requires every logical request slot to own
@@ -3219,6 +3356,36 @@ namespace llaminar2
          * @brief Get current batch size
          */
         virtual int batch_size() const { return 1; }
+
+        /**
+         * @brief R52 pooled-serving geometry probe: the exact pooled KV
+         * geometry for the composed instance (the same geometry that
+         * admitted the ordinary KV cache). @return false when the runner is
+         * not ready / not CPU dense (pooled serving unsupported).
+         */
+
+        /**
+         * @brief R52 phase wiring: set the pooled GROUP decode batch or the
+         * pooled SINGLE binding for the NEXT serving-rows forward. The
+         * serving session's phase-split calls one shape per forward; the
+         * DGO refuses the other's boundary (decode group = one row per
+         * member; single = one prefill row-batch).
+         */
+        virtual void setPooledServingGroup(
+            const std::vector<PooledKVDecodeBinding *> &bindings)
+        {
+            (void)bindings;
+        }
+        virtual void setPooledServingBinding(PooledKVDecodeBinding *binding)
+        {
+            (void)binding;
+        }
+        virtual bool pooledKVCacheGeometry(int &kv_heads, int &head_dim,
+                                           int &layers) const
+        {
+            (void)kv_heads; (void)head_dim; (void)layers;
+            return false;
+        }
 
         /**
          * @brief Get padded sequence length for current batch

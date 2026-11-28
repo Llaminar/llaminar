@@ -115,6 +115,11 @@ namespace llaminar2
              */
             const std::vector<int> *request_seq_lens_host = nullptr;
             /**
+             * @brief CPU continuous-batching rows: request r's persistent slot
+             *        recurrence state (advanced in place). Null otherwise.
+             */
+            const std::vector<float *> *serving_row_states = nullptr;
+            /**
              * @brief Device-owned real row count for each request.
              *
              * The stable arena pointer is the sole GPU owner for padded

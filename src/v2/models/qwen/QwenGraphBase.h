@@ -447,15 +447,38 @@ namespace llaminar2
         public:
             /** @brief Enter one model-forward graph construction interval. */
             ForwardInputConstructionScope(QwenGraphBase &owner,const ForwardInput &input)
-                :owner_(owner),previous_(owner.forward_input_construction_)
-            { owner_.forward_input_construction_=&input; }
+                :owner_(owner),previous_(owner.forward_input_construction_),
+                 previous_slots_(owner.host_request_kv_slots_),
+                 previous_lengths_(owner.host_request_real_lengths_)
+            {
+                // Compute both snapshots before mutating the owner: allocation
+                // failure must leave an enclosing construction intact.
+                std::vector<int> slots, lengths;
+                if (input.device.is_cpu() && input.request_kv_slots &&
+                    input.request_kv_slots->size() == static_cast<std::size_t>(input.batch_size))
+                    slots = *input.request_kv_slots;
+                if (input.device.is_cpu() && input.batch_size > 1 && input.sequence_lengths &&
+                    input.execution_role == ForwardExecutionRole::MainInference &&
+                    input.sequence_lengths->size() == static_cast<std::size_t>(input.batch_size))
+                    lengths = *input.sequence_lengths;
+                owner_.host_request_kv_slots_ = std::move(slots);
+                owner_.host_request_real_lengths_ = std::move(lengths);
+                owner_.forward_input_construction_ = &input;
+            }
             /** @brief Restore the exact enclosing construction binding, including on failure. */
-            ~ForwardInputConstructionScope(){owner_.forward_input_construction_=previous_;}
+            ~ForwardInputConstructionScope()
+            {
+                owner_.forward_input_construction_ = previous_;
+                owner_.host_request_kv_slots_ = std::move(previous_slots_);
+                owner_.host_request_real_lengths_ = std::move(previous_lengths_);
+            }
             ForwardInputConstructionScope(const ForwardInputConstructionScope &)=delete;
             ForwardInputConstructionScope &operator=(const ForwardInputConstructionScope &)=delete;
         private:
             QwenGraphBase &owner_;
             const ForwardInput *previous_;
+            std::vector<int> previous_slots_;
+            std::vector<int> previous_lengths_;
         };
         /** @brief Require the active complete invocation while lowering a model extension. */
         const ForwardInput &modelForwardInput() const;
@@ -521,6 +544,10 @@ namespace llaminar2
         ModelWeightBindings weight_bindings_;
         ModelWeightBindings decode_replicated_dense_weight_bindings_;
         ModelBuffers buffers_;
+        /** @brief Real per-request lengths of the CPU host-token batch being built. */
+        std::vector<int> host_request_real_lengths_;
+        /** @brief KV sequence of each request row of the CPU serving forward being built. */
+        std::vector<int> host_request_kv_slots_;
         StageSnapshotCallback snapshot_callback_;
         bool decode_replicated_dense_graph_active_ = false;
         bool mtp_replicated_dense_graph_active_ = false;
@@ -529,6 +556,8 @@ namespace llaminar2
         bool mtp_mirrored_lm_head_graph_active_ = false;
         bool mtp_kv_cache_only_graph_active_ = false;
         bool prefix_runtime_rehydration_graph_active_ = false;
+        /** P2 grouped pooled decode: ALL rows project logits (never last-row-only). */
+        bool pooled_group_decode_active_ = false;
         std::optional<ForwardExecutionPhase> forward_execution_phase_;
         const ForwardInput *forward_input_construction_=nullptr; ///< Construction-only scoped binding, never live model state.
         /// Borrowed only within a validated main-prefill graph construction scope.

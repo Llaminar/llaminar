@@ -23,6 +23,7 @@
 #include "loaders/HostImmutableRowProvider.h"
 #include "utils/PooledNgramReplayTrace.h"
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
 #include <nlohmann/json.hpp>
 #include <array>
 #include <cstring>
@@ -52,7 +53,7 @@ void originalSetup(DeviceId device,std::uint32_t slots,bool compactDeclaration=f
     const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
         {{{gpuId,ImmutableRowStorage::VRAM},0,slots,{}},{{hostId,ImmutableRowStorage::RAM},0,slots?2u:0u,{}}},{gpuId},{},
-        {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},slots?std::optional(gpuId):std::nullopt,16);
+        {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),2)}},{},slots?std::optional(gpuId):std::nullopt,16);
     const auto physical=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,std::array{gpuId},gpuId);
     const auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},32);
     const auto cpu=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,gpuId);

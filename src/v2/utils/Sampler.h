@@ -335,6 +335,38 @@ namespace llaminar2
          */
         LogitPenaltyBatch compute_penalty_map(const SamplingParams &params, int vocab_size);
 
+    public:
+        /**
+         * @brief Exact typed sampler state (RNG + penalty + DRY histories).
+         *
+         * plan P4: restoring a stochastic sampler from a seed and a token
+         * list does NOT reproduce the RNG position or the generated-count /
+         * DRY histories. Continuation must capture and restore the ACTUAL
+         * typed state so the next decision is identical to an uninterrupted
+         * control (no reseed, no lost penalty state).
+         */
+        struct State
+        {
+            // The engine's ACTUAL serialized words (state + position) are
+            // retained verbatim; restoring with operator>> reproduces the
+            // exact position, including any partially-consumed draw.
+            std::vector<std::uint32_t> engine_words;
+            std::vector<std::pair<int, int>> token_counts; ///< token, count.
+            std::vector<int> dry_history;                  ///< Ring buffer contents.
+            std::size_t dry_capacity = 0;
+            // DRY breaker multimap (head token -> tail sequences) and its
+            // initialized flag: an initialized breaker set changes penalties,
+            // so a continuation without them would NOT reproduce identical
+            // decisions. These are tokenized values; the tokenizer is not
+            // needed again on restore (no re-tokenization ambiguity).
+            std::vector<std::pair<int, std::vector<int>>> dry_breakers;
+            bool dry_breakers_initialized = false;
+        };
+        /** @return Exact current sampler state for later restoration. */
+        State exportState() const;
+        /** @brief Restore an exact typed state (replaces RNG + histories). */
+        void importState(const State &state);
+
     private:
         std::mt19937 rng_; ///< Random number generator
         std::unordered_map<int, int> token_counts_; ///< Token ID → generation count

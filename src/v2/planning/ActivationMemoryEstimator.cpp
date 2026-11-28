@@ -294,7 +294,8 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
         .full_prefill_kv_handoff = geometry.replicated_dense_decode,
         .terminal_hidden_rows = retained_mtp ? std::max(static_cast<size_t>(geometry.batch_size), target_rows) : 0,
         .terminal_hidden_columns = retained_mtp ? (profile.flash_next
-            ? static_cast<size_t>(profile.flash_next->residual_width) : static_cast<size_t>(profile.d_model)) : 0});
+            ? static_cast<size_t>(profile.flash_next->residual_width) : static_cast<size_t>(profile.d_model)) : 0,
+        .cpu_mtp_resident_slots = retained_mtp ? static_cast<size_t>(geometry.batch_size) : 0});
     // Diagnostic mirror of DeviceGraphOrchestrator's arena registration log:
     // admission and allocation must name one identical root inventory.
     for (const auto &entry : layout.entries())

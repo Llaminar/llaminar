@@ -1,0 +1,50 @@
+pma-private-pages-v1 3 128 4 3 empty-zero-generations
+admit A 2 | accepted
+assign A | 0:1
+pin P A 0 | pinned
+admit B 1 | accepted
+assign B | 1:1
+admit C 1 | refused
+drop-request A | retired
+admit C 1 | accepted
+assign C | 2:1
+admit D 1 | refused
+drop-pin P | released
+admit D 1 | accepted
+assign D | 0:2
+drop-request B | retired
+drop-request C | retired
+drop-request D | retired
+admit E 1 | accepted
+assign E | 0:3
+plan W E 0 4 | ready
+copy W 01020304 | copied
+commit W V | published
+read V | 1:01020304
+plan busy E 0 1 | busy
+drop-page V | released
+plan abort E 0 4 | ready
+copy abort ffffffff | copied
+drop-plan abort | aborted
+plan correct E 0 2 | ready
+copy correct 0506 | copied
+commit correct V2 | published
+read V2 | 3:010203040506
+drop-request E | retired
+read V2 | 3:010203040506
+drop-page V2 | released
+admit F 1 | accepted
+assign F | 0:4
+plan W2 F 0 4 | ready
+copy W2 0708090a | copied
+commit W2 V3 | published
+register R V3 | registered
+close F 0 | closed
+drop-page V3 | released
+drop-request F | retired
+admit G 3 | refused
+consume R | 0708090a
+admit G 3 | accepted
+assign G | 0:5
+drop-request G | retired
+end | idle

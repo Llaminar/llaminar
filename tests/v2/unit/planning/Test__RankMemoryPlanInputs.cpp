@@ -12,6 +12,10 @@
  * projection aggregates their storage into the single rank-local host allocator.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "planning/MemoryPlanner.h"
+#include "execution/global_pp/GlobalPPTopology.h"
+#include "app/modes/SerializedInferenceExecutor.h"
+#include "utils/ServingCapacityTestIssuer.h"
 #include "fixtures/backends/OriginalRankLocalNativeCohort.h"
 #include "planning/PipelineTransferMemory.h"
 #include "execution/mtp/DeviceGenerationExecutionPolicy.h"
@@ -151,6 +155,255 @@ namespace
         fixture.plan.primary_device = fixture.plan.local_pp_devices.front();
         return fixture;
     }
+}
+
+
+
+/** @brief SERVING POOL demand designates EXACTLY ONE config per rank (the CPU
+ *  config when present, otherwise the rank's first device config) and never
+ *  multiplies across TP participants. */
+TEST(RankMemoryPlanInputs, ServingPoolDemandDesignatesExactlyOneConfigPerRank)
+{
+    // TP2 GPU device configs: NO cpu config in the list.
+    {
+        Fixture fixture(DeviceType::CUDA, 2);
+        auto request = fixture.request();
+        request.serving_pool_demand_bytes = 777;
+        const auto configs = buildRankMemoryPlanInputs(request);
+        ASSERT_FALSE(configs.empty());
+        std::size_t owners = 0;
+        for (const auto &cfg : configs)
+            if (cfg.serving_pool_demand_bytes)
+            {
+                ++owners;
+                EXPECT_EQ(*cfg.serving_pool_demand_bytes, 777u);
+            }
+        EXPECT_EQ(owners, 1u);
+    }
+    // Absent demand: no config carries it.
+    {
+        Fixture fixture(DeviceType::CUDA, 2);
+        const auto configs = buildRankMemoryPlanInputs(fixture.request());
+        for (const auto &cfg : configs)
+            EXPECT_FALSE(cfg.serving_pool_demand_bytes.has_value());
+    }
+}
+
+
+
+/** @brief SERVING POOL authority binding: a NONZERO rank (the resolved request
+ *  authority) designates exactly one config; nonzero rank is not special-cased
+ *  to zero. */
+TEST(RankMemoryPlanInputs, ServingPoolDemandDesignatesExactlyOneOnNonzeroRank)
+{
+    Fixture fixture(DeviceType::CUDA, 2);
+    fixture.plan.rank = 1;
+    fixture.inventory.rank = 1;
+    // GPU devices on rank 1 must still observe the rank-1 host resource.
+    auto request = fixture.request();
+    request.serving_pool_demand_bytes = 333;
+    const auto configs = buildRankMemoryPlanInputs(request);
+    ASSERT_FALSE(configs.empty());
+    std::size_t owners = 0;
+    for (const auto &cfg : configs)
+        if (cfg.serving_pool_demand_bytes)
+        {
+            ++owners;
+            EXPECT_EQ(*cfg.serving_pool_demand_bytes, 333u);
+        }
+    EXPECT_EQ(owners, 1u);
+}
+
+
+
+/** @brief SERVING POOL GPU JOIN THROUGH THE PLANNER, DISCRIMINATING (seq-211
+ *  #2 + seq-212): EVERY competing host trigger is removed — fresh-load geometry
+ *  cleared AND prefix caching DISABLED (the fixture default enables tiered
+ *  prefix, which owns a host prefix tier and made the old builder supply host
+ *  metadata independently of serving). With the serving demand the builder
+ *  must derive the rank-local host observation/CPU limit itself; the same
+ *  state WITHOUT the demand (negative control) must NOT produce host metadata.
+ *  Odd TP3 builder path. */
+TEST(RankMemoryPlanInputs, ServingPoolDemandGpuJoinThroughPlanner)
+{
+    Fixture fixture(DeviceType::CUDA, 3); // ODD builder path
+    // Disable the fixture's default tiered prefix cache BEFORE the request binds
+    // the (const) plan reference: no prefix host tier trigger remains.
+    fixture.plan.runtime.prefix_cache.enabled = false;   // NO prefix host tier
+    auto request = fixture.request();
+    request.weight_load_geometry = std::nullopt;         // NO fresh-load staging
+
+    // NEGATIVE CONTROL first: same state, NO serving demand => the old builder
+    // has no host trigger and must NOT supply host metadata.
+    {
+        const auto configs = buildRankMemoryPlanInputs(request);
+        ASSERT_EQ(configs.size(), 3u);
+        for (const auto &cfg : configs)
+        {
+            SCOPED_TRACE("negative " + cfg.device.toString());
+            EXPECT_EQ(cfg.weight_load_staging.host_bytes, 0u);
+            EXPECT_FALSE(cfg.associated_host_memory.has_value());
+        }
+    }
+
+    request.serving_pool_demand_bytes = 2048;
+    const auto configs = buildRankMemoryPlanInputs(request);
+    ASSERT_EQ(configs.size(), 3u);
+    for (const auto &cfg : configs)
+    {
+        SCOPED_TRACE(cfg.device.toString());
+        ASSERT_TRUE(cfg.associated_host_memory.has_value());
+        EXPECT_TRUE(cfg.associated_host_memory->valid());
+        EXPECT_TRUE(cfg.associated_host_memory->device.is_cpu());
+        EXPECT_EQ(cfg.weight_load_staging.host_bytes, 0u);
+    }
+    // Exactly one designated config carries the demand.
+    std::size_t owners = 0;
+    for (const auto &cfg : configs)
+        if (cfg.serving_pool_demand_bytes) ++owners;
+    EXPECT_EQ(owners, 1u);
+    const auto plan = MemoryPlanner::plan(fixture.model, configs);
+    const auto *host_bom = plan.physicalPlan().find({0, DeviceId::cpu()});
+    ASSERT_NE(host_bom, nullptr);
+    EXPECT_EQ(host_bom->bytes(PhysicalMemoryOwner::ServingResponsePool), 2048u);
+}
+
+
+
+/** @brief OWNER/FOLLOWER BOM JOIN (RESOLVED AUTHORITY -> BOM -> ADMISSION ->
+ *  RESERVATION): the votes are derived by composing the ACTUAL owner selector
+ *  (requestAuthorityRank on the resolved topology) with the single decision
+ *  helper servingPoolDemandForRank into BOTH ranks — the owner's plan carries
+ *  exactly the typed bytes, the follower's admits none — and the owner's
+ *  admitted plan extends into the real PMA reservation chain. Device-free. */
+TEST(RankMemoryPlanInputs, OwnerFollowerServingBomJoin)
+{
+    // Resolved topology MATCHES the fixture model geometry (4 layers): the
+    // embedding stage [0..1] is owned by rank 0 and the lm-head stage [2..3]
+    // by rank 1 (2 active stage owners in a 4-rank communicator); the
+    // vocabulary-head owner is rank 1 (nonzero AND NOT the last rank).
+    const auto topology = GlobalPPTopology::build(
+        {
+            GlobalPPStageSpec{.stage_id = 0, .first_layer = 0, .last_layer = 1,
+                              .has_embedding = true, .owning_rank = 0},
+            GlobalPPStageSpec{.stage_id = 1, .first_layer = 2, .last_layer = 3,
+                              .has_lm_head = true, .owning_rank = 1},
+        },
+        /*total_layers*/ 4, /*world_size*/ 4);
+    const auto errors = topology.validate();
+    ASSERT_TRUE(errors.empty()) << "fixture topology must be valid";
+    const int owner_rank = requestAuthorityRank(topology);
+    ASSERT_EQ(owner_rank, 1);
+
+    // PROJECT each rank's actual interval/terminal flags into its plan inputs
+    // (the production per-rank projection of the same topology).
+    const auto project = [](Fixture &f, const GlobalPPStageSpec &stage) {
+        f.plan.first_layer = stage.first_layer;
+        f.plan.last_layer = stage.last_layer;
+        f.plan.has_embedding = stage.has_embedding;
+        f.plan.has_lm_head = stage.has_lm_head;
+    };
+
+    const bool serve_mode = true;
+    const auto request = ServingCapacityRequest::authored(1, 2, 0);
+    const ServingPoolPerResponseBudget budget{1024};
+    const auto owner_demand =
+        servingPoolDemandForRank(serve_mode, owner_rank, owner_rank, request, ServingSlotDecisionGeometry{}, budget);
+    const auto follower_demand =
+        servingPoolDemandForRank(serve_mode, owner_rank, 0, request, ServingSlotDecisionGeometry{}, budget);
+    ASSERT_TRUE(owner_demand.has_value());
+    ASSERT_FALSE(follower_demand.has_value());
+    EXPECT_EQ(*owner_demand, 2048u);
+
+    // OWNER (rank 1): the decision-derived bytes become the BOM input.
+    Fixture owner(DeviceType::CUDA, 1);
+    owner.plan.rank = 1;
+    owner.inventory.rank = 1;
+    project(owner, topology.stages[1]);
+    owner.plan.runtime.prefix_cache.enabled = false;
+    auto owner_request = owner.request();
+    owner_request.weight_load_geometry = std::nullopt;
+    owner_request.serving_pool_demand_bytes = owner_demand;
+    const auto owner_configs = buildRankMemoryPlanInputs(owner_request);
+    ASSERT_EQ(owner_configs.size(), 1u);
+    const auto owner_plan = MemoryPlanner::plan(owner.model, owner_configs);
+    ASSERT_TRUE(owner_plan.fits());
+    EXPECT_NO_THROW(owner_plan.admit());
+    // ACROSS-RESOURCE uniqueness: the serving owner line is exactly 2048 once.
+    std::size_t owner_total = 0, owner_lines = 0;
+    for (const auto &bom : owner_plan.physicalPlan().resources())
+        if (const auto bytes = bom.bytes(PhysicalMemoryOwner::ServingResponsePool))
+        {
+            owner_total += bytes;
+            ++owner_lines;
+        }
+    EXPECT_EQ(owner_lines, 1u);
+    EXPECT_EQ(owner_total, 2048u);
+
+    // FOLLOWER (rank 0): no demand -> no serving line anywhere.
+    Fixture follower(DeviceType::CUDA, 1);
+    follower.plan.rank = 0;
+    follower.inventory.rank = 0;
+    project(follower, topology.stages[0]);
+    follower.plan.runtime.prefix_cache.enabled = false;
+    auto follower_request = follower.request();
+    follower_request.weight_load_geometry = std::nullopt;
+    follower_request.serving_pool_demand_bytes = follower_demand;
+    const auto follower_configs = buildRankMemoryPlanInputs(follower_request);
+    ASSERT_EQ(follower_configs.size(), 1u);
+    const auto follower_plan = MemoryPlanner::plan(follower.model, follower_configs);
+    ASSERT_TRUE(follower_plan.fits());
+    EXPECT_NO_THROW(follower_plan.admit()); // follower plan actually admitted
+    std::size_t follower_total = 0, follower_lines = 0;
+    for (const auto &bom : follower_plan.physicalPlan().resources())
+        if (const auto bytes = bom.bytes(PhysicalMemoryOwner::ServingResponsePool))
+        {
+            follower_total += bytes;
+            ++follower_lines;
+        }
+    EXPECT_EQ(follower_lines, 0u);
+    EXPECT_EQ(follower_total, 0u);
+
+    // RESERVATION CHAIN on the OWNER's admitted plan (decision-derived bytes).
+    const auto plan_copy = owner_plan.physicalPlan();
+    auto admission = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(
+        plan_copy);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(admission, 1);
+    // Resolve the executor capacity from the SAME request (no separate mint).
+    const auto resolved = resolveInstalledServingCapacity(request);
+    SerializedInferenceExecutor executor(resolved, authority, budget);
+    EXPECT_TRUE(executor.servingPoolPmaReserved());
+    EXPECT_EQ(executor.servingPoolCommittedBytes(), 2048u);
+}
+
+
+
+/** @brief BOM -> ADMISSION -> RESERVATION chain: the admitted owner plan (with
+ *  the serving line) admits through the certificate, the authority reserves the
+ *  exact typed demand and the executor reports the committed capacity. */
+TEST(RankMemoryPlanInputs, ServingBomToReservationChain)
+{
+    Fixture fixture(DeviceType::CUDA, 1);
+    fixture.plan.rank = 0;
+    fixture.inventory.rank = 0;
+    fixture.plan.runtime.prefix_cache.enabled = false;
+    auto request = fixture.request();
+    request.weight_load_geometry = std::nullopt;
+    request.serving_pool_demand_bytes = 2048;
+    const auto configs = buildRankMemoryPlanInputs(request);
+    const auto plan = MemoryPlanner::plan(fixture.model, configs);
+    ASSERT_TRUE(plan.fits());
+    EXPECT_NO_THROW(plan.admit());
+    const auto plan_copy = plan.physicalPlan();
+    auto admission = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(
+        plan_copy);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(admission, 0);
+    const auto resolved = ServingCapacityTestIssuer::fromComponents(1, 2, 0);
+    // Demand for 2 leases at 1024 bytes each = 2048 — matches the admitted line.
+    SerializedInferenceExecutor executor(
+        resolved, authority, ServingPoolPerResponseBudget{1024});
+    EXPECT_TRUE(executor.servingPoolPmaReserved());
+    EXPECT_EQ(executor.servingPoolCommittedBytes(), 2048u);
 }
 
 TEST(RankMemoryPlanInputs, CPUWorkspaceRequiresObservedWorkersNotPhysicalCoreFallback)

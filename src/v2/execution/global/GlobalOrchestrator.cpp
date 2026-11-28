@@ -3384,28 +3384,8 @@ namespace llaminar2
 
     int GlobalOrchestrator::findTailRank() const
     {
-        std::optional<int> owner;
-        for (const auto &stage : config_.topology.stages)
-        {
-            if (stage.has_lm_head)
-            {
-                if (owner)
-                    throw std::invalid_argument("GlobalOrchestrator: multiple vocabulary-head stages");
-                if (stage.is_global_tp)
-                {
-                    // The domain leader is shared by all ranks' resolved plan;
-                    // it is not necessarily the last physical rank in the job.
-                    if (stage.participating_ranks.empty())
-                        throw std::invalid_argument("GlobalOrchestrator: vocabulary domain has no participants");
-                    owner = stage.participating_ranks.front();
-                }
-                else
-                    owner = stage.owning_rank;
-            }
-        }
-        if (!owner || *owner < 0 || *owner >= config_.world_size)
-            throw std::invalid_argument("GlobalOrchestrator: no valid vocabulary-head request authority");
-        return *owner;
+        // SINGLE SOURCE: the same helper the memory-plan authority seal uses.
+        return llaminar2::requestAuthorityRank(config_.topology);
     }
 
     /** @copydoc StageRunnerRegistry::collectPrefixCacheShutdownAll */

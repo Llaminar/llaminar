@@ -332,4 +332,56 @@ namespace llaminar2
         std::string toTable() const;
     };
 
+
+
+
+
+/** @brief SHARED authority-agreement guard (seal vs graph/frontend).
+ *  @throws std::logic_error When the graph published NO authority, or when
+ *          the sealed request authority and the graph authority diverge —
+ *          one ownership source; absence is never silently skipped. */
+inline void requireRequestAuthorityAgreement(
+    const std::optional<int> &sealed_authority,
+    const std::optional<int> &graph_authority)
+{
+    if (!graph_authority)
+        throw std::logic_error(
+            "Named-domain compute graph did not publish a request authority");
+    if (!sealed_authority || *graph_authority != *sealed_authority)
+        throw std::logic_error(
+            "Compute-graph request authority diverges from the sealed "
+            "request authority used at memory admission");
+}
+
+/** @brief SINGLE request-authority source for a GlobalPP topology.
+ *  The vocabulary-head stage owns request authorization (its owning rank, or
+ *  the first participant of a global-TP vocabulary domain). GlobalOrchestrator
+ *  and the memory-plan authority seal consume this SAME helper so the serving
+ *  pool charge and the public frontend always agree on the serving rank.
+ *  @throws std::invalid_argument For multiple/absent vocabulary-head stages. */
+
+[[nodiscard]] inline int requestAuthorityRank(const GlobalPPTopology &topology)
+{
+    std::optional<int> owner;
+    for (const auto &stage : topology.stages)
+    {
+        if (stage.has_lm_head)
+        {
+            if (owner)
+                throw std::invalid_argument("Global PP topology: multiple vocabulary-head stages");
+            if (stage.is_global_tp)
+            {
+                if (stage.participating_ranks.empty())
+                    throw std::invalid_argument("Global PP topology: vocabulary domain has no participants");
+                owner = stage.participating_ranks.front();
+            }
+            else
+                owner = stage.owning_rank;
+        }
+    }
+    if (!owner || *owner < 0 || *owner >= topology.world_size)
+        throw std::invalid_argument("Global PP topology: no valid vocabulary-head request authority");
+    return *owner;
+}
+
 } // namespace llaminar2

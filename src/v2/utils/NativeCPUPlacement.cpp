@@ -334,11 +334,19 @@ namespace
             throw std::runtime_error("Native OpenMP publication differs from canonical observed capacity order");
     }
 
+    void NativeCPUPlacement::rejectLegacyPlacementEnvironment()
+    {
+        if (::getenv("LLAMINAR_MANAGED_PLACEMENT") ||
+            ::getenv("LLAMINAR_PLACEMENT_RECEIPT_V1"))
+            throw std::runtime_error("Unexpected managed placement environment in native MPI bootstrap");
+    }
+
     void NativeCPUPlacement::claimProcessEntry()
     {
         requireInitialMainThread();
         if(phase!=EntryPhase::Unclaimed)
             throw std::runtime_error("Native CPU process entry was already consumed");
+        rejectLegacyPlacementEnvironment();
         phase=EntryPhase::Claimed;
     }
 

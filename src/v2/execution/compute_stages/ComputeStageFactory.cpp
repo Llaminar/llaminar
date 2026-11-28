@@ -4,6 +4,7 @@
  */
 
 #include "ComputeStageFactory.h"
+#include "execution/compute_stages/stages/PooledKVAppendStage.h"
 
 #include <stdexcept>
 #include <utility>
@@ -388,6 +389,12 @@ namespace llaminar2
     {
         // KV cache append is backend-agnostic (pure memory operations)
         return std::make_unique<KVCacheAppendStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createPooledKVAppend(
+        const PooledKVAppendStage::Params &params)
+    {
+        return std::make_unique<PooledKVAppendStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createKVCacheGather(

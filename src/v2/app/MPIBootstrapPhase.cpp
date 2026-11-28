@@ -281,14 +281,60 @@ namespace llaminar2
     {
         const int max_threads = std::max(1, omp_get_max_threads());
         std::vector<int> observed_cpu(max_threads, -1);
-
+        struct ThreadObservation {
+            int omp_thread_num = -1;
+            int place_num = -1;
+            int place_proc_count = -1;
+            std::vector<int> place_proc_ids;
+            int mask_count = -1;
+            std::vector<int> mask_cpus;
+            int current_cpu = -1;
+            long os_tid = -1;
+            int error = 0;
+        };
+        std::vector<ThreadObservation> observations(
+            static_cast<std::size_t>(max_threads));
 #pragma omp parallel
         {
             const int tid = omp_get_thread_num();
             if (tid >= 0 && tid < static_cast<int>(observed_cpu.size()))
             {
                 observed_cpu[tid] = sched_getcpu();
+                auto &o = observations[static_cast<std::size_t>(tid)];
+                o.omp_thread_num = tid;
+                o.os_tid = static_cast<long>(syscall(SYS_gettid));
+                o.place_num = omp_get_place_num();
+                o.current_cpu = sched_getcpu();
+                if (o.place_num >= 0)
+                {
+                    o.place_proc_count = omp_get_place_num_procs(o.place_num);
+                    o.place_proc_ids.resize(static_cast<std::size_t>(o.place_proc_count));
+                    omp_get_place_proc_ids(o.place_num, o.place_proc_ids.data());
+                }
+                cpu_set_t thread_mask;
+                CPU_ZERO(&thread_mask);
+                if (sched_getaffinity(0, sizeof(thread_mask), &thread_mask) != 0)
+                    o.error = errno;
+                else
+                {
+                    o.mask_count = CPU_COUNT(&thread_mask);
+                    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                        if (CPU_ISSET(cpu, &thread_mask))
+                            o.mask_cpus.push_back(cpu);
+                }
             }
+        }
+        for (const auto &o : observations)
+        {
+            std::string place_ids, mask_listed;
+            for (const int id : o.place_proc_ids) place_ids += " " + std::to_string(id);
+            for (const int cpu : o.mask_cpus) mask_listed += " " + std::to_string(cpu);
+            std::fprintf(stderr,
+                "[verify-diag] worker os_tid=%ld omp_thread_num=%d place=%d "
+                "place_procs=%d[%s] mask_count=%d mask=[%s] getcpu=%d error=%d\n",
+                o.os_tid, o.omp_thread_num, o.place_num,
+                o.place_proc_count, place_ids.c_str(),
+                o.mask_count, mask_listed.c_str(), o.current_cpu, o.error);
         }
 
         std::set<int> numa_nodes;
@@ -440,6 +486,12 @@ namespace llaminar2
         launch.report_bindings = config.mpi_verbose || config.verbose_level > 0;
         launch.verbose = config.mpi_verbose;
         launch.oversubscribe = config.mpi_oversubscribe;
+        // Authored budget intent travels to the per-rank helper: Explicit
+        // when the operator authored a positive worker count, AutoLocal
+        // otherwise (each rank's helper resolves from its OWN admitted
+        // places — heterogeneous hosts never receive a launcher-local
+        // automatic number).
+        launch.omp_threads_per_rank = config.n_threads > 0 ? config.n_threads : 0;
         // MPI maps/binds sockets using each host's hwloc discovery. Thread
         // counts and CPU indices are deliberately absent from this command.
         return launch;
@@ -507,6 +559,11 @@ namespace llaminar2
                                                int argc, char *argv[],
                                                MPIBootstrapArgumentPolicy arguments)
     {
+        // Native rank placement comes only from original process entry. An
+        // inherited helper marker or receipt must never select another binder
+        // or escape across this launch boundary as a fresh rank decision.
+        NativeCPUPlacement::rejectLegacyPlacementEnvironment();
+
         const auto device_intent = installDeviceStartupIntent(config);
         const bool automatic_multi_rank_discovery =
             device_intent == BootstrapDeviceIntent::Automatic &&

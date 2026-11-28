@@ -38,6 +38,8 @@ namespace llaminar2::test
     class MockOrchestrationRunner : public IOrchestrationRunner
     {
     public:
+        std::shared_ptr<PhysicalMemoryAuthority> physicalMemoryAuthority() const override { return nullptr; }
+
         MockOrchestrationRunner()
         {
             // Set up default return values

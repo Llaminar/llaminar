@@ -16,6 +16,7 @@
 
 #include "config/ConfigValidator.h"
 #include "config/OrchestrationConfig.h"
+#include "execution/config/ServingCapacity.h"
 
 #include <algorithm>
 #include <set>
@@ -276,6 +277,69 @@ namespace llaminar2
             .applies = [](const OrchestrationConfig &c) { return c.max_seq_len <= 0; },
             .check = [](const OrchestrationConfig &) -> std::optional<std::string>
             { return "Context length must be positive."; },
+        });
+
+        // §9.4 resident slots S are the runner's admitted request slots. One
+        // authority: --batch-size may not name a different slot count.
+        v.addRule({
+            .id = "serving-capacity-runner-slots",
+            .description = "Authored resident slots S are the runner's request slots; --batch-size may not differ",
+            .fix_hint = "Omit --batch-size when authoring --serving-resident-slots",
+            .applies = [](const OrchestrationConfig &c) {
+                return c.serving_resident_slots.has_value() && c.batch_size != 1 &&
+                       c.batch_size != *c.serving_resident_slots;
+            },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
+            {
+                return "--batch-size " + std::to_string(c.batch_size) + " conflicts with --serving-resident-slots " +
+                       std::to_string(*c.serving_resident_slots) +
+                       "; serving request slots are set only by --serving-resident-slots.";
+            },
+        });
+
+        v.addRule({
+            .id = "serving-capacity-all-or-none",
+            .description = "Authored §9.4 serving capacity is exact and must name every axis",
+            .fix_hint = "Provide all of --serving-resident-slots, --serving-response-leases and --serving-queue-capacity, or omit all three for automatic resolution",
+            .applies = [](const OrchestrationConfig &c) { return c.hasServingCapacityIntent(); },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
+            {
+                if (!c.serving_resident_slots || !c.serving_response_leases || !c.serving_queue_capacity)
+                    return "Serving capacity axes must be authored together (all or none).";
+                return std::nullopt;
+            },
+        });
+
+        // Structural coherence mirrors the §9.4 invariant envelope; the
+        // qualified-capability rejection of an authored higher capacity is a
+        // planning-time decision (Phase A-2b) made through resolveServingCapacity.
+        v.addRule({
+            .id = "serving-capacity-coherent",
+            .description = "Authored serving capacity satisfies S >= 1, Q >= 0, R >= S + Q",
+            .fix_hint = "Choose response leases that cover resident slots plus queue capacity",
+            .applies = [](const OrchestrationConfig &c)
+            {
+                return c.serving_resident_slots.has_value() && c.serving_response_leases.has_value() &&
+                       c.serving_queue_capacity.has_value();
+            },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
+            {
+                try
+                {
+                    (void)ServingCapacityRequest::authored(*c.serving_resident_slots,
+                                                           *c.serving_response_leases,
+                                                           *c.serving_queue_capacity);
+                }
+                catch (const std::invalid_argument &error)
+                {
+                    return error.what();
+                }
+                if (static_cast<std::int64_t>(*c.serving_response_leases) <
+                    static_cast<std::int64_t>(*c.serving_resident_slots) +
+                        static_cast<std::int64_t>(*c.serving_queue_capacity))
+                    return "Serving capacity response leases must cover resident slots plus queue capacity.";
+                return std::nullopt;
+            },
         });
 
         v.addRule({

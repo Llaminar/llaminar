@@ -454,7 +454,15 @@ namespace llaminar2
                     std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
                     rows, estimateTensorAppendBytes(key, rows) +
                               estimateTensorAppendBytes(value, rows));
-                if (!append_to_cache(params_.seq_idx + request, key, value, rows))
+                // Ragged request rows append only their real tokens; the rest
+                // of the prepared slice is padding of the widest row.
+                const int real_rows =
+                    params_.request_real_lengths_host.empty() || requests == 1
+                        ? rows
+                        : params_.request_real_lengths_host[static_cast<size_t>(request)];
+                if (real_rows <= 0 || real_rows > rows)
+                    LLAMINAR_UNREACHABLE("Q16 ragged append real length outside its row slice");
+                if (!append_to_cache(sequenceForRow(request), key, value, real_rows))
                     return false;
             }
             return true;
@@ -585,19 +593,30 @@ namespace llaminar2
             // Note: We create views/copies that the cache will copy from
             for (int b = 0; b < batch_size; ++b)
             {
-                const int seq_idx = params_.seq_idx + b;
+                const int seq_idx = sequenceForRow(b);
                 const size_t offset = b * seq_len * kv_dim;
+                // Ragged request rows: each sequence appends only its real
+                // tokens; the slice beyond them is padding of the widest row.
+                const int rows_b =
+                    params_.request_real_lengths_host.empty()
+                        ? seq_len
+                        : params_.request_real_lengths_host[static_cast<size_t>(b)];
+                if (rows_b <= 0 || rows_b > seq_len)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] invalid real length " << rows_b << " for batch " << b);
+                    return false;
+                }
 
                 // Create temporary FP32 tensors wrapping the slice data
                 // These are views into the contiguous K/V buffer
-                auto k_slice = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
-                auto v_slice = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
+                auto k_slice = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(rows_b), kv_dim});
+                auto v_slice = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(rows_b), kv_dim});
 
                 // Copy slice data (could be optimized with non-owning views)
-                std::memcpy(k_slice->mutable_data(), k_data + offset, seq_len * kv_dim * sizeof(float));
-                std::memcpy(v_slice->mutable_data(), v_data + offset, seq_len * kv_dim * sizeof(float));
+                std::memcpy(k_slice->mutable_data(), k_data + offset, rows_b * kv_dim * sizeof(float));
+                std::memcpy(v_slice->mutable_data(), v_data + offset, rows_b * kv_dim * sizeof(float));
 
-                LOG_TRACE("[KVCacheAppendStage] Appending " << seq_len << " tokens to layer "
+                LOG_TRACE("[KVCacheAppendStage] Appending " << rows_b << " tokens to layer "
                                                             << params_.layer_idx << " seq_idx=" << seq_idx);
 
                 bool success = false;
@@ -607,22 +626,22 @@ namespace llaminar2
                     const auto conv_start = std::chrono::high_resolution_clock::now();
 
                     auto k_fp16 = std::make_unique<FP16Tensor>(
-                        std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
+                        std::vector<size_t>{static_cast<size_t>(rows_b), kv_dim});
                     auto v_fp16 = std::make_unique<FP16Tensor>(
-                        std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
+                        std::vector<size_t>{static_cast<size_t>(rows_b), kv_dim});
 
-                    k_fp16->from_fp32(k_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
-                    v_fp16->from_fp32(v_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
+                    k_fp16->from_fp32(k_slice->data(), static_cast<size_t>(rows_b) * kv_dim);
+                    v_fp16->from_fp32(v_slice->data(), static_cast<size_t>(rows_b) * kv_dim);
 
                     const auto conv_end = std::chrono::high_resolution_clock::now();
                     const uint64_t conv_ns = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
                     const uint64_t conv_bytes = static_cast<uint64_t>(
-                        estimateTensorAppendBytes(k_fp16.get(), seq_len) +
-                        estimateTensorAppendBytes(v_fp16.get(), seq_len));
-                    KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(seq_len), conv_bytes);
+                        estimateTensorAppendBytes(k_fp16.get(), rows_b) +
+                        estimateTensorAppendBytes(v_fp16.get(), rows_b));
+                    KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(rows_b), conv_bytes);
 
-                    success = append_to_cache(seq_idx, k_fp16.get(), v_fp16.get(), seq_len);
+                    success = append_to_cache(seq_idx, k_fp16.get(), v_fp16.get(), rows_b);
                 }
                 else if (cache_k_precision == ActivationPrecision::Q8_1 &&
                          cache_v_precision == ActivationPrecision::Q8_1)
@@ -631,10 +650,10 @@ namespace llaminar2
 
                     auto k_q8 = Q8_1Tensor::quantize_from_fp32(
                         k_slice->data(),
-                        {static_cast<size_t>(seq_len), kv_dim});
+                        {static_cast<size_t>(rows_b), kv_dim});
                     auto v_q8 = Q8_1Tensor::quantize_from_fp32(
                         v_slice->data(),
-                        {static_cast<size_t>(seq_len), kv_dim});
+                        {static_cast<size_t>(rows_b), kv_dim});
 
                     if (!k_q8 || !v_q8)
                     {
@@ -646,11 +665,11 @@ namespace llaminar2
                     const uint64_t conv_ns = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
                     const uint64_t conv_bytes = static_cast<uint64_t>(
-                        estimateTensorAppendBytes(k_q8.get(), seq_len) +
-                        estimateTensorAppendBytes(v_q8.get(), seq_len));
-                    KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_Q8_1, conv_ns, static_cast<uint64_t>(seq_len), conv_bytes);
+                        estimateTensorAppendBytes(k_q8.get(), rows_b) +
+                        estimateTensorAppendBytes(v_q8.get(), rows_b));
+                    KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_Q8_1, conv_ns, static_cast<uint64_t>(rows_b), conv_bytes);
 
-                    success = append_to_cache(seq_idx, k_q8.get(), v_q8.get(), seq_len);
+                    success = append_to_cache(seq_idx, k_q8.get(), v_q8.get(), rows_b);
                 }
                 else if (cache_k_precision == ActivationPrecision::TQ4 &&
                          cache_v_precision == ActivationPrecision::TQ4)
@@ -661,7 +680,7 @@ namespace llaminar2
                         return false;
                     }
                     const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
-                    const std::vector<size_t> tq_shape{static_cast<size_t>(seq_len), kv_dim};
+                    const std::vector<size_t> tq_shape{static_cast<size_t>(rows_b), kv_dim};
 
                     auto k_tq4 = TQ4Tensor::quantize_from_fp32(k_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
                     auto v_tq4 = TQ4Tensor::quantize_from_fp32(v_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
@@ -671,7 +690,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    success = append_to_cache(seq_idx, k_tq4.get(), v_tq4.get(), seq_len);
+                    success = append_to_cache(seq_idx, k_tq4.get(), v_tq4.get(), rows_b);
                 }
                 else if (cache_k_precision == ActivationPrecision::TQ8 &&
                          (cache_v_precision == ActivationPrecision::TQ4 ||
@@ -683,7 +702,7 @@ namespace llaminar2
                         return false;
                     }
                     const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
-                    const std::vector<size_t> tq_shape{static_cast<size_t>(seq_len), kv_dim};
+                    const std::vector<size_t> tq_shape{static_cast<size_t>(rows_b), kv_dim};
 
                     auto k_tq8 = TQ8Tensor::quantize_from_fp32(
                         k_slice->data(), tq_shape, params_.head_dim,
@@ -704,11 +723,11 @@ namespace llaminar2
                     }
 
                     success = append_to_cache(
-                        seq_idx, k_tq8.get(), v_tq.get(), seq_len);
+                        seq_idx, k_tq8.get(), v_tq.get(), rows_b);
                 }
                 else
                 {
-                    success = append_to_cache(seq_idx, k_slice.get(), v_slice.get(), seq_len);
+                    success = append_to_cache(seq_idx, k_slice.get(), v_slice.get(), rows_b);
                 }
 
                 if (!success)

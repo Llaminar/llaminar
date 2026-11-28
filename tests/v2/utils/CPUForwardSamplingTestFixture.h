@@ -46,10 +46,11 @@ namespace llaminar2::test
         std::vector<LayerTensors> layers;
 
         /** @brief Construct tiny weights; @param device Compute endpoint; @param kv_precision Test cache format. */
-        TinyQwenForwardFixture(DeviceId device, KVCachePrecision kv_precision)
+        /** @param layer_count Attention layer count (1 by default; 2+ for multi-layer exports). */
+        TinyQwenForwardFixture(DeviceId device, KVCachePrecision kv_precision, int layer_count = 1)
         {
-            config.n_layers = 1;
-            config.total_n_layers = 1;
+            config.n_layers = layer_count;
+            config.total_n_layers = layer_count;
             config.d_model = 64;
             config.n_heads = 4;
             config.n_kv_heads = 2;

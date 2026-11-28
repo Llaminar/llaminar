@@ -1995,6 +1995,11 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(len(rocm_moe.entries), 12)
         self.assertEqual(len(rocm_decode.entries), 65)
         self.assertEqual(len(cpu_decode.entries), 5)
+        # The verifier registry's declared inventory is exactly the explicit
+        # policy enumeration below: completeness (the count matches the
+        # enumeration one-to-one) and explicitness (every entry names one of
+        # these policies) are the same invariant, so a future candidate can
+        # only enter by extending this enumeration.
         self.assertEqual(len(cpu.entries), 10)
         self.assertEqual(
             {entry.config_json["policy"] for entry in cpu.entries},

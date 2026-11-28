@@ -2251,4 +2251,45 @@ namespace
             << "DRY should be added to presence+frequency penalties, not max'd";
     }
 
+/** @test R14: exact typed state carries DRY breakers and the initialized flag. */
+TEST(SamplerState, DryBreakersSurviveExportImportAndKeepDecisionsIdentical)
+{
+    SamplingParams law;
+    law.temperature = 0.8f;
+    law.seed = 5150;
+    law.dry_allowed_length = 0;
+    law.dry_penalty_last_n = -1;
+    law.dry_multiplier = 1.0f;
+    law.dry_base = 1.75f;
+    Sampler control(law.seed);
+    // Breakers are PART of the sampler's admitted policy state: without them
+    // contradiction penalties do not reset the same way.
+    control.initDryBreakers({"\n", ":"}, [](const std::string &s) -> std::vector<int> {
+        return s == "\n" ? std::vector<int>{7} : std::vector<int>{8};
+    });
+    std::vector<std::vector<float>> logits_bank(5, std::vector<float>(12, 0.1f));
+    for (auto &row : logits_bank)
+        for (int t = 0; t < 12; ++t) row[t] = 0.1f + static_cast<float>(t) * 0.01f;
+    std::vector<int> decisions;
+    for (int i = 0; i < 4; ++i)
+    {
+        decisions.push_back(control.sample(logits_bank[i], law));
+        control.record_token(decisions.back());
+    }
+    auto state = control.exportState();
+    EXPECT_TRUE(state.dry_breakers_initialized);
+    EXPECT_EQ(state.dry_breakers.size(), 2u);
+    Sampler restored(law.seed);
+    restored.importState(state);
+    // With breakers restored, the next draws are IDENTICAL to the control.
+    // (A fresh sampler without the breakers would diverge: the DRY penalty
+    // differs whenever a breaker would reset the repeat window.)
+    for (int i = 4; i < 5; ++i)
+        EXPECT_EQ(restored.sample(logits_bank[i], law), control.sample(logits_bank[i], law));
+    // The imported flag protects the second init: no silent re-tokenization.
+    Sampler reimported(law.seed);
+    reimported.importState(control.exportState());
+    EXPECT_EQ(reimported.sample(logits_bank[4], law), control.sample(logits_bank[4], law));
+}
+
 } // anonymous namespace

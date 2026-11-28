@@ -14,6 +14,7 @@
 
 #include <string>
 #include <functional>
+#include "app/modes/ServingResponseLeasePool.h"
 #include <memory>
 #include <nlohmann/json.hpp>
 
@@ -54,6 +55,16 @@ namespace llaminar2
      * @param executor Sole inference worker and response reservation authority.
      * @param stream_observer Optional trace-only body attachment, never a token/state probe.
      */
+    /**
+     * @brief Chat endpoint for continuous batching (S > 1): every request runs
+     *        concurrently through the handler's batched lane, admitted against
+     *        PMA-backed response leases; @p serving_failure reports a sealed
+     *        session (answered 503).
+     */
+    void registerBatchedChatCompletionEndpoint(
+        httplib::Server &server, ChatCompletionHandler &handler, ServingResponseLeasePool &leases,
+        HttpStreamObserver stream_observer, std::function<std::string()> serving_failure);
+
     void registerChatCompletionEndpoint(httplib::Server &server, ChatCompletionHandler &handler,
                                         SerializedInferenceExecutor &executor,
                                         HttpStreamObserver stream_observer = {});
@@ -103,6 +114,27 @@ namespace llaminar2
                                       std::shared_ptr<HttpProcessStats> process_stats = {});
 
     /**
+     * @brief Produces the /stats "inference_queue" section of the active serving mode.
+     *
+     * Serialized serving reports its executor; continuous batching reports
+     * admitted in-flight requests and the session's resident/queued occupancy.
+     * The source may be replaced before the server starts listening.
+     */
+    using InferenceQueueStatsSource = std::shared_ptr<std::function<nlohmann::json()>>;
+
+    /** @brief The serialized executor's queue section (mode "serialized"). */
+    InferenceQueueStatsSource serializedInferenceQueueStats(const SerializedInferenceExecutor &executor);
+
+    /** @brief registerRuntimeStatsEndpoint() reading its queue section from @p queue_stats. */
+    void registerRuntimeStatsEndpoint(httplib::Server &server,
+                                      ChatCompletionHandler &handler,
+                                      InferenceQueueStatsSource queue_stats,
+                                      std::string model_name,
+                                      nlohmann::json description,
+                                      HttpResponseObserver response_observer = {},
+                                      std::shared_ptr<HttpProcessStats> process_stats = {});
+
+    /**
      * @brief Couple HTTP capacity to bounded, serialized inference admission.
      *
      * The HTTP pool has two more workers than admitted inference responses.
@@ -113,6 +145,9 @@ namespace llaminar2
      * @param server Server configured before listening.
      * @param executor Sole inference ownership and admission authority.
      */
+    /** @brief Size the HTTP pool to @p workers (R plus control headroom). */
+    void configureInferenceHttpServer(httplib::Server &server, std::size_t workers);
+
     void configureInferenceHttpServer(httplib::Server &server,
                                       const SerializedInferenceExecutor &executor);
 

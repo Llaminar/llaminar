@@ -18,7 +18,9 @@
 
 #pragma once
 
+#include "app/modes/RequestGenerationLane.h"
 #include "app/modes/HttpRuntimeStats.h"
+#include "execution/prefix_cache/RetentionIntentResolver.h"
 #include "utils/Sampler.h"
 #include "utils/ChatTemplate.h"
 #include "utils/ToolCallTypes.h"
@@ -129,6 +131,12 @@ namespace llaminar2
         std::optional<bool> enable_thinking; ///< Omission selects the loaded model's reasoning default.
         std::string model;          ///< Model identifier from request (optional)
 
+        /// §8.4 standard retention fields (empty = absent): the typed intent
+        /// resolves through RetentionIntentResolver with a precise
+        /// invalid_request_error for an unsupported value (never a remap).
+        std::string prompt_cache_retention;
+        std::string prompt_cache_key;
+
         /// Thinking budget: maximum tokens to spend in thinking mode.
         /// -1 = no budget (unlimited thinking), 0 = disable thinking.
         /// When exhausted, a stop-thinking sequence is injected into the stream.
@@ -196,6 +204,7 @@ namespace llaminar2
         /// Whether we're currently in the thinking phase
         bool inThinking() const { return phase_ == Phase::Reasoning; }
 
+
     private:
         /** @brief The same reasoning/answer lifecycle governs HTTP and SSE output. */
         enum class Phase
@@ -223,6 +232,39 @@ namespace llaminar2
      * Depends only on IOrchestrationRunner and ITokenizer interfaces,
      * enabling full mock-based unit testing.
      */
+    /** @brief Creates one request's generation lane. */
+    using GenerationLaneFactory = std::function<std::unique_ptr<IRequestGenerationLane>()>;
+
+    /**
+     * @brief Runs a live-state runner read on the thread that owns the runner.
+     *
+     * Under continuous batching the driver thread exclusively owns the runner,
+     * so diagnostic reads of mutable state (MoE optimization) are serialized
+     * through it instead of racing a shared step.
+     */
+    using RunnerReadSerializer = std::function<void(const std::function<void(IOrchestrationRunner &)> &)>;
+
+    /** @brief Immutable request metadata, snapshotted before concurrent serving. */
+    struct ChatRunnerMetadata
+    {
+        ThinkingMode default_thinking = ThinkingMode::Enabled;
+        SamplingParams recommended_thinking;
+        SamplingParams recommended_plain;
+        std::string stop_thinking_prompt;
+        ToolCallFormat tool_call_format = ToolCallFormat::HERMES_2_PRO;
+
+        static ChatRunnerMetadata snapshot(const IOrchestrationRunner &runner)
+        {
+            ChatRunnerMetadata metadata;
+            metadata.default_thinking = runner.getDefaultThinkingMode();
+            metadata.recommended_thinking = runner.getRecommendedSamplingParams(ThinkingMode::Enabled);
+            metadata.recommended_plain = runner.getRecommendedSamplingParams(ThinkingMode::Disabled);
+            metadata.stop_thinking_prompt = runner.getStopThinkingPrompt();
+            metadata.tool_call_format = runner.getToolCallFormat();
+            return metadata;
+        }
+    };
+
     class ChatCompletionHandler
     {
     public:
@@ -237,7 +279,8 @@ namespace llaminar2
         static constexpr int kStreamingPublicationWindowTokens = 16;
 
         ChatCompletionHandler(IOrchestrationRunner &runner, ITokenizer &tokenizer,
-                              const std::string &model_name = "");
+                              const std::string &model_name = "",
+                              std::optional<RetentionClass> retention_ceiling = std::nullopt);
 
         /**
          * @brief Read completed lifetime counters without touching inference state.
@@ -288,10 +331,30 @@ namespace llaminar2
         ChatCompletionResponse handleRawRequest(const std::string &json_body,
                                                 const StreamChunkCallback &stream_cb = nullptr);
 
+        /**
+         * @brief Route generation through per-request lanes (continuous batching).
+         *
+         * Without a factory every request uses the runner's scalar path and
+         * must run on the serialized inference worker.
+         */
+        void setGenerationLaneFactory(GenerationLaneFactory factory, RunnerReadSerializer serializer)
+        {
+            // Snapshot before any concurrent request runs: handler threads then
+            // never read the runner while the serving thread mutates it.
+            metadata_ = ChatRunnerMetadata::snapshot(runner_);
+            lane_factory_ = std::move(factory);
+            runner_reads_ = std::move(serializer);
+        }
+
         /// Generate a unique chat completion ID (e.g., "chatcmpl-a1b2c3d4e5f6")
         static std::string generateRequestId();
 
     private:
+        /// §8.4/P0 §4: configured operator ceiling (nullopt = none), enforced
+        /// HERE at HTTP admission — a request whose retention class exceeds it
+        /// receives a precise invalid_request_error before any inference work,
+        /// never a deep pool refusal afterwards.
+        std::optional<RetentionClass> retention_ceiling_;
         HttpRuntimeStats runtime_stats_; ///< Passive terminal observations; never a GPU state mirror.
         /**
          * @brief Resolve one request's reasoning mode from its override and model default.
@@ -302,7 +365,8 @@ namespace llaminar2
 
         /// Common setup: clear cache, merge sampling params, encode, prefill.
         /// Returns prompt_tokens on success, or sets error response and returns -1.
-        int setupInference(const ChatCompletionRequest &request,
+        int setupInference(IRequestGenerationLane &lane,
+                           const ChatCompletionRequest &request,
                            ChatCompletionResponse &error_out,
                            std::vector<int32_t> &input_ids,
                            HttpRuntimeStats::Request &observation);
@@ -311,9 +375,27 @@ namespace llaminar2
             const char *phase,
             const std::string &detail);
 
+        /** @brief This request's generation lane (factory, or the direct runner lane). */
+        std::unique_ptr<IRequestGenerationLane> makeGenerationLane();
+
         IOrchestrationRunner &runner_;
         ITokenizer &tokenizer_;
         std::string model_name_;
+        GenerationLaneFactory lane_factory_;
+        RunnerReadSerializer runner_reads_;
+        std::optional<ChatRunnerMetadata> metadata_;
+
+        /** @brief MoE maintenance after committed tokens, on the runner's owning thread. */
+        bool runMaintenanceOnRunnerThread(uint64_t committed_tokens);
+
+        /** @brief Run a mutable-state runner access on its owning thread. */
+        void withRunner(const std::function<void(IOrchestrationRunner &)> &read)
+        {
+            if (runner_reads_)
+                runner_reads_(read);
+            else
+                read(runner_);
+        }
     };
 
 } // namespace llaminar2

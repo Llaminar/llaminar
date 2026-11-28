@@ -1264,6 +1264,15 @@ namespace llaminar2
          */
         int first_sequence_index = 0;
         /**
+         * @brief Explicit CPU sidecar row-to-resident-KV-slot mapping.
+         *
+         * Borrowed only during construction; stages retain their own mapping.
+         * Null preserves contiguous indexing. An explicit mapping excludes a
+         * nonzero first_sequence_index and must address distinct admitted slots.
+         * This is not a host-controlled GPU execution input.
+         */
+        const std::vector<int> *request_kv_slots = nullptr;
+        /**
          * @brief Exact producer stream for one-time sidecar device-state publication.
          *
          * GPU MoE sidecar construction may publish immutable runtime

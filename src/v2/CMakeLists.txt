@@ -1661,7 +1661,15 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/prefix_cache/BlockHash.cpp
     execution/prefix_cache/DeviceHotPrefixStorageBackend.cpp
     execution/prefix_cache/DiskPrefixStorageBackend.cpp
+    execution/prefix_cache/DiskExtentQuota.cpp
+    execution/prefix_cache/PagedKVDiskRoute.cpp
+    execution/prefix_cache/PagedKVArchiveStore.cpp
+    execution/prefix_cache/PagedKVRetentionDemotion.cpp
+    execution/prefix_cache/PagedKVDemotionExecutor.cpp
+    execution/prefix_cache/PooledKVPrefixFlow.cpp
     execution/prefix_cache/PrefixArchivePersistence.cpp
+    execution/prefix_cache/RetentionIntentResolver.cpp
+    execution/prefix_cache/RetentionOwner.cpp
     execution/prefix_cache/PrefixCacheCoordinator.cpp
     execution/prefix_cache/PrefixRestoreMetadata.cpp
     execution/prefix_cache/PrefixCacheFingerprint.cpp
@@ -1690,6 +1698,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/runner/MTPVerifierForwardExecutor.cpp
     execution/cache/HybridCacheManager.cpp
     execution/compute_stages/stages/KVCacheAppendStage.cpp
+    execution/compute_stages/stages/PooledKVAppendStage.cpp
     execution/compute_stages/stages/KVCacheGatherStage.cpp
     execution/compute_stages/stages/AttentionComputeStage.cpp
     execution/compute_stages/stages/EmbeddingStage.cpp
@@ -1798,6 +1807,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PlanningImmutableLookupWork.cpp
     planning/PlanningForwardStateWork.cpp
     planning/KVCacheMemoryEstimator.cpp
+    kernels/kvcache/KVStorageLayout.cpp
+    kernels/cpu/attention/CPUFP32PagedKVTable.cpp
     planning/PersistentStateMemoryEstimator.cpp
     planning/ActivationMemoryEstimator.cpp
     planning/WorkspaceMemoryEstimator.cpp
@@ -1810,7 +1821,17 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/GPUFlatGraphStructure.cpp
     backends/RetainedParticipantGraphExecutable.cpp
     planning/PhysicalMemoryAuthority.cpp
+    planning/PagedKVPoolGeometry.cpp
+    planning/PagedKVInstancePlan.cpp
+    planning/AllResourceCompletionWitness.cpp
+    planning/PagedKVInstance.cpp
+    planning/PagedKVInstanceFactory.cpp
+    planning/PhysicalPagePool.cpp
+    planning/CompletionWitness.cpp
+    planning/PageTableAdmission.cpp
     planning/MemoryPlanner.cpp
+    kernels/cpu/attention/PagedKVArchive.cpp
+    kernels/cpu/attention/EffectiveUseOrdering.cpp
     planning/ImmutableRowTablePlacementPlanner.cpp
     planning/ImmutableRowTableAdmissionWire.cpp
     planning/PipelineTransferMemory.cpp
@@ -2091,6 +2112,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/collective/CollectiveContext.cpp
     # NUMA-aware memory allocation
     memory/NUMAAllocator.cpp
+    memory/FirstTouchBoundary.cpp
     # Buffer harmonization (Phase 1: BufferArena + CoherenceTracker)
     memory/BufferArena.cpp
     memory/CPUTensorStorageDeclaration.cpp
@@ -2133,6 +2155,10 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/runner/ModelContextRetirement.cpp
     execution/runner/ContinuationRequestGroup.cpp
     execution/runner/OrchestrationRunner.cpp
+    execution/serving/ServingSession.cpp
+    execution/serving/PooledServingSlotOwner.cpp
+    execution/serving/ServingContinuationManifest.cpp
+    execution/serving/AdmissionPressureGate.cpp
     execution/runner/MTPStochasticVerificationOwner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
     execution/global/NamedDomainGraphBuilder.cpp
@@ -2480,6 +2506,22 @@ target_link_libraries(llaminar_mpi_schizo PRIVATE
 set_target_properties(llaminar_mpi_schizo PROPERTIES
     PREFIX "" OUTPUT_NAME mca_schizo_llaminar
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/llaminar_mpi_components")
+# Placement-receipt diagnostics are not part of the installed product.
+# The helper has no OpenMP dependency: it prepares the diagnostic child's
+# environment before that child's OpenMP runtime initializes.
+if(LLAMINAR_BUILD_TESTS)
+    add_library(llaminar_placement_topology STATIC planning/PlacementTopology.cpp)
+    target_compile_features(llaminar_placement_topology PRIVATE cxx_std_20)
+    target_include_directories(llaminar_placement_topology PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(llaminar_placement_topology PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(llaminar_placement_topology PRIVATE -fno-openmp)
+
+    add_executable(llaminar_placement_helper planning/PlacementHelper.cpp)
+    target_compile_features(llaminar_placement_helper PRIVATE cxx_std_20)
+    target_link_libraries(llaminar_placement_helper PRIVATE llaminar_placement_topology)
+    target_compile_options(llaminar_placement_helper PRIVATE -fno-openmp)
+endif()
+
 add_library(llaminar_mpi_session_owner STATIC
     utils/MPISessionOwner.cpp utils/NativeCPUPlacement.cpp)
 target_compile_features(llaminar_mpi_session_owner PRIVATE cxx_std_20)

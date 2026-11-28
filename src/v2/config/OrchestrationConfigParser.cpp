@@ -1309,6 +1309,7 @@ namespace llaminar2
         // Preserve the order in which categories appear in --help.
         spec.addCategory("Model Configuration")
             .addCategory("Inference Configuration")
+            .addCategory("Serving Configuration")
             .addCategory("Sampling Configuration")
             .addCategory("Chat Configuration")
             .addCategory("Benchmark Configuration")
@@ -1493,8 +1494,44 @@ namespace llaminar2
             .long_name = "--batch-size",
             .category = "Inference Configuration",
             .value_label = "<n>",
-            .description = "Batch size (default: 1)",
+            .description = "Request batch slots for non-serving modes (default: 1). Serve sizes concurrent requests with --serving-resident-slots instead.",
             .setter = setters::parseInt(&OrchestrationConfig::batch_size, "--batch-size"),
+        });
+        spec.add({
+            .long_name = "--serving-resident-slots",
+            .category = "Serving Configuration",
+            .value_label = "<n>",
+            .description = "Authored resident execution slots S (design §9.4): S > 1 serves requests concurrently with continuous batching (serve only; the runner admits S request slots). Exact, never auto-reduced. Supply with --serving-response-leases and --serving-queue-capacity, or omit all three for the automatic capacity-one pool.",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value)
+                {
+                    config.serving_resident_slots = parsePositiveIntValue(
+                        value, "--serving-resident-slots");
+                }),
+        });
+        spec.add({
+            .long_name = "--serving-response-leases",
+            .category = "Serving Configuration",
+            .value_label = "<n>",
+            .description = "Authored maximum response/output leases R (design §9.4, R >= S + Q): sizes the HTTP response pool. Exact, never auto-reduced. Supply with --serving-resident-slots and --serving-queue-capacity, or omit all three for the automatic capacity-one pool.",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value)
+                {
+                    config.serving_response_leases = parsePositiveIntValue(
+                        value, "--serving-response-leases");
+                }),
+        });
+        spec.add({
+            .long_name = "--serving-queue-capacity",
+            .category = "Serving Configuration",
+            .value_label = "<n>",
+            .description = "Authored queue/preparing capacity Q (design §9.4, zero allowed): requests waiting for a resident slot; admission beyond S + Q answers 503. Exact, never auto-reduced. Supply with --serving-resident-slots and --serving-response-leases, or omit all three for the automatic capacity-one pool.",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value)
+                {
+                    config.serving_queue_capacity = parseNonNegativeIntValue(
+                        value, "--serving-queue-capacity");
+                }),
         });
         spec.add({
             .long_name = "--threads",
@@ -3747,6 +3784,18 @@ namespace llaminar2
             else if (key == "batch_size")
             {
                 config.batch_size = parsePositiveIntValue(value, key);
+            }
+            else if (key == "serving_resident_slots")
+            {
+                config.serving_resident_slots = parsePositiveIntValue(value, key);
+            }
+            else if (key == "serving_response_leases")
+            {
+                config.serving_response_leases = parsePositiveIntValue(value, key);
+            }
+            else if (key == "serving_queue_capacity")
+            {
+                config.serving_queue_capacity = parseNonNegativeIntValue(value, key);
             }
             else if (key == "hostfile" || key == "mpi_hostfile")
             {

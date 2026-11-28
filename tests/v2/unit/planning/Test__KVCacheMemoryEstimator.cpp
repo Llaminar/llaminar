@@ -37,6 +37,50 @@ namespace
     }
 } // namespace
 
+/** @test Every existing native codec separates per-page payload from its request-wide basis. */
+TEST(Test__KVCacheMemoryEstimator, NativePagedPayloadKeepsRequestBasisOutsideFrames)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto family : {KVCacheFamily::AttentionOnly, KVCacheFamily::Hybrid})
+    for (const auto codec : {"fp32", "fp16", "bf16", "q8_1", "q16_1", "tq4", "tq"})
+    for (const int dimension : {64, 128, 256})
+    {
+        const bool tq = std::string(codec) == "tq4" || std::string(codec) == "tq";
+        if ((tq && family == KVCacheFamily::Hybrid) || (std::string(codec) == "q16_1" && device.is_gpu()))
+        {
+            EXPECT_THROW(KVNativeStorageLayout::resolve(family, 3, dimension, codec, device), std::invalid_argument);
+            continue;
+        }
+        const auto layout = KVNativeStorageLayout::resolve(family, 3, dimension, codec, device);
+        const bool anchored = tq || (std::string(codec) == "q8_1" &&
+            (device.is_cpu() || family == KVCacheFamily::AttentionOnly));
+        EXPECT_EQ(layout.basis_scope, anchored ? KVKeyBasisScope::RequestFirstSerialKey : KVKeyBasisScope::None);
+        EXPECT_EQ(layout.request_basis_bytes, anchored ? 3u * dimension * sizeof(float) : 0u);
+        const auto page = layout.pagePayload(16);
+        const auto archive = layout.archivePayload(32);
+        EXPECT_EQ(archive.k_bytes, 2 * page.k_bytes + layout.request_basis_bytes);
+        EXPECT_EQ(archive.v_bytes, 2 * page.v_bytes);
+        for (const int live : {1, 15, 16, 17, 33})
+        {
+            const auto payload = layout.pagePayload(live);
+            EXPECT_EQ(payload.k_bytes, static_cast<size_t>(live) * layout.key_position_bytes);
+            EXPECT_EQ(payload.v_bytes, static_cast<size_t>(live) * layout.value_position_bytes);
+        }
+        EXPECT_THROW(layout.pagePayload(0), std::invalid_argument);
+    }
+}
+
+/** @test Native factory retains existing token parsing and rejects unknown geometry before payload access. */
+TEST(Test__KVCacheMemoryEstimator, NativeStorageLayoutRejectsInvalidGeometry)
+{
+    EXPECT_EQ(parseKVStorageFormat("TQ8"), parseKVStorageFormat("tq"));
+    EXPECT_EQ(parseKVStorageFormat("FP32"), KVStorageFormat::FP32);
+    EXPECT_THROW(parseKVStorageFormat("automatic-fallback"), std::invalid_argument);
+    EXPECT_THROW(KVNativeStorageLayout::resolve(KVCacheFamily::AttentionOnly, 0, 64, "fp32", DeviceId::cpu()), std::invalid_argument);
+    EXPECT_THROW(KVNativeStorageLayout::resolve(KVCacheFamily::AttentionOnly, 1, 32, "q8_1", DeviceId::cpu()), std::invalid_argument);
+    EXPECT_THROW(KVNativeStorageLayout::resolve(static_cast<KVCacheFamily>(99), 1, 64, "fp32", DeviceId::cpu()), std::invalid_argument);
+}
+
 TEST(Test__KVCacheMemoryEstimator, CPUFP16OwnsOnlyKeyAndValueHorizons)
 {
     const std::size_t expected =

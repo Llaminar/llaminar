@@ -7,6 +7,7 @@
  * No loader/model/backend startup, device execution, fake provider or ledger.
  */
 #include "loaders/HostImmutableRowProvider.h"
+#include "utils/HostPageSize.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <cstring>
@@ -23,6 +24,8 @@ using Provider = HostImmutableRowProvider;
 static_assert(std::is_same_v<decltype(std::declval<const HostImmutableRowOwnerObservation &>().authority()),
     const std::shared_ptr<const PhysicalMemoryAuthority> &>);
 using Storage = ImmutableRowStorage;
+
+
 using Cache = CpuAdaptiveImmutableRowCache;
 using Geometry = CpuAdaptiveImmutableRowCacheGeometry;
 const PhysicalMemoryAllocatorIdentity hostId{0, DeviceId::cpu()};
@@ -45,6 +48,27 @@ struct NativeFile
         path = name;
         source = {.path = path, .tensor_name = "fixture.ple", .file_offset = 37,
             .rows = 128, .row_elements = 160, .format = GGUFTensorType::IQ4_NL};
+        // Extend source.rows so that at least one row straddles the host
+        // page boundary (64 KiB on the Station). The row bytes come from the
+        // production format computation for IQ4_NL with 160 row_elements.
+        {
+            ImmutableRowTableExtent extent = ImmutableRowTableExtent::fromNative(
+                source.format, source.rows, source.rowBytes());
+            (void)extent;  // just to validate the format/rows combination
+        }
+        // Compute row_bytes the same way the production code does.
+        // IQ4_NL: 160 row_elements → the production tensorBytes() gives the
+        // total. row_bytes = tensorBytes / rows.
+        const std::size_t provisional_tensor_bytes =
+            source.tensorBytes();  // computed with current rows=128
+        const std::size_t row_bytes = provisional_tensor_bytes / 128;
+        const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+        const std::size_t start = source.file_offset;
+        const std::size_t boundary = ((start / page) + 1) * page;
+        const std::size_t crossing_row = (boundary - start) / row_bytes;
+        const std::size_t needed_rows = crossing_row + 2;
+        if (needed_rows > source.rows)
+            source.rows = needed_rows;
         original.resize(source.file_offset + source.tensorBytes());
         for (std::size_t i = 0; i < original.size(); ++i) original[i] = std::byte((i * 13 + i / 31) % 251);
         if (::write(fd, original.data(), original.size()) != static_cast<ssize_t>(original.size()))
@@ -55,6 +79,22 @@ struct NativeFile
     }
     /** @brief Source metadata remains present until all provider handles in the test retire. */
     ~NativeFile() { if (fd >= 0) ::close(fd); ::unlink(path.c_str()); }
+
+    /** @brief The first row index whose byte range straddles a host page boundary. */
+    std::size_t crossingRow() const
+    {
+        const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+        const std::size_t row_bytes = source.rowBytes();
+        const std::size_t start = source.file_offset;
+        const std::size_t boundary = ((start / page) + 1) * page;
+        return (boundary - start) / row_bytes;
+    }
+
+    /** @brief Whether the crossing row exists within the authored extent. */
+    bool hasCrossingRow() const
+    {
+        return crossingRow() < source.rows;
+    }
 };
 /** @return Existing adaptive host-domain proof, including legal hosted GPU consumers. */
 Geometry geometry(const NativeFile &file, std::size_t slots = 2)
@@ -64,7 +104,7 @@ Geometry geometry(const NativeFile &file, std::size_t slots = 2)
         ImmutableRowTableExtent::fromNative(file.source.format, file.source.rows, file.source.rowBytes()),
         ImmutableRowTableTiers::of(tiers), ImmutableRowTableResidency::Adaptive,
         {{{hostId, Storage::RAM}, 0, slots, {}}}, {{0, DeviceId::cuda(0)}}, {},
-        {{hostId, ImmutableRowTableStoragePolicy::forStorage(Storage::MemoryMapped, 4096, 2)}});
+        {{hostId, ImmutableRowTableStoragePolicy::forStorage(Storage::MemoryMapped, hostPageBytes(), 2)}});
     return Geometry::fromLayout(layout, hostId, 8);
 }
 /** @return Sole actual PMA for the supplied complete source-owned plan. */
@@ -76,7 +116,7 @@ std::shared_ptr<PhysicalMemoryAuthority> memory(const PhysicalMemoryPlan &plan)
 std::unique_ptr<ImmutableRowTable> whole(const NativeFile &file, Storage storage,
     std::shared_ptr<PhysicalMemoryAuthority> &authority)
 {
-    const auto policy = ImmutableRowTableStoragePolicy::forStorage(storage, 4096, 2);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(storage, hostPageBytes(), 2);
     PhysicalMemoryPlanBuilder plan;
     plan.add(hostResource(), PhysicalMemoryOwner::ImmutableTableStorage, ImmutableRowTable::physicalBytes(file.source, policy));
     authority = memory(plan.build());
@@ -178,7 +218,7 @@ TEST(HostImmutableRowProvider, FailuresPreserveOriginalOwnerValidationAndRejectN
     for (auto mode : modes)
     {
         NativeFile file; std::shared_ptr<PhysicalMemoryAuthority> authority; auto service = provider(file, mode, authority);
-        const std::array<std::int64_t, 2> bad{0, 128}, good{0, 45}; std::array<std::byte, 180> out;
+        const std::array<std::int64_t, 2> bad{0, static_cast<std::int64_t>(file.source.rows)}, good{0, file.crossingRow()}; std::array<std::byte, 180> out;
         out.fill(std::byte{0x63}); const auto before = out;
         EXPECT_THROW(service->gather(bad, out), std::out_of_range); EXPECT_EQ(out, before);
         const auto observation = service->gather(good, out); expectRows(file, good, out);
@@ -237,7 +277,7 @@ TEST(HostImmutableRowProvider, RetainedOwnerObservationUsesOnlyActualWholeOwnerL
     NativeFile file;
     for (auto storage : {Storage::RAM, Storage::MemoryMapped})
     {
-        const auto policy = ImmutableRowTableStoragePolicy::forStorage(storage, 4096, 2);
+        const auto policy = ImmutableRowTableStoragePolicy::forStorage(storage, hostPageBytes(), 2);
         const auto expected = ImmutableRowTable::physicalBytes(file.source, policy);
         PhysicalMemoryPlanBuilder plan;
         plan.add(hostResource(), PhysicalMemoryOwner::ImmutableTableStorage, expected + 4096);

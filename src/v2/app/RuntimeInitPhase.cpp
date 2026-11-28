@@ -350,6 +350,7 @@ namespace llaminar2
                 config = OrchestrationConfigParser{}.parseArgs(argc, argv);
                 config.benchmark_mode = config.benchmark_mode || benchmark;
                 config.serve_mode = config.serve_mode || serve;
+                config.bindServingCapacityToRunnerSlots(config.serve_mode);
                 if (config.model_path.empty())
                     throw std::invalid_argument("Model path required (-m)");
 
@@ -382,6 +383,8 @@ namespace llaminar2
                 // source/measurement/selection/publication lifecycle.
                 auto startup = AutomaticPlanningStartup::run(config, *cluster, mpi_ctx, prepare_);
                 config = std::move(startup.applied);
+                // Planning re-derives placement; serving slots keep one authority.
+                config.bindServingCapacityToRunnerSlots(config.serve_mode);
                 if (startup.root_selection)
                 {
                     const auto &selected = *startup.root_selection;

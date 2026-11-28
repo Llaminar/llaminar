@@ -25,10 +25,13 @@
  * OpenMP initial thread's single-place mask and compete with model service.
  */
 
+#include "app/modes/ServingBatchDriver.h"
+#include "app/modes/ServingResponseLeasePool.h"
 #include "app/modes/ServerMode.h"
 #include "app/modes/ServerRankMembership.h"
 #include "app/modes/ServerExecutionEvidence.h"
 #include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/SSEPublishChannel.h"
 #include "app/modes/SerializedInferenceExecutor.h"
 #include "app/modes/HttpServiceThreadAffinity.h"
 #include "app/modes/HttpProcessStats.h"
@@ -437,7 +440,12 @@ namespace llaminar2
     void configureInferenceHttpServer(httplib::Server &server,
                                       const SerializedInferenceExecutor &executor)
     {
-        server.new_task_queue = [workers = executor.httpWorkerCount()] {
+        configureInferenceHttpServer(server, executor.httpWorkerCount());
+    }
+
+    void configureInferenceHttpServer(httplib::Server &server, std::size_t workers)
+    {
+        server.new_task_queue = [workers] {
             return std::make_unique<httplib::ThreadPool>(workers).release();
         };
         // A completed connection releases HTTP ownership. Inference thread
@@ -454,9 +462,30 @@ namespace llaminar2
         return server.listen_after_bind();
     }
 
+    InferenceQueueStatsSource serializedInferenceQueueStats(const SerializedInferenceExecutor &executor)
+    {
+        return std::make_shared<std::function<json()>>([&executor] {
+            const auto queue = executor.snapshot();
+            return json{{"mode", "serialized"}, {"capacity", queue.capacity}, {"admitted", queue.admitted},
+                        {"queued", queue.queued}, {"active", queue.active}};
+        });
+    }
+
     void registerRuntimeStatsEndpoint(httplib::Server &server,
                                       ChatCompletionHandler &handler,
                                       const SerializedInferenceExecutor &executor,
+                                      std::string model_name, json description,
+                                      HttpResponseObserver response_observer,
+                                      std::shared_ptr<HttpProcessStats> process_stats)
+    {
+        registerRuntimeStatsEndpoint(server, handler, serializedInferenceQueueStats(executor),
+                                     std::move(model_name), std::move(description),
+                                     std::move(response_observer), std::move(process_stats));
+    }
+
+    void registerRuntimeStatsEndpoint(httplib::Server &server,
+                                      ChatCompletionHandler &handler,
+                                      InferenceQueueStatsSource queue_stats,
                                       std::string model_name, json description,
                                       HttpResponseObserver response_observer,
                                       std::shared_ptr<HttpProcessStats> process_stats)
@@ -478,17 +507,15 @@ namespace llaminar2
         server.Options("/stats", [](const httplib::Request &, httplib::Response &response) {
             response.status = 204;
         });
-        server.Get("/stats", [&handler, &executor, model_name = std::move(model_name),
+        server.Get("/stats", [&handler, queue_stats, model_name = std::move(model_name),
                               description = std::move(description), process_stats = std::move(process_stats)](
                                const httplib::Request &, httplib::Response &response) {
             auto result = handler.runtimeStats();
-            const auto queue = executor.snapshot();
             result["model"] = model_name;
             result["topology"] = description.at("topology");
             result["configuration"] = description.at("configuration");
             result["resources"] = process_stats->snapshot();
-            result["inference_queue"] = {{"capacity", queue.capacity}, {"admitted", queue.admitted},
-                                         {"queued", queue.queued}, {"active", queue.active}};
+            result["inference_queue"] = (*queue_stats)();
             response.set_header("Cache-Control", "no-store");
             response.set_content(result.dump(), "application/json");
         });
@@ -567,24 +594,127 @@ namespace llaminar2
                          if (stream_observer) stream_observer(req, streamed_response_body);
 
                          // SSE streaming response
+                         // §10.1 INDEPENDENT WRITERS (v52, accepted channel):
+                         // run() is ONLY the producer (enqueue, no socket); the
+                         // httplib PROVIDER THREAD is the network writer (drains,
+                         // owns every sink.write). The WRITER LIFECYCLE is a
+                         // NONCOPYABLE owner/state allocated BEFORE the producer
+                         // launch (no unowned thread on any throw), close+join
+                         // exactly once, and the terminal verdict joins the
+                         // producer outcome with the transport outcome: an
+                         // exception mid-stream can never falsely Drain.
+                         auto retained_admission = admission;
+                         auto stream_request = std::move(*parsed_request);
+                         // QUEUED-PAYLOAD WINDOW QUOTA (PROVISIONAL POLICY):
+                         // max_entries = response-limit tokens x 2 (reasoning and
+                         // answer can both publish per token) + a provisional
+                         // framing-line allowance (role/finish/usage/DONE/tool-
+                         // flush). This is an honest provisional quota policy:
+                         // exact handler publication geometry is an OPEN
+                         // derivation — NOT certified. Bytes are UNBOUNDED here
+                         // (no guessed per-token byte constant; physical/admitted
+                         // byte authority (PMA-backed output window) is a
+                         // separate open admission piece, NOT claimed).
+                         auto channel = std::make_shared<SSEPublishChannel>(
+                             SSEPublishChannelBudget::forRequest(
+                                 stream_request.max_tokens));
+                         auto transport_open = std::make_shared<std::atomic<bool>>(true);
+                         auto writer_finished = std::make_shared<std::atomic<bool>>(false);
+                         auto writer_failed = std::make_shared<std::atomic<bool>>(false);
+                         auto producer_error = std::make_shared<std::exception_ptr>(nullptr);
+                         struct SSEWriterLifecycle
+                         {
+                             std::shared_ptr<SSEPublishChannel> channel;
+                             std::shared_ptr<std::atomic<bool>> retired;
+                             std::unique_ptr<std::thread> producer;
+                             SSEWriterLifecycle(std::shared_ptr<SSEPublishChannel> ch)
+                                 : channel(std::move(ch)),
+                                   retired(std::make_shared<std::atomic<bool>>(false)) {}
+                             ~SSEWriterLifecycle()
+                             {
+                                 if (!retired->exchange(true))
+                                 {
+                                     channel->close();
+                                     if (producer && producer->joinable())
+                                         producer->join();
+                                 }
+                             }
+                             SSEWriterLifecycle(const SSEWriterLifecycle &) = delete;
+                             SSEWriterLifecycle &operator=(const SSEWriterLifecycle &) = delete;
+                         };
+                         // OWNER/STATE FIRST (retired flag + channel ownership);
+                         // the thread is installed into it only afterwards, so a
+                         // failed launch never leaves an unowned joinable thread.
+                         auto lifecycle = std::make_shared<SSEWriterLifecycle>(channel);
+                         lifecycle->producer = std::make_unique<std::thread>(
+                             [&handler, producer_error, retained_admission, channel, transport_open,
+                              stream_request = std::move(stream_request), arrival] mutable {
+                                 try
+                                 {
+                                     retained_admission->run([&] {
+                                         auto enqueue = [channel, transport_open](const std::string &line) -> bool
+                                         {
+                                             if (!transport_open->load())
+                                                 return false;
+                                             return channel->push(line);
+                                         };
+                                         return handler.publishStreamingRequest(stream_request, enqueue, arrival);
+                                     });
+                                 }
+                                 catch (...)
+                                 {
+                                     *producer_error = std::current_exception();
+                                 }
+                                 channel->close();
+                             });
                          res.set_chunked_content_provider(
                              "text/event-stream",
-                             [&handler,
-                              admission = std::move(admission),
-                              request = std::move(*parsed_request),
-                              streamed_response_body, arrival](size_t /*offset*/, httplib::DataSink &sink) -> bool
+                             [channel, transport_open, writer_finished, writer_failed,
+                              streamed_response_body](size_t /*offset*/, httplib::DataSink &sink) -> bool
                              {
-                                 auto chunk_cb = [&sink, streamed_response_body](const std::string &sse_line) -> bool
+                                 for (;;)
                                  {
+                                     auto line = channel->popOrClosed();
+                                     if (!line)
+                                         break;
                                      if (streamed_response_body)
-                                         streamed_response_body->append(sse_line);
-                                     return sink.write(sse_line.c_str(), sse_line.size());
-                                 };
-
-                                 admission->run([&] { return handler.publishStreamingRequest(request, chunk_cb, arrival); });
-
+                                         streamed_response_body->append(*line);
+                                     if (!sink.write(line->c_str(), line->size()))
+                                     {
+                                         writer_failed->store(true);
+                                         transport_open->store(false);
+                                         channel->close();
+                                         return false;
+                                     }
+                                 }
                                  sink.done();
+                                 writer_finished->store(true);
                                  return true;
+                             },
+                             [retained_admission, lifecycle, transport_open,
+                              writer_finished, writer_failed, producer_error](bool native_success)
+                             {
+                                 if (!lifecycle->retired->exchange(true))
+                                 {
+                                     transport_open->store(false);
+                                     lifecycle->channel->close();
+                                     if (lifecycle->producer && lifecycle->producer->joinable())
+                                         lifecycle->producer->join();
+                                 }
+                                 // Join the PRODUCER outcome with the TRANSPORT
+                                 // outcome: an exception mid-stream (truncated or
+                                 // empty output with successful native framing)
+                                 // must never be reported as Drained. Fatal
+                                 // invalid-state/join semantics are NOT
+                                 // suppressed here (no try/catch around close or
+                                 // join); only the terminal verdict is computed
+                                 // without throwing.
+                                 const bool producer_ok =
+                                     (producer_error == nullptr || *producer_error == nullptr);
+                                 const bool writer_ok =
+                                     writer_finished->load() && !writer_failed->load();
+                                 retained_admission->publicationTerminal(
+                                     native_success && writer_ok && producer_ok);
                              });
                      }
                      else
@@ -592,8 +722,187 @@ namespace llaminar2
                          // Non-streaming response
                          auto response = admission->run([&] { return handler.handleRequest(*parsed_request, arrival); });
                          res.status = response.http_status;
-                         res.set_content(response.json_body, "application/json");
+                         // §10.1 TERMINAL OWNERSHIP (S2): the body is handed to the
+                         // transport as a ONE-SHOT provider, so the reservation is
+                         // RETAINED through write_response_core and the typed close runs
+                         // at the provider boundary only when the body write was
+                         // accepted. A rejected write leaves the reservation on the
+                         // honest abandoned path (destructor release) — never a
+                         // fabricated success close.
+                         const auto body = std::make_shared<std::string>(response.json_body);
+                         // The reservation is RETAINED through the transport write
+                         // (captured by the provider). NON-CHUNKED VERDICT: the close
+                         // runs inside the provider, gated on the accepted body write;
+                         // a rejected write leaves the honest abandoned path.
+                         res.set_content_provider(
+                             "application/json",
+                             [admission = std::move(admission), body](size_t, httplib::DataSink &sink) -> bool
+                             {
+                                 if (!sink.write(body->data(), body->size()))
+                                     return false;
+                                 sink.done();
+                                 admission->publicationInFlight();
+                                 admission->publicationDetached();
+                                 admission->publicationFinished();
+                                 return true;
+                             },
+                             [](bool) {});
                      }
+                 });
+    }
+
+    /**
+     * @brief Chat endpoint for continuous batching.
+     *
+     * Each request runs its chat handler on its own thread; generation goes
+     * through the handler's batched lane into the runner-owned serving
+     * session, so concurrent requests share execution. Admission takes a
+     * PMA-backed response lease from @p leases (R responses, S + Q executing);
+     * beyond that the server answers 503 without queueing.
+     */
+    void registerBatchedChatCompletionEndpoint(
+        httplib::Server &server, ChatCompletionHandler &handler, ServingResponseLeasePool &leases,
+        HttpStreamObserver stream_observer, std::function<std::string()> serving_failure)
+    {
+        server.Post("/v1/chat/completions",
+                 [&handler, &leases, stream_observer = std::move(stream_observer),
+                  serving_failure = std::move(serving_failure)](
+                     const httplib::Request &req, httplib::Response &res)
+                 {
+                     if (const auto failure = serving_failure(); !failure.empty())
+                     {
+                         res.status = 503;
+                         res.set_content(json{{"error", {{"message", failure}, {"type", "server_error"},
+                             {"code", "serving_failed"}}}}.dump(), "application/json");
+                         return;
+                     }
+                     const HttpRequestArrival arrival;
+                     ChatCompletionResponse parse_error;
+                     auto parsed_request = ChatCompletionHandler::parseRequest(req.body, parse_error);
+                     if (!parsed_request)
+                     {
+                         res.status = parse_error.http_status;
+                         res.set_content(parse_error.json_body, "application/json");
+                         return;
+                     }
+                     // Response lease (R) + execution claim (S + Q); the last
+                     // owner (handler call or streaming producer) releases it.
+                     auto admitted = leases.tryAcquire();
+                     if (!admitted)
+                     {
+                         res.status = 503;
+                         res.set_content(json{{"error", {{"message", "Inference request capacity is full"},
+                             {"type", "server_busy"}, {"code", "inference_queue_full"}}}}.dump(),
+                             "application/json");
+                         return;
+                     }
+
+                     if (!parsed_request->stream)
+                     {
+                         // Non-streaming clients are never written to while
+                         // waiting: probe the socket so a disconnect cancels.
+                         auto cancellation = std::make_shared<ServingRequestCancellation>();
+                         cancellation->setConnectionProbe(req.is_connection_closed);
+                         ServingBatchDriver::RequestScope scope(cancellation, admitted);
+                         const auto response = handler.handleRequest(*parsed_request, arrival);
+                         res.status = response.http_status;
+                         res.set_content(response.json_body, "application/json");
+                         return;
+                     }
+
+                     auto streamed_response_body = traceAccessLoggingEnabled()
+                                                       ? std::make_shared<std::string>()
+                                                       : nullptr;
+                     if (stream_observer) stream_observer(req, streamed_response_body);
+                     auto stream_request = std::move(*parsed_request);
+                     // Producer line + queued lines + the writer's in-flight
+                     // line stay within the per-response budget the PMA
+                     // serving pool committed: the handler splits text into
+                     // deltas of at most kMaxEventBytes, and a slow reader
+                     // blocks only its own producer (and so its grants).
+                     auto budget = SSEPublishChannelBudget::forRequest(stream_request.max_tokens);
+                     budget.max_buffered_bytes = SSEPublishChannelBudget::queuedBytesWithin(
+                         static_cast<std::size_t>(ServingPoolPerResponseBudget::defaultPolicy().bytes_per_response));
+                     auto channel = std::make_shared<SSEPublishChannel>(budget);
+                     auto transport_open = std::make_shared<std::atomic<bool>>(true);
+                     // The producer runs the handler; the provider thread is the
+                     // only socket writer. Closing the channel or the transport
+                     // retires the producer, which cancels its serving request.
+                     // Transport close cancels the serving request at once,
+                     // even while it is queued or waiting for its consumer.
+                     auto cancellation = std::make_shared<ServingRequestCancellation>();
+                     auto producer = std::make_shared<std::thread>(
+                         [&handler, channel, transport_open, admitted, arrival, cancellation,
+                          stream_request = std::move(stream_request)]() mutable {
+                             ServingBatchDriver::RequestScope scope(cancellation, admitted);
+                             try
+                             {
+                                 auto enqueue = [channel, transport_open](const std::string &line) -> bool {
+                                     return transport_open->load() && channel->push(line);
+                                 };
+                                 (void)handler.publishStreamingRequest(stream_request, enqueue, arrival);
+                             }
+                             catch (const std::exception &error)
+                             {
+                                 LOG_ERROR("[Server] batched streaming request failed: " << error.what());
+                             }
+                             channel->close();
+                         });
+                     res.set_chunked_content_provider(
+                         "text/event-stream",
+                         [channel, transport_open, cancellation, streamed_response_body](size_t, httplib::DataSink &sink) -> bool {
+                             // Idle polls between SSE keep-alive comments (10 s).
+                             constexpr int kHeartbeatPolls = 50;
+                             int idle_polls = 0;
+                             for (;;)
+                             {
+                                 std::string line;
+                                 const auto status =
+                                     channel->popOrClosedFor(std::chrono::milliseconds(200), line);
+                                 if (status == SSEPublishChannel::PopStatus::Closed)
+                                     break;
+                                 // While the request waits (queued, prefilling or
+                                 // paced) probe the client (writability plus a
+                                 // socket liveness peek) so a disconnect frees
+                                 // its slot without waiting for the next token,
+                                 // and periodically send an SSE comment, which a
+                                 // reset connection turns into a write error.
+                                 bool alive = true;
+                                 if (status == SSEPublishChannel::PopStatus::Line)
+                                 {
+                                     idle_polls = 0;
+                                     alive = sink.write(line.c_str(), line.size());
+                                 }
+                                 else if (++idle_polls >= kHeartbeatPolls)
+                                 {
+                                     idle_polls = 0;
+                                     static constexpr char kHeartbeat[] = ": keep-alive\n\n";
+                                     alive = sink.write(kHeartbeat, sizeof(kHeartbeat) - 1);
+                                 }
+                                 else
+                                 {
+                                     alive = sink.is_writable();
+                                 }
+                                 if (!alive)
+                                 {
+                                     transport_open->store(false);
+                                     cancellation->cancel();
+                                     channel->close();
+                                     return false;
+                                 }
+                                 if (status == SSEPublishChannel::PopStatus::Line && streamed_response_body)
+                                     streamed_response_body->append(line);
+                             }
+                             sink.done();
+                             return true;
+                         },
+                         [producer, channel, transport_open, cancellation](bool) {
+                             transport_open->store(false);
+                             cancellation->cancel();
+                             channel->close();
+                             if (producer->joinable())
+                                 producer->join();
+                         });
                  });
     }
 
@@ -701,15 +1010,89 @@ namespace llaminar2
         // Extract model name from path for response metadata
         std::string model_name = std::filesystem::path(config.model_path).stem().string();
 
-        ChatCompletionHandler handler(*runner, *tokenizer, model_name);
-        SerializedInferenceExecutor inference_executor;
+        ChatCompletionHandler handler(*runner, *tokenizer, model_name,
+            config.paged_kv_tiers.retention_classes_ceiling);
+        // Adopted §9.4: one resolved serving capacity backs the execution response
+        // pool. Automatic intent preserves the existing accepted-response
+        // semantics (active + queued <= kDefaultCapacity); authored intent is
+        // exact and rejected when the installed envelope cannot serve it.
+        std::optional<ResolvedServingCapacity> resolved_capacity;
+        try
+        {
+            resolved_capacity.emplace(resolveInstalledServingCapacity(config.servingCapacityRequest()));
+        }
+        catch (const std::invalid_argument &error)
+        {
+            std::cerr << "Serving capacity admission failed: " << error.what() << "\n";
+            runner->shutdownMPIWorkers();
+            runner->shutdown();
+            return 1;
+        }
+        // PMA-RESERVED SERVING POOL CAPACITY (REQUIRED): serving requires the
+        // runner's published physical-memory authority. A missing authority is a
+        // fatal startup diagnostic — production never runs an unbacked pool and
+        // never falls back. The executor additionally requires the admitted
+        // ServingResponsePool owner line (exact typed demand; addServingPoolDemand
+        // in the memory plan) and reserves the capacity there (typed-layout
+        // materialization belongs to the real serving-engine slice).
+        const auto serving_memory_authority = runner->physicalMemoryAuthority();
+        if (!serving_memory_authority)
+        {
+            LOG_ERROR("Server mode requires the runner's physical-memory authority; "
+                      "refusing to start with an unbacked serving pool.");
+            runner->shutdownMPIWorkers();
+            runner->shutdown();
+            flushPerfStatsFromEnv();
+            return 1;
+        }
+        // One response-storage authority per serving mode, both committing the
+        // admitted ServingResponsePool owner line: S = 1 serializes on the
+        // executor's stable worker; S > 1 (continuous batching) admits against
+        // PMA-backed response leases and per-slot decision storage.
+        const int batch_capacity = resolved_capacity->residentSlots();
+        // Serving rows serve every resolved S (including S = 1) wherever the
+        // runner provides them; the serialized executor remains only for
+        // topologies without serving rows yet (GPU, MTP, hybrid, multi-rank).
+        const bool serving_rows = !mpi_coordinated && runner->servingBatchCapacity() >= batch_capacity;
+        if (batch_capacity > 1 &&
+            (mpi_coordinated || runner->servingBatchCapacity() < batch_capacity))
+        {
+            // Authored S > 1 is exact: never silently serialize requests.
+            LOG_ERROR("--serving-resident-slots " << batch_capacity
+                      << " requests continuous batching, which is unavailable: "
+                      << (mpi_coordinated ? std::string("multi-rank continuous batching is not implemented yet")
+                          : runner->servingBatchCapacity() > 0
+                              ? "the runner admitted " + std::to_string(runner->servingBatchCapacity()) + " request slots"
+                              : runner->servingBatchUnsupportedReason()));
+            if (mpi_coordinated)
+                runner->shutdownMPIWorkers();
+            runner->shutdown();
+            flushPerfStatsFromEnv();
+            return 1;
+        }
+        PerfStatsCollector::addCounter("server", "serving_path", 1.0, "startup", {},
+                                       {{"path", serving_rows ? "serving_rows" : "serialized"},
+                                        {"resident_slots", std::to_string(batch_capacity)}});
+        if (!serving_rows)
+            LOG_INFO("Serving path: serialized executor (" << (mpi_coordinated ? std::string("multi-rank")
+                                                                              : runner->servingBatchUnsupportedReason())
+                                                           << ")");
+        std::optional<SerializedInferenceExecutor> serialized_executor;
+        std::unique_ptr<ServingResponseLeasePool> response_leases;
+        if (serving_rows)
+            response_leases = std::make_unique<ServingResponseLeasePool>(
+                *resolved_capacity, serving_memory_authority, ServingPoolPerResponseBudget::defaultPolicy(),
+                ServingSlotDecisionGeometry::forVocabulary(runner->vocabSize()));
+        else
+            serialized_executor.emplace(*resolved_capacity, serving_memory_authority,
+                                        ServingPoolPerResponseBudget::defaultPolicy());
         httplib::Server svr;
         g_server_ptr = &svr;
         RequestLogState request_log_state;
 
         // The dedicated worker retains model/OpenMP ownership. HTTP waiters
         // cannot consume the capacity reserved for passive control requests.
-        configureInferenceHttpServer(svr, inference_executor);
+        configureInferenceHttpServer(svr, static_cast<std::size_t>(servingHttpWorkerCount(*resolved_capacity)));
 
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);
@@ -740,9 +1123,17 @@ namespace llaminar2
                     });
 
         // ─── GET /health ─────────────────────────────────────────────
-        svr.Get("/health", [](const httplib::Request &, httplib::Response &res)
+        // Fatal serving policy: a failed continuous-batching session keeps the
+        // process up but reports 503 on /health and inference, so the
+        // operator's supervisor restarts it. Installed below when batching.
+        auto serving_failure = std::make_shared<std::function<std::string()>>([] { return std::string{}; });
+        svr.Get("/health", [serving_failure](const httplib::Request &, httplib::Response &res)
                 {
-            json response = {{"status", "ok"}};
+            const auto failure = (*serving_failure)();
+            json response = failure.empty() ? json{{"status", "ok"}}
+                                             : json{{"status", "failed"}, {"reason", failure}};
+            if (!failure.empty())
+                res.status = 503;
             res.set_content(response.dump(), "application/json"); });
 
         // ─── GET /v1/models ──────────────────────────────────────────
@@ -755,7 +1146,11 @@ namespace llaminar2
         if (runner->executionPlan().runtime.prefix_cache.enabled &&
             runner->executionPlan().runtime.prefix_cache.disk_budget_bytes != 0)
             process_options.filesystems.push_back(runner->executionPlan().runtime.prefix_cache.disk_dir);
-        registerRuntimeStatsEndpoint(svr, handler, inference_executor, model_name,
+        // The serving mode chosen below replaces this source before listening.
+        auto queue_stats = serialized_executor
+            ? serializedInferenceQueueStats(*serialized_executor)
+            : std::make_shared<std::function<json()>>([] { return json::object(); });
+        registerRuntimeStatsEndpoint(svr, handler, queue_stats, model_name,
             serverRuntimeDescription(runner->executionPlan(), runner->config(), mpi_ctx->world_size()),
             [&request_log_state](const httplib::Request &req, const httplib::Response &res) {
                 logServedRequest(req, res, request_log_state);
@@ -781,10 +1176,61 @@ namespace llaminar2
 
         // ─── POST /v1/chat/completions ───────────────────────────────
 
-        registerChatCompletionEndpoint(svr, handler, inference_executor,
-            [&request_log_state](const httplib::Request &request, std::shared_ptr<std::string> body) {
-                request_log_state.attachStreamedResponseBody(request, std::move(body));
-            });
+        // Continuous batching (§9.4): resolved resident slots S > 1 run every
+        // chat request concurrently through the runner-owned serving session;
+        // one driver thread owns it. S = 1 keeps the serialized executor.
+        std::unique_ptr<ServingBatchDriver> batch_driver;
+        auto stream_observer = [&request_log_state](const httplib::Request &request, std::shared_ptr<std::string> body) {
+            request_log_state.attachStreamedResponseBody(request, std::move(body));
+        };
+        if (serving_rows)
+        {
+            // The decision store is materialized from the committed serving
+            // pool (one FP32 vocabulary row per resident slot).
+            batch_driver = std::make_unique<ServingBatchDriver>(
+                *runner, batch_capacity, config.max_seq_len,
+                response_leases->claimDecisionStorage(
+                    ServingSlotDecisionGeometry::forVocabulary(runner->vocabSize()).bytesFor(batch_capacity)));
+            // Install lanes (and snapshot request metadata) before the driver
+            // thread owns the runner.
+            handler.setGenerationLaneFactory(
+                [driver = batch_driver.get()] { return driver->makeLane(); },
+                [driver = batch_driver.get()](const std::function<void(IOrchestrationRunner &)> &access) {
+                    driver->call(access);
+                });
+            std::string batch_error;
+            if (!batch_driver->start(batch_error))
+            {
+                LOG_ERROR("Continuous-batching session failed to open: " << batch_error);
+                runner->shutdown();
+                flushPerfStatsFromEnv();
+                return 1;
+            }
+            *serving_failure = [driver = batch_driver.get()] { return driver->failure(); };
+            registerBatchedChatCompletionEndpoint(svr, handler, *response_leases, stream_observer,
+                                                  [driver = batch_driver.get()] { return driver->failure(); });
+            *queue_stats = [leases = response_leases.get(), driver = batch_driver.get()] {
+                const auto lease_state = leases->snapshot();
+                const auto occupancy = driver->occupancy();
+                return json{{"mode", "continuous_batching"},
+                            {"response_leases", lease_state.response_leases},
+                            {"responses", lease_state.responses},
+                            {"execution_capacity", lease_state.execution_capacity},
+                            {"executing", lease_state.executing},
+                            {"resident_slots", driver->capacity()},
+                            {"active", occupancy.resident}, {"queued", occupancy.queued},
+                            {"committed_bytes", lease_state.committed_bytes},
+                            {"materialized_bytes", lease_state.materialized_bytes}};
+            };
+            LOG_INFO("Serving rows (continuous batching): S=" << batch_capacity << " resident slots, R="
+                     << resolved_capacity->responseLeases() << " response leases, Q="
+                     << resolved_capacity->queueCapacity() << " (PMA serving pool "
+                     << response_leases->snapshot().committed_bytes << " bytes)");
+        }
+        else
+        {
+            registerChatCompletionEndpoint(svr, handler, *serialized_executor, stream_observer);
+        }
 
         // Bind the socket before announcing readiness. cpp-httplib combines
         // bind(2) and listen(2) in bind_to_port(), then listen_after_bind()
@@ -800,6 +1246,8 @@ namespace llaminar2
             }
             if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
+            if (batch_driver)
+                batch_driver->stop(); // the driver thread must stop using the runner first
             runner->shutdown();
             flushPerfStatsFromEnv();
             return 1;
@@ -831,6 +1279,8 @@ namespace llaminar2
                 LOG_ERROR("Server stopped unexpectedly while serving on " << serve_endpoint);
                 if (mpi_coordinated)
                     runner->shutdownMPIWorkers();
+                if (batch_driver)
+                    batch_driver->stop(); // the driver thread must stop using the runner first
                 runner->shutdown();
                 flushPerfStatsFromEnv();
                 return 1;
@@ -839,7 +1289,12 @@ namespace llaminar2
 
         // All HTTP workers have drained their responses. Join inference before
         // retiring model/MPI owners; no maintenance or GPU cancellation occurs.
-        inference_executor.shutdown();
+        if (batch_driver)
+            batch_driver->stop();
+        if (response_leases)
+            response_leases->close();
+        if (serialized_executor)
+            serialized_executor->shutdown();
         LOG_INFO("Server shut down.");
         g_server_ptr = nullptr;
 

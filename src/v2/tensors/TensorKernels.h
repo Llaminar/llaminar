@@ -15,6 +15,7 @@
 #pragma once
 #include "kernels/FloatingActivationOperandPrecision.h"
 #include "kernels/common/Q8ResidualCorrection.h"
+#include "kernels/PagedKVSnapshotRef.h"
 #include "kernels/common/OriginalOutputSlice.h"
 #include "kernels/common/GatedRMSNormProjection.h"
 #include "kernels/CPUSharedGDNSnapshots.h"
@@ -2181,6 +2182,82 @@ namespace llaminar2
         }
 
         /**
+         * @brief Compute one CPU decode row through a POOLED paged snapshot (P2).
+         *
+         * The pooled snapshot is the table's immutable publication for one
+         * request; this entry computes attention against the snapshot pages
+         * directly (no contiguous adapter, no full-history gather). Default
+         * fails closed: a backend without the pooled entry refuses rather than
+         * silently substituting another path (plan P2 exit).
+         * @return True on success; false on unsupported backend (never a
+         * silent ring-cache substitution).
+         */
+        virtual bool compute_pooled_snapshot_decoder(
+            const ITensor *Q, const PagedKVReadView &paged_view,
+            ITensor *output, int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int window_size, int position_offset, int head_start,
+            int gqa_n_rep, const attention::AttentionExecutionPolicy &policy)
+        {
+            (void)Q;
+            (void)paged_view;
+            (void)output;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)position_offset;
+            (void)head_start;
+            (void)gqa_n_rep;
+            (void)policy;
+            return false;
+        }
+
+        /**
+         * @brief Compute grouped pooled decode rows, one per request (P2).
+         *
+         * A grouped pooled decode graph carries N live requests in ONE forward:
+         * each row r owns its own pooled publication. This entry consumes the
+         * whole per-request paged-view descriptor set through one grouped API
+         * and preserves each request's ordinary serial-decode math (design
+         * §13.2 "ordinary grouped decode remains genuinely grouped"). Row-local
+         * internal loops inside the implementation are allowed; calling
+         * `compute_pooled_snapshot_decoder()` once per request at the stage
+         * layer is NOT — it would turn the production graph into a row-replay
+         * loop crossing the polymorphic dispatch path per request.
+         *
+         * @param Q Row-major query tensor `[request_count, q_dim]`.
+         * @param paged_views One exact pooled paged view per request (distinct
+         *        publications; never the same view twice).
+         * @param positions One logical decode position per request (publication
+         *        row count - 1; the publication is the authority).
+         * @param output Row-major output tensor matching @p Q.
+         * @return true only when the grouped pooled implementation executed.
+         */
+        virtual bool compute_pooled_request_batch_decoder(
+            const ITensor *Q, const PagedKVReadView *const *paged_views,
+            const int *positions, ITensor *output, int request_count,
+            int n_heads, int n_kv_heads, int head_dim, bool causal,
+            int window_size, int head_start, int gqa_n_rep,
+            const attention::AttentionExecutionPolicy &policy)
+        {
+            (void)Q;
+            (void)paged_views;
+            (void)positions;
+            (void)output;
+            (void)request_count;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)head_start;
+            (void)gqa_n_rep;
+            (void)policy;
+            return false;
+        }
+
+        /**
          * @brief Compute independent request-batched decode rows from per-request KV views.
          *
          * A request batch does not share one contiguous KV history: request
@@ -2204,6 +2281,9 @@ namespace llaminar2
          *        callers use an all-zero element for a compact tensor rather
          *        than omitting ownership information.
          * @param output Row-major output tensor matching @p Q.
+         * @param query_rows_by_request Optional real query rows per request for
+         *        ragged host batches: request r attends only its first
+         *        `query_rows_by_request[r]` rows; its padding rows are zeroed.
          * @return true only when the grouped implementation executed.
          */
         virtual bool compute_request_batch_decode_equivalent(
@@ -2224,8 +2304,10 @@ namespace llaminar2
             int head_start = 0,
             int gqa_n_rep = 0,
             const attention::AttentionExecutionPolicy &execution_policy = {},
-            const attention::AttentionKVLogicalView *kv_logical_views = nullptr)
+            const attention::AttentionKVLogicalView *kv_logical_views = nullptr,
+            const int *query_rows_by_request = nullptr)
         {
+            (void)query_rows_by_request;
             (void)Q;
             (void)K_by_request;
             (void)V_by_request;
@@ -3896,6 +3978,20 @@ namespace llaminar2
         }
 
         /**
+         * @brief Bind serving-row states: request r of the next request-batched
+         *        call reads and advances @p states[r] in place (no request bank,
+         *        no request-zero mirror). Null unbinds.
+         *
+         * Continuous-batching rows address persistent per-slot state, so a
+         * request's state never depends on which other slots share the call.
+         * @return false when the kernel cannot address external states.
+         */
+        virtual bool bindServingRowStates(const std::vector<float *> *states)
+        {
+            return states == nullptr;
+        }
+
+        /**
          * @brief Return true if this kernel can isolate live conv state per request.
          *
          * Batched MTP verifier publication is only correct when every request
@@ -4487,6 +4583,20 @@ namespace llaminar2
         {
             (void)workspace;
             (void)state_size;
+        }
+
+        /**
+         * @brief Bind serving-row states: request r of the next request-batched
+         *        call reads and advances @p states[r] in place (no request bank,
+         *        no request-zero mirror). Null unbinds.
+         *
+         * Continuous-batching rows address persistent per-slot state, so a
+         * request's state never depends on which other slots share the call.
+         * @return false when the kernel cannot address external states.
+         */
+        virtual bool bindServingRowStates(const std::vector<float *> *states)
+        {
+            return states == nullptr;
         }
 
         /**

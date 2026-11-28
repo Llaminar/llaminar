@@ -536,7 +536,8 @@ namespace llaminar2
                     PrefixCacheStorageMode::Device;
             if (device.is_gpu() &&
                 (owns_host_prefix_tier ||
-                 cfg.weight_load_staging.host_bytes != 0u || profile.flash_next.has_value()))
+                 cfg.weight_load_staging.host_bytes != 0u || profile.flash_next.has_value() ||
+                 request.serving_pool_demand_bytes.has_value()))
             {
                 // DeviceId::cpu() is the rank-local allocator used by runtime
                 // owners. NUMA affinity may be unbound or a sparse physical ID;
@@ -831,6 +832,20 @@ namespace llaminar2
                 input.weight_load_staging.host_bytes=input.native_weight_load_staging
                     ? input.native_weight_load_staging->physical_bytes:0;
             }
+        }
+        // EXACTLY ONE designated serving-pool host owner per rank: the CPU
+        // config when the plan has one, otherwise the rank's first device
+        // config. This keeps the ServingResponsePool owner line admitted once
+        // per rank (never once per GPU/TP config, whose host builders share
+        // the same rank-local host resource).
+        if (request.serving_pool_demand_bytes && !device_configs.empty())
+        {
+            DevicePlanConfig *owner = nullptr;
+            for (auto &cfg : device_configs)
+                if (cfg.device.is_cpu()) { owner = &cfg; break; }
+            if (!owner)
+                owner = &device_configs.front();
+            owner->serving_pool_demand_bytes = request.serving_pool_demand_bytes;
         }
         return device_configs;
     }

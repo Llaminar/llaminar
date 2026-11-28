@@ -27,6 +27,9 @@
 namespace llaminar2
 {
     class PhysicalMemoryAuthority;
+    class PhysicalPagePool;
+    class CPUStoragePlacement;
+    struct PhysicalPagePoolGeometry;
     class GPUDeviceProcessLifetime;
     class RetainedHostServiceUseToken;
     class RetainedHostServiceDeclarations;
@@ -1121,6 +1124,16 @@ namespace llaminar2
         [[nodiscard]] std::size_t plannedBytes(
             DeviceId device,
             PhysicalMemoryOwner owner) const;
+
+        /**
+         * @brief Issue a CPU page suballocation authority over fully charged backing and metadata.
+         * @param device Original rank-local CPU allocator identity.
+         * @param geometry Exact immutable page and bounded request geometry.
+         * @param placement Explicit first-touch policy for every pool root.
+         * @return Canonical logical grant owner; no public independent constructor exists.
+         */
+        [[nodiscard]] std::shared_ptr<PhysicalPagePool> createCPUPagePool(DeviceId device,
+            PhysicalPagePoolGeometry geometry, const CPUStoragePlacement &placement);
 
         /**
          * @brief Claim a newly allocated local CPU/GPU region.

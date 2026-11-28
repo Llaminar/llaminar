@@ -131,6 +131,37 @@ llaminar_require_onednn_origin("${GIT_PROGRAM}" "${PROBE_SOURCE}" "${EXPECTED_OR
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(config.read_bytes(), before)
 
+    def test_origin_authentication_accepts_native_gitfile(self) -> None:
+        """An explicitly owned gitfile remains valid without ancestor discovery."""
+        origin = self.initialize_origin()
+        metadata = self.root / "source-metadata"
+        (self.source / ".git").rename(metadata)
+        (self.source / ".git").write_text(f"gitdir: {metadata}\n")
+        before = (metadata / "config").read_bytes()
+        result = self.probe_origin(origin)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((metadata / "config").read_bytes(), before)
+
+    def test_origin_authentication_rejects_matching_ancestor(self) -> None:
+        """The original native probe accepts an ancestor; the authority must not."""
+        origin = "https://example.invalid/lifecycle-fixture.git"
+        subprocess.run([GIT, "init", "--quiet", str(self.root)], check=True)
+        subprocess.run([GIT, "-C", str(self.root), "remote", "add", "origin", origin], check=True)
+        config = self.root / ".git/config"
+        before = config.read_bytes()
+        original = subprocess.run(
+            [GIT, "-C", str(self.source), "remote", "get-url", "origin"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(original.returncode, 0, original.stdout)
+        self.assertEqual(original.stdout.strip(), origin)
+        result = self.probe_origin(origin)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("oneDNN origin authentication failed", result.stdout)
+        self.assertIn("not a git repository", result.stdout)
+        self.assertEqual(config.read_bytes(), before)
+        self.assertTrue((self.source / "CMakeLists.txt").exists())
+        self.assertFalse((self.source / ".git").exists())
+
     def test_origin_mismatch_preserves_existing_source_and_configuration(self) -> None:
         """A wrong origin rejects rather than recursively deleting user source/builds."""
         self.initialize_origin()

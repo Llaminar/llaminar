@@ -1,0 +1,179 @@
+/**
+ * @file ServingPoolMemoryDemand.h
+ * @brief Typed physical-memory demand for the accepted serving response pool.
+ *
+ * The serving capacity contract (design §9.4) bounds accepted response leases,
+ * resident slots and queue capacity. Their hosting state (pool records,
+ * delivery staging and detached-response retention) is real host memory, so
+ * the capacity must be admitted by the same authority as every other
+ * allocation (PhysicalMemoryAuthority / PhysicalMemoryBOM): this header is
+ * the typed estimator input that converts one resolved serving capacity into
+ * the exact owner charge. PRODUCTION state: MemoryPlanner writes the
+ * ServingResponsePool line directly from servingPoolMemoryDemand-computed
+ * bytes (the runner/candidate BOM gates); the addServingPoolDemand helper
+ * below is the BOM-builder path (tests/future aggregate builders). The
+ * candidate-admission and MoE pipeline/overlay aggregate wiring is still
+ * INCOMPLETE (recorded open) — no all-entrypoints claim is made here.
+ */
+
+#pragma once
+
+#include "execution/config/ServingCapacity.h"
+#include "planning/PhysicalMemoryBOM.h"
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+
+namespace llaminar2
+{
+    /** @brief Per-accepted-response hosting budget for the serving pool. */
+    struct ServingPoolPerResponseBudget
+    {
+        /** @brief Bytes admitted per accepted response lease (pool record + retained delivery staging). */
+        std::uint64_t bytes_per_response = 0;
+
+        /** @brief Starting POLICY default for the per-response hosting budget.
+         *
+         *  One accepted response lease hosts the pool record plus its detached
+         *  delivery staging (bounded response window). This is a policy input to
+         *  the typed BOM estimation — the value is expected to become plan/
+         *  configuration-derived; it is a starting default, not certified
+         *  geometry. */
+        [[nodiscard]] static ServingPoolPerResponseBudget defaultPolicy()
+        {
+            return ServingPoolPerResponseBudget{64 * 1024};
+        }
+    };
+
+    /**
+     * @brief Geometry of the per-slot decision state of continuous batching.
+     *
+     * Serving rows retain each resident slot's next-decision full-vocabulary
+     * FP32 logits between shared forwards (a paced request may wait for its
+     * grant). Planning prices one row per slot (S >= 1) because the serving
+     * path is chosen after admission; the serialized S = 1 executor, which
+     * decides from the runner's own logits, prices none (unset vocabulary).
+     */
+    struct ServingSlotDecisionGeometry
+    {
+        std::uint64_t vocab_size = 0;
+
+        /**
+         * @brief Geometry of a model's vocabulary; zero leaves it unset, which
+         *        prices capacity-one serving but rejects S > 1 (bytesFor()).
+         * @throws std::invalid_argument For a negative vocabulary.
+         */
+        [[nodiscard]] static ServingSlotDecisionGeometry forVocabulary(int vocab_size)
+        {
+            if (vocab_size < 0)
+                throw std::invalid_argument("Serving slot decision geometry requires a nonnegative vocabulary");
+            return ServingSlotDecisionGeometry{static_cast<std::uint64_t>(vocab_size)};
+        }
+
+        /**
+         * @return Retained decision-logits bytes for @p resident_slots slots.
+         * @throws std::invalid_argument For S > 1 without a vocabulary.
+         */
+        [[nodiscard]] std::uint64_t bytesFor(int resident_slots) const
+        {
+            if (resident_slots <= 0)
+                return 0;
+            const auto slots = static_cast<std::uint64_t>(resident_slots);
+            if (vocab_size == 0)
+            {
+                if (resident_slots == 1)
+                    return 0; // serialized capacity-one executor: no retained rows
+                throw std::invalid_argument("Serving slot decision geometry is unset");
+            }
+            if (vocab_size > std::numeric_limits<std::uint64_t>::max() / sizeof(float) / slots)
+                throw std::overflow_error("Serving slot decision storage overflows uint64");
+            return slots * vocab_size * sizeof(float);
+        }
+    };
+
+    /**
+     * @brief Compute the exact serving-pool physical demand for one resolved capacity.
+     *
+     * The pool hosts one budgeted region per accepted response lease (the
+     * response bound R already covers resident slots plus queue capacity by
+     * the §9.4 invariant). The result is the single typed BOM charge for
+     * @ref PhysicalMemoryOwner::ServingResponsePool; it is never recomputed
+     * elsewhere.
+     *
+     * @param capacity Resolved serving capacity (R/S/Q, already envelope-checked).
+     * @param budget Typed per-response hosting budget.
+     * @return Exact total demand in bytes.
+     * @throws std::invalid_argument For a non-positive budget.
+     * @throws std::overflow_error When the demand cannot be represented.
+     */
+    [[nodiscard]] inline std::uint64_t servingPoolMemoryDemand(
+        const ResolvedServingCapacity &capacity,
+        const ServingPoolPerResponseBudget &budget,
+        const ServingSlotDecisionGeometry &slots)
+    {
+        if (budget.bytes_per_response == 0)
+            throw std::invalid_argument("Serving pool per-response budget must be positive");
+        const auto leases = static_cast<std::uint64_t>(capacity.responseLeases());
+        if (leases == 0)
+            throw std::invalid_argument("Serving pool response leases must be positive");
+        if (budget.bytes_per_response >
+            std::numeric_limits<std::uint64_t>::max() / leases)
+            throw std::overflow_error("Serving pool memory demand overflows uint64");
+        const std::uint64_t responses = budget.bytes_per_response * leases;
+        const std::uint64_t decisions = slots.bytesFor(capacity.residentSlots());
+        if (decisions > std::numeric_limits<std::uint64_t>::max() - responses)
+            throw std::overflow_error("Serving pool memory demand overflows uint64");
+        return responses + decisions;
+    }
+
+    /**
+     * @brief FAIL-CLOSED serving-pool demand decision for one rank (BOM gate).
+     *
+     * Serving requires a SEALED request authority before BOM admission:
+     *   - not serving           -> no demand;
+     *   - serving, UNSEALED     -> fatal (never a silent non-owner);
+     *   - serving, rank != owner-> no demand (follower, no pool charge);
+     *   - serving, rank == owner-> the exact typed demand.
+     * The runner's seal phase engages the authority beforehand; the runner BOM
+     * gate calls this helper as the single decision point (candidate/MoE
+     * aggregate wiring remains open — no all-entrypoints claim).
+     * @throws std::logic_error When serving is selected without a sealed
+     *         request authority.
+     */
+    [[nodiscard]] inline std::optional<std::uint64_t> servingPoolDemandForRank(
+        bool serve_mode,
+        const std::optional<int> &sealed_authority,
+        int rank,
+        const ServingCapacityRequest &request,
+        const ServingSlotDecisionGeometry &slots,
+        const ServingPoolPerResponseBudget &budget = ServingPoolPerResponseBudget::defaultPolicy())
+    {
+        if (!serve_mode)
+            return std::nullopt;
+        if (!sealed_authority)
+            throw std::logic_error(
+                "Serve mode requires a sealed request authority before BOM admission");
+        if (rank != *sealed_authority)
+            return std::nullopt; // follower rank: no serving pool charge
+        return servingPoolMemoryDemand(resolveInstalledServingCapacity(request), budget, slots);
+    }
+
+    /**
+     * @brief Charge one serving pool demand on a physical-memory BOM builder.
+     *  The builder is the sole charge authority; this helper writes the owner
+     *  line through the builder API. The PRODUCTION ordinary path writes the
+     *  same typed bytes directly in MemoryPlanner; candidate-admission and MoE
+     *  pipeline/overlay aggregate wiring is still INCOMPLETE (open).
+     */
+    inline void addServingPoolDemand(PhysicalMemoryBOMBuilder &builder,
+                                     const ResolvedServingCapacity &capacity,
+                                     const ServingPoolPerResponseBudget &budget,
+                                     const ServingSlotDecisionGeometry &slots)
+    {
+        builder.add(PhysicalMemoryOwner::ServingResponsePool,
+                    servingPoolMemoryDemand(capacity, budget, slots));
+    }
+} // namespace llaminar2

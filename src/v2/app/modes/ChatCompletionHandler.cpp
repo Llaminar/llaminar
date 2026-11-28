@@ -25,6 +25,7 @@
  */
 
 #include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/StreamingDeltaFragments.h"
 #include "app/modes/MoEMovementLedgerJson.h"
 #include "app/modes/PrefixMovementJson.h"
 #include "execution/runner/IOrchestrationRunner.h"
@@ -34,6 +35,7 @@
 #include "utils/Logger.h"
 #include "utils/ToolCallParser.h"
 #include "nlohmann/json.hpp"
+#include "execution/prefix_cache/RetentionIntentResolver.h"
 
 #include <algorithm>
 #include <cctype>
@@ -134,43 +136,6 @@ namespace llaminar2
             return value.dump(/*indent=*/-1, /*indent_char=*/' ', /*ensure_ascii=*/false,
                               json::error_handler_t::replace);
         }
-
-        GenerationResult decodeStepWithBudget(IOrchestrationRunner &runner, int max_tokens)
-        {
-            struct BudgetGuard
-            {
-                IOrchestrationRunner &runner;
-                ~BudgetGuard() { runner.setDecodeStepTokenBudget(0); }
-            };
-
-            runner.setDecodeStepTokenBudget(max_tokens);
-            BudgetGuard guard{runner};
-            return runner.decodeStep();
-        }
-
-        class RequestCacheCleanup
-        {
-        public:
-            explicit RequestCacheCleanup(IOrchestrationRunner &runner) : runner_(runner) {}
-            ~RequestCacheCleanup() noexcept
-            {
-                try
-                {
-                    runner_.clearCache();
-                }
-                catch (const std::exception &e)
-                {
-                    LOG_WARN("[ChatCompletion] request cleanup failed: " << e.what());
-                }
-                catch (...)
-                {
-                    LOG_WARN("[ChatCompletion] request cleanup failed with unknown exception");
-                }
-            }
-
-        private:
-            IOrchestrationRunner &runner_;
-        };
 
         const char *boolString(bool value)
         {
@@ -580,10 +545,32 @@ namespace llaminar2
 
     ChatCompletionHandler::ChatCompletionHandler(
         IOrchestrationRunner &runner, ITokenizer &tokenizer,
-        const std::string &model_name)
+        const std::string &model_name,
+        std::optional<RetentionClass> retention_ceiling)
         : runtime_stats_(runner.prefixCacheTelemetrySources()),
-          runner_(runner), tokenizer_(tokenizer), model_name_(model_name)
+          runner_(runner), tokenizer_(tokenizer), model_name_(model_name),
+          retention_ceiling_(retention_ceiling)
     {
+    }
+
+    bool ChatCompletionHandler::runMaintenanceOnRunnerThread(uint64_t committed_tokens)
+    {
+        // Continuous batching: the serving driver runs maintenance once per
+        // shared step on the runner's thread; no per-request round-trip.
+        if (lane_factory_)
+            return true;
+        bool ok = true;
+        withRunner([&](IOrchestrationRunner &runner) {
+            ok = runChatMoERebalanceMaintenance(runner, committed_tokens);
+        });
+        return ok;
+    }
+
+    std::unique_ptr<IRequestGenerationLane> ChatCompletionHandler::makeGenerationLane()
+    {
+        if (lane_factory_)
+            return lane_factory_();
+        return std::make_unique<DirectGenerationLane>(runner_);
     }
 
     ChatCompletionResponse ChatCompletionHandler::handleUnhandledRequestException(
@@ -593,7 +580,8 @@ namespace llaminar2
         LOG_ERROR("[ChatCompletion] " << phase << " failed with unhandled exception: " << detail);
         try
         {
-            runner_.clearCache();
+            if (!lane_factory_)
+                runner_.clearCache();
         }
         catch (const std::exception &cleanup_error)
         {
@@ -823,6 +811,41 @@ namespace llaminar2
         // Model identifier (optional, echoed back in response)
         if (body.contains("model"))
             request.model = body["model"].get<std::string>();
+
+        // §8.4 standard retention fields: exact typed parse with precise
+        // invalid_request_error for a mistyped or unsupported value (never a
+        // silent remap; absent value -> code-owned default class).
+        for (const auto *field : {"prompt_cache_retention", "prompt_cache_key"})
+        {
+            if (!body.contains(field)) continue;
+            if (!body[field].is_string())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", std::string(field) + " must be a string"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+        }
+        if (body.contains("prompt_cache_retention"))
+            request.prompt_cache_retention =
+                body["prompt_cache_retention"].get<std::string>();
+        if (body.contains("prompt_cache_key"))
+            request.prompt_cache_key = body["prompt_cache_key"].get<std::string>();
+        // The VALUE is validated here against the code-owned class map (the
+        // operator ceiling is applied by the config owner when the retention
+        // owner is admitted; no ceiling at this layer).
+        {
+            const auto resolution = RetentionIntentResolver{std::nullopt}.resolve(
+                request.prompt_cache_retention, request.prompt_cache_key);
+            if (!resolution.ok())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", resolution.refusal}, {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+        }
 
         // Sampling parameters — track which fields the client explicitly specified.
         // Fields not set by the client will be filled in from model-recommended defaults
@@ -1063,25 +1086,28 @@ namespace llaminar2
     bool ChatCompletionHandler::thinkingEnabled(const ChatCompletionRequest &request) const
     {
         return request.enable_thinking.value_or(
-            runner_.getDefaultThinkingMode() == ThinkingMode::Enabled);
+            (metadata_ ? metadata_->default_thinking : runner_.getDefaultThinkingMode()) == ThinkingMode::Enabled);
     }
 
     int ChatCompletionHandler::setupInference(
+        IRequestGenerationLane &lane,
         const ChatCompletionRequest &request,
         ChatCompletionResponse &error_out,
         std::vector<int32_t> &input_ids,
         HttpRuntimeStats::Request &observation)
     {
-        // Clear KV cache for fresh conversation
-        runner_.clearCache();
+        // Fresh generation state for this request
+        lane.beginRequest();
 
         // Per-field merge of model-recommended defaults: the model defaults apply to
         // any field the client did NOT explicitly set. Use the loaded revision
         // and the same reasoning mode as the template: architecture-only defaults
         // incorrectly penalize Qwen3.8's thinking continuations.
         SamplingParams effective = request.sampling;
-        SamplingParams model_defaults = runner_.getRecommendedSamplingParams(
-            thinkingEnabled(request) ? ThinkingMode::Enabled : ThinkingMode::Disabled);
+        SamplingParams model_defaults = metadata_
+            ? (thinkingEnabled(request) ? metadata_->recommended_thinking : metadata_->recommended_plain)
+            : runner_.getRecommendedSamplingParams(
+                  thinkingEnabled(request) ? ThinkingMode::Enabled : ThinkingMode::Disabled);
         const auto &set_ = request.sampling_set;
 
         if (!set_.temperature)
@@ -1119,7 +1145,7 @@ namespace llaminar2
 
         try
         {
-            runner_.setSamplingParams(effective);
+            lane.setSamplingParams(effective);
         }
         catch (const UnsupportedMTPSamplingRequest &error)
         {
@@ -1141,7 +1167,10 @@ namespace llaminar2
          * authority that clips a transaction after later verifier rows have
          * already mutated KV or recurrent state.
          */
-        runner_.setStopTokens(tokenizer_.stop_tokens());
+        {
+            const auto stop_tokens = tokenizer_.stop_tokens();
+            lane.setStopTokens(std::vector<int32_t>(stop_tokens.begin(), stop_tokens.end()));
+        }
 
         // Encode with chat template (pass tools for tool-aware templates)
         const json admitted_tools = admittedToolDefinitions(request);
@@ -1191,10 +1220,10 @@ namespace llaminar2
 
         const auto prefill_start = SteadyClock::now();
         observation.prefillStarted(prefill_start);
-        if (!runner_.prefill(input_ids))
+        if (!lane.prefill(input_ids))
         {
             error_out.http_status = 500;
-            json err = {{"error", {{"message", std::string("Prefill failed: ") + runner_.lastError()}, {"type", "server_error"}}}};
+            json err = {{"error", {{"message", std::string("Prefill failed: ") + lane.lastError()}, {"type", "server_error"}}}};
             error_out.json_body = dumpJsonForHttp(err);
             return -1;
         }
@@ -1228,10 +1257,12 @@ namespace llaminar2
             observation.fail(response.http_status);
             return response;
         }
-        RequestCacheCleanup request_cleanup(runner_);
+        // The lane owns this request's generation state and retires it.
+        const auto lane_owner = makeGenerationLane();
+        IRequestGenerationLane &lane = *lane_owner;
         std::vector<int32_t> input_ids;
 
-        int prompt_tokens = setupInference(request, response, input_ids, observation);
+        int prompt_tokens = setupInference(lane, request, response, input_ids, observation);
         if (prompt_tokens < 0)
         {
             observation.fail(response.http_status);
@@ -1284,7 +1315,7 @@ namespace llaminar2
         // Pre-tokenize stop-thinking prompt if budget is active
         if (thinking_budget_active)
         {
-            std::string stop_prompt = runner_.getStopThinkingPrompt();
+            std::string stop_prompt = (metadata_ ? metadata_->stop_thinking_prompt : runner_.getStopThinkingPrompt());
             if (!stop_prompt.empty())
             {
                 /*
@@ -1335,7 +1366,7 @@ namespace llaminar2
                 step_forced = true;
                 const int32_t forced_token = stop_thinking_tokens[stop_thinking_idx++];
                 const auto forced_start = SteadyClock::now();
-                GenerationResult result = runner_.forceDecodeToken(forced_token);
+                GenerationResult result = lane.forceDecodeToken(forced_token);
                 if (traceGeneratedTokensEnabled())
                 {
                     LOG_INFO("[ChatCompletion/trace] forceDecodeToken token="
@@ -1362,7 +1393,7 @@ namespace llaminar2
                 const int remaining = effective_max_tokens - completion_tokens;
                 const int step_budget = thinking_budget_active ? 1 : remaining;
                 const auto decode_start = SteadyClock::now();
-                GenerationResult result = decodeStepWithBudget(runner_, step_budget);
+                GenerationResult result = lane.decodeStep(step_budget);
                 if (traceGeneratedTokensEnabled())
                 {
                     LOG_INFO("[ChatCompletion/trace] decodeStep budget="
@@ -1469,17 +1500,16 @@ namespace llaminar2
 
             if (!step_tokens.empty())
             {
-                if (!runChatMoERebalanceMaintenance(
-                        runner_, step_tokens.size()))
+                if (!runMaintenanceOnRunnerThread(step_tokens.size()))
                     return rebalance_error();
             }
         }
 
         observation.decodeFinished();
-        runner_.flushStageTimeline();
+        lane.flushStageTimeline();
         // Read once after the terminal result, before RAII request cleanup.
         // Logging and the opt-in response see the same immutable outcome.
-        const auto runtime_summary = runner_.requestRuntimeSummary();
+        const auto runtime_summary = lane.requestRuntimeSummary();
         logRuntimeStateSummary(runtime_summary, "non-streaming");
 
         // HTTP and SSE share marker decisions, including token-split closes;
@@ -1491,7 +1521,7 @@ namespace llaminar2
         bool has_tool_calls = false;
         if (toolCallParsingEnabled(request))
         {
-            ToolCallFormat format = runner_.getToolCallFormat();
+            ToolCallFormat format = (metadata_ ? metadata_->tool_call_format : runner_.getToolCallFormat());
             tool_result = parseToolCalls(content, format, admittedToolDefinitions(request));
             has_tool_calls = tool_result.hasToolCalls();
             if (has_tool_calls)
@@ -1549,15 +1579,18 @@ namespace llaminar2
         if (request.runtime_output == CompletionRuntimeOutput::Include)
         {
             json_response["runtime_summary"] = runtimeSummaryJson(runtime_summary);
-            json_response["runtime_summary"]["expert_optimization"] =
-                moeOptimizationStatusJson(runner_.moeOptimizationStatus());
+            // Mutable runner state is read on the runner's owning thread.
             // This is an immutable, already-published ledger, not a request
             // reset or maintenance join. Keep it out of routine INFO logging:
             // only an explicit terminal representation pays the copy cost.
-            json_response["runtime_summary"]["expert_movement"] =
-                moeMovementLedgerJson(runner_.moeOptimizationMovementLedger());
-            json_response["runtime_summary"]["expert_movement_topology"] =
-                moeMovementTopologyJson(runner_.moeOptimizationMovementTopology());
+            withRunner([&](IOrchestrationRunner &runner) {
+                json_response["runtime_summary"]["expert_optimization"] =
+                    moeOptimizationStatusJson(runner.moeOptimizationStatus());
+                json_response["runtime_summary"]["expert_movement"] =
+                    moeMovementLedgerJson(runner.moeOptimizationMovementLedger());
+                json_response["runtime_summary"]["expert_movement_topology"] =
+                    moeMovementTopologyJson(runner.moeOptimizationMovementTopology());
+            });
         }
 
         response.ok = true;
@@ -1608,10 +1641,12 @@ namespace llaminar2
             observation.fail(response.http_status);
             return response;
         }
-        RequestCacheCleanup request_cleanup(runner_);
+        // The lane owns this request's generation state and retires it.
+        const auto lane_owner = makeGenerationLane();
+        IRequestGenerationLane &lane = *lane_owner;
         std::vector<int32_t> input_ids;
 
-        int prompt_tokens = setupInference(request, response, input_ids, observation);
+        int prompt_tokens = setupInference(lane, request, response, input_ids, observation);
         if (prompt_tokens < 0)
         {
             observation.fail(response.http_status);
@@ -1648,11 +1683,15 @@ namespace llaminar2
             std::string sse_line = "data: " + dumpJsonForHttp(chunk) + "\n\n";
             return chunk_cb(sse_line);
         };
-        auto emit_chunk = [&](const json &delta, const char *finish_reason) -> bool
+        auto emit_one_chunk = [&](const json &delta, const char *finish_reason) -> bool
         {
             json choice = {{"index", 0}, {"delta", delta},
                            {"finish_reason", finish_reason ? json(finish_reason) : json(nullptr)}};
-            const bool delivered = emit_payload(json::array({choice}), nullptr);
+            return emit_payload(json::array({choice}), nullptr);
+        };
+        auto emit_chunk = [&](const json &delta, const char *finish_reason) -> bool
+        {
+            const bool delivered = streaming_detail::publishDeltaFragments(delta, finish_reason, emit_one_chunk);
             if (delivered && (delta.contains("content") || delta.contains("reasoning_content") ||
                               delta.contains("tool_calls")))
                 observation.outputPublished();
@@ -1695,7 +1734,7 @@ namespace llaminar2
         // only answer content can become an executable model-native call.
         const bool has_tools = toolCallParsingEnabled(request);
         const ToolCallFormat tool_format = has_tools
-            ? runner_.getToolCallFormat()
+            ? (metadata_ ? metadata_->tool_call_format : runner_.getToolCallFormat())
             : ToolCallFormat::NONE;
         StreamingToolCallSplitter tool_splitter(tool_format, admittedToolDefinitions(request));
         StreamingUtf8Text utf8_text;
@@ -1773,7 +1812,7 @@ namespace llaminar2
 
         if (thinking_budget_active)
         {
-            std::string stop_prompt = runner_.getStopThinkingPrompt();
+            std::string stop_prompt = (metadata_ ? metadata_->stop_thinking_prompt : runner_.getStopThinkingPrompt());
             if (!stop_prompt.empty())
             {
                 /*
@@ -1826,7 +1865,7 @@ namespace llaminar2
                 step_forced = true;
                 const int32_t forced_token = stop_thinking_tokens[stop_thinking_idx++];
                 const auto forced_start = SteadyClock::now();
-                GenerationResult result = runner_.forceDecodeToken(forced_token);
+                GenerationResult result = lane.forceDecodeToken(forced_token);
                 if (traceGeneratedTokensEnabled())
                 {
                     LOG_INFO("[ChatCompletion/trace] stream forceDecodeToken token="
@@ -1866,7 +1905,7 @@ namespace llaminar2
                           ChatCompletionHandler::
                               kStreamingPublicationWindowTokens);
                 const auto decode_start = SteadyClock::now();
-                GenerationResult result = decodeStepWithBudget(runner_, step_budget);
+                GenerationResult result = lane.decodeStep(step_budget);
                 if (traceGeneratedTokensEnabled())
                 {
                     LOG_INFO("[ChatCompletion/trace] stream decodeStep budget="
@@ -1900,8 +1939,7 @@ namespace llaminar2
                 step_complete = result.is_complete;
             }
 
-            if (!runChatMoERebalanceMaintenance(
-                    runner_, step_tokens.size()))
+            if (!runMaintenanceOnRunnerThread(step_tokens.size()))
                 return emit_rebalance_error();
 
             committed_tokens += static_cast<int>(step_tokens.size());
@@ -2022,8 +2060,8 @@ namespace llaminar2
             emit_tool_events(tool_splitter.flush());
 
         observation.decodeFinished();
-        runner_.flushStageTimeline();
-        const auto runtime_summary = runner_.requestRuntimeSummary();
+        lane.flushStageTimeline();
+        const auto runtime_summary = lane.requestRuntimeSummary();
         logRuntimeStateSummary(runtime_summary, "streaming");
 
         if (!client_connected)
@@ -2107,6 +2145,24 @@ namespace llaminar2
         auto request = parseRequest(json_body, error);
         if (!request)
             return error;
+
+        // §8.4/P0 §4: the operator ceiling is enforced HERE, at HTTP request
+        // admission — a request whose retention class exceeds the configured
+        // ceiling receives a precise invalid_request_error before any
+        // inference work (never a deep pool refusal after acceptance).
+        if (retention_ceiling_.has_value())
+        {
+            const auto resolution = RetentionIntentResolver{retention_ceiling_}.resolve(
+                request->prompt_cache_retention, request->prompt_cache_key);
+            if (!resolution.ok())
+            {
+                error.ok = false;
+                error.http_status = 400;
+                error.json_body = dumpJsonForHttp({{"error", {
+                    {"message", resolution.refusal}, {"type", "invalid_request_error"}}}});
+                return error;
+            }
+        }
 
         if (request->stream && stream_cb)
             return handleStreamingRequest(*request, stream_cb);

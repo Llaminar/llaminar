@@ -23,6 +23,7 @@
 #include "kernels/common/SamplingMath.h"
 #include "transfer/TransferEngine.h"
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -132,7 +133,7 @@ void proveEarlyHostedLookup(DeviceId device)
         const auto gpu=session->resource(device);
         const auto io=RetainedHostServiceProgram::original(RetainedHostServiceRole::ImmutableLookupIO);
         const auto caseBudget=[&](ImmutableRowStorage tier) {
-            const auto policy=ImmutableRowTableStoragePolicy::forStorage(tier,4096,2);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(tier,llaminar2::hostPageBytes(),2);
             const auto layout = ImmutableLookupLayout::create(maxIds, Source::rowBytes);
 
 
@@ -159,7 +160,7 @@ void proveEarlyHostedLookup(DeviceId device)
         for (const auto tier : {ImmutableRowStorage::RAM, ImmutableRowStorage::MemoryMapped}) {
             SCOPED_TRACE(::testing::Message() << device.toString() << " tier=" << static_cast<int>(tier));
             const auto layout=ImmutableLookupLayout::create(maxIds,Source::rowBytes);
-            const auto policy=ImmutableRowTableStoragePolicy::forStorage(tier,4096,2);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(tier,llaminar2::hostPageBytes(),2);
             {
             // Keep the original ledger outside the complete captured-owner scope
             // so retirement is observed after every copied source binding dies.

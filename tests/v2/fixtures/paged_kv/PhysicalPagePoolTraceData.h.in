@@ -1,0 +1,26 @@
+/**
+ * @file PhysicalPagePoolTraceData.h
+ * @brief Build-bound copies of small retained page-authority recordings.
+ *
+ * Embedding these exact fixture bytes lets installed compiler/source-free test
+ * runners replay the same inputs without relying on builder filesystem paths.
+ * Edit recordings only through explicit capture and review, not failing replay.
+ */
+#pragma once
+namespace llaminar2::test
+{
+inline constexpr const char *privatePageOwnershipTrace = R"PMA_TRACE(@PMA_OWNERSHIP_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageAppendTrace = R"PMA_TRACE(@PMA_APPEND_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageReaderTrace = R"PMA_TRACE(@PMA_READER_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageTableTrace = R"PMA_TRACE(@PMA_TABLE_TRACE@)PMA_TRACE";
+inline constexpr const char *pagedFP32AttentionTrace = R"PMA_TRACE(@PMA_ATTENTION_TRACE@)PMA_TRACE";
+inline constexpr const char *pagedFP32AppendTrace = R"PMA_TRACE(@PMA_APPEND_ATTENTION_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageShareTrace = R"PMA_TRACE(@PMA_SHARING_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageWitnessTrace = R"PMA_TRACE(@PMA_WITNESS_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageCombinedTrace = R"PMA_TRACE(@PMA_COMBINED_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePagePrefixTrace = R"PMA_TRACE(@PMA_PREFIX_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageReservationTrace = R"PMA_TRACE(@PMA_RESERVATION_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageEffectiveUseTrace = R"PMA_TRACE(@PMA_EFFECTIVE_USE_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageEndToEndTrace = R"PMA_TRACE(@PMA_END_TO_END_TRACE@)PMA_TRACE";
+inline constexpr const char *pooledAppendDecodeTrace = R"PMA_TRACE(@POOLED_APPEND_DECODE_TRACE@)PMA_TRACE";
+}

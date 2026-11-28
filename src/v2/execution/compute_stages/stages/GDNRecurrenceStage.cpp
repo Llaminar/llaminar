@@ -1654,6 +1654,25 @@ namespace llaminar2
                 return false;
             }
         }
+        // Serving rows address persistent per-slot states for this call only.
+        struct ServingRowStateBinding
+        {
+            ITensorGatedDeltaNet *kernel = nullptr;
+            ~ServingRowStateBinding()
+            {
+                if (kernel)
+                    (void)kernel->bindServingRowStates(nullptr);
+            }
+        } serving_row_binding;
+        if (request_batched && params_.serving_row_states)
+        {
+            if (!params_.kernel->bindServingRowStates(params_.serving_row_states))
+            {
+                LOG_ERROR("[GDNRecurrenceStage] CPU kernel cannot address serving-row states");
+                return false;
+            }
+            serving_row_binding.kernel = params_.kernel;
+        }
         bool ok = false;
 
         if (merged_qkv)

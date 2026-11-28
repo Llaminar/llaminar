@@ -5388,13 +5388,16 @@ target_link_libraries(v2_mpi_singleton_session_probe PRIVATE llaminar2_core)
 set_target_properties(v2_mpi_singleton_session_probe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
-foreach(V2_MPI_REPLAY_CASE IN ITEMS launcher mpi native_options stubborn ctest_timeout singleton identity)
+# Include a relocated singleton with an exact-sibling negative control; a
+# successful launch proxy alone cannot authenticate entry to its MPI rank.
+foreach(V2_MPI_REPLAY_CASE IN ITEMS launcher mpi native_options stubborn ctest_timeout singleton staged_singleton identity)
     add_v2_test(V2_Integration_MPISessionRetirement_${V2_MPI_REPLAY_CASE}
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_session_lifecycle.py
             --helper $<TARGET_FILE:llaminar_mpi_session>
             --probe $<TARGET_FILE:v2_mpi_session_probe>
             --singleton $<TARGET_FILE:v2_mpi_singleton_session_probe>
+            --module $<TARGET_FILE:llaminar_mpi_schizo>
             --mpirun ${MPIEXEC_EXECUTABLE}
             --case ${V2_MPI_REPLAY_CASE}
         LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Regression"
@@ -8924,7 +8927,17 @@ add_v2_test(V2_Unit_Q16VNNISafeNormalization
 )
 
 # Test: CPUFlashAttentionKernelT (exact FP32/Q16 attention, causal, GQA, window)
-add_executable(v2_test_cpu_flash_attention_kernel_t unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp)
+add_executable(v2_test_cpu_flash_attention_kernel_t
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionPaged.cpp
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedReplay.cpp
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedRunner.cpp
+    unit/kernels/cpu/attention/Test__CPUFP32PagedKVTable.cpp
+    unit/kernels/cpu/attention/Test__PooledAppendReplay.cpp
+    unit/kernels/cpu/attention/Test__CPUFP32PagedKVAppend.cpp
+    unit/kernels/cpu/attention/Test__PagedKVArchive.cpp
+    unit/kernels/cpu/attention/Test__EffectiveUseOrdering.cpp)
+target_include_directories(v2_test_cpu_flash_attention_kernel_t PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(v2_test_cpu_flash_attention_kernel_t
     llaminar2_core
     GTest::gtest
@@ -8936,6 +8949,77 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     MPI_PROCS 1
 )
 
+# Direct paged FP32 optimized arithmetic witness, not serving/native append qualification.
+add_v2_test(V2_Integration_CPUFlashAttentionPagedFP32
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFlashAttentionPaged.PermutedPagesMatchContiguousBytes
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Attention;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedFP32)
+add_v2_test(V2_Integration_CPUFlashAttentionPagedReplay
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFlashAttentionPaged.RecordedFP32InputsReplayExactly:CPUFlashAttentionPaged.RecordedNativeAppendInputsReplayExactly:CPUFlashAttentionPaged.IncompleteRecordedInputsAreRejected
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Attention;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedReplay)
+add_v2_test(V2_Integration_CPUFlashAttentionPagedRunner
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFlashAttentionPagedRunner.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Attention;Runner;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedRunner)
+add_v2_test(V2_Integration_CPUFP32PagedKVTableLifecycle
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFP32PagedKVTable.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Lifecycle;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVTableLifecycle)
+add_v2_test(V2_Integration_CPUFP32PagedKVAppendContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFP32PagedKVAppend.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Contract;Ownership;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_PhysicalPagePoolSharingContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalPagePoolSharing.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Contract;Ownership;Sharing;COW;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVAppendContract)
+add_v2_test(V2_Integration_PagedKVArchiveContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=PagedKVArchive.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Contract;Archive;Provenance;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVArchiveContract)
+add_v2_test(V2_Integration_EffectiveUseOrderingContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=EffectiveUseOrdering.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Contract;Prefix;Retention;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_EffectiveUseOrderingContract)
+add_v2_test(V2_Integration_PageTableAdmissionContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PageTableAdmission.*
+    LABELS "V2;Integration;CPU;DeviceFree;Planning;Contract;Admission;Conservation;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PageTableAdmissionContract)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PhysicalPagePoolSharingContract)
+add_v2_test(V2_Integration_CompletionWitnessContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=CompletionWitness.*
+    LABELS "V2;Integration;CPU;DeviceFree;Planning;Contract;Witness;Conservation;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CompletionWitnessContract)
 # Flash-attention entry points admit banks, head mapping and output
 # disjointness before any team, returning false without writes otherwise:
 # raw batches, native request batches and Q16 tensor/verifier entries admit
@@ -9004,6 +9088,47 @@ add_v2_test(V2_Unit_AttentionComputeStage
     LABELS "V2;Unit;Kernels;Attention;ComputeStage;KernelFactory;CPU"
     MPI_PROCS 1
 )
+
+# P2 stage-level pooled consumption (device-free): the production
+# AttentionComputeStage pooled path is byte-identical to the contiguous
+# control across a two-page pooled publication.
+add_v2_test(V2_Integration_PooledStageConsumption
+    COMMAND $<TARGET_FILE:v2_test_attention_compute_stage>
+            --gtest_filter=PooledStageConsumption.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Attention;Pooled;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledStageConsumption)
+# R26 O1: register the pooled caller/P2 negatives and matrix by name so the
+# preflight lane owns them, not only the Unit lane.
+add_v2_test(V2_Integration_PooledStepGuard
+    COMMAND $<TARGET_FILE:v2_test_attention_compute_stage>
+            --gtest_filter=PooledStepGuard.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Pooled;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledStepGuard)
+add_v2_test(V2_Integration_PooledMatrix
+    COMMAND $<TARGET_FILE:v2_test_attention_compute_stage>
+            --gtest_filter=PooledMatrix.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Pooled;Matrix;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledMatrix)
+add_v2_test(V2_Integration_PooledAppendReplay
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+            --gtest_filter=PooledAppendReplay.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Pooled;Replay;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledAppendReplay)
+add_v2_test(V2_Integration_PooledDenseDecode
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+            --gtest_filter=PooledDenseDecode.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Pooled;Runner;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledDenseDecode)
 # These production workspace descriptors query immutable physical-device
 # properties. Keep their proof in both backend preflight lanes, not Unit.
 foreach(V2_ATTENTION_BACKEND CUDA ROCm)
@@ -16017,7 +16142,7 @@ add_v2_test(V2_Integration_PrefixArchiveMaintenanceWriter
     LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Disk;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_disk_prefix_storage_backend unit/prefix_cache/Test__DiskPrefixStorageBackend.cpp)
+add_executable(v2_test_disk_prefix_storage_backend unit/prefix_cache/Test__DiskPrefixStorageBackend.cpp unit/prefix_cache/Test__DiskExtentQuota.cpp)
 target_link_libraries(v2_test_disk_prefix_storage_backend llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DiskPrefixStorageBackend
     COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
@@ -16026,6 +16151,126 @@ add_v2_test(V2_Unit_DiskPrefixStorageBackend
     NO_MODELS
 )
 
+add_executable(v2_test_paged_kv_disk_route unit/prefix_cache/Test__PagedKVDiskRoute.cpp)
+target_link_libraries(v2_test_paged_kv_disk_route llaminar2_core GTest::gtest GTest::gtest_main)
+
+add_executable(v2_test_paged_kv_archive_store unit/prefix_cache/Test__PagedKVArchiveStore.cpp)
+target_link_libraries(v2_test_paged_kv_archive_store llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PagedKVArchiveStore
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_archive_store>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Disk;Quota;Ownership;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVArchiveStore)
+add_v2_test(V2_Unit_PagedKVDiskRoute
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_disk_route>
+    LABELS "V2;Unit;PrefixCache;Storage;Route;Tier"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# Focused ProductionTestPreflight regression: zero-quota ledger must never
+# admit extents (checked arithmetic, no underflow admission) and impossible
+# configured disk routes must fail before any backend opens.
+add_v2_test(V2_Integration_PagedKVDiskRoute
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_disk_route>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Storage;Quota;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_DiskExtentQuota
+    COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
+        --gtest_filter=DiskExtentQuota.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Storage;Quota;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DiskExtentQuota)
+add_v2_test(V2_Integration_PagedKVPoolGeometry
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PagedKVPoolGeometry.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Geometry;Budget;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVPoolGeometry)
+add_v2_test(V2_Integration_PagedKVInstancePlan
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PagedKVInstancePlan.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Instance;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVInstancePlan)
+add_v2_test(V2_Integration_PagedKVInstanceContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PagedKVInstance.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Instance;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVInstanceContract)
+add_executable(v2_test_pooled_kv_prefix_flow integration/prefix_cache/Test__PooledKVPrefixFlow.cpp)
+target_link_libraries(v2_test_pooled_kv_prefix_flow llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PooledKVPrefixFlow
+    COMMAND $<TARGET_FILE:v2_test_pooled_kv_prefix_flow>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Pooled;Flow;Demotion;Restore;Trust;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledKVPrefixFlow)
+add_executable(v2_test_pooled_binding_import unit/kernels/cpu/attention/Test__PooledBindingImport.cpp)
+target_link_libraries(v2_test_pooled_binding_import llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PooledBindingImport
+    COMMAND $<TARGET_FILE:v2_test_pooled_binding_import>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PagedKV;Pooled;Import;Restore;Provenance;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledBindingImport)
+add_executable(v2_test_paged_kv_demotion_executor integration/prefix_cache/Test__PagedKVDemotionExecutor.cpp)
+target_link_libraries(v2_test_paged_kv_demotion_executor llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PagedKVDemotionExecutor
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_demotion_executor>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Demotion;Executor;MoveOnce;Rollback;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVDemotionExecutor)
+add_executable(v2_test_paged_kv_retention_demotion integration/prefix_cache/Test__PagedKVRetentionDemotion.cpp)
+target_link_libraries(v2_test_paged_kv_retention_demotion llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PagedKVRetentionDemotion
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_retention_demotion>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Retention;Demotion;TailFirst;DeficitOnly;MoveOnce;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVRetentionDemotion)
+add_executable(v2_test_retention_intent_resolver unit/prefix_cache/Test__RetentionIntentResolver.cpp)
+target_link_libraries(v2_test_retention_intent_resolver llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_RetentionIntentResolver
+    COMMAND $<TARGET_FILE:v2_test_retention_intent_resolver>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Retention;Ordering;Parser;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetentionIntentResolver)
+add_executable(v2_test_retention_owner unit/prefix_cache/Test__RetentionOwner.cpp)
+target_link_libraries(v2_test_retention_owner llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_RetentionOwner
+    COMMAND $<TARGET_FILE:v2_test_retention_owner>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Retention;Ordering;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetentionOwner)
+add_executable(v2_test_composed_paged_kv_ram_disk_route
+    integration/prefix_cache/Test__ComposedPagedKVRamDiskRoute.cpp)
+target_link_libraries(v2_test_composed_paged_kv_ram_disk_route
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_ComposedPagedKVRamDiskRoute
+    COMMAND $<TARGET_FILE:v2_test_composed_paged_kv_ram_disk_route>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Disk;Route;RAM;Composed;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ComposedPagedKVRamDiskRoute)
+add_v2_test(V2_Integration_PagedKVInstanceFactory
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PagedKVInstanceFactory.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Instance;Factory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVInstanceFactory)
+add_v2_test(V2_Integration_AllResourceCompletionWitness
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=AllResourceCompletionWitness.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Witness;AllResource;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AllResourceCompletionWitness)
+add_v2_test(V2_Integration_PagedKVTierConfig
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_tier_config>
+        --gtest_filter=PagedKVTierConfig.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PagedKV;Tiers;Config;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVTierConfig)
 add_v2_test(V2_Integration_PrefixCommittedIdentityPreservation
     COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
         --gtest_filter=Test__DiskPrefixStorageBackend.CommittedIdentityCorruptionPreservesArchive:Test__DiskPrefixStorageBackend.CommittedMetadataCorruptionPreservesArchive
@@ -16034,6 +16279,17 @@ add_v2_test(V2_Integration_PrefixCommittedIdentityPreservation
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixCommittedIdentityPreservation)
+
+# Engine-only cleanup (plan P3): a foreign payload-directory entry must refuse
+# recovery with a precise diagnostic and must NEVER be unlinked by the archive.
+add_v2_test(V2_Integration_PrefixArchiveEngineOnlyCleanup
+    COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
+        --gtest_filter=Test__DiskPrefixStorageBackend.ForeignPayloadEntryRefusesRecoveryAndSurvives
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Disk;Cleanup;Ownership;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PrefixArchiveEngineOnlyCleanup)
 
 
 # Request-thread archive rewrites previously stalled a live ExpertOverlay
@@ -16135,6 +16391,25 @@ add_v2_test(V2_Unit_PrefixCachePrefillFlow
     LABELS "V2;Unit;PrefixCache;OrchestrationRunner;Prefill"
     MPI_PROCS 1
 )
+# Injected post-open prefix failure regressions (slot handoff retirement).
+add_v2_test(V2_Integration_PrefixPostOpenFailureRetiresSlotHandoff
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_prefill_flow>
+        --gtest_filter=Test__PrefixCachePrefillFlow.TerminalRestoreFailureAfterOpenRetiresSlotHandoff:Test__PrefixCachePrefillFlow.HarvestFailureAfterOpenRetiresSlotHandoff
+    LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;ServingSlotHandoff;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PrefixPostOpenFailureRetiresSlotHandoff)
+
+# Fatal corruption death regressions: payload in a retired bank is a fatal
+# precondition (std::abort) for all five production entrypoints.
+add_v2_test(V2_Integration_ServingSlotHandoffDeathRegressions
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffDeathRegressions.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;DeathRegression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffDeathRegressions)
+
 add_v2_test(V2_Integration_PrefixMetadataOnlyRestoreSummary
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_prefill_flow>
         --gtest_filter=Test__PrefixCachePrefillFlow.MetadataOnlyLookupReportsRestoredMTPSections
@@ -16696,7 +16971,8 @@ add_v2_test(V2_Integration_MTPLearnedBlockAccounting
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # Test: MTP sidecar graph construction
-add_executable(v2_test_mtp_graph_construction unit/mtp/Test__MTPGraphConstruction.cpp)
+add_executable(v2_test_mtp_graph_construction unit/mtp/Test__MTPGraphConstruction.cpp
+    unit/execution/local_execution/orchestrators/Test__PooledDenseDecode.cpp)
 target_link_libraries(v2_test_mtp_graph_construction llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_mtp_graph_construction PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -16710,6 +16986,25 @@ add_v2_test(V2_Unit_MTPGraphConstruction
     LABELS "V2;Unit;MTP;Graph;PrefixCache"
     MPI_PROCS 1
 )
+
+# J1 (R20 H2): model-free real-orchestrator KV export/import round trip —
+# position restored, byte re-export equality, session length check and the
+# full negative set (truncated/foreign/precision) leave the slot untouched.
+add_v2_test(V2_Integration_P4DenseOrchestratorKVExportImport
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+        --gtest_filter=MTPGraphConstruction.DenseOrchestratorSlotKVExportImportRoundTrip
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Serving;Continuation;P4;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_P4DenseOrchestratorKVExportImport)
+# Sidecar construction retains arbitrary resident slots without leaking maps into later graphs.
+add_v2_test(V2_Integration_MTPServingSlotMappingLifecycle
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+        --gtest_filter=Test__MTPGraphConstruction.ServingSidecarSlotAdmission:Test__MTPGraphConstruction.ServingSidecarSlotMappingLifecycle:Test__MTPGraphConstruction.ServingSidecarCacheIdentityIncludesSlots:Test__MTPGraphConstruction.ResidentHiddenPublicationLifecycle:Test__MTPGraphConstruction.ResidentMainHiddenTracksProductionForward
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MTP;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPServingSlotMappingLifecycle)
 # Real expert slabs retain their separate routed allocation owner in CPU sidecars.
 add_v2_test(V2_Integration_MTPCPUExpertRegistryOwners
     COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
@@ -17135,6 +17430,12 @@ add_v2_test(V2_Integration_MoEGlobalPipelineStageOwnership
         --gtest_filter=ResolvedRankOrchestration.MoEGlobalPipeline*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MPI;MoE;Pipeline;Ownership;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_MoEOverlayServingPoolAdmissionContract
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=AutomaticOrchestrationCandidates.OverlayServingPoolAdmitsOwnerLineForContinuation:AutomaticOrchestrationCandidates.ServingPoolOwnershipTypedDecision
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Serving;ContinuousBatching;MoE;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 40
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 
 # Stage-local TP is validated before native birth; no enclosing rank context
 # may be allocated merely to satisfy the model-geometry guard.
@@ -17359,6 +17660,17 @@ target_link_libraries(v2_test_validation_config llaminar2_core GTest::gtest GTes
 add_v2_test(V2_Unit_ValidationConfig
     COMMAND $<TARGET_FILE:v2_test_validation_config>
     LABELS "V2;Unit;Execution;Validation;ValidationConfig;BufferContracts;DebugEnv"
+    MPI_PROCS 1
+)
+
+# Test: ServingCapacity (typed serving-capacity contract, continuous batching design §9.4)
+# Tests exact-or-reject resolution of resident S / response R / queue Q ownership counts
+# against the qualified envelope, the invariant R >= S + Q, and the hard admission bound.
+add_executable(v2_test_serving_capacity unit/execution/config/Test__ServingCapacity.cpp)
+target_link_libraries(v2_test_serving_capacity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingCapacity
+    COMMAND $<TARGET_FILE:v2_test_serving_capacity>
+    LABELS "V2;Unit;Execution;Validation;ServingCapacity;ContinuousBatching;Configuration"
     MPI_PROCS 1
 )
 
@@ -18209,6 +18521,107 @@ add_v2_test(V2_Integration_QwenRevisionChatTemplate
     LABELS "V2;Integration;ProductionTestPreflight;Qwen;ChatTemplate;Reasoning;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
+# Node-0 binding is skipped only when sysfs, memory-policy syscalls and hwloc
+# all agree the kernel has no NUMA (never on a hidden-sysfs NUMA container).
+add_executable(v2_test_non_numa_kernel unit/utils/Test__NonNUMAKernelClassification.cpp)
+target_link_libraries(v2_test_non_numa_kernel llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_NonNUMAKernelClassification
+    COMMAND $<TARGET_FILE:v2_test_non_numa_kernel>
+    LABELS "V2;Unit;NUMA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_NonNUMAKernelClassification
+    COMMAND $<TARGET_FILE:v2_test_non_numa_kernel>
+    LABELS "V2;Integration;ProductionTestPreflight;NUMA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# Recorded-input replay of the continuous-batching serving step: a real-model
+# trace replayed device-free through the production ServingSession.
+add_executable(v2_test_pooled_serving_slot
+    unit/execution/serving/Test__PooledServingSlotOwner.cpp)
+target_include_directories(v2_test_pooled_serving_slot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_pooled_serving_slot llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PooledServingSlotOwner
+    COMMAND $<TARGET_FILE:v2_test_pooled_serving_slot>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Pooled;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledServingSlotOwner)
+
+add_executable(v2_test_serving_step_replay unit/execution/serving/Test__ServingStepReplay.cpp unit/execution/serving/Test__ServingSubmissionOutcome.cpp unit/execution/serving/Test__ServingContinuationManifest.cpp unit/execution/serving/Test__AdmissionPressureGate.cpp)
+target_include_directories(v2_test_serving_step_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(v2_test_serving_step_replay PRIVATE
+    LLAMINAR_SERVING_TRACE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/serving_step_replay/qwen2.5-0.5b-instruct-q4_0.cpu.trace")
+target_link_libraries(v2_test_serving_step_replay llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingStepReplay
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+    LABELS "V2;Unit;Serving;ContinuousBatching;TraceReplay;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_ServingStepReplay
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;TraceReplay;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_ServingSubmissionOutcome
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+        --gtest_filter=ServingSubmissionOutcome.*
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Submission;Queue;Fairness;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSubmissionOutcome)
+add_v2_test(V2_Integration_ServingContinuationManifest
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+        --gtest_filter=ServingContinuationManifest.*
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Continuation;Suspension;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingContinuationManifest)
+add_v2_test(V2_Integration_AdmissionPressureGate
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+        --gtest_filter=AdmissionPressureGate.*
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Admission;Pressure;Witness;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AdmissionPressureGate)
+
+add_v2_test(V2_Integration_ServingLiveIdentityLifecycle
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+        --gtest_filter=ServingSessionLifecycle.DuplicateLiveIdentityIsRejectedBeforeMutation
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# Continuous-batching HTTP driver: exactly-once mailbox outcomes on finish,
+# cancellation (incl. transport close while queued), shutdown with pending
+# submissions, throwing steps and shared-forward failure; device-free.
+add_executable(v2_test_serving_batch_driver unit/app/modes/Test__ServingBatchDriver.cpp)
+target_include_directories(v2_test_serving_batch_driver PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/mocks
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor/cpp-httplib
+)
+target_link_libraries(v2_test_serving_batch_driver llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_v2_test(V2_Unit_ServingBatchDriver
+    COMMAND $<TARGET_FILE:v2_test_serving_batch_driver>
+    LABELS "V2;Unit;Server;ContinuousBatching;Threading"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 120
+)
+add_v2_test(V2_Integration_ServingBatchDriverLifecycle
+    COMMAND $<TARGET_FILE:v2_test_serving_batch_driver>
+        --gtest_filter=ServingBatchDriverLifecycle.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Server;ContinuousBatching;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 120
+)
+
+# Dedicated process confines replacement allocation operators to this witness.
+add_executable(v2_test_streaming_fragment_allocations unit/app/modes/Test__StreamingFragmentAllocations.cpp)
+target_include_directories(v2_test_streaming_fragment_allocations PRIVATE
+    ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_streaming_fragment_allocations PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_StreamingFragmentAllocations
+    COMMAND $<TARGET_FILE:v2_test_streaming_fragment_allocations>
+    LABELS "V2;Unit;HTTP;Streaming;Regression" NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_StreamingFragmentAllocations
+    COMMAND $<TARGET_FILE:v2_test_streaming_fragment_allocations>
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;Streaming;Regression" MPI_PROCS 1 NO_MPI NO_MODELS)
+
 add_executable(v2_test_chat_completion_handler unit/app/modes/Test__ChatCompletionHandler.cpp)
 target_include_directories(v2_test_chat_completion_handler PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
@@ -18258,6 +18671,12 @@ add_v2_test(V2_Integration_HTTPStreamingUnicodeAndErrorFraming
         --gtest_filter=Test__ChatCompletionHandler.EmojiChatMessagesParseLiteralAndEscapedJSONExactly:Test__ChatCompletionHandler.EmojiByteFragmentsSurviveJSONAndSSEAtEveryBoundary:Test__ChatCompletionHandler.StreamingTransportErrorsTerminateExactlyOnce
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;Streaming;Unicode;Regression"
     NO_MODELS)
+# Long deltas reconstruct exactly and stop at the first rejected fragment.
+add_v2_test(V2_Integration_HTTPStreamingTextFragmentation
+    COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
+        --gtest_filter=Test__ChatCompletionHandler.StreamingSplitsLongTextIntoBoundedEvents:Test__ChatCompletionHandler.StreamingLongTextStopsAtRejectedFragment:Test__ChatCompletionHandler.StreamingLongToolArgumentsReconstructAndCancel
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;Streaming;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_HTTPStreamingUsageAccounting
     COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
         --gtest_filter=Test__ChatCompletionHandler.StreamingUsageOptionsAreTypedAndModeBound:Test__ChatCompletionHandler.StreamingUsagePublishesExactCountsAfterTerminalChoice:Test__ChatCompletionHandler.StreamingUsageErrorsAndDisconnectsCannotPublishSuccessTail
@@ -18335,6 +18754,53 @@ add_v2_test(V2_Unit_HttpRuntimeStats
     COMMAND $<TARGET_FILE:v2_test_http_runtime_stats>
     LABELS "V2;Unit;Server;Observability;Threading"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# Test: SerializedInferenceExecutor (typed serving admission R/Q at the response-lease boundary)
+add_executable(v2_test_sse_publish_channel unit/app/modes/Test__SSEPublishChannel.cpp)
+target_link_libraries(v2_test_sse_publish_channel llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SSEPublishChannel
+    COMMAND $<TARGET_FILE:v2_test_sse_publish_channel>
+    LABELS "V2;Unit;HTTP;Serving;ContinuousBatching;Publication;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_SSEPublishChannelRegressions
+    COMMAND $<TARGET_FILE:v2_test_sse_publish_channel>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Publication;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_executable(v2_test_serialized_inference_executor unit/app/modes/Test__SerializedInferenceExecutor.cpp)
+target_include_directories(v2_test_serialized_inference_executor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_serialized_inference_executor llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SerializedInferenceExecutor
+    COMMAND $<TARGET_FILE:v2_test_serialized_inference_executor>
+    LABELS "V2;Unit;HTTP;Serving;ContinuousBatching;Admission;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
+# Test: ServingLifetimes (typed request/slot identity + response/execution/publication leases)
+add_executable(v2_test_serving_lifetimes unit/execution/config/Test__ServingLifetimes.cpp)
+target_link_libraries(v2_test_serving_lifetimes llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingLifetimes
+    COMMAND $<TARGET_FILE:v2_test_serving_lifetimes>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Lifetimes;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# Production preflight regressions for the serving admission/ownership defects
+# found in review (worker-owned completion, S-exemption transfer with displaced
+# recharging, Q-boundary refusal, throwing occupant; lease machines incl.
+# pre-execution cancellation and authenticated generation retirement). Both
+# suites are device-free host-threading tests, so the preflight host lane runs
+# the complete executables.
+add_v2_test(V2_Integration_ServingTransportVerdictRegressions
+    COMMAND $<TARGET_FILE:v2_test_server_mode>
+            --gtest_filter=Test__ServerRuntimeStats.TransportVerdictDistinguishesDrainedFromAbandoned
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Publication;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+add_v2_test(V2_Integration_ServingExecutorAdmissionRegressions
+    COMMAND $<TARGET_FILE:v2_test_serialized_inference_executor>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Admission;Threading;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_ServingLeaseMachineRegressions
+    COMMAND $<TARGET_FILE:v2_test_serving_lifetimes>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Lifetimes;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 add_v2_test(V2_Integration_HTTPRuntimeStatsHandlerLifecycle
     COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
         --gtest_filter=Test__ChatCompletionHandler.RuntimeStats*:Test__ChatCompletionHandler.RuntimeSummaryNeverProbesLiveInferenceState
@@ -19548,6 +20014,39 @@ add_v2_test(V2_Integration_StageDumpIntegrity
     MPI_PROCS 1
     LABELS "V2;Integration;StageDump;Debug;Infrastructure"
 )
+
+# Test: real-model continuous batching on CPU (requires LLAMINAR_CB_TEST_MODEL)
+add_executable(v2_integration_continuous_batching_cpu
+    integration/serving/Test__ContinuousBatchingCPU.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_include_directories(v2_integration_continuous_batching_cpu PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_integration_continuous_batching_cpu
+    llaminar2_core
+    v2_test_utils
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_ContinuousBatchingCPU
+    COMMAND $<TARGET_FILE:v2_integration_continuous_batching_cpu>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Serving;ContinuousBatching;CPU"
+)
+
+# P4 production continuation: ServingSession -> real CPU runner suspend/restore
+# equivalence (same slot and different slot vs an uninterrupted control) and
+# malformed-header negatives. Model-gated (LLAMINAR_CB_TEST_MODEL): like the
+# canonical CB CPU integration it requires V2_Models and is therefore NOT a
+# device-free preflight entry (a model-free preflight has no runner here).
+add_v2_test(V2_Integration_P4ServingRestoreEquivalence
+    COMMAND $<TARGET_FILE:v2_integration_continuous_batching_cpu>
+        --gtest_filter=ContinuousBatchingCPU.ProductionSuspendRestoreMatchesControl
+    LABELS "V2;Integration;Serving;ContinuousBatching;Continuation;P4;Regression"
+    MPI_PROCS 1
+    FIXTURES_REQUIRED V2_Models)
 
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
 # Validates end-to-end pipeline functionality including Q/K/V/O bias application
@@ -25451,6 +25950,15 @@ target_link_libraries(v2_unit_prefill_decode_transition
     GTest::gmock
     GTest::gtest_main
 )
+# Recorded serving-slot handoff baseline. Captured at the reference production
+# source identity (content-blob hashes recorded inside the fixture header,
+# written only by the explicit capture invocation) through the device-free
+# boundary; replay validates the metadata structurally, compares behavior,
+# and never requires an identical commit. Regeneration is the explicit capture
+# switch only, never an automatic reaction to a failing comparison.
+target_compile_definitions(v2_unit_prefill_decode_transition PRIVATE
+    LLAMINAR_CB_HANDOFF_GOLDEN="${CMAKE_CURRENT_LIST_DIR}/../../tests/v2/fixtures/serving_slot_handoff/pin28dd_replay_baseline.txt"
+)
 add_v2_test(V2_Unit_PrefillDecodeTransition
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
     LABELS "V2;Unit;Orchestration;OrchestrationRunner;Regression;PrefillDecode"
@@ -25482,6 +25990,35 @@ add_v2_test(V2_Integration_MTPDirectTokenHistoryContracts
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPDirectTokenHistoryContracts)
+
+# Serving-slot handoff: recorded-input replay of the production controller
+# through the device-free boundary (reference identity recorded separately in
+# the fixture) plus the capacity-one lifecycle contracts. Registered beside the
+# prefill→decode family because they share its executable and mock harness.
+add_v2_test(V2_Integration_ServingSlotHandoffRecordedReplay
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffReplay.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffRecordedReplay)
+
+# The hardened lifecycle/defect regressions are explicit ProductionTestPreflight
+# members, not Unit-only cells, per the review-correction register.
+add_v2_test(V2_Integration_ServingSlotHandoffLifecycleContracts
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffLifecycle.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffLifecycleContracts)
+
+add_v2_test(V2_Unit_ServingSlotHandoffLifecycle
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffLifecycle.*
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;ServingSlotHandoff;Lifecycle;DeviceFree;CPU;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 
 add_v2_test(V2_Integration_MTPBoundedSamplingPositionEvidence
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
@@ -26529,6 +27066,12 @@ add_v2_test(V2_Unit_GlobalPPTopology
     LABELS "V2;Unit;GlobalPP;Topology;RankPlan;PipelineParallel;TensorParallel"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_ServingPoolAuthorityContract
+    COMMAND $<TARGET_FILE:v2_test_global_pp_topology>
+        --gtest_filter=*RequestAuthority*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Serving;ContinuousBatching;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 40
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 
 message(STATUS "V2 Tests: Added Global PP unit tests")
 
@@ -29619,6 +30162,13 @@ add_v2_test(V2_Unit_KVCacheMemoryEstimator
     MPI_PROCS 1
 )
 
+add_v2_test(V2_Integration_KVNativePageGeometry
+    COMMAND $<TARGET_FILE:v2_test_kvcache_memory_estimator>
+        --gtest_filter=Test__KVCacheMemoryEstimator.NativePagedPayloadKeepsRequestBasisOutsideFrames:Test__KVCacheMemoryEstimator.NativeStorageLayoutRejectsInvalidGeometry
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;KVCache;Planning;Geometry;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_KVNativePageGeometry)
+
 # Test: ActivationMemoryEstimator — activation buffer peak estimation
 add_executable(v2_test_activation_memory_estimator
     unit/planning/Test__ActivationMemoryEstimator.cpp
@@ -29656,6 +30206,14 @@ add_v2_test(V2_Integration_GraphFamilyObservationScope
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.CapturedGraphPoolGrowthIsCertifiedAgainstTheCompleteFamily
     LABELS "V2;Integration;ProductionTestPreflight;Memory;PhysicalMemoryAuthority;GraphCapture;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
+# Plan P3: a tiered disk route with a zero RAM budget admits its durable I/O
+# staging but never invents a RAM host tier (RAM-off disk staging).
+add_v2_test(V2_Integration_PrefixTieredRamOffDiskStaging
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.TieredDiskWithoutRamAdmitsOnlyStaging
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;PrefixCache;Tiers;Staging;DeviceFree;Regression"
     MPI_PROCS 1 NO_MODELS)
 
 add_v2_test(V2_Integration_MoEProjectionTransportAccounting
@@ -29737,6 +30295,7 @@ add_executable(v2_test_memory_planner
     unit/planning/Test__MoEPipelineFixedMemory.cpp)
 target_link_libraries(v2_test_memory_planner llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_v2_test(V2_Integration_AutomaticPlanningRejectsUnrelatedNativeWorker
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=AutomaticOrchestrationPlanner.DefaultCalibrationRejectsExistingWorkerWithoutRetiringIt
@@ -29794,6 +30353,12 @@ add_v2_test(V2_Unit_MemoryPlanner
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_ServingPoolDemandAdmissionContract
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=*ServingPoolDemand*:*OwnerFollowerServingBomJoin*:*ServingBomToReservationChain*:MoEPipelineMemoryAdmission.ServingPoolChargedOnceForParentStage
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Serving;ContinuousBatching;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 40
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 add_v2_test(V2_Integration_NgramMandatoryBaseCapacity
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=OrchestrationCandidateNgramAdmission.MandatoryBaseCapacityRejectsBeforeOptionalTableSelection
@@ -30088,6 +30653,17 @@ add_v2_test(V2_Integration_RecurrentOnlyPipelinePrefixAdmission
 # Test: canonical topology-wide CPU/GPU admission and live allocation ledger
 add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalMemoryAuthority.cpp
+    unit/planning/Test__PhysicalPagePoolReplay.cpp
+    unit/planning/Test__PhysicalPagePoolSharing.cpp
+    unit/planning/Test__PagedKVPoolGeometry.cpp
+    unit/planning/Test__PagedKVInstancePlan.cpp
+    unit/planning/Test__AllResourceCompletionWitness.cpp
+    unit/planning/Test__PagedKVInstance.cpp
+    unit/planning/Test__PagedKVInstanceFactory.cpp
+    unit/planning/Test__PagedKVInstance.cpp
+    unit/planning/Test__PagedKVInstanceFactory.cpp
+    unit/planning/Test__CompletionWitness.cpp
+    unit/planning/Test__PageTableAdmission.cpp
     unit/planning/Test__PhysicalMemoryRankHostPool.cpp
     unit/planning/Test__NativeStoragePreparing.cpp
     unit/backends/Test__PreparedGPUWorkerThread.cpp
@@ -30100,12 +30676,73 @@ target_link_libraries(v2_test_physical_memory_authority
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_physical_memory_authority PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
+# Embed small controller recordings so installed runners do not need builder source paths.
+set(PMA_TRACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/paged_kv")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${PMA_TRACE_ROOT}/private_ownership_v1.txt"
+    "${PMA_TRACE_ROOT}/private_append_v1.txt"
+    "${PMA_TRACE_ROOT}/private_readers_v1.txt"
+    "${PMA_TRACE_ROOT}/attention_fp32_v1.txt"
+    "${PMA_TRACE_ROOT}/private_tables_v2.txt"
+    "${PMA_TRACE_ROOT}/attention_append_fp32_v2.txt"
+    "${PMA_TRACE_ROOT}/private_sharing_v1.txt"
+    "${PMA_TRACE_ROOT}/private_witness_v1.txt"
+    "${PMA_TRACE_ROOT}/private_combined_v1.txt"
+    "${PMA_TRACE_ROOT}/private_prefix_v1.txt"
+    "${PMA_TRACE_ROOT}/pooled_append_decode_v1.txt")
+file(READ "${PMA_TRACE_ROOT}/private_ownership_v1.txt" PMA_OWNERSHIP_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_append_v1.txt" PMA_APPEND_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_readers_v1.txt" PMA_READER_TRACE)
+file(READ "${PMA_TRACE_ROOT}/attention_fp32_v1.txt" PMA_ATTENTION_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_tables_v2.txt" PMA_TABLE_TRACE)
+file(READ "${PMA_TRACE_ROOT}/attention_append_fp32_v2.txt" PMA_APPEND_ATTENTION_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_sharing_v1.txt" PMA_SHARING_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_witness_v1.txt" PMA_WITNESS_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_combined_v1.txt" PMA_COMBINED_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_prefix_v1.txt" PMA_PREFIX_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_reservation_v1.txt" PMA_RESERVATION_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_effective_use_v1.txt" PMA_EFFECTIVE_USE_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_end_to_end_v1.txt" PMA_END_TO_END_TRACE)
+file(READ "${PMA_TRACE_ROOT}/pooled_append_decode_v1.txt" POOLED_APPEND_DECODE_TRACE)
+configure_file("${PMA_TRACE_ROOT}/PhysicalPagePoolTraceData.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/PhysicalPagePoolTraceData.h" @ONLY)
+target_include_directories(v2_test_physical_memory_authority PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 add_v2_test(V2_Unit_PhysicalMemoryAuthority
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
     LABELS "V2;Unit;Planning;MemoryPlan;MemoryBudget;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
+# Aggregate CPU payload ownership must not require explicit NUMA hardware admission.
+add_v2_test(V2_Integration_PreparedNativeLookupAggregateCPU
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PreparedNativeLookupFixture.OriginalSourceFreezeAdmitAndPayloadResetReplay
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;PhysicalMemoryAuthority;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PreparedNativeLookupAggregateCPU)
+# Native operand geometry over retained publications; no attention kernel or serving cutover yet.
+add_v2_test(V2_Integration_CPUFP32PagedKVViewContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalMemoryAuthority.PagePoolFP32OperandsUseLogicalPagesNotPhysicalStride
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Geometry;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVViewContract)
+# Initial private page grants: no native kernel or serving cutover yet.
+add_v2_test(V2_Integration_PMAPagePoolUnpublishedContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalMemoryAuthority.PagePoolUnpublishedCommitmentLifecycle:PhysicalMemoryAuthority.PagePoolPrivatePinsDeferRealRetirement:PhysicalMemoryAuthority.PagePoolMultiClassAdmissionIsAtomic:PhysicalMemoryAuthority.PagePoolGeometryAndConstructionRollback:PhysicalMemoryAuthority.PagePoolExclusiveAppendPublicationLifecycle:PhysicalMemoryAuthority.PagePoolRegisteredReadersCloseBeforeRetirement:PhysicalMemoryAuthority.PagePoolPrivateFrameReturnIsGenerationQualified
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Planning;PhysicalMemoryAuthority;Contract;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PMAPagePoolUnpublishedContract)
+add_v2_test(V2_Integration_PMAPagePoolUnpublishedReplay
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalMemoryAuthority.PagePoolRecordedUnpublishedOwnershipReplay:PhysicalMemoryAuthority.PagePoolRecordedTableBanksReplayExactly:PhysicalMemoryAuthority.PagePoolTableReplayRejectsAlteredStateAndObservations:PhysicalMemoryAuthority.PagePoolReplayRejectsIncompleteInitialState
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Planning;PhysicalMemoryAuthority;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PMAPagePoolUnpublishedReplay)
 # Shared CPU+integrated-GPU pool (GB10/APU) joint admission; device-free preflight.
 add_v2_test(V2_Integration_PhysicalMemoryRankHostPool
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
@@ -44669,6 +45306,261 @@ if(HAVE_CUDA AND TARGET v2_integration_cuda_attention_padding_parity)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAAttentionPaddingInvocationContract)
     endif()
 endif()
+
+# ============================================================================
+# ============================================================================
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PlacementHelperTests.cmake)
+# Preserved: bootstrap/MPI inventory + serving locality preflight (the restored
+# accepted Test__ClusterInventoryBootstrap fixture supports --placement-contract).
+add_v2_test(V2_Integration_ClusterPlacementAuthorityContract
+    COMMAND $<TARGET_FILE:v2_integration_cluster_inventory_bootstrap>
+        --placement-contract
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Placement;Bootstrap;MPI;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+
+
+
+# Preserved: first-touch contract filter (used by the preserved preflight registration below)
+set(NUMA_FIRST_TOUCH_CONTRACT_CASES
+    FirstTouchBoundary.PreconditionRejectsIncompleteOpsAndGeometry
+    FirstTouchBoundary.CaptureAffinityFailureLeavesThreadUnmutated
+    FirstTouchBoundary.CapturePolicyFailureLeavesThreadUnmutated
+    FirstTouchBoundary.NodeCpuResolutionFailureIsAttributed
+    FirstTouchBoundary.EmptyTargetCpuSetFailsWithoutMutation
+    FirstTouchBoundary.BindAffinityFailureRestoresStateAndPreservesErrno
+    FirstTouchBoundary.BindPolicyFailureRestoresBothPartsPreservesErrno
+    FirstTouchBoundary.FirstMutationExceptionWindowStillRestores
+    FirstTouchBoundary.UnwindOutOfTouchStillRestores
+    FirstTouchBoundary.RestorePolicyFailureIsFatal
+    FirstTouchBoundary.RestoreAffinityFailureIsFatal
+    FirstTouchBoundary.RestoreBothPartsFailureIsFatal
+    FirstTouchBoundary.UnwindOutOfTouchWithFailedRestoreIsFatal
+    FirstTouchBoundary.TraceFileFailedAcquisitionIsSafeAndVisible
+    FirstTouchBoundary.TraceFileRecordingFailureIsVisiblePreservesErrno
+    FirstTouchBoundary.TraceFileReadIsHardBounded
+    FirstTouchBoundary.TraceEvidenceValidatorRejectsTruncatedEvidenceContainingMarkers
+    FirstTouchBoundary.TraceEvidenceValidatorRejectsReadError
+    FirstTouchBoundary.TraceEvidenceValidatorRejectsReadErrorValueContainingMarkers
+    FirstTouchBoundary.TraceRecordingFailureProducesDistinctChildFailure
+    FirstTouchBoundary.MutationControlOmitBindFailsTheValidator
+    FirstTouchBoundary.SilentPolicyRestoreOmissionIsFatal
+    FirstTouchBoundary.SilentAffinityReplacementIsFatal
+    FirstTouchBoundary.SilentHighCpuLossIsFatal
+    FirstTouchBoundary.MutationControlTouchBeforeBindFailsTheValidator
+    FirstTouchBoundaryMasks.WordCountsCoverTheCompleteNodeSpace
+    FirstTouchBoundaryMasks.SetAndQueryNodeBitsAcrossAllWords
+    FirstTouchBoundaryMasks.OutOfBoundsIsRejectedWithoutMutation
+    FirstTouchBoundaryMasks.EqualityAndEmptinessCoverAllWords
+    FirstTouchBoundary.NativeMaxnodePreservesLastNodeAcrossWordBoundary
+    FirstTouchBoundary.EmptyPolicyRestoreUsesNullButReadbackUsesFullMask
+    FirstTouchBoundary.SilentPolicyModeChangeIsFatalWithMaskIntact
+    FirstTouchBoundary.SilentHighPolicyBitLossDuringUnwindIsFatal
+    FirstTouchBoundary.BindRejectionAndBothRestoreFailuresRetainEachOutcome
+    FirstTouchBoundary.RejectedRestoreIsFatalEvenWhenBothReadsMatch
+    FirstTouchBoundary.ThrowingRestoresAreFatalEvenWhenBothReadsMatch
+    FirstTouchBoundary.RejectedPolicyReadbackStillQueriesAffinityBeforeFatal
+    FirstTouchBoundary.ThrowingAffinityReadbackIsFatalDuringUnwind
+    FirstTouchBoundary.BothReadbackFailuresRetainedDuringUnwind
+)
+list(JOIN NUMA_FIRST_TOUCH_CONTRACT_CASES ":" NUMA_FIRST_TOUCH_CONTRACT_FILTER)
+
+add_executable(v2_test_placement_topology unit/planning/Test__PlacementTopology.cpp)
+target_link_libraries(v2_test_placement_topology llaminar2_core llaminar_placement_topology GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PlacementTopology
+    COMMAND $<TARGET_FILE:v2_test_placement_topology>
+    LABELS "V2;Unit;DeviceFree;CPU;Planning;Placement;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+# PRESERVED REGISTRATIONS (rebase preservation: delivered branch content)
+# Restored from the accepted A-2 tree (b4e107ee) because the develop rebase
+# dropped these branch-only tests/sources; registrations replayed verbatim.
+# Duplicate target/test registrations already present in develop are ADOPTED
+# (dropped here) rather than duplicated — see the reconcile table.
+# ============================================================================
+
+add_v2_test(V2_Integration_PlacementReceiptCapacityOrderedCorePlaces
+    COMMAND $<TARGET_FILE:v2_test_placement_topology>
+        --gtest_filter=PlacementTopology.CapacityOrderedCorePlacesSortsFastestFirstNonIdentity:PlacementTopology.CapacityOrderedCorePlacesRejectsEmptyAndDuplicateAdmittedSets:PlacementTopology.ReceiptRoundtripThroughRealPath
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Placement;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_PlacementNativeWorkerContract
+    COMMAND $<TARGET_FILE:v2_integration_cpu_startup_affinity>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Bootstrap;Placement;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+
+add_v2_test(V2_Integration_NUMABufferIteratorAllocationContract
+    COMMAND $<TARGET_FILE:v2_test_numa_allocator>
+            --gtest_filter=Test__NUMAAllocator.NUMABufferIterators
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_NUMAObservedGeometryContracts
+    COMMAND $<TARGET_FILE:v2_test_numa_allocator>
+            --gtest_filter=Test__NUMAAllocator.PrepareExternalReceiveRangeUsesCertifiedFirstTouch:Test__NUMAAllocator.DedicatedMappingsSurviveAlternatingNodeChurn:Test__NUMAAllocator.HugePageAdvisedMappingsRetainExactFirstTouchNode
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_numa_first_touch_boundary
+    unit/memory/Test__NUMAFirstTouchBoundary.cpp)
+
+target_link_libraries(v2_test_numa_first_touch_boundary
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+add_v2_test(V2_Unit_NUMAFirstTouchBoundary
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary>
+    LABELS "V2;Unit;Memory;NUMA;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_numa_first_touch_boundary_native
+    integration/memory/Test__NUMAFirstTouchBoundaryNative.cpp)
+
+target_link_libraries(v2_test_numa_first_touch_boundary_native
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+add_v2_test(V2_Integration_NUMAFirstTouchBoundaryFailureContracts
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary>
+            --gtest_filter=${NUMA_FIRST_TOUCH_CONTRACT_FILTER}
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+
+add_v2_test(V2_Integration_NUMAFirstTouchBoundaryQueryValidators
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary_native>
+            --gtest_filter=FirstTouchBoundaryNative.QueryValidatorRejectsPerPageErrors:FirstTouchBoundaryNative.QueryValidatorRejectsEmptyExtent:FirstTouchBoundaryNative.QueryValidatorRejectsMixedPlacement
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_NUMAFirstTouchBoundaryNativeSingleNode
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary_native>
+            --gtest_filter=FirstTouchBoundaryNative.SingleNodeTransitionProof
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+
+add_v2_test(V2_Integration_NUMAFirstTouchRemoteRAMPlacement_MultiRAMNode
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary_native>
+            --gtest_filter=FirstTouchBoundaryNative.RemoteRAMPlacementMultiRAMNode
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+
+
+target_link_libraries(v2_test_placement_topology llaminar2_core llaminar_placement_topology GTest::gtest GTest::gtest_main)
+# A-2c + roadmap-3 substrate registrations (added on top of the A-3 v6 tree; the v6
+# preserved placement/first-touch registrations remain UNCHANGED)
+
+
+add_executable(v2_test_serving_window_decode unit/execution/serving/Test__ServingWindowDecode.cpp)
+target_include_directories(v2_test_serving_window_decode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_serving_window_decode llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_v2_test(V2_Unit_ServingWindowDecode
+    COMMAND $<TARGET_FILE:v2_test_serving_window_decode>
+    LABELS "V2;Unit;Serving;ContinuousBatching;WindowDecode;ABI;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingWindowDecodeContract
+    COMMAND $<TARGET_FILE:v2_test_serving_window_decode>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;WindowDecode;ABI;DeviceFree;Contract;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
+
+
+
+
+
+
+
+
+
+
+add_executable(v2_test_window_grant unit/execution/serving/Test__WindowGrant.cpp)
+target_link_libraries(v2_test_window_grant llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_WindowGrant
+    COMMAND $<TARGET_FILE:v2_test_window_grant>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Grants;Backpressure;Scheduling;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+
+
+
+add_executable(v2_test_request_intrinsic_coordinates unit/execution/serving/Test__RequestIntrinsicCoordinates.cpp)
+target_link_libraries(v2_test_request_intrinsic_coordinates llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_RequestIntrinsicCoordinates
+    COMMAND $<TARGET_FILE:v2_test_request_intrinsic_coordinates>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Sampling;RNG;Window;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_capacity_intent unit/execution/config/Test__ServingCapacityIntent.cpp)
+target_link_libraries(v2_test_serving_capacity_intent llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingCapacityIntent
+    COMMAND $<TARGET_FILE:v2_test_serving_capacity_intent>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Config;Knobs;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_paged_kv_tier_config unit/execution/config/Test__PagedKVTierConfig.cpp)
+target_link_libraries(v2_test_paged_kv_tier_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PagedKVTierConfig
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_tier_config>
+    LABELS "V2;Unit;Serving;ContinuousBatching;PagedKV;Tiers;Config;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_http_pool_contract unit/execution/config/Test__ServingHttpPoolContract.cpp)
+target_link_libraries(v2_test_serving_http_pool_contract llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingHttpPoolContract
+    COMMAND $<TARGET_FILE:v2_test_serving_http_pool_contract>
+    LABELS "V2;Unit;Serving;ContinuousBatching;HTTP;Pool;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_publication_drain unit/app/modes/Test__ServingPublicationDrain.cpp)
+target_link_libraries(v2_test_serving_publication_drain llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingPublicationDrain
+    COMMAND $<TARGET_FILE:v2_test_serving_publication_drain>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Publication;Lifetimes;ExactlyOnce;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingIntrinsicCoordinates
+    COMMAND $<TARGET_FILE:v2_test_request_intrinsic_coordinates>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;RNG;Windows;Overflow;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_ServingPolicyContractRegressions
+    COMMAND $<TARGET_FILE:v2_test_window_grant>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Policy;Grants;Aging;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_ServingPublicationCompletionRegressions
+    COMMAND $<TARGET_FILE:v2_test_serving_publication_drain>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Publication;Lifetimes;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_pool_memory_demand unit/execution/config/Test__ServingPoolMemoryDemand.cpp)
+target_link_libraries(v2_test_serving_pool_memory_demand llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingPoolMemoryDemand
+    COMMAND $<TARGET_FILE:v2_test_serving_pool_memory_demand>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Memory;Planning;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingPoolPMAChargeContract
+    COMMAND $<TARGET_FILE:v2_test_serving_pool_memory_demand>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Memory;Planning;PMA;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_pool_pma_reservation unit/app/modes/Test__ServingPoolPmaReservation.cpp)
+target_link_libraries(v2_test_serving_pool_pma_reservation llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_serving_pool_pma_reservation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_ServingPoolPmaReservation
+    COMMAND $<TARGET_FILE:v2_test_serving_pool_pma_reservation>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Memory;Planning;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingPoolPmaReservationContract
+    COMMAND $<TARGET_FILE:v2_test_serving_pool_pma_reservation>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Memory;Planning;PMA;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # Report, never hide, every registration omitted (after all includes) because their compiled backend
 # family is absent from this build (for example a CPU-only build).

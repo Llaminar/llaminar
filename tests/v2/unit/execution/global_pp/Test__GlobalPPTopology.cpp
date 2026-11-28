@@ -1078,3 +1078,72 @@ TEST_F(Test__GlobalPPTopology, PhysicalConnectionDiagnostics)
     EXPECT_STREQ(pipelineConnectionName(RankConnectionLocality::SameNode), "SAME_NODE");
     EXPECT_THROW(pipelineConnectionName(static_cast<RankConnectionLocality>(-1)), std::invalid_argument);
 }
+
+
+/** @brief SINGLE request-authority source: the vocabulary-head stage owns
+ *  request authorization (owning rank, or the global-TP domain leader);
+ *  multiple/absent heads are refused. The same helper backs the memory-plan
+ *  authority seal and GlobalOrchestrator::findTailRank. */
+
+
+/** @brief SHARED AUTHORITY-AGREEMENT GUARD: graph absence = fatal; seal
+ *  absence = fatal; divergence = fatal; exact agreement = pass. */
+TEST_F(Test__GlobalPPTopology, RequestAuthorityAgreementGuard)
+{
+    const std::optional<int> sealed = 2;
+    const std::optional<int> graph = 2;
+    EXPECT_NO_THROW(requireRequestAuthorityAgreement(sealed, graph));
+    // Graph published NO authority.
+    EXPECT_THROW(requireRequestAuthorityAgreement(sealed, std::nullopt),
+                 std::logic_error);
+    // Seal absent (unsealed state).
+    EXPECT_THROW(requireRequestAuthorityAgreement(std::nullopt, graph),
+                 std::logic_error);
+    // Divergence (graph == 3, seal == 2).
+    EXPECT_THROW(requireRequestAuthorityAgreement(sealed, std::optional<int>{3}),
+                 std::logic_error);
+}
+
+TEST_F(Test__GlobalPPTopology, RequestAuthorityRankSingleSource)
+{
+    // Single-rank tail: the owning rank is the authority.
+    {
+        GlobalPPTopology topology;
+        topology.world_size = 3;
+        GlobalPPStageSpec tail;
+        tail.has_lm_head = true;
+        tail.owning_rank = 2;
+        topology.stages.push_back(tail);
+        EXPECT_EQ(requestAuthorityRank(topology), 2);
+    }
+    // Global-TP vocabulary domain: the domain leader is the authority.
+    {
+        GlobalPPTopology topology;
+        topology.world_size = 4;
+        GlobalPPStageSpec tail;
+        tail.has_lm_head = true;
+        tail.is_global_tp = true;
+        tail.participating_ranks = {1, 3};
+        topology.stages.push_back(tail);
+        EXPECT_EQ(requestAuthorityRank(topology), 1);
+    }
+    // Multiple vocabulary heads are refused.
+    {
+        GlobalPPTopology topology;
+        topology.world_size = 2;
+        GlobalPPStageSpec a, b;
+        a.has_lm_head = true; a.owning_rank = 0;
+        b.has_lm_head = true; b.owning_rank = 1;
+        topology.stages.push_back(a); topology.stages.push_back(b);
+        EXPECT_THROW((void)requestAuthorityRank(topology), std::invalid_argument);
+    }
+    // No vocabulary head is refused.
+    {
+        GlobalPPTopology topology;
+        topology.world_size = 2;
+        GlobalPPStageSpec a;
+        a.owning_rank = 0;
+        topology.stages.push_back(a);
+        EXPECT_THROW((void)requestAuthorityRank(topology), std::invalid_argument);
+    }
+}

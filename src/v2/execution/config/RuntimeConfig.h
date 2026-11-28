@@ -25,6 +25,7 @@
 #include "../../utils/Logger.h"
 #include "../../loaders/ImmutableRowTablePolicy.h"
 #include "../local_execution/graph/ReadAheadScheduling.h"
+#include "../prefix_cache/RetentionOwner.h"
 #include "RoutedExpertPolicy.h"
 #include "OrdinaryTerminalProjectionCapacity.h"
 #include "MTPDepthDefaults.h"
@@ -490,6 +491,94 @@ namespace llaminar2
      */
     inline constexpr size_t kDefaultPrefixCacheDiskBudgetBytes =
         32ull * 1024ull * 1024ull * 1024ull;
+
+    /** @brief Resident shared-KV pool intent: `auto` maximizes after the
+     *         complete non-pool BOM; an explicit cap bounds the same pool. */
+    enum class PagedKVPoolBudgetMode
+    {
+        Auto,   ///< PMA resolves after complete execution/non-pool admission.
+        Cap,    ///< Explicit finite byte cap (per real participant identity).
+    };
+    inline const char *pagedKVPoolBudgetModeToString(PagedKVPoolBudgetMode mode)
+    {
+        switch (mode)
+        {
+        case PagedKVPoolBudgetMode::Auto: return "auto";
+        case PagedKVPoolBudgetMode::Cap: return "cap";
+        default: return "unknown";
+        }
+    }
+
+    /** @brief Host retained tier intent: off, auto, or an explicit bounded cap. */
+    enum class PagedKVHostTierMode
+    {
+        Off,   ///< No resident host retained tier (disk-only possible).
+        Auto,  ///< Bounded by the remaining admitted host budget.
+        Cap,   ///< Explicit finite per-host/NUMA cap, never duplicated per rank.
+    };
+    inline const char *pagedKVHostTierModeToString(PagedKVHostTierMode mode)
+    {
+        switch (mode)
+        {
+        case PagedKVHostTierMode::Off: return "off";
+        case PagedKVHostTierMode::Auto: return "auto";
+        case PagedKVHostTierMode::Cap: return "cap";
+        default: return "unknown";
+        }
+    }
+
+    /**
+     * @brief Typed pooled paged-KV tier intents (design §4.3).
+     *
+     * Resolved through the canonical parser, lossless configuration, MPI/
+     * startup publication and PMA admission path. No frontend-private default
+     * or duplicate budget exists here; the prefix-cache namespace is a
+     * SEPARATE retained prefix store and is not reinterpreted as the live KV
+     * pool cap.
+     *
+     * Disk enablement requires an explicit finite cap and configured
+     * directory; an impossible combination fails typed validation before any
+     * instance is constructed. UMA omission of a redundant retained RAM copy
+     * is derived from the observed canonical physical domain, never a
+     * frontend heuristic.
+     */
+    struct PagedKVTierConfig
+    {
+        PagedKVPoolBudgetMode pool_budget_mode = PagedKVPoolBudgetMode::Auto;
+        size_t pool_cap_bytes = 0;        ///< Required with Cap; ignored for Auto.
+        PagedKVHostTierMode host_tier_mode = PagedKVHostTierMode::Off;
+        size_t host_cap_bytes = 0;        ///< Required with Cap; ignored otherwise.
+        bool disk_enabled = false;        ///< Disk is never an implicit fallback.
+        size_t disk_cap_bytes = 0;        ///< Required finite quota when enabled.
+        size_t disk_journal_membership = 0; ///< Admitted extent-record membership (typed journal cap).
+        std::string disk_dir;             ///< Configured directory, validated nonempty.
+        /** @brief Operator ceiling on accepted retention classes (§8.4/P0 §4).
+         * When set, a request retention class whose rank exceeds the ceiling
+         * is REFUSED with a precise invalid_request_error (never demoted to a
+         * lower class silently). Nullopt = no ceiling. */
+        std::optional<RetentionClass> retention_classes_ceiling;
+
+        /** @return Whether the typed intent is complete and representable. */
+        bool valid(std::string *error = nullptr) const noexcept
+        {
+            if (pool_budget_mode == PagedKVPoolBudgetMode::Cap && pool_cap_bytes == 0)
+            {
+                if (error) *error = "paged KV pool cap requires a positive finite byte budget";
+                return false;
+            }
+            if (host_tier_mode == PagedKVHostTierMode::Cap && host_cap_bytes == 0)
+            {
+                if (error) *error = "paged KV host tier cap requires a positive finite byte budget";
+                return false;
+            }
+            if (disk_enabled && (disk_cap_bytes == 0 || disk_journal_membership == 0 || disk_dir.empty()))
+            {
+                if (error) *error = "paged KV disk tier requires an explicit finite quota, an admitted extent membership and a configured directory";
+                return false;
+            }
+            return true;
+        }
+    };
 
     struct PrefixCacheRuntimeConfig
     {
@@ -2242,6 +2331,9 @@ namespace llaminar2
         /// Cross-request prefix-state cache configuration.
         PrefixCacheRuntimeConfig prefix_cache;
 
+        /// Typed pooled paged-KV tier intents (design §4.3); resolved through PMA.
+        PagedKVTierConfig paged_kv_tiers;
+
         /// Explicit native PLE table storage; file capacity is not prepared-weight memory.
         ImmutableRowTablePolicy ngram_table_policy;
         /** Internal explicit phase policy, projected unchanged into planning and native graph construction. */
@@ -2292,6 +2384,7 @@ namespace llaminar2
             RoutedExpertPrefillRuntimeConfig moe_routed_prefill = {},
             MoERebalanceRuntimeConfig moe_rebalance = {},
             PrefixCacheRuntimeConfig prefix_cache = {},
+            PagedKVTierConfig paged_kv_tiers = {},
             MTPRuntimeConfig mtp = {},
             std::string tp_allreduce_precision_override = {},
             ImmutableRowTablePolicy ngram_table_policy = {})
@@ -2314,6 +2407,10 @@ namespace llaminar2
             rc.moe_routed_prefill = moe_routed_prefill;
             rc.moe_rebalance = moe_rebalance;
             rc.prefix_cache = prefix_cache;
+            std::string tier_error;
+            if (!paged_kv_tiers.valid(&tier_error))
+                throw std::invalid_argument(tier_error);
+            rc.paged_kv_tiers = paged_kv_tiers;
             ngram_table_policy.validate();
             rc.ngram_table_policy = ngram_table_policy;
             rc.mtp = mtp;

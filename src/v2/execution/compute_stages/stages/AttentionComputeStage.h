@@ -14,6 +14,8 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
+#include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
+#include "kernels/PagedKVSnapshotRef.h"
 #include "../../../kernels/attention/AttentionExecutionPolicy.h"
 #include "../../../memory/BufferId.h"
 
@@ -58,6 +60,10 @@ namespace llaminar2
             // Dimensions
             int batch_size = 1;
             int seq_len = 0;
+            /** @brief Host real query rows per request of a CPU ragged batch (empty: all real). */
+            std::vector<int> request_real_lengths_host;
+            /** @brief Host KV sequence per request row (empty: row index). */
+            std::vector<int> request_kv_slots_host;
             int kv_len = 0;
             int n_heads = 0;
             int n_kv_heads = 0;
@@ -100,6 +106,66 @@ namespace llaminar2
              */
             IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
+
+            /**
+             * @brief P2 pooled consumption: the owning pooled table and the EXACT
+             * typed reference of this request's pooled publication.
+             *
+             * When @p pooled_table is non-null, the CPU decode path resolves
+             * @p pooled_ref (authority identity + MONOTONIC publication
+             * version; never a bank index) against the table and computes
+             * through the production pooled kernel — no contiguous adapter, no
+             * full-history gather, and never another bank's or a superseded
+             * version's history. The reference maps the REQUEST identity; the
+             * table performs the authentication (J3).
+             *
+             * NOTE (effective use): this resolve/borrow path does NOT yet mint
+             * an effective-use lease. When the production caller lands, the
+             * attachment must record effective use (design §8.2) through
+             * touchEffectiveUse; until then no lease claim is made and the
+             * comment is not a claim of one.
+             */
+            CPUFP32PagedKVTable *pooled_table = nullptr; ///< Owning pooled table.
+            /**
+             * @brief Exact typed publication reference (J3) for direct stage tests.
+             *
+             * A production caller instead supplies @p pooled_ref_cell: the
+             * pooled append stage writes the ref into a caller-owned cell
+             * during graph execution, and this stage reads that cell at
+             * execute time (a fixed value in Params would be stale because the
+             * publication only exists after the append ran).
+             */
+            PagedKVSnapshotRef pooled_ref;
+            /**
+             * @brief Caller-owned cell holding the CURRENT pooled publication ref.
+             *
+             * When non-null it takes precedence over @p pooled_ref and is read
+             * at execute time. The cell lives as long as the graph family
+             * (per request, per layer) and is written only by the owning
+             * pooled append stage; a refused resolve still fails closed.
+             */
+            const PagedKVSnapshotRef *pooled_ref_cell = nullptr;
+            /**
+             * @brief Per-request pooled ref cells for a GROUPED decode.
+             *
+             * When @p pooled_table is non-null and @p pooled_ref_cells is
+             * non-empty (size == @p batch_size), this stage consumes N pooled
+             * publications in ONE grouped pooled kernel invocation — one ref
+             * per decode row, never a stage-level row-replay loop. Each cell
+             * is a DISTINCT request's current publication; duplicate cells or
+             * a cell also named by @p pooled_ref_cell are refused during
+             * execution.
+             */
+            std::vector<const PagedKVSnapshotRef *> pooled_ref_cells;
+            /**
+             * @brief Derive the decode position from the pooled publication rows.
+             *
+             * The pooled runner's host position counter is not the authority:
+             * the publication's row count is. When set, the stage computes
+             * position_offset = live rows - 1 at execute (single-row decode),
+             * so a pooled decode at row N never depends on a host cursor.
+             */
+            bool pooled_position_from_publication = false;
 
             /**
              * @brief Device-owned logical query width for a scalar GPU graph.
@@ -290,6 +356,9 @@ namespace llaminar2
         /// host materialization; attention execute() never performs D2H reads.
         mutable const ITensor *debug_effective_k_tensor_ = nullptr;
         mutable const ITensor *debug_effective_v_tensor_ = nullptr;
+        /// Stable diagnostic names for individual CPU cache owners; never flatten separate slots.
+        std::vector<std::string> cpu_cache_k_dump_names_;
+        std::vector<std::string> cpu_cache_v_dump_names_;
         mutable size_t debug_effective_k_rows_ = 0;
         mutable size_t debug_effective_k_cols_ = 0;
         mutable size_t debug_effective_v_rows_ = 0;

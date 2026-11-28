@@ -29,7 +29,9 @@
  */
 
 #pragma once
+#include "execution/compute_stages/stages/PooledKVDecodeBinding.h"
 #include "execution/mtp/OrdinaryForwardRetention.h"
+#include "execution/mtp/CPUResidentMTPHidden.h"
 #include "execution/mtp/HostedDeviceGenerationFragment.h"
 #include "../../../execution/moe/MoEOverlayFinitePlacementGraphs.h"
 #include "backends/ReadAheadNativeResourceFamily.h"
@@ -139,6 +141,8 @@ namespace llaminar2
             AcceptedVerifier,
             CheckpointRestore,
             VisibleZeroHiddenBootstrap,
+            ResidentMainRows,
+            ResidentDraftRows,
         };
 
         /** @brief Immutable identity of one current mailbox publication. */
@@ -180,6 +184,10 @@ namespace llaminar2
                 return "checkpoint_restore";
             case Source::VisibleZeroHiddenBootstrap:
                 return "visible_zero_hidden_bootstrap";
+            case Source::ResidentMainRows:
+                return "resident_main_rows";
+            case Source::ResidentDraftRows:
+                return "resident_draft_rows";
             }
             return "invalid";
         }
@@ -219,6 +227,12 @@ namespace llaminar2
         void publishVisibleZeroHiddenBootstrap() noexcept
         {
             publish(Source::VisibleZeroHiddenBootstrap);
+        }
+
+        /** @brief Publish compact CPU rows copied from their current resident main/draft owners. */
+        void publishResidentRows(CPUResidentMTPHidden::Bank bank) noexcept
+        {
+            publish(bank == CPUResidentMTPHidden::Bank::Main ? Source::ResidentMainRows : Source::ResidentDraftRows);
         }
 
         /**
@@ -687,6 +701,21 @@ namespace llaminar2
         /** @brief Project only original declarative storage owner and host request epoch for complete TP source admission. */
         std::pair<std::shared_ptr<IRetainedGraphStorageBoundary>,std::uint64_t> retainedStorageSourceAdmission() const;
     private:
+        /** Caller-owned pooled decode binding attached for the current serving interval. */
+        PooledKVDecodeBinding *pooled_kv_binding_ = nullptr;
+        /** Grouped pooled decode: N caller-owned bindings, ONE graph. */
+        std::vector<PooledKVDecodeBinding *> pooled_kv_binding_group_;
+        /** N1: RAII owner of the current pooled step (cancels on unwind). */
+        PooledKVDecodeBinding::StepGuard pooled_step_guard_;
+        /** N1 (grouped): one guard per member; all advance or all cancel. */
+        std::vector<PooledKVDecodeBinding::StepGuard> pooled_step_guards_;
+        /** Typed cursor lifecycle: last publication-epoch adopted per binding.
+         * When a binding's epoch advances (truncate/import changed the row
+         * counts) the orchestrator adopts the publication's authoritative
+         * position instead of requiring a host-side cursor setter. */
+        std::uint64_t pooled_cursor_epoch_seen_single_ = 0;
+        std::vector<std::uint64_t> pooled_cursor_epochs_seen_group_;
+    private:
         // Only the original Rank can order these phases across every participant.
         /** @brief Join original prior producers and publish this grouped channel's reset close before any TP peer awaits. */
         void prepareGroupedRetainedStorageReset(const InferenceStateResetRequest& request);
@@ -813,7 +842,7 @@ namespace llaminar2
              * a concrete weight-manager downcast because arenas, caches, and
              * workspaces are peer allocation owners rather than weight details.
              */
-            std::shared_ptr<PhysicalMemoryAuthority>
+    std::shared_ptr<PhysicalMemoryAuthority>
                 physical_memory_authority;
         };
 
@@ -849,6 +878,72 @@ namespace llaminar2
          */
         [[nodiscard]] static std::unique_ptr<DeviceGraphOrchestrator>
         createForTest(Dependencies deps);
+
+        /**
+         * @brief Attach one pooled decode binding to this orchestrator (test-only).
+         *
+         * The binding is injected into every forward graph this orchestrator
+         * builds while attached. It is owned by the caller (runner serving
+         * state) and must outlive the attached interval; detach with nullptr.
+         * Only a CPU single-row dense decode forward may consume it; the graph
+         * builder refuses other combinations before any ring work. R24: this
+         * surface has NO production caller while the pooled decode path is
+         * under qualification; it exists purely for the runner-level unit
+         * fixture to drive the graph seam. Production attach arrives with the
+         * P2 admission/runner milestone.
+         */
+        void setPooledDecodeBinding(PooledKVDecodeBinding *binding) noexcept
+        {
+            pooled_kv_binding_ = binding;
+        }
+
+        /**
+         * @brief Test-only: attach a GROUPED pooled decode set (N bindings, one graph).
+         *
+         * When non-empty this takes precedence over the single binding. All
+         * members must share one pool/table (validated each forward). Like
+         * the single-binding setter this has NO production caller while the
+         * pooled decode path is under qualification.
+         */
+        void setPooledDecodeGroup(std::vector<PooledKVDecodeBinding *> bindings) noexcept
+        {
+            pooled_kv_binding_group_ = std::move(bindings);
+        }
+
+        /**
+         * @brief Test-only: set the host decode cursor for a pooled forward.
+         *
+         * A runner-level truncate/import changes the pooled publication's
+         * row count; the host cursor authority must be re-seated to the
+         * truncated position before the next forward or the pooled gate
+         * refuses (which is exactly the fail-closed contract). This setter
+         * exists only for the runner-level unit fixture to model that
+         * re-seat; production restoration goes through the request/prefix
+         * admission path.
+         */
+        void setPooledDecodeStartPosition(int position) noexcept
+        {
+            if (!state_.positions.empty())
+                state_.positions[0] = position;
+        }
+
+        /**
+         * @brief Test-only: seed the per-REQUEST decode cursors for a GROUPED pooled forward.
+         *
+         * Grouped pooled decode (N bindings, one graph) checks each member's
+         * publication row count against its OWN host cursor row (request r
+         * uses positions[r]). This setter exists only for the runner-level
+         * unit fixture to model re-seating N requests after a shared-prefix
+         * attach; production restoration goes through the request/prefix
+         * admission path.
+         */
+        void setPooledDecodePositions(std::vector<int> positions) noexcept
+        {
+            state_.positions = std::move(positions);
+            if (!state_.sequence_lengths.empty() &&
+                state_.sequence_lengths.size() < state_.positions.size())
+                state_.sequence_lengths.resize(state_.positions.size(), 0);
+        }
 
         /**
          * @brief Construct an isolated orchestrator for model-free unit tests.
@@ -3776,6 +3871,8 @@ namespace llaminar2
                 RequestStateResetTransaction::Phase::
                     ResetReplaySessions);
             admitted_sparse_query_program_.reset();
+            if (cpu_resident_mtp_hidden_)
+                cpu_resident_mtp_hidden_->retireAll();
             for (auto &entry : layer_graph_cache_)
             {
                 entry.resetSessionState();
@@ -4212,6 +4309,47 @@ namespace llaminar2
          */
         bool forward_batch(const std::vector<std::vector<int>> &token_batches) override;
 
+        /** @brief CPU serving rows: single-device main KV, no MTP, no recurrent state. */
+        std::string servingRowsUnsupportedReason() const override;
+        std::string servingRowError() const override { return serving_row_error_; }
+        int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
+                                    PrefixLookupResult &admission) override;
+        bool harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
+                                     const std::vector<int32_t> &prompt) override;
+        /** @brief harvestPrefix() body for an explicit sequence; serving rows archive KV only. */
+        bool harvestPrefixFromSequence(const PrefixLookupResult &admission, const std::vector<int32_t> &tokens,
+                                       int prompt_token_count, int seq_idx, bool serving_row);
+
+        /** @brief Ragged forward of the given resident serving slots (CPU). */
+        bool forwardServingRows(const std::vector<int> &slots,
+                                const std::vector<std::vector<int>> &rows) override;
+
+        /** @brief Row @p row's last-token logits from the latest serving forward. */
+        const float *servingRowLogits(int row) const override;
+
+        /** @brief Retire one serving slot's KV and logical position (CPU). */
+        bool resetServingRow(int slot) override;
+
+        /**
+         * @brief Export one serving slot's ACTUAL KV continuation (P4 CPU).
+         *
+         * The production CPU path serializes the ring cache's native-precision
+         * logical blocks through the cache's own exportLogicalBlock API (one
+         * typed per-layer header + exact payload bytes). The cache is the
+         * single byte authority — no host shadow, no reassembled tensor.
+         * @return Packed continuation, or empty when the runner cannot export
+         * (the session then refuses suspension before mutation).
+         */
+        std::optional<std::vector<std::byte>> exportSlotKV(int slot) const override;
+        /**
+         * @brief Import an exported continuation back into its slot (P4 CPU).
+         * @return True when the exact bytes were reinstalled through the cache
+         * itself; false on refusal (restore then refuses; no fabricated KV).
+         */
+        bool importSlotKV(int slot, std::span<const std::byte> bytes) override;
+        /** @brief Verify the imported slot KV length (H2 session check). */
+        bool resumedSlotKVLength(int slot, int expected) const override;
+
         /**
          * @brief Get logits for a specific sequence in batch
          *
@@ -4522,6 +4660,32 @@ namespace llaminar2
          */
         int n_kv_heads() const { return graph_builder_ ? graph_builder_->config().n_kv_heads : 0; }
 
+        void setPooledServingGroup(
+            const std::vector<PooledKVDecodeBinding *> &bindings) override
+        {
+            setPooledDecodeGroup(bindings);
+        }
+        void setPooledServingBinding(
+            PooledKVDecodeBinding *binding) override
+        {
+            setPooledDecodeBinding(binding);
+        }
+        bool pooledKVCacheGeometry(int &kv_heads, int &head_dim,
+                                   int &layers) const override
+        {
+            if (!graph_builder_ || !state_.kv_cache ||
+                !state_.device_id.is_cpu())
+                return false;
+            const int heads = n_kv_heads();
+            const int dim = state_.kv_cache->local_kv_dim();
+            if (heads <= 0 || dim <= 0 || dim % heads != 0)
+                return false;
+            kv_heads = heads;
+            head_dim = dim / heads;
+            layers = n_layers();
+            return layers > 0;
+        }
+
         /**
          * @brief Get cache statistics
          */
@@ -4541,6 +4705,7 @@ namespace llaminar2
         friend struct DeviceGraphOrchestratorLiveStateTestAccess;
         /** @brief Device-free peer of the actual CPU bootstrap producer and mailbox read lease. */
         friend struct DeviceGraphOrchestratorMTPZeroHiddenTestAccess;
+        friend struct DeviceGraphOrchestratorMTPSlotsTestAccess;
         /** @brief Device-free peer of the actual cold serving-family buffer scope. */
         friend struct DeviceGraphOrchestratorServingBuffersTestAccess;
         /** @brief Device-free peer of exact publication-child ownership and retirement. */
@@ -7127,6 +7292,18 @@ namespace llaminar2
                               bool defer_final_sync = false);
 
         /**
+         * @brief Execute one shared CPU predictor transaction over arbitrary resident slots.
+         * @param slots Distinct admitted slots in compact row order.
+         * @param tokens One condition token per slot.
+         * @param positions Independent predictor position per slot.
+         * @param source Current main or previous draft hidden publication.
+         * @return True only after every draft hidden row is published back to its slot.
+         * @throws std::logic_error For missing, stale or foreign CPU publication state.
+         */
+        bool executeCPUResidentMTPDraft(const std::vector<int> &slots,
+            std::span<const int32_t> tokens, std::span<const int> positions, CPUResidentMTPHidden::Bank source);
+
+        /**
          * @brief Submit one retained depth-zero MTP sidecar transaction.
          *
          * This is the common ownership and ordering boundary for scalar decode,
@@ -7176,6 +7353,7 @@ namespace llaminar2
          * @param device_position_offset Offset added by the device composer.
          * @param first_seq_idx First shifted-KV sequence owned by this batch.
          * @param submission Execute normally, or seal an authenticated scalar chained sibling without publishing input data.
+         * @param request_kv_slots Optional explicit CPU resident-slot map, copied into sidecar cache identity.
          * @return `true` after ordinary execution publishes every required event,
          *         or after cold-only submission seals the complete chained graph without executing it.
          */
@@ -7206,7 +7384,8 @@ namespace llaminar2
                                      int device_position_offset = 0,
                                      int first_seq_idx = 0,
                                      DeviceGraphExecutor::GraphInitialSubmissionPolicy submission =
-                                         DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch);
+                                         DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch,
+                                     const std::vector<int> *request_kv_slots = nullptr);
 
         /**
          * @brief Populate CPU shifted-MTP KV from one completed main prefill.
@@ -7383,6 +7562,8 @@ namespace llaminar2
             int seq_len = 0;
             int batch_size = 1;
             int first_seq_idx = 0;
+            /// CPU graph identity owns its exact row-to-cache-slot mapping.
+            std::vector<int> request_kv_slots;
             bool uses_device_token_ids = false;
             bool uses_device_position_ids = false;
             int condition_token_slot = -1;
@@ -9554,6 +9735,16 @@ namespace llaminar2
 
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;
+        /** @brief Rows of terminal logits published by the latest serving forward. */
+        int serving_logits_rows_ = 0;
+        /** @brief Cached tokens of each serving slot (KV sequence). */
+        std::vector<int> serving_slot_positions_;
+        /// Metadata only: borrows the arena's disjoint CPU main/draft hidden root.
+        std::unique_ptr<CPUResidentMTPHidden> cpu_resident_mtp_hidden_;
+        /** @brief Diagnostic of the last failed serving forward. */
+        std::string serving_row_error_;
+        /** @brief KV sequence of each row of the serving forward in flight. */
+        std::vector<int> serving_row_slots_;
 
         // =========================================================================
         // Snapshot Capture Members

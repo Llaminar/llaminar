@@ -12,6 +12,8 @@
  * - Typed final-weight placement rejects invalid identities before allocation
  * - Actual allocator placement lifecycle checks under scoped syscall/allocation faults
  * - Native happy-path CPU and memory-policy restoration before publication
+ * - Native page geometry and CPU-bearing placement are observed independently
+ *   of memory-only NUMA nodes; allocation refusal remains a test failure
  *
  * @author David Sanftenberg
  * @date 2026-01-21
@@ -19,10 +21,12 @@
 
 #include <gtest/gtest.h>
 #include "memory/NUMAAllocator.h"
+#include "memory/FirstTouchBoundary.h"
 #include "memory/CPUWeightStoragePlacement.h"
 #include "memory/NUMAPageQuery.h"
 #include "utils/Logger.h"
 #include "tensors/AlignedVector.h"
+#include "utils/NUMATopology.h"
 
 #include <cstdlib>
 #include <algorithm>
@@ -37,6 +41,8 @@
 #include <thread>
 #include <vector>
 #include <numeric>
+#include <algorithm>
+#include <system_error>
 
 #include <sched.h>
 #include <numaif.h>
@@ -254,7 +260,7 @@ extern "C" long set_mempolicy(int mode, const unsigned long *nodes, unsigned lon
     const bool restoring = probe->policy_writes++ != 0;
     if ((!restoring && (probe->fault == PlacementFault::RejectPolicy || probe->fault == PlacementFault::RejectPolicyAndRestoreAffinity)) ||
         (restoring && probe->fault == PlacementFault::RestorePolicy)) { errno = EIO; return -1; }
-    const size_t words = (max_nodes + sizeof(unsigned long)*8-1)/(sizeof(unsigned long)*8);
+    const size_t words = max_nodes >= 2 ? (max_nodes - 2) / kFirstTouchMaskWordBits + 1 : 0;
     if (words > probe->nodes.size()) std::_Exit(95);
     probe->mode = mode; probe->nodes.fill(0);
     if (nodes) std::copy_n(nodes, words, probe->nodes.begin());
@@ -267,7 +273,7 @@ extern "C" long get_mempolicy(int *mode, unsigned long *nodes, unsigned long max
     auto *probe = placement_probe;
     if (!probe || flags) return nativePolicyRead()(mode, nodes, max_nodes, address, flags);
     if (probe->policy_restored && probe->fault == PlacementFault::ReadPolicy) { errno = EIO; return -1; }
-    const size_t words = (max_nodes + sizeof(unsigned long)*8-1)/(sizeof(unsigned long)*8);
+    const size_t words = max_nodes >= 2 ? (max_nodes - 2) / kFirstTouchMaskWordBits + 1 : 0;
     if (words > probe->nodes.size()) std::_Exit(96);
     if (mode) *mode = probe->mode;
     if (nodes) std::copy_n(probe->nodes.begin(), words, nodes);
@@ -286,6 +292,8 @@ extern "C" long move_pages(int pid, unsigned long count, void **pages, const int
 
 TEST(Test__NUMAAllocator, FirstTouchPlacementPreparesBeforeBorrowingAndRestoresExactCaller)
 {
+    // The probe observes the memory-policy protocol of a NUMA kernel.
+    ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     auto &allocator = NUMAAllocator::instance();
     const auto incoming = placementCallerMask();
     for (int lifetime = 0; lifetime < 20; ++lifetime)
@@ -318,8 +326,10 @@ TEST(Test__NUMAAllocator, FirstTouchPlacementPreparesBeforeBorrowingAndRestoresE
     }
 }
 
-TEST(Test__NUMAAllocator, FirstTouchPlacementPolicyRejectionRestoresOnlyPublishedCPU)
+TEST(Test__NUMAAllocator, FirstTouchPlacementPolicyRejectionRestoresBothSettings)
 {
+    // The probe observes the memory-policy protocol of a NUMA kernel.
+    ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     auto &allocator = NUMAAllocator::instance();
     const auto incoming = placementCallerMask();
     PlacementProbe probe; probe.fault = PlacementFault::RejectPolicy;
@@ -328,7 +338,10 @@ TEST(Test__NUMAAllocator, FirstTouchPlacementPolicyRejectionRestoresOnlyPublishe
         PlacementFaultScope scope(probe);
         EXPECT_EQ(allocator.allocateOnNode(4096, -1, 4096), nullptr);
         after = placementCallerMask();
-        EXPECT_EQ(probe.policy_writes, 1u);
+        EXPECT_EQ(probe.policy_writes, 2u);
+        EXPECT_EQ(probe.affinity_writes, 2u);
+        EXPECT_TRUE(probe.policy_restored);
+        EXPECT_TRUE(probe.affinity_restored);
         EXPECT_FALSE(probe.borrowed);
         EXPECT_EQ(probe.mode, MPOL_PREFERRED);
         EXPECT_EQ(probe.nodes[0], 1ul);
@@ -339,6 +352,8 @@ TEST(Test__NUMAAllocator, FirstTouchPlacementPolicyRejectionRestoresOnlyPublishe
 
 TEST(Test__NUMAAllocator, FirstTouchPlacementExceptionsReleaseUnpublishedStorage)
 {
+    // The probe observes the memory-policy protocol of a NUMA kernel.
+    ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     auto &allocator = NUMAAllocator::instance();
     const int node = allocator.getCurrentNUMANode();
     const auto prior_level = Logger::getInstance().getLogLevel();
@@ -368,6 +383,8 @@ TEST(Test__NUMAAllocator, FirstTouchPlacementExceptionsReleaseUnpublishedStorage
 
 TEST(Test__NUMAAllocator, FirstTouchPlacementRestorationErrorsAndContradictionsAreFatal)
 {
+    // The probe observes the memory-policy protocol of a NUMA kernel.
+    ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     for (const auto fault : {PlacementFault::RestoreAffinity, PlacementFault::RestorePolicy,
                              PlacementFault::ReadAffinity, PlacementFault::ReadPolicy,
                              PlacementFault::ContradictAffinity, PlacementFault::ContradictPolicy})
@@ -378,18 +395,58 @@ TEST(Test__NUMAAllocator, FirstTouchPlacementRestorationErrorsAndContradictionsA
             PlacementFaultScope scope(probe);
             void *memory = allocator.allocateOnNode(4096, -1, 4096);
             if (memory) allocator.free(memory, 4096);
-        }()), "cannot restore exact first-touch caller placement");
+        }()), "cannot restore first-touch thread placement");
     }
-    // A rejected policy still owns the already-published CPU write. The same
-    // fatal behavior is required while acquire() is rolling that write back.
+    // A rejected policy still requires verification of both original settings.
+    // Failure to restore the already-published affinity write must be fatal.
     EXPECT_DEATH(( [] {
         auto &allocator = NUMAAllocator::instance();
         PlacementProbe probe; probe.fault = PlacementFault::RejectPolicyAndRestoreAffinity;
         PlacementFaultScope scope(probe);
         (void)allocator.allocateOnNode(4096, -1, 4096);
-    }()), "cannot restore exact first-touch caller placement");
+    }()), "cannot restore first-touch thread placement");
 }
 
+
+namespace
+{
+    /**
+     * @brief Observe this process's allowed memory-node identities.
+     * @return Allowed node IDs, including memory-only nodes.
+     * @throws std::system_error When the required kernel observation is denied.
+     */
+    std::vector<int> allowedMemoryNodes()
+    {
+        const int max_node = numa_max_possible_node();
+        if (max_node < 0)
+            throw std::runtime_error("Missing fixture memory-node geometry");
+        constexpr size_t bits = sizeof(unsigned long) * 8u;
+        std::vector<unsigned long> mask(static_cast<size_t>(max_node) / bits + 1);
+        if (get_mempolicy(nullptr, mask.data(), static_cast<unsigned long>(max_node) + 2,
+                          nullptr, MPOL_F_MEMS_ALLOWED) != 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "observe fixture memory-node admission");
+        std::vector<int> nodes;
+        for (int node = 0; node <= max_node; ++node)
+            if ((mask[node / bits] & (1ul << (node % bits))) != 0)
+                nodes.push_back(node);
+        return nodes;
+    }
+
+    /**
+     * @brief Select CPU-bearing nodes from the observed memory-node envelope.
+     * @return Physical nodes with CPUs that can perform first touch; sparse IDs
+     *         are preserved rather than interpreting a node count as placement.
+     */
+    std::vector<int> cpuBearingMemoryNodes()
+    {
+        auto nodes = allowedMemoryNodes();
+        std::erase_if(nodes, [](int node) {
+            return NUMATopology::getCPUsOnNode(node).empty();
+        });
+        return nodes;
+    }
+}
 
 TEST(Test__NUMAAllocator, CPUWeightPlacementRejectsNegativeNodeBeforeAllocation)
 {
@@ -596,8 +653,10 @@ TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
     if (!allocator.isNUMAAvailable())
         GTEST_SKIP() << "NUMA policy APIs are unavailable";
 
-    constexpr size_t page_size = 4096;
-    constexpr size_t bytes = 3 * page_size;
+    const size_t page_size = NUMAAllocator::externalRangeAlignment();
+    const size_t bytes = 3 * page_size;
+    const auto cpu_nodes = cpuBearingMemoryNodes();
+    ASSERT_FALSE(cpu_nodes.empty());
     std::unique_ptr<void, decltype(&std::free)> storage(
         std::aligned_alloc(page_size, bytes), &std::free);
     ASSERT_NE(storage, nullptr);
@@ -607,19 +666,27 @@ TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
                   0, sizeof(incoming_affinity), &incoming_affinity),
               0);
 
-    constexpr unsigned long word_bits = std::numeric_limits<unsigned long>::digits;
-    const unsigned long policy_bits = std::max(word_bits, static_cast<unsigned long>(numa_max_node() + 1));
-    std::vector<unsigned long> incoming_nodes((policy_bits + word_bits - 1) / word_bits, 0);
+    const int max_policy_node = numa_max_possible_node();
+    ASSERT_GE(max_policy_node, 0);
+    const unsigned long policy_bits = static_cast<unsigned long>(max_policy_node) + 2;
+    std::vector<unsigned long> incoming_nodes(firstTouchMaskWordCount(max_policy_node), 0);
     int incoming_mode = MPOL_DEFAULT;
     ASSERT_EQ(get_mempolicy(&incoming_mode, incoming_nodes.data(), policy_bits, nullptr, 0), 0);
 
     // Repeatedly alternate nodes so recycled resident pages cannot make a
     // policy-only implementation appear correct. Each preparation must also
     // restore the exact launcher/container affinity before returning.
-    const int rounds = allocator.numNUMANodes() > 1 ? 32 : 1;
+    // Memory-only nodes are valid policy destinations, but cannot supply the
+    // CPU required by first-touch placement. Preserve their explicit rejection.
+    for (int node : allowedMemoryNodes())
+        if (NUMATopology::getCPUsOnNode(node).empty())
+            EXPECT_FALSE(allocator.prepareExternalReceiveRangeOnNode(
+                storage.get(), bytes, node));
+
+    constexpr int rounds = 32;
     for (int round = 0; round < rounds; ++round)
     {
-        const int target_node = round % allocator.numNUMANodes();
+        const int target_node = cpu_nodes[round % cpu_nodes.size()];
         ASSERT_TRUE(allocator.prepareExternalReceiveRangeOnNode(
             storage.get(), bytes, target_node));
 
@@ -648,53 +715,18 @@ TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
     }
 }
 
-TEST(Test__NUMAAllocator, FirstTouchOverridesInheritedRemoteMemoryPolicy)
-{
-    NUMAAllocator &allocator = NUMAAllocator::instance();
-    if (!allocator.isNUMAAvailable() || allocator.numNUMANodes() < 2)
-        GTEST_SKIP() << "Two NUMA nodes are required for conflicting-policy proof";
-
-    constexpr size_t bytes = 3u * 4096u;
-    constexpr unsigned long max_nodes = sizeof(unsigned long) * 8u;
-    const unsigned long preferred_node_zero = 1ul;
-    int policy_error = 0;
-    bool allocated_on_requested_node = false;
-    int restored_mode = -1;
-    unsigned long restored_nodes = 0;
-
-    // A separate thread lets the kernel discard this deliberately conflicting
-    // policy at exit, even if an assertion later fails in the test process.
-    std::thread worker([&] {
-        if (set_mempolicy(MPOL_PREFERRED, &preferred_node_zero, max_nodes) != 0)
-        {
-            policy_error = errno;
-            return;
-        }
-
-        void *memory = allocator.allocateOnNode(bytes, 1, 4096);
-        if (memory)
-        {
-            allocated_on_requested_node =
-                allocator.getNUMANodeForAddress(memory) == 1;
-            allocator.free(memory, bytes);
-        }
-
-        if (get_mempolicy(&restored_mode, &restored_nodes, max_nodes,
-                          nullptr, 0) != 0)
-            policy_error = errno;
-    });
-    worker.join();
-
-    if (policy_error != 0)
-        GTEST_SKIP() << "This environment cannot set/query thread NUMA policy: "
-                     << std::strerror(policy_error);
-    EXPECT_TRUE(allocated_on_requested_node)
-        << "First touch must target the requested NUMA node despite an "
-           "inherited policy preferring a remote node";
-    EXPECT_EQ(restored_mode, MPOL_PREFERRED);
-    EXPECT_EQ(restored_nodes & preferred_node_zero, preferred_node_zero)
-        << "First-touch policy must be restored for subsequent allocations";
-}
+// RETIRED (approved design v3 relocation): the old
+// FirstTouchOverridesInheritedRemoteMemoryPolicy case used a
+// memoryless allowed node as the "remote" policy node — on
+// single-RAM-node machines it cannot even find a distinct allowed
+// memory node, and on multi-node machines an allowed-but-memoryless
+// node proves nothing about remote placement. The genuine obligation
+// now lives in V2_Integration_NUMAFirstTouchRemoteRAMPlacement_
+// MultiRAMNode (memory-node contract: >= 2 allowed RAM-bearing nodes,
+// strict-remote positive control, per-page placement proof, omit-bind
+// negative) and the deterministic transition proof lives in
+// V2_Unit_NUMAFirstTouchBoundary +
+// V2_Integration_NUMAFirstTouchBoundaryNativeSingleNode.
 
 TEST(Test__NUMAAllocator, DedicatedMappingsSurviveAlternatingNodeChurn)
 {
@@ -705,10 +737,12 @@ TEST(Test__NUMAAllocator, DedicatedMappingsSurviveAlternatingNodeChurn)
     const size_t page_size =
         NUMAAllocator::externalRangeAlignment();
     constexpr size_t pages_per_round = 384;
-    const int rounds = allocator.numNUMANodes() > 1 ? 32 : 4;
+    const auto cpu_nodes = cpuBearingMemoryNodes();
+    ASSERT_FALSE(cpu_nodes.empty());
+    constexpr int rounds = 32;
     for (int round = 0; round < rounds; ++round)
     {
-        const int target_node = round % allocator.numNUMANodes();
+        const int target_node = cpu_nodes[round % cpu_nodes.size()];
         auto storage =
             AlignedVector<std::uint8_t>::pageMappedUninitialized(
                 pages_per_round * page_size - 17u);
@@ -736,10 +770,12 @@ TEST(Test__NUMAAllocator, HugePageAdvisedMappingsRetainExactFirstTouchNode)
     const size_t page_size =
         NUMAAllocator::externalRangeAlignment();
     constexpr size_t mapping_bytes = 4u * 1024u * 1024u;
-    const int rounds = allocator.numNUMANodes() > 1 ? 16 : 4;
+    const auto cpu_nodes = cpuBearingMemoryNodes();
+    ASSERT_FALSE(cpu_nodes.empty());
+    constexpr int rounds = 16;
     for (int round = 0; round < rounds; ++round)
     {
-        const int target_node = round % allocator.numNUMANodes();
+        const int target_node = cpu_nodes[round % cpu_nodes.size()];
         auto storage =
             AlignedVector<std::uint8_t>::pageMappedUninitialized(
                 mapping_bytes);
@@ -969,6 +1005,7 @@ TEST(Test__NUMAAllocator, NUMABufferIterators)
 {
     constexpr size_t count = 64;
     NUMABuffer<int> buffer(count, 0);
+    ASSERT_TRUE(buffer.valid());
 
     // Fill using iterators
     int value = 0;
