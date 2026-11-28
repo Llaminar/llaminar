@@ -1133,9 +1133,14 @@ public:
      * cursorEpoch bumps on success (typed cursor lifecycle).
      *
      * @param archives One archive per layer, in layer order.
+     * @param expected_trust_domain The ROUTE's authenticated trust domain the
+     * restore expects (the flow's real value — never the archive's own).
+     * @param expected_ancestry_id The ROUTE's exact ancestry identity.
      * @return True on success; false without mutation on any refusal.
      */
-    bool attachStoredImport(const std::vector<PagedKVArchive> &archives)
+    bool attachStoredImport(const std::vector<PagedKVArchive> &archives,
+        std::uint64_t expected_trust_domain,
+        std::uint64_t expected_ancestry_id)
     {
         if (!pool_ || !table_ || cancelled_)
         {
@@ -1202,7 +1207,6 @@ public:
                 LOG_ERROR("[PooledKVDecodeBinding] Stored import bank refused at layer " << layer);
                 return false;
             }
-            const auto &meta = metas[layer];
             try
             {
                 // Table-level private materialization with the authenticated
@@ -1211,19 +1215,19 @@ public:
                 // history/placement state is restored — only native K/V
                 // bytes enter the bank).
                 //
-                // G1 (reviewer carry): at THIS call site the binding forwards
-                // the archive's OWN record as the expectation, so the trust/
-                // ancestry comparison is tautological and cannot fire. That
-                // is intentional NOW (the binding restores bytes; the
-                // authenticated expectation is the FLOW's — the store route
-                // and the resolver's trust domain own the real values). The
-                // flow adapter MUST pass the real expected trust domain and
-                // ancestry; until then this call site performs NO trust
-                // ENFORCEMENT (only self-consistency). The primitive-level
-                // mismatch refusal is proven by the negative test at the
-                // table layer.
+                // G1 (reviewer carry) RESOLVED: the flow passes the ROUTE's
+                // expected trust domain / ancestry identity — the REAL
+                // authenticated expectations, never the archive's own record.
+                // The primitive compares these expectations against the
+                // section's stamped record BEFORE any byte is staged; a
+                // tampered or swapped extent (digest-revalidated but
+                // stamped differently) refuses here. The stamping happens at
+                // the WRITE side (flow withProvenance before store.put), so
+                // write and restore see the SAME route values and an
+                // attacker-controlled record cannot.
                 update->attachArchivedPrefix(archives[layer], *grant,
-                    page_tokens_, meta.trust_domain, meta.ancestry_id);
+                    page_tokens_, expected_trust_domain,
+                    expected_ancestry_id);
             }
             catch (const std::exception &e)
             {

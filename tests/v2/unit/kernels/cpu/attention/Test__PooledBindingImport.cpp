@@ -93,7 +93,8 @@ TEST(PooledBindingImport, StoredSectionImportsByteExact)
     auto binding = fx.binding(/*request_id=*/701, /*layers=*/1);
     EXPECT_FALSE(binding.hasLivePublication());
     const auto epoch_before = binding.cursorEpoch();
-    EXPECT_TRUE(binding.attachStoredImport({archive}));
+    EXPECT_TRUE(binding.attachStoredImport({archive},
+        archive.meta().trust_domain, archive.meta().ancestry_id));
     ASSERT_TRUE(binding.hasLivePublication());
     EXPECT_EQ(binding.cursorEpoch(), epoch_before + 1);
     EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 12);
@@ -116,7 +117,8 @@ TEST(PooledBindingImport, PartialTailImportExact)
     ImportFixture fx;
     const auto archive = publishArchive(fx, /*rows=*/11, /*seed=*/5); // Mid-page.
     auto binding = fx.binding(702);
-    EXPECT_TRUE(binding.attachStoredImport({archive}));
+    EXPECT_TRUE(binding.attachStoredImport({archive},
+        archive.meta().trust_domain, archive.meta().ancestry_id));
     EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 11);
     auto reexport = binding.exportLayer(0);
     ASSERT_TRUE(reexport.has_value());
@@ -135,14 +137,17 @@ TEST(PooledBindingImport, MultiLayerSkewRefusesAndExactSucceeds)
     const auto archive_b = publishArchive(fx, 9, 2); // Different extent.
     auto binding = fx.binding(703, /*layers=*/2);
     // Layer count mismatch refuses.
-    EXPECT_FALSE(binding.attachStoredImport({archive_a}));
+    EXPECT_FALSE(binding.attachStoredImport({archive_a}, 0, 0));
     EXPECT_FALSE(binding.hasLivePublication());
     // Skewed extents refuse.
-    EXPECT_FALSE(binding.attachStoredImport({archive_a, archive_b}));
+    EXPECT_FALSE(binding.attachStoredImport({archive_a, archive_b}, 0, 0));
     EXPECT_FALSE(binding.hasLivePublication());
-    // Exact pair succeeds; both layers byte-exact.
+    // Exact pair succeeds; both layers byte-exact (the FLOW supplies the
+    // route expectations; this binding-level self-consistency case passes
+    // the archive's own record).
     const auto archive_b2 = publishArchive(fx, 12, 8);
-    EXPECT_TRUE(binding.attachStoredImport({archive_a, archive_b2}));
+    EXPECT_TRUE(binding.attachStoredImport({archive_a, archive_b2},
+        archive_a.meta().trust_domain, archive_a.meta().ancestry_id));
     ASSERT_TRUE(binding.hasLivePublication());
     ASSERT_EQ(binding.importAncestry().size(), 2u);
     const auto a = archive_a.serialize();
@@ -162,7 +167,8 @@ TEST(PooledBindingImport, GateNegativesRefuseWithoutMutation)
     // Fresh-history refusal: first import succeeds, second refuses.
     auto binding = fx.binding(704);
     SCOPED_TRACE("case A: fresh destination");
-    EXPECT_TRUE(binding.attachStoredImport({archive}));
+    EXPECT_TRUE(binding.attachStoredImport({archive},
+        archive.meta().trust_domain, archive.meta().ancestry_id));
     const auto epoch = binding.cursorEpoch();
     SCOPED_TRACE("case B: duplicate attach refusal");
     EXPECT_FALSE(binding.attachStoredImport({archive}));
@@ -173,7 +179,7 @@ TEST(PooledBindingImport, GateNegativesRefuseWithoutMutation)
     SCOPED_TRACE("case C: wide fixture ctor");
     auto other = PooledKVDecodeBinding(wide.pool.get(), wide.table.get(), 705, 0,
         1, 16, 8, 1, 4);
-    EXPECT_FALSE(other.attachStoredImport({archive})); // heads/dim mismatch.
+    EXPECT_FALSE(other.attachStoredImport({archive}, 0, 0)); // heads/dim mismatch.
     EXPECT_FALSE(other.hasLivePublication());
     // Cancelled binding refuses.
     // Fresh pool/table for the cancelled case: the shared fixture's tail
@@ -183,7 +189,7 @@ TEST(PooledBindingImport, GateNegativesRefuseWithoutMutation)
     auto cancelled = PooledKVDecodeBinding(cancelled_fx.pool.get(),
         cancelled_fx.table.get(), 706, 0, 1, 8, 8, 1, 4);
     cancelled.cancelRequest();
-    EXPECT_FALSE(cancelled.attachStoredImport({archive}));
+    EXPECT_FALSE(cancelled.attachStoredImport({archive}, 0, 0));
     // NOTE: a VALID archive on another authority of the same geometry does
     // import legitimately — the binding restores bytes only; the
     // trust-domain/namespace gate is the FLOW's job (store route + resolver
@@ -191,7 +197,8 @@ TEST(PooledBindingImport, GateNegativesRefuseWithoutMutation)
     ImportFixture other_fx;
     auto foreign = PooledKVDecodeBinding(other_fx.pool.get(), other_fx.table.get(),
         707, 0, fx.kv_heads, fx.dimension, fx.page_tokens, 1, 4);
-    EXPECT_TRUE(foreign.attachStoredImport({archive}));
+    EXPECT_TRUE(foreign.attachStoredImport({archive},
+        archive.meta().trust_domain, archive.meta().ancestry_id));
     ASSERT_TRUE(foreign.hasLivePublication());
 }
 /** @test CARRY G1 primitive-level negative: a non-matching trust domain or

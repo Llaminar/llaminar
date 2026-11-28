@@ -16202,6 +16202,13 @@ add_v2_test(V2_Integration_PagedKVInstanceContract
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Instance;Admission;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVInstanceContract)
+add_executable(v2_test_pooled_kv_prefix_flow integration/prefix_cache/Test__PooledKVPrefixFlow.cpp)
+target_link_libraries(v2_test_pooled_kv_prefix_flow llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PooledKVPrefixFlow
+    COMMAND $<TARGET_FILE:v2_test_pooled_kv_prefix_flow>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Pooled;Flow;Demotion;Restore;Trust;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledKVPrefixFlow)
 add_executable(v2_test_pooled_binding_import unit/kernels/cpu/attention/Test__PooledBindingImport.cpp)
 target_link_libraries(v2_test_pooled_binding_import llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_PooledBindingImport
