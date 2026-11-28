@@ -53,8 +53,67 @@ class PooledKVDecodeBinding final
 {
 public:
     PooledKVDecodeBinding() = default;
-    PooledKVDecodeBinding(PooledKVDecodeBinding &&) = default;
-    PooledKVDecodeBinding &operator=(PooledKVDecodeBinding &&) = default;
+    ~PooledKVDecodeBinding() { abandonAttachReceipts(); }
+    PooledKVDecodeBinding(PooledKVDecodeBinding &&other) noexcept
+        : pool_(other.pool_), table_(other.table_),
+          request_id_(other.request_id_), slot_(other.slot_),
+          kv_heads_(other.kv_heads_), head_dim_(other.head_dim_),
+          page_tokens_(other.page_tokens_), admitted_issuances_(other.admitted_issuances_),
+          cells_(std::move(other.cells_)), reservation_(std::move(other.reservation_)),
+          cancelled_(other.cancelled_), cursor_epoch_(other.cursor_epoch_),
+          step_grant_(std::move(other.step_grant_)),
+          private_publication_grant_(std::move(other.private_publication_grant_)),
+          step_rows_(other.step_rows_), step_prepared_(other.step_prepared_),
+          tail_grant_(std::move(other.tail_grant_)),
+          tail_frames_(std::move(other.tail_frames_)),
+          fresh_tail_frames_(std::move(other.fresh_tail_frames_)),
+          persistent_tail_(other.persistent_tail_),
+          prefix_ancestry_refs_(std::move(other.prefix_ancestry_refs_)),
+          attach_use_leases_(std::move(other.attach_use_leases_))
+    {
+        // The moved-from binding must not double-free or cancel the moved
+        // state: it keeps its scalars but loses every owning/move-only member.
+        other.pool_ = nullptr;
+        other.table_ = nullptr;
+        other.reservation_.reset();
+        other.step_grant_.reset();
+        other.private_publication_grant_.reset();
+        other.tail_grant_.reset();
+        other.cancelled_ = true; // Inert: no operation may run on it.
+    }
+    PooledKVDecodeBinding &operator=(PooledKVDecodeBinding &&other) noexcept
+    {
+        if (this != &other)
+        {
+            abandonAttachReceipts();
+            pool_ = other.pool_; table_ = other.table_;
+            request_id_ = other.request_id_; slot_ = other.slot_;
+            kv_heads_ = other.kv_heads_; head_dim_ = other.head_dim_;
+            page_tokens_ = other.page_tokens_;
+            admitted_issuances_ = other.admitted_issuances_;
+            cells_ = std::move(other.cells_);
+            reservation_ = std::move(other.reservation_);
+            cancelled_ = other.cancelled_;
+            cursor_epoch_ = other.cursor_epoch_;
+            step_grant_ = std::move(other.step_grant_);
+            private_publication_grant_ = std::move(other.private_publication_grant_);
+            step_rows_ = other.step_rows_; step_prepared_ = other.step_prepared_;
+            tail_grant_ = std::move(other.tail_grant_);
+            tail_frames_ = std::move(other.tail_frames_);
+            fresh_tail_frames_ = std::move(other.fresh_tail_frames_);
+            persistent_tail_ = other.persistent_tail_;
+            prefix_ancestry_refs_ = std::move(other.prefix_ancestry_refs_);
+            attach_use_leases_ = std::move(other.attach_use_leases_);
+            other.pool_ = nullptr;
+            other.table_ = nullptr;
+            other.reservation_.reset();
+            other.step_grant_.reset();
+            other.private_publication_grant_.reset();
+            other.tail_grant_.reset();
+            other.cancelled_ = true;
+        }
+        return *this;
+    }
     PooledKVDecodeBinding(const PooledKVDecodeBinding &) = delete;
     PooledKVDecodeBinding &operator=(const PooledKVDecodeBinding &) = delete;
 
@@ -310,6 +369,17 @@ public:
      * borrows — the pool retires each frame after its last pin. After this
      * call the binding is inert: prepareStep/export/truncate refuse.
      */
+    /** @brief Bounded receipt cleanup: abandon every unacknowledged attach
+     * receipt (never a silent leak, never a permanent source pin) and clear
+     * the retained leases. Called by ~PooledKVDecodeBinding, the move
+     * assignment target and cancelRequest. */
+    void abandonAttachReceipts() noexcept
+    {
+        for (auto &lease : attach_use_leases_)
+            lease.abandon();
+        attach_use_leases_.clear();
+    }
+
     void cancelRequest() noexcept
     {
         step_grant_.reset();
@@ -327,6 +397,9 @@ public:
         tail_grant_.reset();
         private_publication_grant_.reset();
         reservation_.reset();
+        // Bounded: pending attach receipts are explicitly abandoned, never
+        // silently leaked (a source replica must not stay pinned forever).
+        abandonAttachReceipts();
         cancelled_ = true;
     }
     /** @return Whether the request was explicitly cancelled. */
@@ -615,6 +688,13 @@ public:
     {
         for (auto &pair : cells_)
             pair.cells[0] = std::move(pair.cells[1]);
+        // P3 ordering point: the first decode step that consumes the
+        // attached prefix acknowledges every attach receipt. The recency pin
+        // retires here — 'hotness' is a real recorded use, never a permanent
+        // protection. (advanceStep is called only on a complete step.)
+        for (auto &lease : attach_use_leases_)
+            lease.acknowledge();
+        attach_use_leases_.clear();
         // Promote each rolled fresh tail frame to the persistent tail frame
         // (the step's final partial page is now the live tail). Frames that
         // were NOT rolled (in-place or empty-start) keep their position.
@@ -761,6 +841,11 @@ public:
         auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
         cell.ref = ref;
         cell.snapshot = std::move(snapshot);
+        // The attached prefix (if any) is being replaced: abandon the
+        // outstanding attach receipts (bounded — the old content is dropped).
+        for (auto &lease : attach_use_leases_)
+            lease.abandon();
+        attach_use_leases_.clear();
         // Typed cursor lifecycle: the row counts changed outside a forward;
         // the orchestrator adopts the authoritative position via cursorEpoch.
         ++cursor_epoch_;
@@ -983,6 +1068,37 @@ public:
             const auto *src_cell = source.priorFor(static_cast<int>(layer));
             prefix_ancestry_refs_.push_back(src_cell ? src_cell->ref : PagedKVSnapshotRef{});
         }
+        // P3 effective-use ordering at successful attachment: mint ONE
+        // content/replica-bound receipt per layer on the SOURCE publications
+        // we adopted. The lease is the bounded temporary pin/fence: the
+        // replica cannot be retired while this receipt is outstanding, and it
+        // is acknowledged at the ordering point (the first decode step that
+        // consumes the attached prefix) — never a permanent protection that
+        // fakes 'hotness'. A lease that cannot be minted (journal full /
+        // sealed / obsolete) refuses the attachment BEFORE it is considered
+        // successful; duplicates cannot affect a replacement because every
+        // touch minted its own fresh ordinal (never a glow on an old receipt).
+        attach_use_leases_.clear();
+        attach_use_leases_.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            const auto *src_cell = source.priorFor(static_cast<int>(layer));
+            auto lease = table_->touchEffectiveUse(src_cell->snapshot);
+            if (!lease)
+            {
+                // Obligations for already-minted leases are explicitly
+                // abandoned (bounded; never a silent leak) and the attach
+                // fails closed: no effective use is recorded as successful
+                // when the receipt cannot be issued.
+                for (auto &held : attach_use_leases_)
+                    held.abandon();
+                attach_use_leases_.clear();
+                LOG_ERROR("[PooledKVDecodeBinding] Shared prefix effective-use touch refused at layer "
+                          << layer);
+                return false;
+            }
+            attach_use_leases_.push_back(std::move(*lease));
+        }
         ++cursor_epoch_;
         return true;
     }
@@ -1039,6 +1155,10 @@ private:
     std::optional<PhysicalPagePool::Grant> private_publication_grant_;
     /** Exact source-ref ancestry recorded by attachSharedPrefix (per layer). */
     std::vector<PagedKVSnapshotRef> prefix_ancestry_refs_;
+    /** Effective-use receipts minted at shared-prefix attach (one per layer);
+     * owned by this binding until acknowledged at the ordering point or
+     * abandoned on cancellation (never a silent leak). */
+    std::vector<EffectiveUseLease> attach_use_leases_;
     int step_rows_ = 0;
     bool step_prepared_ = false;
     /** Persistent exclusive-tail grant (one frame per layer), admitted at binding. */

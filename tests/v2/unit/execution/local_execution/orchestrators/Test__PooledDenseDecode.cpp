@@ -1700,3 +1700,160 @@ TEST(PooledDenseDecode, SharedPrefixAttachPageBoundaryCopiesNothing)
     EXPECT_EQ(dst8.priorFor(0)->snapshot.view().rows(), 8);
     EXPECT_EQ(dst16.priorFor(0)->snapshot.view().rows(), 16);
 }
+
+/** @test P3 effective-use ordering at shared-prefix attachment (plan P3:
+ * "content/replica-bound immutable receipts, retention
+ * watermark/acknowledgment and bounded temporary pin/fence... Recency pins
+ * retire after the ordering point rather than making 'hotness' tests pass by
+ * permanent protection").
+ * A successful attach mints one receipt per layer on the SOURCE replica; the
+ * first decode step that consumes the attached prefix acknowledges them (the
+ * ordering point); a cancelled/failed consumer abandons them (bounded, never
+ * a leak); a refused attach records NO effective use. */
+TEST(PooledDenseDecode, SharedPrefixAttachEffectiveUseOrdering)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 10> prompt_src{1, 3, 5, 7, 9, 11, 13, 15, 17, 19};
+    const std::array<int32_t, 2> decode{2, 4};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 16;
+
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 4 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 8;
+        budget.max_pages_per_request = 64;
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/fx.config.n_layers, /*admitted_issuances=*/10, /*readers_per_bank=*/4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        auto table_geom = plan->table_geometry;
+        table_geom.bank_count = 2 * table_geom.bank_count;
+        table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+        table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+        auto pool_geom = plan->pool_geometry;
+        pool_geom.frames = 64 + 8 * pool_geom.frames;
+        pool_geom.request_records = 8;
+        auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+        widened->pool_geometry = pool_geom;
+        widened->table_geometry = table_geom;
+        widened->total_bytes = PhysicalPagePool::physicalBytes(pool_geom, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=widened->total_bytes,
+            .admission_available_bytes=widened->total_bytes},
+            PhysicalMemoryOwner::KVCache, widened->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *widened, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    PagedKVInstance src_instance;
+    ASSERT_TRUE(make_instance(src_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> src_owner;
+    PreparedWeightStore src_store;
+    std::shared_ptr<QwenStandardGraph> src_builder;
+    make_runner(fx, src_owner, src_store, src_builder);
+    PooledKVDecodeBinding src(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/421, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    src_owner->setPooledDecodeBinding(&src);
+    ASSERT_OK("source prefill", src_owner->forward(prompt_src.data(), 10, 1) != nullptr);
+    EXPECT_EQ(src_instance.table().effectiveUseWatermark(), 0u);
+
+    // Consumer A attaches (success): the source watermark advances by the
+    // layer count (a real recorded effective use on the source replica).
+    PagedKVInstance dst_a_instance;
+    ASSERT_TRUE(make_instance(dst_a_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> dst_a_owner;
+    PreparedWeightStore dst_a_store;
+    std::shared_ptr<QwenStandardGraph> dst_a_builder;
+    make_runner(fx, dst_a_owner, dst_a_store, dst_a_builder);
+    PooledKVDecodeBinding dst_a(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/422, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    ASSERT_TRUE(dst_a.attachSharedPrefix(src, 9));
+    const auto &src_table = src_instance.table();
+    EXPECT_EQ(src_table.effectiveUseWatermark(),
+        static_cast<std::uint64_t>(fx.config.n_layers))
+        << "a successful attach must record effective use on every layer";
+
+    // A refused attach (cross-authority consumer) records NOTHING.
+    PagedKVInstance foreign_instance;
+    ASSERT_TRUE(make_instance(foreign_instance));
+    PooledKVDecodeBinding foreign(&foreign_instance.pool(), &foreign_instance.table(),
+        /*request_id=*/423, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    EXPECT_FALSE(foreign.attachSharedPrefix(src, 9));
+    EXPECT_EQ(src_table.effectiveUseWatermark(),
+        static_cast<std::uint64_t>(fx.config.n_layers))
+        << "a refused attach must not record effective use";
+
+    // Ordering point: A's first decode step consumes the attached prefix —
+    // the receipts are acknowledged (watermark stays; no permanent pin).
+    dst_a_owner->setPooledDecodeBinding(&dst_a);
+    ASSERT_OK("consumer A decode", dst_a_owner->forward(&decode[0], 1, 1) != nullptr);
+    EXPECT_EQ(src_table.effectiveUseWatermark(),
+        static_cast<std::uint64_t>(fx.config.n_layers))
+        << "watermark records issued receipts, not outstanding pins";
+    // The source may now be retired: acknowledge means the replica retains no
+    // outstanding lease from A (the source's own publication still lives).
+    EXPECT_TRUE(src_table.effectiveUseMayEvict(src.priorFor(0)->snapshot.version()))
+        << "after the ordering point the replica is eviction-eligible";
+
+    // Bounded abandonment: a consumer that attaches then cancels never leaks
+    // its receipt (the replica would otherwise stay pinned forever).
+    PagedKVInstance dst_b_instance;
+    ASSERT_TRUE(make_instance(dst_b_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> dst_b_owner;
+    PreparedWeightStore dst_b_store;
+    std::shared_ptr<QwenStandardGraph> dst_b_builder;
+    make_runner(fx, dst_b_owner, dst_b_store, dst_b_builder);
+    PooledKVDecodeBinding dst_b(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/424, /*slot=*/2,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    ASSERT_TRUE(dst_b.attachSharedPrefix(src, 9));
+    EXPECT_EQ(src_table.effectiveUseWatermark(),
+        static_cast<std::uint64_t>(fx.config.n_layers) * 2)
+        << "second attach issues fresh receipts (never a duplicate glow)";
+    dst_b.cancelRequest();
+    EXPECT_EQ(src_table.effectiveUseWatermark(),
+        static_cast<std::uint64_t>(fx.config.n_layers) * 2)
+        << "cancellation abandons receipts without issuing new ones";
+    EXPECT_TRUE(src_table.effectiveUseMayEvict(src.priorFor(0)->snapshot.version()))
+        << "after abandonment the replica is eviction-eligible (no leak)";
+}
