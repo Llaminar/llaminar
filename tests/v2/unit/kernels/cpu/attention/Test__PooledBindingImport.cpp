@@ -26,7 +26,7 @@ struct ImportFixture
         const PhysicalPagePoolGeometry pool_geometry{24,
             static_cast<std::size_t>(page_tokens) * 2 * kv_heads * dimension *
                 sizeof(float),
-            2, 4};
+            /*request_records=*/6, 4};
         const CPUFP32PagedKVTableGeometry table_geometry{8, 4, 4, page_tokens,
             32, 8};
         const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
