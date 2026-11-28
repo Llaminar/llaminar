@@ -43,7 +43,61 @@ struct ShapeData {
     ~ShapeData(){ free(A16); free(B16); free(A32); free(B32); free(A8); free(B8); }
 };
 
+static const char* kRowFile = "/tmp/tier2d_rows.txt";
+static const char* Lnames[6]={"FP32 scalar","AVX512-BF16 4x4","AVX512-BF16 packed 16x24","FMA32 512-bit","VNNI int8","AMX-BF16"};
+static const char* Onames[7]={"oneDNN FP32 (avx512_core)",
+                               "oneDNN int8 (avx512 vnni)",
+                               "oneDNN BF16 (avx512_core_bf16)",
+                               "oneDNN int8 (AMX int8)",
+                               "oneDNN BF16 (AMX, default)",
+                               "oneDNN BF16 (avx512_core_bf16, other)",
+                               "(spare)"};
+static int showMode(int){
+    FILE* f=fopen(kRowFile,"r");
+    if(!f){ printf("no saved rows - run once plain and once with DNNL_MAX_CPU_ISA=avx512_core_bf16 first\n"); return 1; }
+    double mn[5][6]={}, mx[5][6]={}; bool have[5][6]={};
+    char line[512];
+    while(fgets(line,sizeof line,f)){
+        // row|<canon>|v0min,v0max|v1min,v1max|...|v5min,v5max|
+        int canon=-1;
+        if(sscanf(line,"row|%d|",&canon)!=1 || canon<0 || canon>4) continue;
+        char* p=strchr(line+5,'|');
+        if(!p) continue;
+        for(int l=0;l<6;++l){
+            double a=0,b=0;
+            if(sscanf(p+1,"%lf,%lf|",&a,&b)!=2) break;
+            if(a<0){ p=strchr(p+1,'|'); if(!p) break; continue; }
+            if(!have[canon][l] || a<mn[canon][l]) mn[canon][l]=a;
+            if(!have[canon][l] || b>mx[canon][l]) mx[canon][l]=b;
+            have[canon][l]=true;
+            p=strchr(p+1,'|'); if(!p) break;
+        }
+    }
+    fclose(f);
+    printf("SINGLE 2D INSTRUCTION-TIER MATRIX: oneDNN tiers (rows, low->high) x Llaminar engines (cols, low->high)\n");
+    printf("cell = oneDNN_time / Llaminar_time (range over the 4 shapes); >1.0 = Llaminar faster\n\n");
+    const char* RN[5]={"oneDNN FP32 (avx512_core)",
+                       "oneDNN int8 (avx512 vnni)",
+                       "oneDNN BF16 (avx512_core_bf16)",
+                       "oneDNN int8 (AMX int8)",
+                       "oneDNN BF16 (AMX, default)"};
+    printf("%-26s | %-20s | %-20s | %-20s | %-20s | %-20s | %-20s\n","","FP32 scalar","AVX512-BF16 4x4","AVX512-BF16 pk 16x24","FMA32 512","VNNI int8","AMX-BF16");
+    for(int c=0;c<5;++c){
+        printf("%-26s |", RN[c]);
+        for(int l=0;l<6;++l){
+            char cell[28];
+            if(!have[c][l]) snprintf(cell,sizeof cell,"%s","-");
+            else if(mx[c][l]-mn[c][l]<0.05) snprintf(cell,sizeof cell,"%.2fx",(mn[c][l]+mx[c][l])/2);
+            else snprintf(cell,sizeof cell,"%.2f-%.2fx",mn[c][l],mx[c][l]);
+            printf(" %-20s |", cell);
+        }
+        printf("\n");
+    }
+    printf("\naligned same-instruction-type cells (should be >= 1.0): FP32 col x row 1; AVX512-BF16 cols x row 3; AMX-BF16 col x row 5; VNNI int8 col x rows 2 and 4.\n");
+    return 0;
+}
 int main(int argc, char** argv){
+    if(argc>1 && !strcmp(argv[1],"--show")) return showMode(0);
     const int T = argc>1 ? atoi(argv[1]) : 8;
     omp_set_num_threads(T);
     const int shapes[][3]={{16,4096,4096},{32,4096,4096},{96,4096,4096},{32,8192,8192}};
@@ -129,15 +183,30 @@ int main(int argc, char** argv){
         }
     }
     const bool forced = getenv("DNNL_MAX_CPU_ISA") && strstr(getenv("DNNL_MAX_CPU_ISA"),"avx512_core_bf16");
-    const char* Lnames[6]={"FP32 scalar","AVX512-BF16 4x4","AVX512-BF16 packed 16x24","FMA32 512-bit","VNNI int8","AMX-BF16"};
-    const char* Onames[3]={"oneDNN FP32","oneDNN int8","oneDNN BF16"};
-    const char* Oisa[3]={ forced?"avx512_core":"avx512_core", forced?"avx512_vnni/bf16-cap":"AMX int8", forced?"avx512_core_bf16":"AMX (default)"};
-    printf("2D INSTRUCTION-TIER MATRIX - Llaminar engines (columns, low->high) x oneDNN tiers (rows, low->high)\n");
-    printf("cell = oneDNN_time / Llaminar_time over the 4 shapes (min-max); >1.0 = Llaminar faster.\n");
-    printf("oneDNN ISA cap: %s\n\n", forced?"avx512_core_bf16 (forced)":"default (AMX on this appliance)");
+    const char* Oisa[3]={ "avx512_core", forced?"avx512_vnni":"AMX int8", forced?"avx512_core_bf16":"AMX (default)"};
+    // canonical row ids: fp32=0, int8-avx512=1, bf16-avx512=2, int8-amx=3, bf16-amx=4
+    int rowId[3] = {0, forced?1:3, forced?2:4};
+    printf("this run\'s rows saved; run the second ISA mode too, then ./tier2d --show for the single merged matrix.\n");
+    {
+        FILE* f=fopen(kRowFile,"a");
+        if(f){
+            for(int o=0;o<3;++o){
+                fprintf(f,"row|%d|", rowId[o]);
+                for(int l=0;l<6;++l){
+                    double vmin=99,vmax=0; bool any=false;
+                    for(int s=0;s<4;++s){ double r=to[o][s]/tl[l][s]; if(r<vmin)vmin=r; if(r>vmax)vmax=r; any=true; }
+                    if(any) fprintf(f,"%.4f,%.4f|", vmin, vmax);
+                    else fprintf(f,"-1,-1|");
+                }
+                fprintf(f,"\n");
+            }
+            fclose(f);
+        }
+    }
+    printf("single-run rows (raw):\n");
     printf("%-22s | %22s | %22s | %22s | %22s | %22s | %22s\n","","FP32 scalar","AVX512-BF16 4x4","AVX512-BF16 16x24 pk","FMA32 512","VNNI int8","AMX-BF16");
     for(int o=0;o<3;++o){
-        char buf[64]; snprintf(buf,sizeof buf,"%s (%s)",Onames[o],Oisa[o]);
+        char buf[64]; snprintf(buf,sizeof buf,"%s (%s)",Onames[o], forced?Oisa[o]:Oisa[o]);
         printf("%-22s |", buf);
         for(int l=0;l<6;++l){
             double vmin=99,vmax=0; bool any=false;
