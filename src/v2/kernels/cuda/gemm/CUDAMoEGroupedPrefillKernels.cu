@@ -825,11 +825,13 @@ namespace
         constexpr bool kStreamContributions =
             ColumnsPerBlock == 32 && (CodebookId == 4 || CodebookId == 13);
         constexpr int kStreamThreads = Geometry::projection_threads;
-        constexpr int kStreamPlanes = CodebookId == 13 ? 16 : 12;
+        // CB13 reuses the retired warp-private B tile for two high-dot planes;
+        // only the remaining two high-dot planes need dedicated storage.
+        constexpr int kStreamDotPlanes = CodebookId == 13 ? 6 : 4;
         __shared__ float streamed_sums[
             kStreamContributions ? 8 * kStreamThreads : 1];
         __shared__ int32_t streamed_dots[
-            kStreamContributions ? (kStreamPlanes - 8) * kStreamThreads : 1];
+            kStreamContributions ? kStreamDotPlanes * kStreamThreads : 1];
         const int stream_lane = static_cast<int>(threadIdx.x);
         constexpr bool kStageIQ4Metadata =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut && ColumnsPerBlock == 32;
@@ -963,12 +965,25 @@ namespace
 
                 if constexpr (kStreamContributions)
                 {
+                    if constexpr (CodebookId == 13)
+                    {
+                        // All lanes have loaded B into registers before any lane
+                        // overwrites it. Each warp owns a disjoint aligned 256B
+                        // tile: exactly two planes of 32 signed int32 dots. A is
+                        // separate and remains live for the contribution helper.
+                        __syncwarp();
+                    }
 #pragma unroll
                     for (int element = 0; element < 4; ++element)
                     {
                         streamed_dots[element * kStreamThreads + stream_lane] = dot_lo[element];
                         if constexpr (CodebookId == 13)
-                            streamed_dots[(4 + element) * kStreamThreads + stream_lane] = dot_hi[element];
+                        {
+                            if (element < 2)
+                                reinterpret_cast<int32_t *>(shared_b)[element * 32 + lane] = dot_hi[element];
+                            else
+                                streamed_dots[(2 + element) * kStreamThreads + stream_lane] = dot_hi[element];
+                        }
                     }
                 }
 
@@ -995,7 +1010,9 @@ namespace
                             : dot_lo[element];
                         int32_t high_dot = 0;
                         if constexpr (kStreamContributions && CodebookId == 13)
-                            high_dot = streamed_dots[(4 + element) * kStreamThreads + stream_lane];
+                            high_dot = element < 2
+                                ? reinterpret_cast<const int32_t *>(shared_b)[element * 32 + lane]
+                                : streamed_dots[(2 + element) * kStreamThreads + stream_lane];
                         else if constexpr (!kStreamContributions)
                             high_dot = dot_hi[element];
                         const float previous = kStreamContributions
@@ -1040,6 +1057,8 @@ namespace
                 else
                     ::llaminar2::native_quantised_scale::withMetadataRepresentation<CodebookId>(weight_meta,
                                                                                                accumulate_elements);
+                // Retire every contribution read (including CB13's aliased B
+                // dots) before the next block decodes fresh operand bytes.
                 __syncthreads();
             }
 
