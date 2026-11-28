@@ -3,6 +3,7 @@
  * @brief Mechanical demotion executor contracts (P3 M9).
  */
 #include "execution/prefix_cache/PagedKVDemotionExecutor.h"
+#include "execution/prefix_cache/BlockHash.h"
 #include "planning/PagedKVInstanceFactory.h"
 
 #include <filesystem>
@@ -115,7 +116,9 @@ TEST(PagedKVDemotionExecutor, ExecutesRealMoveThroughComposedStore)
     ASSERT_TRUE(store != nullptr);
     auto section = exportPage(*fx.instance);
     const auto serialized = section.serialize();
-    const auto planned = PagedKVArchiveExtentKey{100, 3, 42, 4096};
+    const auto planned = PagedKVArchiveExtentKey{100, 3,
+        hashPrefixBytes(serialized.data(), serialized.size()),
+        pagedKVArchiveExtentBytes(serialized.size())};
     auto plan = oneMovePlan(3, 100, 7, planned);
     auto bytes = [&](const PagedDemotionMove &) {
         return std::optional<std::vector<std::byte>>(serialized);
@@ -151,7 +154,9 @@ TEST(PagedKVDemotionExecutor, MidPlanUnavailableRollsBackAll)
     auto section = exportPage(*fx.instance);
     const auto serialized = section.serialize();
     PagedDemotionPlan plan;
-    plan.moves.push_back({3, 100, 1, {100, 3, 42, 4096}});
+    plan.moves.push_back({3, 100, 1, {100, 3,
+        hashPrefixBytes(serialized.data(), serialized.size()),
+        pagedKVArchiveExtentBytes(serialized.size())}});
     plan.moves.push_back({3, 100, 0, {100, 3, 43, 4096}});
     auto bytes = [&](const PagedDemotionMove &m) {
         if (m.page_index != 1) return std::optional<std::vector<std::byte>>{};
@@ -161,6 +166,32 @@ TEST(PagedKVDemotionExecutor, MidPlanUnavailableRollsBackAll)
     EXPECT_FALSE(execution.ok());
     EXPECT_TRUE(execution.executed.empty());
     // The FIRST move's extent was published then ROLLED BACK: no residue.
+    EXPECT_EQ(store->quota().bytesAdmitted(), 0u);
+    std::error_code ec;
+    EXPECT_EQ(std::filesystem::directory_iterator(fx.dir.path, ec) ==
+              std::filesystem::directory_iterator(), true);
+}
+
+/** @test F1 NEGATIVE: a provider that yields digest-different bytes than the
+ * plan gated refuses precisely and rolls back EVERYTHING — quota 0, empty
+ * directory (the planned identity is authoritative; no stale-plan execution). */
+TEST(PagedKVDemotionExecutor, IdentityDisagreementRollsBackAll)
+{
+    Composition fx;
+    auto *store = fx.instance->diskStore();
+    ASSERT_TRUE(store != nullptr);
+    // Provider content whose REAL digest differs from the planned one (42).
+    auto section = exportPage(*fx.instance, /*heads=*/1, /*dimension=*/8, /*seed=*/99);
+    const auto serialized = section.serialize();
+    auto plan = oneMovePlan(3, 100, 7, {100, 3, /*planned digest*/ 42, 4096});
+    auto bytes = [&](const PagedDemotionMove &) {
+        return std::optional<std::vector<std::byte>>(serialized);
+    };
+    auto execution = executePagedDemotionPlan(plan, *fx.instance, bytes);
+    EXPECT_FALSE(execution.ok());
+    EXPECT_TRUE(execution.executed.empty());
+    EXPECT_NE(execution.refusal.find("stored extent identity disagrees"),
+        std::string::npos);
     EXPECT_EQ(store->quota().bytesAdmitted(), 0u);
     std::error_code ec;
     EXPECT_EQ(std::filesystem::directory_iterator(fx.dir.path, ec) ==
