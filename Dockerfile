@@ -587,6 +587,58 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then cp /usr/local/lib/librccl.so.1.0 /src/runtime-libs/; fi \
  && echo "==> [release] done; elapsed_seconds=$(( $(date +%s) - release_started_epoch )); final size: $(du -sh build_v2_release | cut -f1)"
 
+# The ARM64 NEON register witness proof binds the exact gcc/cc1plus/assembler
+# programs, their symlink/alternatives selection chain and the C++ header
+# closure at Integration build time. The slim test-runner cannot reproduce that
+# closure with a later apt install (Ubuntu publishes binutils/gcc security
+# updates, which is exactly what the witness already detected), so stage the
+# builder's own closure with its symlink shape intact and digest it. The
+# test-runner copies and verifies it; future toolchain drift then fails that
+# image build with a precise diagnostic instead of surfacing as a proof failure
+# inside the sealed ARM64 tests.
+RUN W=/src/witness-toolchain; \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        mkdir -p \
+            "${W}/usr/bin" \
+            "${W}/etc/alternatives" \
+            "${W}/usr/libexec/gcc/aarch64-linux-gnu/14" \
+            "${W}/usr/lib/gcc/aarch64-linux-gnu" \
+            "${W}/usr/lib/aarch64-linux-gnu" \
+            "${W}/usr/include/c++" \
+            "${W}/usr/include/aarch64-linux-gnu/c++"; \
+        for p in cc c++ gcc g++ gcc-14 g++-14 \
+                 aarch64-linux-gnu-gcc-14 aarch64-linux-gnu-g++-14 \
+                 as aarch64-linux-gnu-as ld aarch64-linux-gnu-ld \
+                 objdump aarch64-linux-gnu-objdump collect2; do \
+            [ -e "/usr/bin/${p}" ] && cp -a "/usr/bin/${p}" "${W}/usr/bin/${p}"; \
+        done; \
+        for a in cc c++ gcc g++; do \
+            [ -L "/etc/alternatives/${a}" ] && cp -a "/etc/alternatives/${a}" "${W}/etc/alternatives/"; \
+        done; \
+        for p in cc1 cc1plus collect2 g++-mapper-server lto1 lto-wrapper liblto_plugin.so; do \
+            [ -e "/usr/libexec/gcc/aarch64-linux-gnu/14/${p}" ] \
+                && cp -a "/usr/libexec/gcc/aarch64-linux-gnu/14/${p}" "${W}/usr/libexec/gcc/aarch64-linux-gnu/14/"; \
+        done; \
+        cp -a /usr/lib/gcc/aarch64-linux-gnu/14 "${W}/usr/lib/gcc/aarch64-linux-gnu/"; \
+        for lib in /usr/lib/aarch64-linux-gnu/libstdc++.so.6* /usr/lib/aarch64-linux-gnu/libgcc_s.so.1; do \
+            [ -e "${lib}" ] && cp -a "${lib}" "${W}/usr/lib/aarch64-linux-gnu/"; \
+        done; \
+        [ -d /usr/lib/aarch64-linux-gnu/ldscripts ] \
+            && cp -a /usr/lib/aarch64-linux-gnu/ldscripts "${W}/usr/lib/aarch64-linux-gnu/"; \
+        cp -a /usr/include/c++/14 "${W}/usr/include/c++/"; \
+        cp -a /usr/include/aarch64-linux-gnu/c++/14 "${W}/usr/include/aarch64-linux-gnu/c++/"; \
+        python3 scripts/ci/arm_witness_toolchain_manifest.py capture \
+            --root "${W}" --out /src/witness-toolchain-manifest.json; \
+    else \
+        # Docker COPY cannot be conditional, and the x86 test-runner shares
+        # these COPY sources; keep empty/marker artifacts so the COPY layers
+        # resolve for every architecture. The verify step below runs only on
+        # arm64, so the stub manifest is never authenticated elsewhere. \
+        mkdir -p "${W}"; \
+        printf '{"schema":1,"tool":"arm-witness-toolchain-manifest","entries":{}}\n' \
+            > /src/witness-toolchain-manifest.json; \
+    fi
+
 # The source-identity Unit constructs a tiny Git fixture using the real ignore
 # policy. Materialize this source-policy input after compilation so a revision
 # label cannot invalidate compilation. The test-runner stage copies this sealed
@@ -785,23 +837,26 @@ ARG LLAMINAR_SOURCE_TREE
 # CTest executes the sealed CMake registration and the source-identity test
 # creates a private Git fixture.  A small number of Unit scripts also compile
 # generated selectors in private temporary directories, summarize JSON through
-# ``jq``, and invoke the same pinned Ninja path recorded by CMake. Retain only
-# that fixture closure (``g++``, ``jq``, and the pinned Ninja binary), not the
-# production toolchain, SDK headers, or build objects. The runtime already
-# provides Python and OpenMPI; these are the only host tools absent from its
-# production closure.
+# ``jq``, and invoke the same pinned Ninja path recorded by CMake. Retain that
+# fixture closure (``build-essential``, ``jq``, and the pinned Ninja binary),
+# not the production toolchain, SDK headers, or build objects. The runtime
+# already provides Python and OpenMPI; these are the only host tools absent
+# from its production closure.
+#
+# On ARM64 the NEON register proof authenticates the GCC driver, compiler,
+# assembler and system headers against the witness captured at Integration
+# build time. The apt closure below therefore cannot substitute: a fresh apt
+# install would track Ubuntu security updates published since the cached
+# toolchain context was built and break the program identity check. The exact
+# witness programs are instead *copied* from the builder in the
+# witness-toolchain COPY/verify below, which runs after this layer and owns
+# the authenticated /usr/bin /usr/libexec /usr/lib /usr/include + alternatives
+# paths for every program the proof binds.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential \
       git \
       jq \
- # The NEON register proof authenticates the GCC driver, compiler, assembler \
- # and system headers before re-disassembling the retained witness. \
- && if [ "${TARGETARCH}" = "arm64" ]; then \
-        apt-get install -y --no-install-recommends g++-14 \
-        && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
-              --slave /usr/bin/g++ g++ /usr/bin/g++-14; \
-    fi \
  && rm -rf /var/lib/apt/lists/*
 
 # The compiler-stage annotations must also resolve when sealed test binaries
@@ -831,6 +886,21 @@ COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/c
 COPY --from=test-workspace /src/ /src/
 COPY --from=builder /usr/local/lib/python3.12/dist-packages/ \
      /usr/local/lib/python3.12/dist-packages/
+
+# ARM64: byte-exact witness toolchain closure (assembler, gcc driver chain,
+# cc1plus, headers) plus its digest manifest, copied from the builder that
+# compiled the register witness. A fresh apt install would silently pick up
+# Ubuntu security updates published since the cached toolchain context was
+# built and fail the proof's program identity at test time; copying the
+# builder's own bytes keeps witness and verification environments identical.
+# The manifest authentication below fails this image build on any drift,
+# long before the sealed ARM64 test suite runs.
+COPY --from=builder /src/witness-toolchain/ /
+COPY --from=builder /src/witness-toolchain-manifest.json /src/witness-toolchain-manifest.json
+RUN if [ "${TARGETARCH}" = "arm64" ]; then \
+        python3 /src/scripts/ci/arm_witness_toolchain_manifest.py verify \
+            --root / --manifest /src/witness-toolchain-manifest.json; \
+    fi
 
 # The sealed CTest registration replays the builder's exact configured MPI
 # library path (CMake recorded the toolchain's unversioned MPI dev link, whose
