@@ -153,12 +153,14 @@ jobs:
               --output /evidence/tests
       - name: Export the BuildKit compiler cache mount
         id: export-ccache
-        if: steps.ccache.outputs.cache-hit != 'true'
+        # Also after a failed build or test step: the compiled objects are still
+        # valid, and skipping the save leaves every later run on this cache prefix cold.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.ccache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         shell: bash
         run: bash scripts/ci/transfer_arm64_ccache.sh save
       - name: Save ARM64 compiler objects
-        if: steps.export-ccache.outcome == 'success'
+        if: ${{ !cancelled() && steps.export-ccache.outcome == 'success' }}
         uses: actions/cache/save@v5
         with:
           path: ${{ runner.temp }}/llaminar-neon-ccache
