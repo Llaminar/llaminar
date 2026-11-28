@@ -42,6 +42,7 @@
 #pragma once
 #include "execution/compute_stages/stages/PooledKVAppendStage.h"
 #include "kernels/PagedKVSnapshotRef.h"
+#include "kernels/cpu/attention/PagedKVArchive.h"
 #include "planning/PhysicalPagePool.h"
 #include "planning/PagedKVInstancePlan.h"
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
@@ -69,6 +70,7 @@ public:
           fresh_tail_frames_(std::move(other.fresh_tail_frames_)),
           persistent_tail_(other.persistent_tail_),
           prefix_ancestry_refs_(std::move(other.prefix_ancestry_refs_)),
+          import_meta_(std::move(other.import_meta_)),
           attach_use_leases_(std::move(other.attach_use_leases_))
     {
         // The moved-from binding must not double-free or cancel the moved
@@ -103,6 +105,7 @@ public:
             fresh_tail_frames_ = std::move(other.fresh_tail_frames_);
             persistent_tail_ = other.persistent_tail_;
             prefix_ancestry_refs_ = std::move(other.prefix_ancestry_refs_);
+            import_meta_ = std::move(other.import_meta_);
             attach_use_leases_ = std::move(other.attach_use_leases_);
             other.pool_ = nullptr;
             other.table_ = nullptr;
@@ -1105,6 +1108,181 @@ public:
     }
 
     /**
+     * @brief P3 M10: import one nonresident archive section per layer
+     * (deduplicated nonresident restore path).
+     *
+     * A stored prefix (exported through the R23 seam, persisted through the
+     * composed disk store, read back and parse-verified) is materialized into
+     * THIS binding's fresh bank as PRIVATE pages: every page of every layer
+     * is copied from the archive payload into a new pool frame (one normal
+     * pool grant retained for the bank's lifetime, the same rule as truncate
+     * and the shared-prefix COW). Nothing is shared, no source binding
+     * exists, and the trust/namespace gate is the flow's job (the archive
+     * carries the typed provenance; the binding restores native bytes only).
+     *
+     * Fail-closed gates BEFORE any mutation: live destination (fresh history
+     * refuses), cancelled, per-layer archive count mismatch, non-FP32 or
+     * non-attention provenance, geometry mismatch (heads/dimension/page
+     * tokens vs this binding), per-layer row skew (no partial-layer port),
+     * empty or aggregate-oversized section, page-materialization grant
+     * refusal. The publish is all-or-none across layers (the shared-prefix
+     * rule): every update commits, every bank binds+refs, no cell becomes
+     * live until every layer succeeded; a failure drops every snapshot
+     * (banks return to Free/unbound), releases the grant, and leaves this
+     * binding exactly as it was (epoch unchanged, no private grant).
+     * cursorEpoch bumps on success (typed cursor lifecycle).
+     *
+     * @param archives One archive per layer, in layer order.
+     * @return True on success; false without mutation on any refusal.
+     */
+    bool attachStoredImport(const std::vector<PagedKVArchive> &archives)
+    {
+        if (!pool_ || !table_ || cancelled_)
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Stored import requires a live, uncancelled binding");
+            return false;
+        }
+        if (archives.size() != cells_.size())
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Stored import requires exactly one archive per layer");
+            return false;
+        }
+        if (hasLivePublication())
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Stored import requires a FRESH destination");
+            return false;
+        }
+        // Provenance + geometry + per-layer row-consistency gates BEFORE any
+        // mutation (the table primitive re-checks trust/ancestry/authority/
+        // capacity atomically; here we bind the archive to THIS binding's
+        // exact geometry and require an identical row extent per layer — no
+        // partial-layer port).
+        int import_rows = -1;
+        std::vector<PagedKVArchiveMeta> metas;
+        metas.reserve(cells_.size());
+        std::size_t total_pages = 0;
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            const auto &meta = archives[layer].meta();
+            if (archives[layer].empty() || meta.family != KVCacheFamily::AttentionOnly ||
+                meta.format != KVStorageFormat::FP32 || meta.heads != kv_heads_ ||
+                meta.dimension != head_dim_ || meta.page_tokens != page_tokens_ ||
+                meta.rows <= 0)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Stored import provenance or geometry mismatch at layer " << layer);
+                return false;
+            }
+            if (import_rows < 0)
+                import_rows = static_cast<int>(meta.rows);
+            else if (import_rows != static_cast<int>(meta.rows))
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Stored import layers differ in extent");
+                return false;
+            }
+            total_pages += archives[layer].pageCount(page_tokens_);
+            metas.push_back(meta);
+        }
+        // One normal pool grant for EVERY materialized page (private
+        // publications stay owned for the bank's lifetime — the same rule as
+        // truncate and the shared-prefix COW). The table primitive preflights
+        // protected growth for every page.
+        auto grant = pool_->tryAdmit(total_pages);
+        if (!grant)
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Stored import materialization grant refused");
+            return false;
+        }
+        std::vector<std::optional<CPUFP32PagedKVTable::Update>> updates;
+        updates.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            auto update = table_->tryBeginReserved(*reservation_);
+            if (!update)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Stored import bank refused at layer " << layer);
+                return false;
+            }
+            const auto &meta = metas[layer];
+            try
+            {
+                // Table-level private materialization with the authenticated
+                // provenance gates (trust domain + ancestry identity must
+                // agree with the archive's own record, checked before a
+                // single byte is staged; no sampler/RNG/history/placement
+                // state is restored — only native K/V bytes enter the bank).
+                update->attachArchivedPrefix(archives[layer], *grant,
+                    page_tokens_, meta.trust_domain, meta.ancestry_id);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Stored import table attach refused at layer "
+                          << layer << ": " << e.what());
+                return false;
+            }
+            updates.push_back(std::move(*update));
+        }
+        // Publish all-or-none across layers (identical to shared prefix):
+        // commit every update, bind+ref every bank, no cell live until every
+        // layer succeeded; a failure drops every snapshot (banks return to
+        // Free/unbound) and releases the grant — the binding is exactly as
+        // before the call.
+        std::vector<CPUFP32PagedKVTable::Snapshot> snapshots;
+        snapshots.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+            snapshots.push_back(updates[static_cast<std::size_t>(layer)]->commit());
+        std::vector<PagedKVSnapshotRef> refs;
+        refs.reserve(cells_.size());
+        bool publish_ok = true;
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            if (!table_->bindPublication(snapshots[static_cast<std::size_t>(layer)],
+                    request_id_, slot_))
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Stored import bind refused at layer " << layer);
+                publish_ok = false;
+                break;
+            }
+            const auto ref = table_->refFor(snapshots[static_cast<std::size_t>(layer)],
+                request_id_, slot_);
+            if (!ref.valid())
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Stored import ref refused at layer " << layer);
+                publish_ok = false;
+                break;
+            }
+            refs.push_back(ref);
+        }
+        if (!publish_ok)
+        {
+            snapshots.clear(); // Banks -> Free/unbound; grant releases.
+            return false;
+        }
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
+            cell.ref = refs[static_cast<std::size_t>(layer)];
+            cell.snapshot = std::move(snapshots[static_cast<std::size_t>(layer)]);
+        }
+        private_publication_grant_ = std::move(grant);
+        import_meta_ = std::move(metas);
+        ++cursor_epoch_;
+        return true;
+    }
+
+    /**
+     * @return The exact archive provenance this binding imported (per layer:
+     * family/format/heads/dimension/page_tokens/rows/terminal boundary/trust
+     * domain/ancestry id), or empty when no stored import happened. The
+     * recorded provenance is the collision-resolving ancestry of the
+     * restored content (same rule as prefixAncestryRefs: an exact identity,
+     * never a content hash the caller could collide).
+     */
+    const std::vector<PagedKVArchiveMeta> &importAncestry() const noexcept
+    {
+        return import_meta_;
+    }
+
+    /**
      * @return The exact source ref identities this binding's prefix was
      * attached from (per layer), or empty when no shared attach happened.
      * The recorded identity is the collision-resolving ancestry proof of the
@@ -1156,6 +1334,8 @@ private:
     std::optional<PhysicalPagePool::Grant> private_publication_grant_;
     /** Exact source-ref ancestry recorded by attachSharedPrefix (per layer). */
     std::vector<PagedKVSnapshotRef> prefix_ancestry_refs_;
+    /** Exact archive provenance recorded by attachStoredImport (per layer). */
+    std::vector<PagedKVArchiveMeta> import_meta_;
     /** Effective-use receipts minted at shared-prefix attach (one per layer);
      * owned by this binding until acknowledged at the ordering point or
      * abandoned on cancellation (never a silent leak). */
