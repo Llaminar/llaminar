@@ -130,6 +130,12 @@ namespace llaminar2
         std::optional<bool> enable_thinking; ///< Omission selects the loaded model's reasoning default.
         std::string model;          ///< Model identifier from request (optional)
 
+        /// §8.4 standard retention fields (empty = absent): the typed intent
+        /// resolves through RetentionIntentResolver with a precise
+        /// invalid_request_error for an unsupported value (never a remap).
+        std::string prompt_cache_retention;
+        std::string prompt_cache_key;
+
         /// Thinking budget: maximum tokens to spend in thinking mode.
         /// -1 = no budget (unlimited thinking), 0 = disable thinking.
         /// When exhausted, a stop-thinking sequence is injected into the stream.

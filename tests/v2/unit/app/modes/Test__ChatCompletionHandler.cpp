@@ -304,6 +304,53 @@ TEST_F(Test__ChatCompletionHandler, ThinkingSamplingDefaultsRespectEveryExplicit
     }
 }
 
+/** @test §8.4 standard retention fields parse exactly; an unsupported or
+ * mistyped value is a precise 400 invalid_request_error, never a remap. */
+TEST_F(Test__ChatCompletionHandler, RetentionFieldsParseExactly)
+{
+    {
+        ChatCompletionResponse error;
+        auto request = ChatCompletionHandler::parseRequest(
+            minimalRequest({{"prompt_cache_retention", "24h"},
+                            {"prompt_cache_key", "shared-key"}}), error);
+        ASSERT_TRUE(request.has_value()) << error.json_body;
+        EXPECT_EQ(request->prompt_cache_retention, "24h");
+        EXPECT_EQ(request->prompt_cache_key, "shared-key");
+    }
+    {
+        // Retention without a key and key without retention: both accepted.
+        ChatCompletionResponse error;
+        auto request = ChatCompletionHandler::parseRequest(
+            minimalRequest({{"prompt_cache_retention", "in_memory"}}), error);
+        ASSERT_TRUE(request.has_value()) << error.json_body;
+        EXPECT_TRUE(request->prompt_cache_key.empty());
+        request = ChatCompletionHandler::parseRequest(
+            minimalRequest({{"prompt_cache_key", "k"}}), error);
+        ASSERT_TRUE(request.has_value()) << error.json_body;
+        EXPECT_TRUE(request->prompt_cache_retention.empty());
+    }
+    {
+        // Unsupported value: precise failure, never silently mapped.
+        ChatCompletionResponse error;
+        EXPECT_FALSE(ChatCompletionHandler::parseRequest(
+            minimalRequest({{"prompt_cache_retention", "48h"}}), error));
+        EXPECT_EQ(error.http_status, 400);
+        EXPECT_NE(error.json_body.find("invalid_request_error"), std::string::npos);
+    }
+    {
+        // Mistyped field: precise failure.
+        ChatCompletionResponse error;
+        EXPECT_FALSE(ChatCompletionHandler::parseRequest(
+            minimalRequest({{"prompt_cache_key", 42}}), error));
+        EXPECT_EQ(error.http_status, 400);
+        EXPECT_NE(error.json_body.find("must be a string"), std::string::npos);
+        error = {};
+        EXPECT_FALSE(ChatCompletionHandler::parseRequest(
+            minimalRequest({{"prompt_cache_retention", false}}), error));
+        EXPECT_EQ(error.http_status, 400);
+    }
+}
+
 /** @test Reasoning controls reject conflicting or mistyped requests before inference. */
 TEST_F(Test__ChatCompletionHandler, ThinkingModeRejectsInvalidOrConflictingOverrides)
 {

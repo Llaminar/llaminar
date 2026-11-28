@@ -35,6 +35,7 @@
 #include "utils/Logger.h"
 #include "utils/ToolCallParser.h"
 #include "nlohmann/json.hpp"
+#include "execution/prefix_cache/RetentionIntentResolver.h"
 
 #include <algorithm>
 #include <cctype>
@@ -808,6 +809,42 @@ namespace llaminar2
         // Model identifier (optional, echoed back in response)
         if (body.contains("model"))
             request.model = body["model"].get<std::string>();
+
+        // §8.4 standard retention fields: exact typed parse with precise
+        // invalid_request_error for a mistyped or unsupported value (never a
+        // silent remap; absent value -> code-owned default class).
+        for (const auto *field : {"prompt_cache_retention", "prompt_cache_key"})
+        {
+            if (!body.contains(field)) continue;
+            if (!body[field].is_string())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", std::string(field) + " must be a string"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+        }
+        if (body.contains("prompt_cache_retention"))
+            request.prompt_cache_retention =
+                body["prompt_cache_retention"].get<std::string>();
+        if (body.contains("prompt_cache_key"))
+            request.prompt_cache_key = body["prompt_cache_key"].get<std::string>();
+        // The VALUE is validated here against the code-owned class map (the
+        // operator ceiling is applied by the config owner when the retention
+        // owner is admitted; no ceiling at this layer).
+        {
+            std::string refusal;
+            const auto resolution = RetentionIntentResolver{std::nullopt}.resolve(
+                request.prompt_cache_retention, request.prompt_cache_key);
+            if (!resolution.ok())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", refusal}, {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+        }
 
         // Sampling parameters — track which fields the client explicitly specified.
         // Fields not set by the client will be filled in from model-recommended defaults

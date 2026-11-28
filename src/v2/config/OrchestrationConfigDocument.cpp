@@ -54,6 +54,7 @@ namespace
     ENUM(PPSplitMode, VALUE(EQUAL), VALUE(WEIGHTED), VALUE(MANUAL))
     ENUM(MPIProfile, VALUE(AUTO), VALUE(TUNED))
     ENUM(CollectiveBackendType, VALUE(AUTO), VALUE(NCCL), VALUE(RCCL), VALUE(HETEROGENEOUS), VALUE(UPI), VALUE(MPI), VALUE(HOST))
+    ENUM(RetentionClass, VALUE(InMemory), VALUE(Default), VALUE(TieredDay))
     ENUM(ExecutionDomainScope, VALUE(AUTO), VALUE(SINGLE), VALUE(RANK_LOCAL), VALUE(NODE_LOCAL), VALUE(GLOBAL))
     ENUM(FusedAttentionBackend, VALUE(JIT), VALUE(REFERENCE), VALUE(TILED), VALUE(Q16_INTEGER))
     ENUM(RoutedExpertComputePolicy, VALUE(Unspecified), VALUE(Replicated), VALUE(Apportioned), VALUE(TensorSharded), VALUE(GateUpOwnedDownColumns), VALUE(Automatic))
@@ -147,7 +148,8 @@ namespace
     RECORD(PrefixCacheRuntimeConfig, enabled, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(pool_cap_bytes) X(host_tier_mode) X(host_cap_bytes) \
-    X(disk_enabled) X(disk_cap_bytes) X(disk_journal_membership) X(disk_dir)
+    X(disk_enabled) X(disk_cap_bytes) X(disk_journal_membership) X(disk_dir) \
+    X(retention_classes_ceiling)
     RECORD(PagedKVTierConfig, pool_budget_mode, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(protected_numerator) X(protected_denominator)

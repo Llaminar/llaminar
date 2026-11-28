@@ -25,6 +25,7 @@
 #include "../../utils/Logger.h"
 #include "../../loaders/ImmutableRowTablePolicy.h"
 #include "../local_execution/graph/ReadAheadScheduling.h"
+#include "../prefix_cache/RetentionOwner.h"
 #include "RoutedExpertPolicy.h"
 #include "OrdinaryTerminalProjectionCapacity.h"
 #include "MTPDepthDefaults.h"
@@ -551,6 +552,11 @@ namespace llaminar2
         size_t disk_cap_bytes = 0;        ///< Required finite quota when enabled.
         size_t disk_journal_membership = 0; ///< Admitted extent-record membership (typed journal cap).
         std::string disk_dir;             ///< Configured directory, validated nonempty.
+        /** @brief Operator ceiling on accepted retention classes (§8.4/P0 §4).
+         * When set, a request retention class whose rank exceeds the ceiling
+         * is REFUSED with a precise invalid_request_error (never demoted to a
+         * lower class silently). Nullopt = no ceiling. */
+        std::optional<RetentionClass> retention_classes_ceiling;
 
         /** @return Whether the typed intent is complete and representable. */
         bool valid(std::string *error = nullptr) const noexcept
