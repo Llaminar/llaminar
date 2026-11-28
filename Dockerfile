@@ -596,7 +596,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
 # test-runner copies and verifies it; future toolchain drift then fails that
 # image build with a precise diagnostic instead of surfacing as a proof failure
 # inside the sealed ARM64 tests.
-RUN W=/src/witness-toolchain; \
+RUN set -e; W=/src/witness-toolchain; \
     if [ "${TARGETARCH}" = "arm64" ]; then \
         mkdir -p \
             "${W}/usr/bin" \
@@ -610,30 +610,38 @@ RUN W=/src/witness-toolchain; \
                  aarch64-linux-gnu-gcc-14 aarch64-linux-gnu-g++-14 \
                  as aarch64-linux-gnu-as ld aarch64-linux-gnu-ld \
                  objdump aarch64-linux-gnu-objdump collect2; do \
-            [ -e "/usr/bin/${p}" ] && cp -a "/usr/bin/${p}" "${W}/usr/bin/${p}"; \
+            if [ -e "/usr/bin/${p}" ]; then \
+                cp -a "/usr/bin/${p}" "${W}/usr/bin/${p}"; \
+            fi; \
         done; \
         for a in cc c++ gcc g++; do \
-            [ -L "/etc/alternatives/${a}" ] && cp -a "/etc/alternatives/${a}" "${W}/etc/alternatives/"; \
+            if [ -L "/etc/alternatives/${a}" ]; then \
+                cp -a "/etc/alternatives/${a}" "${W}/etc/alternatives/"; \
+            fi; \
         done; \
         for p in cc1 cc1plus collect2 g++-mapper-server lto1 lto-wrapper liblto_plugin.so; do \
-            [ -e "/usr/libexec/gcc/aarch64-linux-gnu/14/${p}" ] \
-                && cp -a "/usr/libexec/gcc/aarch64-linux-gnu/14/${p}" "${W}/usr/libexec/gcc/aarch64-linux-gnu/14/"; \
+            if [ -e "/usr/libexec/gcc/aarch64-linux-gnu/14/${p}" ]; then \
+                cp -a "/usr/libexec/gcc/aarch64-linux-gnu/14/${p}" \
+                    "${W}/usr/libexec/gcc/aarch64-linux-gnu/14/"; \
+            fi; \
         done; \
         cp -a /usr/lib/gcc/aarch64-linux-gnu/14 "${W}/usr/lib/gcc/aarch64-linux-gnu/"; \
         for lib in /usr/lib/aarch64-linux-gnu/libstdc++.so.6* /usr/lib/aarch64-linux-gnu/libgcc_s.so.1; do \
-            [ -e "${lib}" ] && cp -a "${lib}" "${W}/usr/lib/aarch64-linux-gnu/"; \
+            if [ -e "${lib}" ]; then \
+                cp -a "${lib}" "${W}/usr/lib/aarch64-linux-gnu/"; \
+            fi; \
         done; \
-        [ -d /usr/lib/aarch64-linux-gnu/ldscripts ] \
-            && cp -a /usr/lib/aarch64-linux-gnu/ldscripts "${W}/usr/lib/aarch64-linux-gnu/"; \
+        if [ -d /usr/lib/aarch64-linux-gnu/ldscripts ]; then \
+            cp -a /usr/lib/aarch64-linux-gnu/ldscripts "${W}/usr/lib/aarch64-linux-gnu/"; \
+        fi; \
         cp -a /usr/include/c++/14 "${W}/usr/include/c++/"; \
         cp -a /usr/include/aarch64-linux-gnu/c++/14 "${W}/usr/include/aarch64-linux-gnu/c++/"; \
         python3 scripts/ci/arm_witness_toolchain_manifest.py capture \
             --root "${W}" --out /src/witness-toolchain-manifest.json; \
     else \
-        # Docker COPY cannot be conditional, and the x86 test-runner shares
-        # these COPY sources; keep empty/marker artifacts so the COPY layers
-        # resolve for every architecture. The verify step below runs only on
-        # arm64, so the stub manifest is never authenticated elsewhere. \
+        # x86: no witness closure is needed, but the shared COPY destinations below
+        # must resolve (Docker COPY cannot be conditional), so keep a marker tree
+        # and a stub manifest that the arm64-only verify never reads.
         mkdir -p "${W}"; \
         printf '{"schema":1,"tool":"arm-witness-toolchain-manifest","entries":{}}\n' \
             > /src/witness-toolchain-manifest.json; \
