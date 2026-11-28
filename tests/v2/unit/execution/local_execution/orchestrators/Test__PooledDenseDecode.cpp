@@ -2010,3 +2010,146 @@ TEST(PooledDenseDecode, SharedPrefixAttachTouchRefusalLeavesDestinationFresh)
             lease.abandon();
     }
 }
+
+/** @test R52 (a): CONTINUED pooled prefill over a live publication — the
+ * shared-prefix + private-divergence vertical. A destination attaches a
+ * 9-row prefix (page 8 full + 1 partial), then PREFILLS its private prompt
+ * remainder (3 rows) in a second prefill graph, then decodes 3 rows. Every
+ * logit must be byte-identical to an uninterrupted control whose full 12-row
+ * prompt prefilled in ONE graph. This is the operation the DGO previously
+ * refused ('continued pooled prefill; pooled attention is decode-only'). */
+TEST(PooledDenseDecode, ContinuedPrefillAfterSharedAttachMatchesControl)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 10> prompt_src{1, 3, 5, 7, 9, 11, 13, 15, 17, 19};
+    const std::array<int32_t, 2> src_after{2, 4};
+    const std::array<int32_t, 3> private_rest{19, 2, 4};
+    const std::array<int32_t, 3> decodes{6, 8, 10};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 32;
+
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 4 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 8;
+        budget.max_pages_per_request = 64;
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/fx.config.n_layers, /*admitted_issuances=*/12, /*readers_per_bank=*/4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        auto table_geom = plan->table_geometry;
+        table_geom.bank_count = 2 * table_geom.bank_count;
+        table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+        table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+        auto pool_geom = plan->pool_geometry;
+        pool_geom.frames = 96 + 8 * pool_geom.frames;
+        pool_geom.request_records = 8;
+        auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+        widened->pool_geometry = pool_geom;
+        widened->table_geometry = table_geom;
+        widened->total_bytes = PhysicalPagePool::physicalBytes(pool_geom, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=widened->total_bytes,
+            .admission_available_bytes=widened->total_bytes},
+            PhysicalMemoryOwner::KVCache, widened->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *widened, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    // SOURCE: prefill 10, decode 2 = 12 rows.
+    PagedKVInstance src_instance;
+    ASSERT_TRUE(make_instance(src_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> src_owner;
+    PreparedWeightStore src_store;
+    std::shared_ptr<QwenStandardGraph> src_builder;
+    make_runner(fx, src_owner, src_store, src_builder);
+    PooledKVDecodeBinding src(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/501, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/12,
+        /*persistent_tail=*/false);
+    src_owner->setPooledDecodeBinding(&src);
+    ASSERT_OK("source prefill", src_owner->forward(prompt_src.data(), 10, 1) != nullptr);
+    ASSERT_OK("source decode 0", src_owner->forward(&src_after[0], 1, 1) != nullptr);
+    ASSERT_OK("source decode 1", src_owner->forward(&src_after[1], 1, 1) != nullptr);
+    EXPECT_EQ(src.priorFor(0)->snapshot.view().rows(), 12);
+
+    // DESTINATION: attach 9 shared rows, then CONTINUED PREFILL of its
+    // private remainder (19, 2, 4) as ONE 3-row prefill graph over the live
+    // publication, then 3 decodes.
+    PagedKVInstance dst_instance;
+    ASSERT_TRUE(make_instance(dst_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> dst_owner;
+    PreparedWeightStore dst_store;
+    std::shared_ptr<QwenStandardGraph> dst_builder;
+    make_runner(fx, dst_owner, dst_store, dst_builder);
+    PooledKVDecodeBinding dst(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/503, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/12,
+        /*persistent_tail=*/false);
+    ASSERT_TRUE(dst.attachSharedPrefix(src, 9));
+    EXPECT_EQ(dst.nextPosition(), 9);
+    dst_owner->setPooledDecodeBinding(&dst);
+    ASSERT_OK("continued prefill (live publication)",
+        dst_owner->forward(private_rest.data(), 3, 1) != nullptr);
+    EXPECT_EQ(dst.priorFor(0)->snapshot.view().rows(), 12);
+    EXPECT_EQ(dst.nextPosition(), 12);
+
+    // CONTROL: uninterrupted full 12-row prompt prefill + the SAME decodes.
+    PagedKVInstance ctrl_instance;
+    ASSERT_TRUE(make_instance(ctrl_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> ctrl_owner;
+    PreparedWeightStore ctrl_store;
+    std::shared_ptr<QwenStandardGraph> ctrl_builder;
+    make_runner(fx, ctrl_owner, ctrl_store, ctrl_builder);
+    PooledKVDecodeBinding ctrl(&ctrl_instance.pool(), &ctrl_instance.table(),
+        /*request_id=*/504, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/12,
+        /*persistent_tail=*/false);
+    ctrl_owner->setPooledDecodeBinding(&ctrl);
+    const std::array<int32_t, 12> full_prompt{1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 2, 4};
+    ASSERT_OK("control full prefill",
+        ctrl_owner->forward(full_prompt.data(), 12, 1) != nullptr);
+    EXPECT_EQ(ctrl.priorFor(0)->snapshot.view().rows(), 12);
+
+    const std::size_t vocab = static_cast<std::size_t>(fx.config.vocab_size);
+    for (int step = 0; step < static_cast<int>(decodes.size()); ++step)
+    {
+        const auto *ctrl_next = ctrl_owner->forward(&decodes[step], 1, 1);
+        const auto *dst_next = dst_owner->forward(&decodes[step], 1, 1);
+        ASSERT_NE(ctrl_next, nullptr);
+        ASSERT_NE(dst_next, nullptr);
+        EXPECT_EQ(std::memcmp(dst_next, ctrl_next, vocab * sizeof(float)), 0)
+            << "continued-prefill decode diverged at step " << step;
+    }
+}

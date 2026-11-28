@@ -18537,17 +18537,15 @@ namespace llaminar2
         }
         else if (pooled_kv_binding_)
         {
-            // M4: a continued/chunked prefill with live pooled history is
-            // refused BEFORE graph execution — pooled attention is single-row
-            // decode only and would attend to the current chunk alone.
-            if (input.execution_phase == ForwardExecutionPhase::Prefill &&
-                pooled_kv_binding_->hasLivePublication())
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Continued pooled prefill refused "
-                    "(live pooled history; pooled attention is decode-only)");
-                return std::nullopt;
-            }
+            // M4 (amended): a continued/chunked prefill with live pooled
+            // history is LEGAL — the append stage extends the publication
+            // with this chunk's rows and the pooled attention consumes the
+            // full publication causally from the publication row count (the
+            // shared-prefix + private-divergence vertical). The graph builder
+            // refuses the combination it cannot support; the DGO only checks
+            // the position authority below.
+            // (Grouped pooled prefill remains decode-only: each group member
+            // is a one-row decode participant by contract.)
             const int pooled_next_position = pooled_kv_binding_->nextPosition();
             if (pooled_next_position != state_.positions[0])
             {

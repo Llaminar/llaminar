@@ -5566,12 +5566,38 @@ namespace llaminar2
             }
             else if (pooled)
             {
-                // Pooled PREFILL: the pooled append stage writes the prompt's
-                // K/V into pooled pages, but attention still consumes the
-                // explicit K/V projections of THIS graph (kv_cache is null in
-                // pooled mode, so the ring path is untouched). The pooled
-                // snapshot becomes the decode-time source after this graph.
+                // Pooled PREFILL. TWO legal shapes:
+                // 1. FRESH prefill (no live publication yet): the pooled
+                //    append stage writes the prompt's K/V into pooled pages;
+                //    attention consumes the explicit K/V projections of THIS
+                //    graph (kv_cache is null in pooled mode, so the ring path
+                //    is untouched). The pooled snapshot becomes the
+                //    decode-time source after this graph.
+                // 2. CONTINUED prefill (a live publication from a previous
+                //    prefill chunk or a restored attached prefix): the append
+                //    stage extends the publication with this chunk's rows and
+                //    publishes the new ref into the SAME next cell the
+                //    attention reads at execute time; attention runs over the
+                //    FULL publication [0 .. P+total_tokens) causally, with
+                //    the first query position P = the publication's row count
+                //    (position_offset; pooled_position_from_publication is
+                //    decode-only). This is the shared-prefix +
+                //    private-divergence vertical: a partial hit restores P
+                //    rows and the prompt remainder continues them.
+                auto *pooled_cell = pooled->nextCell(layer_idx);
+                if (!pooled_cell)
+                    throw std::invalid_argument("Pooled prefill binding has no attention cell");
                 attn_params.kv_cache = nullptr;
+                if (pooled->hasLivePublication())
+                {
+                    attn_params.pooled_table = pooled->table();
+                    attn_params.pooled_ref = pooled_cell->ref;
+                    attn_params.pooled_ref_cell = &pooled_cell->ref;
+                    attn_params.n_kv_heads = pooled->kvHeads();
+                    attn_params.head_dim = pooled->headDim();
+                    attn_params.active_query_rows_device = nullptr;
+                    attn_params.pooled_position_from_publication = false;
+                }
             }
             else
             {

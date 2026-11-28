@@ -1503,10 +1503,16 @@ namespace llaminar2
                 pooled_ok = false;
                 LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode requires a CPU device");
             }
-            else if (!is_decode_mode || params_.batch_size != 1 || params_.seq_len != 1)
+            else if (params_.batch_size != 1 || params_.seq_len < 1)
             {
                 pooled_ok = false;
-                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode supports only single-row CPU decode");
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode requires one CPU request row-batch"
+                          << " (batch=" << params_.batch_size << " seq=" << params_.seq_len << ")");
+            }
+            else if (is_decode_mode && params_.seq_len != 1)
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot decode supports only a single row");
             }
             else if (!current_ref.valid())
             {
@@ -2186,8 +2192,12 @@ namespace llaminar2
                     view.heads = params_.n_kv_heads;
                     view.dimension = params_.head_dim;
                     view.page_tokens = params_.pooled_table->tableGeometry().page_tokens;
-                    // Pooled decode position: the publication's row count is
-                    // the authority (the host cursor may not have advanced).
+                    // Pooled position: DECODE uses the publication's row
+                    // count as the authority (the host cursor may not have
+                    // advanced). CONTINUED PREFILL is a row batch whose first
+                    // query position P is the publication row count — the
+                    // graph supplies it through position_offset (causal
+                    // masking then covers rows [0 .. P + r] per query row).
                     const int pooled_position =
                         params_.pooled_position_from_publication
                             ? borrowed_view.rows() - 1
