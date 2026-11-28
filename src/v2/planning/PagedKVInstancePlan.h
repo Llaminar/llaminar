@@ -42,11 +42,16 @@ struct PagedKVInstancePlan
     /**
      * @brief The validated composed disk route (quota + membership + exact
      * directory); present exactly when the tier's disk is enabled. The
-     * membership is checked against the planned geometry's typed need (one
-     * record per admitted frame + in-flight + pending replacement + rounding)
-     * and the quota is checked to hold at least one rounded extent of the
-     * admitted frame geometry — an impossible composed route fails closed
-     * here, never at a silent boundary.
+     * membership is checked against the planned geometry's typed need =
+     * frames + one in-flight write + one pending replacement + one retained
+     * old generation + one journal/rounding record; the quota is checked to
+     * hold at least one rounded extent of the admitted frame geometry.
+     * Quota floor note: the floor uses the pool frame bytes WITHOUT the
+     * archive header (a lower bound on the true serialized extent the store
+     * charges = header + payload, rounded). A per-section put can still
+     * refuse when the exact serialized size crosses the block boundary; that
+     * per-put refusal is precise and numeric — an impossible composed route
+     * still fails closed in planning, never at a silent boundary.
      */
     std::optional<PagedKVDiskRoute> disk_route;
 };

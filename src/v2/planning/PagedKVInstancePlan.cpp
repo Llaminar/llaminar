@@ -60,14 +60,18 @@ std::optional<PagedKVInstancePlan> planPagedKVInstance(
     if (config.disk_enabled)
     {
         // Composed route: the disk membership is sized from the PLANNED
-        // geometry's typed need (one record per admitted frame, plus one
-        // in-flight write, one pending replacement and journal rounding) and
-        // the quota must hold at least one rounded extent of the admitted
-        // frame geometry. An authored cap below the need, or a quota that
-        // cannot hold the smallest possible section, fails closed here with
-        // a precise diagnostic (never a silent boundary, never a default).
+        // geometry's typed need — one record per admitted frame, plus one
+        // in-flight write, one pending replacement, one retained old
+        // generation (old+new extents are both admitted until retired) and
+        // one journal/rounding record. The quota must hold at least one
+        // rounded extent of the admitted frame geometry (floor note: without
+        // the archive header; a per-section put refuses precisely when its
+        // exact serialized size crosses a block boundary). An authored cap
+        // below the need, or a quota that cannot hold the smallest possible
+        // section, fails closed here with a precise diagnostic (never a
+        // silent boundary, never a default).
         const std::size_t membership_need =
-            pool->geometry.frames + 4; // + in-flight + pending + rounding.
+            pool->geometry.frames + 4; // + in-flight + pending + old gen + rounding.
         if (config.disk_journal_membership < membership_need)
             throw std::invalid_argument("paged KV disk membership " +
                 std::to_string(config.disk_journal_membership) +
