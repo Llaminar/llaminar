@@ -124,33 +124,69 @@ TEST(PagedKVRetentionDemotion, TailFirstDeficitOnlyVictimOrder)
     EXPECT_EQ(plan.moves[0].extent.digest, 7u);
 }
 
-/** @test Move-once: a shared tail page referenced by two victims appears
- * exactly once, and the deficit then selects the next tail page. */
-TEST(PagedKVRetentionDemotion, SharedPageMovesOnce)
+/** @test F2 MOVE-ONCE on PHYSICAL identity: two prefixes sharing ONE extent
+ * (same resolved digest+bytes) move it exactly once; the deficit then fills
+ * from the second prefix's distinct page. */
+TEST(PagedKVRetentionDemotion, SharedExtentMovesExactlyOnce)
 {
     Composition fx;
     RetentionOwner owner(16);
     ASSERT_TRUE(owner.admit({1, 1}, {RetentionClass::Default, 0}, 0, score(5), false));
     ASSERT_TRUE(owner.admit({1, 2}, {RetentionClass::Default, 0}, 0, score(4), false));
-    // Both prefixes SHARE page 1 (same ns+page identity); distinct page 0s.
+    // Both prefixes SHARE the physical page 1 (same resolved extent: digest
+    // 111, bytes 4096); page 0 differs per prefix.
     std::vector<PagedPrefixTierEntry> entries{
         entry(1, 11, {1, 1}, {0, 1}),
         entry(1, 12, {1, 2}, {0, 1})};
     auto page = [](std::uint64_t ns, std::uint64_t prefix, std::uint64_t idx) {
-        (void)ns;
+        (void)ns; (void)prefix;
         return std::optional<PagedKVArchiveExtentKey>(
-            ext(1 /*shared ns*/, 0, idx, 4096, 100 + idx));
+            ext(1, 0, idx, 4096, idx == 1 ? 1000 : (100 + prefix + idx)));
     };
     auto admit = [](const PagedKVArchiveExtentKey &) { return true; };
-    auto plan = planTailFirstDemotion(entries, owner, 1, /*deficit=*/2, page, admit);
+    // DEFICIT 3 over two prefixes: victim 12 (lower value) first, its tail
+    // page 1 (shared) counted once, its page 0, then victim 11's page 1 is
+    // DEDUPED (same physical extent) and its page 0 closes the deficit.
+    auto plan = planTailFirstDemotion(entries, owner, 1, /*deficit=*/3, page, admit);
     ASSERT_TRUE(plan.ok()) << plan.refusal;
-    ASSERT_EQ(plan.moves.size(), 2u);
-    // Victim 2 (lower value) first: its tail page 1, then (deduped) it picks
-    // its page 0; victim 1's page 1 is NEVER duplicated.
+    ASSERT_EQ(plan.moves.size(), 3u);
     EXPECT_EQ(plan.moves[0].prefix_id, 12u);
     EXPECT_EQ(plan.moves[0].page_index, 1u);
-    EXPECT_EQ(plan.moves[1].prefix_id, 12u);
-    EXPECT_EQ(plan.moves[1].page_index, 0u); // Shared page 1 counted once.
+    EXPECT_EQ(plan.moves[2].prefix_id, 11u);
+    EXPECT_EQ(plan.moves[2].page_index, 0u);
+    // The shared physical page (digest 111) appears EXACTLY once.
+    std::size_t shared = 0;
+    for (const auto &m : plan.moves)
+        if (m.extent.digest == 1000u) ++shared;
+    EXPECT_EQ(shared, 1u);
+}
+
+/** @test F2 NEGATIVE: two prefixes with the SAME page index but DIFFERENT
+ * physical content (different resolved digest) are never deduped — both move. */
+TEST(PagedKVRetentionDemotion, SameIndexDifferentExtentMovesBoth)
+{
+    Composition fx;
+    RetentionOwner owner(16);
+    ASSERT_TRUE(owner.admit({1, 1}, {RetentionClass::Default, 0}, 0, score(5), false));
+    ASSERT_TRUE(owner.admit({1, 2}, {RetentionClass::Default, 0}, 0, score(4), false));
+    std::vector<PagedPrefixTierEntry> entries{
+        entry(1, 11, {1, 1}, {0, 1}),
+        entry(1, 12, {1, 2}, {0, 1})};
+    auto page = [](std::uint64_t ns, std::uint64_t prefix, std::uint64_t idx) {
+        // Same index 1 in the same namespace, DIFFERENT content per prefix.
+        return std::optional<PagedKVArchiveExtentKey>(
+            ext(ns, prefix, idx, 4096, (prefix == 11 ? 111u : 222u) + idx));
+    };
+    auto admit = [](const PagedKVArchiveExtentKey &) { return true; };
+    auto plan = planTailFirstDemotion(entries, owner, 1, /*deficit=*/3, page, admit);
+    ASSERT_TRUE(plan.ok()) << plan.refusal;
+    ASSERT_EQ(plan.moves.size(), 3u);
+    // Victim 12 tail (page 1, its own digest 222+1), its page 0, then victim
+    // 11's page 1 with its OWN digest (111+1) — the logical-index pair is NOT
+    // the dedup key.
+    EXPECT_EQ(plan.moves[2].prefix_id, 11u);
+    EXPECT_EQ(plan.moves[2].page_index, 1u);
+    EXPECT_EQ(plan.moves[2].extent.digest, 112u);
 }
 
 /** @test Live/protected prefixes are never victimized (retention owner
@@ -170,8 +206,8 @@ TEST(PagedKVRetentionDemotion, LiveEntriesNeverDemoted)
     EXPECT_FALSE(plan.refusal.empty());
 }
 
-/** @test REAL-OVERFLOW campus: a refuse from the composed quota turns the
- * plan into cascade_required with NO partial moves (all-or-none). */
+/** @test REAL-OVERFLOW: a refuse from the composed quota turns the plan
+ * into cascade_required with NO partial moves (all-or-none). */
 TEST(PagedKVRetentionDemotion, RealOverflowCascadesAndNeverPartials)
 {
     Composition fx;
@@ -185,6 +221,27 @@ TEST(PagedKVRetentionDemotion, RealOverflowCascadesAndNeverPartials)
     auto plan = planTailFirstDemotion(entries, owner, 1, 2, page, admit);
     EXPECT_TRUE(plan.cascade_required);
     EXPECT_TRUE(plan.moves.empty()); // All-or-none.
+    EXPECT_FALSE(plan.refusal.empty());
+}
+
+/** @test F1 MID-PLAN negative: the TAIL page (page 1) admits but the NEXT
+ * selected page (page 0) refuses — the plan publishes NO moves and marks
+ * cascade (all-or-none output, not a partial decision set). */
+TEST(PagedKVRetentionDemotion, MidPlanRefusalDropsAllDecisions)
+{
+    Composition fx;
+    RetentionOwner owner(16);
+    ASSERT_TRUE(owner.admit({1, 1}, {RetentionClass::Default, 0}, 0, score(1), false));
+    std::vector<PagedPrefixTierEntry> entries{entry(1, 11, {1, 1}, {0, 1})};
+    auto page = [](std::uint64_t ns, std::uint64_t prefix, std::uint64_t idx) {
+        return std::optional<PagedKVArchiveExtentKey>(ext(ns, prefix, idx));
+    };
+    auto admit = [](const PagedKVArchiveExtentKey &e) {
+        return e.digest != 7u; // Page index 1 (digest 7) admits; page 0 refuses.
+    };
+    auto plan = planTailFirstDemotion(entries, owner, 1, 2, page, admit);
+    EXPECT_TRUE(plan.cascade_required);
+    EXPECT_TRUE(plan.moves.empty()); // Page 1's earlier decision is DROPPED.
     EXPECT_FALSE(plan.refusal.empty());
 }
 
@@ -202,6 +259,7 @@ TEST(PagedKVRetentionDemotion, UnresolvableExtentRefuses)
     auto admit = [](const PagedKVArchiveExtentKey &) { return true; };
     auto plan = planTailFirstDemotion(entries, owner, 1, 1, page, admit);
     EXPECT_TRUE(plan.refusal.find("no storable extent") != std::string::npos);
+    EXPECT_TRUE(plan.moves.empty()); // F1: no partial decision leaks.
 }
 
 /** @test Zero deficit and zero-page rounding: both are no-ops. */

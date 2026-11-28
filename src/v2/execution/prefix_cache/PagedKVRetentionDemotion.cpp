@@ -53,8 +53,20 @@ PagedDemotionPlan planTailFirstDemotion(
     // Tail-first: each victim demotes its LAST page first; leading pages stay
     // resident (a hit starts at token zero). Deficit-only: stop exactly at
     // deficit_pages. Move-once: a shared page appears at most once.
+    //
+    // F1 (all-or-none OUTPUT): decisions are accumulated in a LOCAL vector and
+    // published only after EVERY gate passed — a refusal anywhere (unresolved
+    // extent, real overflow, unsatisfiable deficit) leaves the plan's moves
+    // EMPTY, never a partial decision set.
+    std::vector<PagedDemotionMove> decisions;
     std::size_t planned = 0;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> seen;
+    struct PhysicalIdentity
+    {
+        std::uint64_t namespace_id;
+        std::uint64_t digest;
+        std::size_t bytes;
+    };
+    std::vector<PhysicalIdentity> seen;
     for (const auto *entry : ordered)
     {
         for (auto it = entry->page_indices.rbegin();
@@ -62,15 +74,6 @@ PagedDemotionPlan planTailFirstDemotion(
              ++it)
         {
             const auto page = *it;
-            bool duplicate = false;
-            for (const auto &[seen_ns, seen_page] : seen)
-                if (seen_ns == entry->namespace_id && seen_page == page)
-                {
-                    duplicate = true;
-                    break;
-                }
-            if (duplicate) continue; // Shared page: move once.
-            seen.emplace_back(entry->namespace_id, page);
             // The exact extent identity is supplied by the CALLER (the real
             // bytes live in the RAM pool; the wiring resolves the extent).
             const auto extent = extent_for_page(entry->namespace_id,
@@ -80,17 +83,35 @@ PagedDemotionPlan planTailFirstDemotion(
                 // The page has no storable extent (never exported): it cannot
                 // be demoted — the deficit is unsatisfiable against this tier.
                 plan.refusal = "a selected tail page has no storable extent identity";
-                return plan;
+                return plan; // decisions dropped: all-or-none.
             }
+            // F2 (MOVE-ONCE on PHYSICAL identity): dedup on the RESOLVED
+            // content identity (namespace + digest + bytes), never on the
+            // logical (namespace, page_index) pair — two prefixes may own
+            // different content at the same index and must BOTH move. A
+            // genuinely shared page resolves to the SAME extent identity and
+            // moves exactly once.
+            bool duplicate = false;
+            for (const auto &id : seen)
+            {
+                if (id.namespace_id == extent->namespace_id &&
+                    id.digest == extent->digest && id.bytes == extent->bytes)
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue; // Physical shared page: move once.
             // REAL-OVERFLOW gate: the composed route's quota decides. A
             // refusal means the next tier is actually full (cascade required).
             if (!can_admit(*extent))
             {
                 plan.cascade_required = true;
                 plan.refusal = "the admitted disk quota cannot hold the selected extent (real overflow)";
-                return plan;
+                return plan; // decisions dropped: all-or-none.
             }
-            plan.moves.push_back({entry->namespace_id, entry->prefix_id,
+            seen.push_back({extent->namespace_id, extent->digest, extent->bytes});
+            decisions.push_back({entry->namespace_id, entry->prefix_id,
                 page, *extent});
             ++planned;
         }
@@ -99,8 +120,9 @@ PagedDemotionPlan planTailFirstDemotion(
     if (planned < deficit_pages)
     {
         plan.refusal = "the idle prefix set cannot satisfy the deficit tail-first";
-        return plan;
+        return plan; // decisions dropped: all-or-none.
     }
+    plan.moves = std::move(decisions); // Publish only after every gate passed.
     return plan;
 }
 } // namespace llaminar2

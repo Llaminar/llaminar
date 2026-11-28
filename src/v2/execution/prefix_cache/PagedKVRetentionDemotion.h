@@ -21,7 +21,9 @@
  * only from the retention owner's ordered idle set (live/protected never
  * selected), no partial plan (all-or-none: if the admitted disk quota cannot
  * hold the selected extent set, the plan refuses with a precise diagnostic),
- * and exactly one entry per shared page.
+ * and exactly one entry per PHYSICALLY shared page (deduped on the resolved
+ * extent identity: namespace + digest + bytes, never a logical index) —
+ * all-or-none output: any refusal publishes NO moves at all.
  */
 #pragma once
 #include "execution/prefix_cache/PagedKVArchiveStore.h"
