@@ -1206,10 +1206,22 @@ public:
             try
             {
                 // Table-level private materialization with the authenticated
-                // provenance gates (trust domain + ancestry identity must
-                // agree with the archive's own record, checked before a
-                // single byte is staged; no sampler/RNG/history/placement
-                // state is restored — only native K/V bytes enter the bank).
+                // provenance gates (the primitive compares its EXPECTATION
+                // parameters against the archive's record; no sampler/RNG/
+                // history/placement state is restored — only native K/V
+                // bytes enter the bank).
+                //
+                // G1 (reviewer carry): at THIS call site the binding forwards
+                // the archive's OWN record as the expectation, so the trust/
+                // ancestry comparison is tautological and cannot fire. That
+                // is intentional NOW (the binding restores bytes; the
+                // authenticated expectation is the FLOW's — the store route
+                // and the resolver's trust domain own the real values). The
+                // flow adapter MUST pass the real expected trust domain and
+                // ancestry; until then this call site performs NO trust
+                // ENFORCEMENT (only self-consistency). The primitive-level
+                // mismatch refusal is proven by the negative test at the
+                // table layer.
                 update->attachArchivedPrefix(archives[layer], *grant,
                     page_tokens_, meta.trust_domain, meta.ancestry_id);
             }

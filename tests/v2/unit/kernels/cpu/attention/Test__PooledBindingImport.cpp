@@ -194,4 +194,28 @@ TEST(PooledBindingImport, GateNegativesRefuseWithoutMutation)
     EXPECT_TRUE(foreign.attachStoredImport({archive}));
     ASSERT_TRUE(foreign.hasLivePublication());
 }
+/** @test CARRY G1 primitive-level negative: a non-matching trust domain or
+ * ancestry identity makes the table's authenticated attach THROW before any
+ * byte is staged (the binding call site forward is tautological today; the
+ * primitive itself enforces). */
+TEST(PooledBindingImport, PrimitiveRefusesMismatchedTrustAndAncestry)
+{
+    ImportFixture fx;
+    const auto archive = publishArchive(fx, 8, 1);
+    auto grant = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    auto update = fx.table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    EXPECT_THROW(update->attachArchivedPrefix(archive, *grant, fx.page_tokens,
+        archive.meta().trust_domain + 1 /* mismatch */,
+        archive.meta().ancestry_id), std::invalid_argument);
+    EXPECT_THROW(update->attachArchivedPrefix(archive, *grant, fx.page_tokens,
+        archive.meta().trust_domain,
+        archive.meta().ancestry_id + 1 /* mismatch */), std::invalid_argument);
+    // Matching identity stages cleanly (the trust/ancestry self-consistency
+    // case the binding call site uses today).
+    EXPECT_NO_THROW(update->attachArchivedPrefix(archive, *grant, fx.page_tokens,
+        archive.meta().trust_domain, archive.meta().ancestry_id));
+}
+
 } // namespace llaminar2
