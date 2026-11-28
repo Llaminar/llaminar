@@ -327,3 +327,27 @@ Evidence: /tmp/amxperm.cpp, /tmp/cfgcmp.cpp (mixed palette #UD vs uniform OK),
 /tmp/tdpbuf.cpp + /tmp/tdpmap.cpp (per-cell deviation probing), /tmp/amxgrid.cpp
 (engine-vs-serial grids), /tmp/sample1t.cpp + gdb sampling (reference kernel
 identification).
+
+## Final parity result (2026-11): native AMX-BF16 meets and exceeds oneDNN
+
+With the aligned-direct tile loads (row-stride tileloadd straight from the
+matrices; the engine gates on 64-byte base alignment and falls back to the
+scratch copy otherwise) and the flat (mb,nb) worker chunking, the
+same-process interleaved Release-style benchmark (min of 20 runs,
+taskset 0-7, 8 threads) on M x N x K = 16/32/96 x 4096 x 4096 and
+32 x 8192 x 8192 now measures:
+
+| shape         | native AMX engine | oneDNN  | native/oneDNN |
+|---------------|-------------------|---------|---------------|
+| 16x4096x4096  | 2595 GF/s (0.207ms)| 1625 GF/s | 1.60x |
+| 32x4096x4096  | 4238 GF/s (0.253ms)| 3567 GF/s | 1.19x |
+| 96x4096x4096  | 6103 GF/s (0.528ms)| 6026 GF/s | 1.01x |
+| 32x8192x8192  | 5476 GF/s (0.784ms)| 4151 GF/s | 1.32x |
+
+Single thread on 96x4096x4096: native 962 GF/s vs oneDNN 791 GF/s.
+The objective "meets the oneDNN speed" is satisfied on every measured
+shape. The production path used for this membership is the AMX-BF16
+round engine (uniform 64-byte palette, permission-gated admission,
+constant-operand tile dispatch, direct aligned tile loads) which now
+admits and executes on this appliance; the AVX512-BF16 route remains
+for non-AMX hosts with its own deterministic contract.

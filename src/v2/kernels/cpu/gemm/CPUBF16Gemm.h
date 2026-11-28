@@ -801,6 +801,33 @@ namespace llaminar2
                 }
             }
 
+            /** @brief Load one 16×32 BF16 tile directly from strided matrix rows.
+             *
+             * The tile base is any alignment the executing implementation
+             * accepts (this appliance does not enforce the documented 64-byte
+             * alignment; hardware may), so callers pre-check alignment and
+             * fall back to `amxLoadBf16Tile` over the scratch-copy path when
+             * the base is not 64-byte aligned.
+             * @param base First row of the tile inside the source matrix.
+             * @param stride Row stride in bytes (the producer's row length).
+             */
+            inline void amxLoadBf16TileStrided(int tile, const void *base,
+                                               std::size_t stride) noexcept
+            {
+                switch (tile)
+                {
+                case 0: asm volatile("tileloadd (%0,%1,1), %%tmm0" :: "r"(base), "r"(stride) : "memory"); return;
+                case 1: asm volatile("tileloadd (%0,%1,1), %%tmm1" :: "r"(base), "r"(stride) : "memory"); return;
+                case 2: asm volatile("tileloadd (%0,%1,1), %%tmm2" :: "r"(base), "r"(stride) : "memory"); return;
+                case 3: asm volatile("tileloadd (%0,%1,1), %%tmm3" :: "r"(base), "r"(stride) : "memory"); return;
+                case 4: asm volatile("tileloadd (%0,%1,1), %%tmm4" :: "r"(base), "r"(stride) : "memory"); return;
+                case 5: asm volatile("tileloadd (%0,%1,1), %%tmm5" :: "r"(base), "r"(stride) : "memory"); return;
+                case 6: asm volatile("tileloadd (%0,%1,1), %%tmm6" :: "r"(base), "r"(stride) : "memory"); return;
+                case 7: asm volatile("tileloadd (%0,%1,1), %%tmm7" :: "r"(base), "r"(stride) : "memory"); return;
+                default: std::abort(); // unreachable: constant enum tiles
+                }
+            }
+
             /** @brief Load one 16×32 BF16 tile from a 64-byte-aligned buffer. */
             inline void amxLoadBf16Tile(int tile, const void *base) noexcept
             {
@@ -967,11 +994,20 @@ namespace llaminar2
                     static_cast<std::size_t>(transpose_B ? K : N) * 2;
                 const int row_blocks = M / 16;
                 const int m_blocks = (row_blocks + 3) / 4;
+                const int n_blocks = (N + kAMXBf16NBlock - 1) / kAMXBf16NBlock;
                 auto work = [&]()
                 {
 #pragma omp for schedule(static)
-                    for (int mb = 0; mb < m_blocks; ++mb)
+                    for (int chunk = 0; chunk < m_blocks * n_blocks; ++chunk)
                     {
+                        // Flattened (mb, nb) chunking: a 64-row x 48-column
+                        // block is the unit of worker parallelism. The small
+                        // M shapes that dominate serving expose only one or
+                        // two row blocks, so partitioning by M alone would
+                        // leave most workers idle; the column dimension
+                        // supplies the remaining parallelism.
+                        const int mb = chunk / n_blocks;
+                        const int nb = (chunk % n_blocks) * kAMXBf16NBlock;
                         // Per-thread tile scratch: AMX tile state and the tile
                         // buffers are per-logical-processor state, so every
                         // worker owns its own storage and scope.
@@ -993,7 +1029,6 @@ namespace llaminar2
                         // tiles would otherwise sum A x B0 + A x B1 + A x B2
                         // into one 16-column output instead of keeping the
                         // column groups side by side.
-                        for (int nb = 0; nb < N; nb += kAMXBf16NBlock)
                         {
                             // Every 16-column group gets its own D pass; the
                             // last 48-block may hold fewer than three groups.
@@ -1006,18 +1041,28 @@ namespace llaminar2
                                 {
                                     // The weight tile stays resident across all
                                     // four activation sub-tiles of this K step.
-                                    copyAMXTile(b_tile,
-                                                transpose_B
-                                                    ? B + static_cast<std::size_t>(nb + c * 16) * K + kt
-                                                    : B + static_cast<std::size_t>(kt) * N + nb + c * 16,
-                                                b_stride);
-                                    amxLoadBf16Tile(AMX_TILE_B0, b_tile);
+                                    const uint16_t *b_base =
+                                        transpose_B
+                                            ? B + static_cast<std::size_t>(nb + c * 16) * K + kt
+                                            : B + static_cast<std::size_t>(kt) * N + nb + c * 16;
+                                    if ((reinterpret_cast<std::uintptr_t>(b_base) & 63u) == 0)
+                                        amxLoadBf16TileStrided(AMX_TILE_B0, b_base, b_stride);
+                                    else
+                                    {
+                                        copyAMXTile(b_tile, b_base, b_stride);
+                                        amxLoadBf16Tile(AMX_TILE_B0, b_tile);
+                                    }
                                     for (int d = 0; d < msub_live; ++d)
                                     {
-                                        copyAMXTile(a_tile,
-                                                    A + static_cast<std::size_t>(mb * 4 + d) * 16 * K + kt,
-                                                    a_stride);
-                                        amxLoadBf16Tile(AMX_TILE_A, a_tile);
+                                        const uint16_t *a_base =
+                                            A + static_cast<std::size_t>(mb * 4 + d) * 16 * K + kt;
+                                        if ((reinterpret_cast<std::uintptr_t>(a_base) & 63u) == 0)
+                                            amxLoadBf16TileStrided(AMX_TILE_A, a_base, a_stride);
+                                        else
+                                        {
+                                            copyAMXTile(a_tile, a_base, a_stride);
+                                            amxLoadBf16Tile(AMX_TILE_A, a_tile);
+                                        }
                                         amxDpbf16(AMX_TILE_D0 + d, AMX_TILE_A, AMX_TILE_B0);
                                     }
                                 }
