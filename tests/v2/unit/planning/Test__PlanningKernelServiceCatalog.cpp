@@ -2315,6 +2315,31 @@ TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipFiltersNativeAndHostDevi
     EXPECT_EQ(no_native.mpi().size(), 18u);
 }
 
+/** @test Duplicate NUMA-local visibility assigns each physical GPU exactly one arithmetic reporter. */
+TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipDeduplicatesPreparedArithmeticReporters)
+{
+    auto cluster = inventory();
+    cluster.ranks[0].cpu.numa_node = 0;
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const AutomaticOrchestrationRequest selection({.only_backends = std::vector{backend}});
+        const auto observers = PlanningKernelServiceCatalog::observers(cluster, selection);
+        ASSERT_EQ(observers.size(), 2u);
+        std::set<std::pair<int, std::string>> physical;
+        std::set<int> reporters;
+        for (const auto &observer : observers)
+        {
+            EXPECT_EQ(observer.device().type, backend);
+            EXPECT_TRUE(physical.emplace(observer.physicalNode(), observer.uuid()).second);
+            EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(observer.discoveryRank()),
+                observer.device(), "prepared arithmetic reporter"));
+            reporters.insert(observer.discoveryRank());
+        }
+        EXPECT_EQ(reporters, (std::set<int>{0, 2}));
+        EXPECT_EQ(observers.front().device().ordinal, 4);
+    }
+}
+
 /** @test Locality filtering cannot turn corrupt visible inventory into an empty valid roster. */
 TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipRejectsMalformedRemoteAliases)
 {

@@ -475,20 +475,14 @@ namespace
         const auto mpi=MPIContextFactory::global();
         const auto inventory=mpi->clusterInventory();
         ASSERT_NE(inventory,nullptr);
-        const bool present=std::any_of(inventory->ranks.begin(),inventory->ranks.end(),[&](const auto &rank) {
-            return std::any_of(rank.gpus.begin(),rank.gpus.end(),[&](const auto &gpu) {
-                return gpu.type==backend && rankOwnsGPUDevice(rank,gpu);
-            });
-        });
-        ASSERT_TRUE(present)<<"Required original NUMA-local backend executor is absent";
+        const AutomaticOrchestrationRequest selection({.only_backends = std::vector{backend}});
+        const auto observers=PlanningKernelServiceCatalog::observers(*inventory,selection);
+        ASSERT_FALSE(observers.empty())<<"Required original NUMA-local backend executor is absent";
         const auto &original=inventory->getRank(mpi->rank());
-        std::optional<DeviceId> selected;
-        for(const auto &gpu:original.gpus)
-            if(gpu.type==backend && rankOwnsGPUDevice(original,gpu)) {
-                selected=DeviceId(backend,gpu.local_device_id);break;
-            }
-        if(!selected)return; // This original rank has no role for this backend.
-        const auto device=*selected;
+        for(const auto &observer:observers) {
+        if(observer.discoveryRank()!=mpi->rank())continue;
+        const auto device=observer.device();
+        requireRankLocalGPUOwnership(original,device,"prepared arithmetic lifecycle reporter");
         const auto host=planningObservedResource(original,DeviceId::cpu());
         const auto execution=planningObservedResource(original,device);
         auto &worker=GPUDeviceContextPool::instance().getContext(device);
@@ -569,6 +563,7 @@ namespace
                 EXPECT_THROW(producer.prepareNextPhaseStorage(),std::logic_error);
             });
             requireRetired();
+        }
         }
     }
 
