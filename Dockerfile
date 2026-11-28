@@ -414,6 +414,17 @@ FROM toolchain AS builder-integration-operation
 
 ARG TARGETARCH
 
+# ARM64: the NEON tile-register proof binds the exact compiler, assembler and
+# headers, and the separate test-runner re-checks them. Repack the toolchain's
+# installed compiler packages so the test-runner installs the same bytes
+# instead of whatever the archive serves later.
+RUN --mount=type=bind,source=scripts/docker/arm64-compiler-debs.sh,target=/tmp/arm64-compiler-debs.sh \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        sh /tmp/arm64-compiler-debs.sh save /src/arm64-compiler-debs; \
+    else \
+        mkdir -p /src/arm64-compiler-debs; \
+    fi
+
 # An admitted OCI toolchain is an external image, so build arguments must be
 # declared here rather than relying on inheritance from an in-file stage.
 ARG LLAMINAR_BUILD_TYPE
@@ -469,17 +480,6 @@ COPY .github ./.github
 COPY .devcontainer ./.devcontainer
 COPY AGENTS.md README.md ./
 COPY benchmarks/production ./benchmarks/production
-
-# ARM64: the NEON tile-register proof binds the exact compiler, assembler and
-# headers, and the separate test-runner re-checks them. Bring the cached
-# toolchain's compiler packages current and save their exact .debs, so the
-# test-runner installs the same bytes instead of whatever the archive serves
-# later. Placed after the source copies so it refreshes on every commit.
-RUN if [ "${TARGETARCH}" = "arm64" ]; then \
-        sh scripts/docker/arm64-compiler-debs.sh save /src/arm64-compiler-debs; \
-    else \
-        mkdir -p /src/arm64-compiler-debs; \
-    fi
 
 # Integration build — what CI drives for unit, parity, and E2E tests. Has
 # debug symbols, assertions active, tensor verification enabled.
