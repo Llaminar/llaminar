@@ -16153,6 +16153,16 @@ add_v2_test(V2_Unit_DiskPrefixStorageBackend
 
 add_executable(v2_test_paged_kv_disk_route unit/prefix_cache/Test__PagedKVDiskRoute.cpp)
 target_link_libraries(v2_test_paged_kv_disk_route llaminar2_core GTest::gtest GTest::gtest_main)
+
+add_executable(v2_test_paged_kv_archive_store unit/prefix_cache/Test__PagedKVArchiveStore.cpp)
+target_link_libraries(v2_test_paged_kv_archive_store llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PagedKVArchiveStore
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_archive_store>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Disk;Quota;Ownership;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVArchiveStore)
 add_v2_test(V2_Unit_PagedKVDiskRoute
     COMMAND $<TARGET_FILE:v2_test_paged_kv_disk_route>
     LABELS "V2;Unit;PrefixCache;Storage;Route;Tier"

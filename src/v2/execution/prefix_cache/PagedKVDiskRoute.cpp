@@ -11,7 +11,7 @@ PagedKVDiskRoute validatePagedKVDiskRoute(const PagedKVTierConfig &tiers)
     if (!tiers.disk_enabled)
         // Disabled: no route, no quota, one reserved journal record so the
         // off state is representable and every admit still refuses (quota 0).
-        return PagedKVDiskRoute{true, {}, 0, 1};
+        return PagedKVDiskRoute{true, {}, 0, 1, {}};
     std::string error;
     if (!tiers.valid(&error))
         return PagedKVDiskRoute{false, error, 0};
@@ -30,7 +30,8 @@ PagedKVDiskRoute validatePagedKVDiskRoute(const PagedKVTierConfig &tiers)
     if (tiers.disk_journal_membership == 0)
         return PagedKVDiskRoute{false,
             "paged KV disk route requires an admitted extent membership (typed journal cap)"};
-    return PagedKVDiskRoute{true, {}, tiers.disk_cap_bytes, tiers.disk_journal_membership};
+    return PagedKVDiskRoute{true, {}, tiers.disk_cap_bytes,
+        tiers.disk_journal_membership, tiers.disk_dir};
 }
 
 DiskExtentQuota makePagedKVDiskQuota(const PagedKVDiskRoute &route)

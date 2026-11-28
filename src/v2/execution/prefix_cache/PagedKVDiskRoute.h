@@ -35,6 +35,9 @@ struct PagedKVDiskRoute
      * the quota journal can always hold its own admitted extent set.
      */
     std::size_t admitted_extent_membership = 0;
+    /** @brief The configured engine-owned directory (exact route, never a
+     * default); empty exactly when the tier is disabled. */
+    std::string directory;
 };
 
 /**
