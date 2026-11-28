@@ -93,13 +93,17 @@ PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
         outcome.refusal = "demotion requires the composed instance's binding";
         return outcome;
     }
-    // Export the CURRENT live publication per layer (R23 oracle seam), stamp
-    // the ROUTE's trust/ancestry (the same values the restore expects), and
-    // slice the TAIL pages out as their own per-layer extents.
+    // Export the CURRENT live publication ONCE per layer (N1: no double
+    // export), stamp the ROUTE's trust/ancestry (the same values the restore
+    // expects), and slice the HEAD + TAIL pages out as their own per-layer
+    // extents. Rows are UNIFORM across layers (the binding's publication
+    // invariant); a skew refuses before any byte moves.
     const auto page_tokens = binding.pageTokens();
     const auto layers = binding.layerCount();
+    std::vector<PagedKVArchive> heads;
     std::vector<PagedKVArchive> tails;
     int head_rows = 0;
+    std::optional<int> rows0;
     for (int layer = 0; layer < layers; ++layer)
     {
         auto section = binding.exportLayer(layer);
@@ -109,18 +113,22 @@ PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
             return outcome;
         }
         const auto rows = section->meta().rows;
+        if (!rows0.has_value())
+            rows0 = static_cast<int>(rows);
+        else if (*rows0 != static_cast<int>(rows))
+        {
+            outcome.refusal = "demotion requires uniform per-layer extents";
+            return outcome;
+        }
         const auto pages = (rows + static_cast<std::size_t>(page_tokens) - 1) /
             static_cast<std::size_t>(page_tokens);
         if (deficit_pages > pages)
-            deficit_pages = pages; // Deficit-only: bounded by the chain.
+            deficit_pages = pages; // Deficit-only: bounded by the chain
+                                   // (hoist: same value for every layer).
         // TAIL-FIRST page arithmetic: the LAST `deficit_pages` pages of the
         // chain are demoted; the final page may be PARTIAL (a mid-page
         // terminal boundary), so the tail row count is the exact sum of the
         // last pages' rows — never deficit*page_tokens blindly.
-        // The last `deficit_pages` pages counted FROM THE END (their exact
-        // rows): page p (0-based from the start) holds
-        // min(page_tokens, rows - p*page_tokens); a mid-page terminal
-        // boundary never over/under-demotes.
         std::size_t tail_rows = 0;
         for (std::size_t k = 0; k < deficit_pages; ++k)
         {
@@ -140,10 +148,8 @@ PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
         const auto head = rows - tail_rows;
         if (layer == 0)
             head_rows = static_cast<int>(head);
-        // Page-aligned head; the tail slice is exactly the last tail_rows.
-        auto tail = section->slice(head, rows)
-            .withProvenance(trust_domain_, prefix);
-        tails.push_back(std::move(tail));
+        heads.push_back(section->slice(0, head).withProvenance(trust_domain_, prefix));
+        tails.push_back(section->slice(head, rows).withProvenance(trust_domain_, prefix));
     }
     // ALL-or-none against the store: publish the RESIDENT HEAD and the TAIL
     // as separate per-layer extents (the restore path owns the complete
@@ -160,21 +166,6 @@ PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
         if (!key) return std::nullopt;
         return key;
     };
-    // Head slices are the FIRST head_rows of each exported layer (the head
-    // version keeps the record's own stamped provenance).
-    std::vector<PagedKVArchive> heads;
-    for (int layer = 0; layer < layers; ++layer)
-    {
-        auto section = binding.exportLayer(layer);
-        if (!section)
-        {
-            for (auto &done : published) (void)store->retire(done);
-            outcome.refusal = "head export refused during demotion";
-            return outcome;
-        }
-        heads.push_back(section->slice(0, static_cast<std::size_t>(head_rows))
-            .withProvenance(trust_domain_, prefix));
-    }
     for (std::size_t layer = 0; layer < heads.size(); ++layer)
     {
         auto key = putExtent(heads[layer], prefix);
@@ -197,18 +188,16 @@ PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
         }
         published.push_back(*key);
     }
-    // RAM-side retirement at the call boundary: truncate EVERY layer to the
-    // resident head (all-or-none again: a truncate refusal rolls the store
-    // back — the store retire is exact).
-    for (int layer = 0; layer < layers; ++layer)
+    // RAM-side retirement at the call boundary: the binding-level ATOMIC
+    // truncate (F1) — every layer prechecked and published all-or-none; a
+    // refusal means NOTHING changed (the store is rolled back and no layer
+    // lost its rows).
+    if (!binding.truncateAllLayers(head_rows))
     {
-        if (!binding.truncateLayer(layer, head_rows))
-        {
-            for (auto &done : published)
-                (void)store->retire(done);
-            outcome.refusal = "binding truncate refused at layer " + std::to_string(layer);
-            return outcome;
-        }
+        for (auto &done : published)
+            (void)store->retire(done);
+        outcome.refusal = "binding atomic truncate refused (no layer changed; store rolled back)";
+        return outcome;
     }
     rec->resident_head_rows = head_rows;
     // Split the published extents: the first `layers` are HEAD slices.
@@ -290,15 +279,18 @@ bool PooledKVPrefixFlow::restore(std::uint64_t ns, std::uint64_t prefix,
             *refusal = "restored tail import refused (trust/ancestry or provenance gate)";
         return false;
     }
-    // The import succeeded: the hybrid prefix is fully resident again; the
-    // tail record clears (the extents stay admitted until retirement plays
-    // out through the store lifecycle — the flow keeps them until the
-    // next demotion or the record's removal, so a subsequent restore is
-    // idempotent-safe only after the owner re-orders; here we clear the
-    // TAIL list so the record reflects residency).
+    // F2: move-between-tiers CREDITS THE SOURCE AFTER PRESERVATION — the
+    // demoted extents are retired now (store quota returns to its
+    // pre-demotion value; no anonymous unowned disk quota), AFTER the import
+    // succeeded (failed restores keep the extents and the record).
+    auto *store_retire = instance_.diskStore();
+    for (const auto &head : rec->head_extents)
+        (void)store_retire->retire(head);
+    for (const auto &tail : rec->tail_extents)
+        (void)store_retire->retire(tail);
     rec->tail_extents.clear();
     rec->head_extents.clear();
-    rec->resident_head_rows = 0;
+    rec->resident_head_rows = 0; // Fully resident again: no demoted head.
     return true;
 }
 } // namespace llaminar2

@@ -201,6 +201,32 @@ TEST(PooledBindingImport, GateNegativesRefuseWithoutMutation)
         archive.meta().trust_domain, archive.meta().ancestry_id));
     ASSERT_TRUE(foreign.hasLivePublication());
 }
+/** @test F1 (atomic truncate) negative DIRECT: an out-of-range rows request
+ * refuses in the PRECHECK with NO layer changed and NO epoch bump; a valid
+ * request after it succeeds on every layer. */
+TEST(PooledBindingImport, AtomicTruncatePrecheckRefusesWithoutMutation)
+{
+    ImportFixture fx;
+    auto a = publishArchive(fx, 12, 1);
+    auto b = publishArchive(fx, 12, 2);
+    auto binding = fx.binding(710, /*layers=*/2);
+    ASSERT_TRUE(binding.attachStoredImport({a, b}, 0, 0));
+    // Shrink both layers to 8, then ask for 10: the precheck must refuse
+    // BEFORE any layer changes.
+    ASSERT_TRUE(binding.truncateAllLayers(8));
+    EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 8);
+    EXPECT_EQ(binding.priorFor(1)->snapshot.view().rows(), 8);
+    const auto epoch = binding.cursorEpoch();
+    EXPECT_FALSE(binding.truncateAllLayers(10));
+    EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 8); // Unchanged.
+    EXPECT_EQ(binding.priorFor(1)->snapshot.view().rows(), 8); // Unchanged.
+    EXPECT_EQ(binding.cursorEpoch(), epoch);                    // No bump.
+    // A valid following request still works -> no poisoned state.
+    EXPECT_TRUE(binding.truncateAllLayers(4));
+    EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 4);
+    EXPECT_EQ(binding.priorFor(1)->snapshot.view().rows(), 4);
+}
+
 /** @test CARRY G1 primitive-level negative: a non-matching trust domain or
  * ancestry identity makes the table's authenticated attach THROW before any
  * byte is staged (the binding call site forward is tautological today; the

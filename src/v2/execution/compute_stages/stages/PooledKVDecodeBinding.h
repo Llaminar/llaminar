@@ -856,6 +856,139 @@ public:
     }
 
     /**
+     * @brief P3 M11 (F1): truncate EVERY layer to @p rows ATOMICALLY.
+     *
+     * All-or-none like attachStoredImport: every layer is prechecked (live
+     * prior, 0 < rows <= current), ONE pool grant is admitted for every
+     * layer's re-materialized pages, every bank publishes under this
+     * request's own accepted-work envelope, and NO cell changes until every
+     * layer bound+reffed. A refusal BEFORE the publish loop (skewed row
+     * counts, grant refusal, bank refusal, archive attach exception) leaves
+     * EVERY layer exactly as it was — a per-layer truncate loop can never
+     * leave the tail rows lost from RAM and store (the reviewer F1 shape).
+     * @return True on success; false without ANY mutation on any refusal.
+     */
+    bool truncateAllLayers(int rows)
+    {
+        if (!pool_ || !table_ || rows <= 0 || cancelled_)
+            return false;
+        // Precheck EVERY layer before ANY mutation: live prior, rows valid.
+        std::size_t total_pages = 0;
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            const auto *prior = priorFor(static_cast<int>(layer));
+            if (!prior || !prior->live())
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Atomic truncate requires a live publication on every layer");
+                return false;
+            }
+            const int current = prior->snapshot.view().rows();
+            if (rows > current)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Atomic truncate rows exceed layer " << layer
+                          << " extent (" << current << ")");
+                return false;
+            }
+            const auto pages_needed =
+                (static_cast<std::size_t>(rows) + static_cast<std::size_t>(page_tokens_) - 1) /
+                static_cast<std::size_t>(page_tokens_);
+            total_pages += pages_needed ? pages_needed : 1;
+        }
+        auto grant = pool_->tryAdmit(total_pages);
+        if (!grant)
+        {
+            LOG_ERROR("[PooledKVDecodeBinding] Atomic truncate grant refused");
+            return false;
+        }
+        // Build EVERY layer's clipped bank under the SAME grant first.
+        std::vector<std::optional<CPUFP32PagedKVTable::Update>> updates;
+        updates.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            const auto *prior = priorFor(static_cast<int>(layer));
+            if (!prior) return false; // Prechecked; unreachable.
+            const int current = prior->snapshot.view().rows();
+            if (rows == current)
+                continue; // No-op layer: keep the existing bank untouched.
+            auto clipped = prior->snapshot.view().prefix(static_cast<std::size_t>(rows));
+            auto archive = PagedKVArchive::fromView(clipped);
+            if (archive.empty()) return false;
+            auto update = reservation_
+                ? table_->tryBeginReserved(*reservation_)
+                : table_->tryBeginUpdate();
+            if (!update)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Atomic truncate bank refused at layer " << layer);
+                return false;
+            }
+            try
+            {
+                update->attachArchivedPrefix(archive, *grant, page_tokens_,
+                    /*trust_domain=*/0, /*ancestry_id=*/0);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Atomic truncate attach refused at layer "
+                          << layer << ": " << e.what());
+                return false;
+            }
+            updates.push_back(std::move(*update));
+        }
+        // Publish all-or-none (identical rule to attachStoredImport).
+        std::vector<CPUFP32PagedKVTable::Snapshot> snapshots;
+        snapshots.reserve(updates.size());
+        for (auto &update : updates)
+            snapshots.push_back(update->commit());
+        std::vector<PagedKVSnapshotRef> refs;
+        refs.reserve(snapshots.size());
+        std::size_t next = 0;
+        bool publish_ok = true;
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            const auto *prior = priorFor(static_cast<int>(layer));
+            if (prior && prior->snapshot.view().rows() == rows) continue; // No-op layer.
+            auto &snapshot = snapshots[next];
+            if (!table_->bindPublication(snapshot, request_id_, slot_))
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Atomic truncate bind refused at layer " << layer);
+                publish_ok = false;
+                break;
+            }
+            const auto ref = table_->refFor(snapshot, request_id_, slot_);
+            if (!ref.valid())
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] Atomic truncate ref refused at layer " << layer);
+                publish_ok = false;
+                break;
+            }
+            refs.push_back(ref);
+            ++next;
+        }
+        if (!publish_ok)
+        {
+            snapshots.clear(); // Banks -> Free/unbound; grant releases.
+            return false;
+        }
+        // Infallible state publication: assign ONLY after every gate passed.
+        next = 0;
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
+            const auto *prior = priorFor(static_cast<int>(layer));
+            if (prior && prior->snapshot.view().rows() == rows) continue;
+            cell.ref = refs[next];
+            cell.snapshot = std::move(snapshots[next]);
+            ++next;
+        }
+        private_publication_grant_ = std::move(grant);
+        for (auto &lease : attach_use_leases_)
+            lease.abandon();
+        attach_use_leases_.clear();
+        ++cursor_epoch_;
+        return true;
+    }
+
+    /**
      * @brief P3 M1: attach a compatible PREFIX of another live request's
      * publication to THIS request's fresh bank as DEDUPLICATED shared frames.
      *

@@ -142,7 +142,7 @@ TEST(PooledKVPrefixFlow, DemoteThenRestoreRoundTripByteExact)
         ASSERT_TRUE(binding.attachStoredImport({source}, 0, 0));
         auto outcome = flow.demoteTail(3, 99, binding, /*deficit_pages=*/1);
         ASSERT_TRUE(outcome.ok()) << outcome.refusal;
-        EXPECT_EQ(outcome.head_rows, 8); // 12 rows -> 1 tail page of 8 demoted.
+        EXPECT_EQ(outcome.head_rows, 8); // 12 rows -> last page is partial (4 rows).
         ASSERT_EQ(outcome.moved.size(), 1u);
         EXPECT_GT(fx.instance->diskStore()->quota().bytesAdmitted(), 0u);
         // The binding was truncated to the resident head (RAM retirement).
@@ -160,6 +160,10 @@ TEST(PooledKVPrefixFlow, DemoteThenRestoreRoundTripByteExact)
         auto fresh = fx.binding(802);
         std::string refusal;
         EXPECT_TRUE(flow.restore(3, 99, fresh, &refusal)) << refusal;
+        // F2: the successful restore RETIRED the demoted extents — the store
+        // quota returns to its PRE-demotion value (0); the disk tier credits
+        // the source after preservation (no anonymous unowned quota).
+        EXPECT_EQ(fx.instance->diskStore()->quota().bytesAdmitted(), 0u);
         ASSERT_TRUE(fresh.hasLivePublication());
         ASSERT_TRUE(fresh.priorFor(0));
         EXPECT_EQ(fresh.priorFor(0)->snapshot.view().rows(), 12);
@@ -229,6 +233,45 @@ TEST(PooledKVPrefixFlow, TamperedTailRefusesRestore)
     const auto *r2 = flow.record(3, 99);
     ASSERT_TRUE(r2 != nullptr);
     EXPECT_EQ(r2->tail_extents.size(), 1u); // Kept: restore failed closed.
+}
+
+/** @test F1 NEGATIVE: a LATE-stage refusal — the second demotion's store puts
+ * succeed but the atomic truncate's bank update refuses (the binding's
+ * accepted-work envelope is exhausted) — refuses with NOTHING changed: the
+ * NEW store extents are rolled back, the binding keeps the FIRST demotion's
+ * 8 rows, and the record still holds ONLY the first demotion's extents. */
+TEST(PooledKVPrefixFlow, LateTruncateRefusalLeavesEverything)
+{
+    FlowFixture fx;
+    auto source = publishArchive(fx, 12, 5);
+    PooledKVPrefixFlow flow(*fx.instance, 4, 8, std::nullopt, 42);
+    ASSERT_TRUE(flow.admit(3, 95, "24h", "k").has_value());
+    ASSERT_TRUE(flow.setLive(3, 95, false));
+    // The binding's accepted-work envelope: import consumes one issuance,
+    // the first atomic truncate one, the second has NONE left.
+    auto binding = fx.binding(807, 1, /*issuances=*/2);
+    ASSERT_TRUE(binding.attachStoredImport({source}, 0, 0));
+    auto first = flow.demoteTail(3, 95, binding, 1);
+    ASSERT_TRUE(first.ok()) << first.refusal;
+    EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 8);
+    const auto quota_after_first =
+        fx.instance->diskStore()->quota().bytesAdmitted();
+    EXPECT_GT(quota_after_first, 0u);
+    // SECOND demotion on the 8-row head: a 1-page deficit covers the whole
+    // (single-page) head — the precheck refuses BEFORE any store write.
+    auto second = flow.demoteTail(3, 95, binding, 1);
+    ASSERT_FALSE(second.ok()) << "whole-prefix second demotion must refuse";
+    EXPECT_NE(second.refusal.find("no resident head remains"), std::string::npos)
+        << second.refusal;
+    // NOTHING changed: the new extents were rolled back (quota == the FIRST
+    // demotion's), the binding still holds 8 rows, the record keeps ONLY the
+    // first demotion's extents.
+    EXPECT_EQ(fx.instance->diskStore()->quota().bytesAdmitted(), quota_after_first);
+    EXPECT_EQ(binding.priorFor(0)->snapshot.view().rows(), 8);
+    const auto *r = flow.record(3, 95);
+    ASSERT_TRUE(r != nullptr);
+    EXPECT_EQ(r->head_extents.size(), 1u);
+    EXPECT_EQ(r->tail_extents.size(), 1u);
 }
 
 /** @test GATE NEGATIVES: live record refuses demotion; no-demoted record
