@@ -134,7 +134,10 @@ class EnvelopeChecks(unittest.TestCase):
     def test_failed_attempt_is_host_readable(self):
         import os
         from types import SimpleNamespace
-        with tempfile.TemporaryDirectory() as directory:
+        # The reader changes identity, so neither TMPDIR nor Python's cached
+        # temporary root may place this fixture below a private ancestor.
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            Path(directory).chmod(0o755)
             def execute(*args, **kwargs):
                 return SimpleNamespace(returncode=7)
             self.assertEqual(run('.', directory, execute, test_identity=False), 1)
@@ -144,7 +147,10 @@ class EnvelopeChecks(unittest.TestCase):
             if os.name == 'posix' and os.geteuid() == 0:
                 # Exercise real Linux DAC with a root-created failed attempt,
                 # not root's ability to read its own private output.
-                Path(directory).chmod(0o755)
+                for ancestor in (Path(directory), *Path(directory).resolve().parents):
+                    self.assertTrue(
+                        ancestor.stat().st_mode & 0o001,
+                        f'unprivileged reader fixture ancestor is not world-traversable: {ancestor}')
                 child = os.fork()
                 if child == 0:
                     try:
@@ -156,6 +162,21 @@ class EnvelopeChecks(unittest.TestCase):
                                 path.read_bytes()
                         os._exit(0)
                     except BaseException:
+                        import traceback
+                        traceback.print_exc()
                         os._exit(1)
                 _, status = os.waitpid(child, 0)
-                self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0,
+                                 'unprivileged reader could not read failed-attempt artifacts')
+
+    def test_failed_attempt_is_host_readable_with_private_tmpdir(self):
+        import os
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(dir='/tmp') as private:
+            Path(private).chmod(0o700)
+            # tempfile caches its selected root independently of the environment.
+            # Bind both so this reproduces a root runner with a private TMPDIR.
+            with patch.dict(os.environ, TMPDIR=private), patch.object(tempfile, 'tempdir', private):
+                self.test_failed_attempt_is_host_readable()
+            self.assertEqual(Path(private).stat().st_mode & 0o777, 0o700)
+            self.assertEqual(list(Path(private).iterdir()), [])
