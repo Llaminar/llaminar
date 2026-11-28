@@ -478,6 +478,12 @@ namespace
         const AutomaticOrchestrationRequest selection({.only_backends = std::vector{backend}});
         const auto observers=PlanningKernelServiceCatalog::observers(*inventory,selection);
         ASSERT_FALSE(observers.empty())<<"Required original NUMA-local backend executor is absent";
+        std::set<std::pair<int,std::string>> physical;
+        for(const auto &rank:inventory->ranks)
+            for(const auto &gpu:rank.gpus)
+                if(gpu.type==backend && rankOwnsGPUDevice(rank,gpu))
+                    physical.emplace(inventory->connectionBetweenRanks(rank.rank,rank.rank).sourceNode(),gpu.uuid);
+        std::uint64_t executed=0;
         const auto &original=inventory->getRank(mpi->rank());
         for(const auto &observer:observers) {
         if(observer.discoveryRank()!=mpi->rank())continue;
@@ -564,7 +570,12 @@ namespace
             });
             requireRetired();
         }
+        ++executed;
         }
+        std::uint64_t global_executed=0;
+        ASSERT_EQ(MPI_Allreduce(&executed,&global_executed,1,MPI_UINT64_T,MPI_SUM,mpi->communicator()),MPI_SUCCESS);
+        EXPECT_GT(global_executed,0u);
+        EXPECT_EQ(global_executed,physical.size());
     }
 
     /** @brief Join real FP32/streaming observations without another sample or model warmup. */

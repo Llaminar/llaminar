@@ -2337,6 +2337,16 @@ TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipDeduplicatesPreparedArit
         }
         EXPECT_EQ(reporters, (std::set<int>{0, 2}));
         EXPECT_EQ(observers.front().device().ordinal, 4);
+        auto distinct = cluster;
+        auto &peer = distinct.ranks[1].gpus;
+        const auto gpu = std::find_if(peer.begin(), peer.end(), [&](const auto &value) { return value.type == backend; });
+        ASSERT_NE(gpu, peer.end());
+        gpu->uuid = "distinct-owned-peer";
+        const auto distinct_observers = PlanningKernelServiceCatalog::observers(distinct, selection);
+        ASSERT_EQ(distinct_observers.size(), 3u);
+        EXPECT_EQ(std::count_if(distinct_observers.begin(), distinct_observers.end(),
+            [](const auto &observer) { return observer.physicalNode() == 0; }), 2);
+
     }
 }
 
