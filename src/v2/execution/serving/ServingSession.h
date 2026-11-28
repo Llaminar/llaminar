@@ -70,6 +70,15 @@ namespace llaminar2
         virtual int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
                                             PrefixLookupResult &admission) = 0;
         /**
+         * @brief Whether this executor serves through the pooled paged-KV
+         * path (R52, F2): when TRUE the session uses ONLY pooledAdmit for
+         * prefix admission/restore — a pooled refusal is a precise request
+         * error, NEVER a silent ring-restore fallback inside a pooled
+         * session. When FALSE the ring path is used exclusively.
+         */
+        virtual bool pooledConfigured() const { return false; }
+
+        /**
          * @brief POOLED slot admission (R52): when the runner serves through
          * the composed paged-KV instance the session calls this INSTEAD of
          * the ring prefix restore. The executor admits the retention record

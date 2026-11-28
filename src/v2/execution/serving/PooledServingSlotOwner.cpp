@@ -74,7 +74,10 @@ bool PooledServingSlotOwner::admitSlot(int slot, std::uint64_t request_id,
     // HIT: a record with store-resident extents restores into the fresh
     // binding (route trust/ancestry enforced by the authenticated attach).
     const auto *rec = flow_->record(ns, prefix);
-    if (rec && !rec->head_extents.empty() && !rec->tail_extents.empty())
+    // A HIT is any store-resident record: head+tail (multi-page demotion) or
+    // head-only with the stored row count (single-page whole store, F1(a)).
+    if (rec && !rec->head_extents.empty() &&
+        (!rec->tail_extents.empty() || rec->stored_rows > 0))
     {
         if (!flow_->restore(ns, prefix, *binding, &error))
         {
@@ -133,10 +136,22 @@ bool PooledServingSlotOwner::demoteSlot(int slot, std::string &error)
         return true;
     }
     // Tail-first deficit: demote every page except the final resident one
-    // (the R49 tail-first semantics at the serving boundary; a single-page
-    // prefix keeps its one page resident).
+    // (the R49 tail-first semantics at the serving boundary). A SINGLE-page
+    // prefix is stored WHOLE (storeFullPrefix — head-only store-resident
+    // extents; F1(a): no zombie record — the follow-up request restores it),
+    // then the slot releases its binding (the store owns the prefix).
     const int total_pages = (rows + page_tokens_ - 1) / page_tokens_;
-    if (total_pages > 1)
+    if (total_pages == 1)
+    {
+        if (!flow_->setLive(ns, prefix, false))
+        {
+            error = "pooled prefix could not be marked idle";
+            return false;
+        }
+        if (!flow_->storeFullPrefix(ns, prefix, *binding, &error))
+            return false;
+    }
+    else if (total_pages > 1)
     {
         if (!flow_->setLive(ns, prefix, false))
         {
@@ -150,12 +165,6 @@ bool PooledServingSlotOwner::demoteSlot(int slot, std::string &error)
             error = "pooled demotion refused: " + outcome.refusal;
             return false;
         }
-    }
-    else if (flow_->record(ns, prefix))
-    {
-        // Single-page prefix: keep it resident (no demotion); the record
-        // stays with its extents empty until the next demotion opportunity.
-        (void)flow_->setLive(ns, prefix, false);
     }
     releaseSlot(slot);
     return true;

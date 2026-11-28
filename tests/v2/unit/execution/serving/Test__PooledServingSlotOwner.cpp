@@ -199,12 +199,15 @@ TEST(PooledServingSlotOwner, IdentityPolicyIsByteIdentityPerNamespace)
     EXPECT_EQ(restored, 0);
 }
 
-/** @test R52 wiring retirement: a single-page prefix keeps its one page
- * resident (no disk write, quota 0, record marked idle). */
-TEST(PooledServingSlotOwner, SinglePagePrefixStaysResident)
+/** @test R52 wiring retirement (F1(a)): a single-page prefix is stored
+ * WHOLE on the disk tier at retirement (head-only extents, store quota
+ * charged) and the SAME prompt's FOLLOW-UP request on a fresh slot is a HIT
+ * that restores every row — never a zombie record, never a duplicate
+ * refusal. */
+TEST(PooledServingSlotOwner, SinglePagePrefixIsStoreResidentAndHitsLater)
 {
     SlotFixture fx;
-    PooledServingSlotOwner owner(*fx.instance, 1, 1, 8, 1, 8, 12, 4,
+    PooledServingSlotOwner owner(*fx.instance, 2, 1, 8, 1, 8, 12, 4,
         std::nullopt, 42, 4, 8);
     const std::vector<int32_t> prompt{1, 3, 5, 7};
     std::string error;
@@ -213,8 +216,21 @@ TEST(PooledServingSlotOwner, SinglePagePrefixStaysResident)
     auto source = publishArchive(fx, 8); // Exactly one full page.
     ASSERT_TRUE(owner.bindingFor(0)->attachStoredImport({source}, 0, 0));
     ASSERT_TRUE(owner.demoteSlot(0, error)) << error;
-    EXPECT_EQ(fx.instance->diskStore()->quota().bytesAdmitted(), 0u);
+    EXPECT_GT(fx.instance->diskStore()->quota().bytesAdmitted(), 0u);
     EXPECT_TRUE(owner.bindingFor(0) == nullptr);
+    // FOLLOW-UP: the same prefix on a fresh slot must HIT (restore 8 rows).
+    ASSERT_TRUE(owner.admitSlot(1, 822, "24h", "k", prompt, restored, error))
+        << error;
+    EXPECT_EQ(restored, 8);
+    EXPECT_EQ(fx.instance->diskStore()->quota().bytesAdmitted(), 0u);
+    EXPECT_EQ(owner.bindingFor(1)->priorFor(0)->snapshot.view().rows(), 8);
+    // Byte identity again: head-only store restores the exact section.
+    auto reexport = owner.bindingFor(1)->exportLayer(0);
+    ASSERT_TRUE(reexport.has_value());
+    const auto a = source.serialize();
+    const auto b = reexport->serialize();
+    ASSERT_EQ(a.size(), b.size());
+    EXPECT_EQ(std::memcmp(a.data(), b.data(), a.size()), 0);
 }
 
 /** @test R52 wiring: the operator ceiling refuses at slot admission (the
@@ -244,6 +260,7 @@ public:
     int pooled_demote_calls = 0;
     int ring_restore_calls = 0;
     bool pooled = true;
+    bool pooled_mode = true; // configured pooled (mode); pooled=false rejects
     bool forwardServingRows(const std::vector<int> &, const std::vector<std::vector<int>> &rows) override
     {
         logits_.assign(rows.size() * kVocab, 0.0f);
@@ -263,6 +280,7 @@ public:
     {
         return true;
     }
+    bool pooledConfigured() const override { return pooled_mode; }
     bool pooledAdmit(int, std::uint64_t, std::string_view, std::string_view,
                      const std::vector<int32_t> &, int &restored) override
     {
@@ -281,6 +299,38 @@ private:
     std::vector<float> logits_;
 };
 } // namespace
+
+/** @test R52 session wiring (F2): a POOLED refusal is a precise request
+ * error — restoreServingRowPrefix is NEVER called inside a pooled session
+ * (no silent mode change); the request row errors and the slot frees. */
+TEST(PooledServingSlotOwner, PooledRefusalNeverFallsBackToRing)
+{
+    PooledScriptedRows rows;
+    rows.pooled = false; // scripted pooled refusal
+    ServingSession session(rows, 64, PooledScriptedRows::kVocab);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error));
+    ServingBatchRequest request;
+    request.id = 11;
+    request.prompt = {1, 2, 3, 4, 5};
+    request.max_new_tokens = 3;
+    request.sampling.temperature = 0.0f;
+    request.sampling.top_k = 1;
+    request.sampling.seed = 1;
+    request.prompt_cache_retention = "24h";
+    request.prompt_cache_key = "k";
+    ASSERT_TRUE(session.submit(std::move(request), error) != ServingSubmissionOutcome::Refused);
+    ServingBatchEvent terminal;
+    for (int step = 0; step < 8 && terminal.finish == ServingFinishReason::None; ++step)
+        for (const auto &event : session.step())
+            if (event.finished()) terminal = event;
+    EXPECT_NE(terminal.finish, ServingFinishReason::None);
+    EXPECT_EQ(terminal.finish, ServingFinishReason::Error);
+    EXPECT_EQ(rows.pooled_admit_calls, 1);
+    EXPECT_EQ(rows.ring_restore_calls, 0); // NEVER the ring inside pooled mode
+    EXPECT_EQ(rows.pooled_demote_calls, 0);
+    ASSERT_TRUE(session.idle());
+}
 
 /** @test R52 session wiring: with a pooled executor, promotion calls
  * pooledAdmit INSTEAD of the ring restore (the ring restore is not called),

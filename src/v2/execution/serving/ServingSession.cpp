@@ -373,9 +373,33 @@ namespace llaminar2
             // prefix into the slot's pooled binding (the ring restore is not
             // called; a miss prefills through the pooled single row-batch).
             int restored = 0;
-            if (!executor_.pooledAdmit(slot, row.request.id,
-                    row.request.prompt_cache_retention,
-                    row.request.prompt_cache_key, row.request.prompt, restored))
+            if (executor_.pooledConfigured())
+            {
+                // F2: pooled serving admits the prefix through the flow ONLY
+                // — a refusal is a precise request error, never a silent
+                // ring-restore mode change inside a pooled session.
+                if (!executor_.pooledAdmit(slot, row.request.id,
+                        row.request.prompt_cache_retention,
+                        row.request.prompt_cache_key, row.request.prompt,
+                        restored))
+                {
+                    ServingBatchEvent event;
+                    event.id = row.request.id;
+                    event.finish = ServingFinishReason::Error;
+                    event.error = executor_.servingRowError().empty()
+                        ? "pooled prefix admission refused"
+                        : executor_.servingRowError();
+                    event.prompt_tokens =
+                        static_cast<int>(row.request.prompt.size());
+                    events.push_back(std::move(event));
+                    if (!executor_.resetServingRow(slot))
+                        return sealAll("Serving slot " + std::to_string(slot) +
+                                       " could not be reset after a pooled admission refusal", events);
+                    --slot; // the slot is still free for the next queued request
+                    continue;
+                }
+            }
+            else
             {
                 restored = executor_.restoreServingRowPrefix(slot, row.request.prompt, row.prefix_admission);
             }

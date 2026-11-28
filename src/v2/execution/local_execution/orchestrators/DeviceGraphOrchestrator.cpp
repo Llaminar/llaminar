@@ -18558,6 +18558,12 @@ namespace llaminar2
             // the position authority below.
             // (Grouped pooled prefill remains decode-only: each group member
             // is a one-row decode participant by contract.)
+            // F5 (R52): the pooled publication is the position authority —
+            // the host check below is a CONSISTENCY guard, not a fail-closed
+            // cursor mirror. The serving path seats state_.positions FROM
+            // nextPosition() (R30's host-cursor-fail-closed rule is
+            // superseded: the mirror can never disagree because it is
+            // derived); the forward() shape still re-seats on epoch change.
             const int pooled_next_position = pooled_kv_binding_->nextPosition();
             if (pooled_next_position != state_.positions[0])
             {

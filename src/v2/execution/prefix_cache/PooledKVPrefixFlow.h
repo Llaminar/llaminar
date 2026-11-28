@@ -45,6 +45,9 @@ struct PooledPrefixRecord
     RetentionEntryKey owner_key;
     /** @brief Rows still resident in the RAM tier (the hybrid head). */
     int resident_head_rows = 0;
+    /** @brief Total store-resident rows of the demoted prefix (head+tail
+     * extents together cover exactly this many rows; 0 = not stored). */
+    int stored_rows = 0;
     /** @brief Stamped head extents in the disk tier (at demotion the
      * complete prefix becomes store-resident: head + tail per layer). */
     std::vector<PagedKVArchiveExtentKey> head_extents;
@@ -119,6 +122,15 @@ public:
         std::size_t deficit_pages);
 
     /**
+     * @brief Store the COMPLETE prefix as one store-resident head extent
+     * (tail empty): the single-page serving-retirement form. Failure keeps
+     * the record untouched. @return The stored row count.
+     */
+    bool storeFullPrefix(std::uint64_t namespace_id,
+        std::uint64_t prefix_id, PooledKVDecodeBinding &binding,
+        std::string *refusal = nullptr);
+
+    /**
      * @brief Restore a hybrid prefix into a FRESH binding.
      * @param namespace_id/prefix_id Record identity.
      * @param binding Fresh destination binding (same pool/table authority).
@@ -139,6 +151,10 @@ public:
     /** @brief Bounded record access (no unbounded map on the hot path). */
     const PooledPrefixRecord *record(std::uint64_t namespace_id,
         std::uint64_t prefix_id) const;
+    /** @brief Mutable record access for the flow's own cascade/discard
+     * paths (exact retire + owner remove — never a caller public surface). */
+    PooledPrefixRecord *mutableRecord(std::uint64_t namespace_id,
+        std::uint64_t prefix_id);
 
     /** @return Admitted record count. */
     std::size_t count() const noexcept { return count_; }
@@ -147,9 +163,13 @@ public:
 
 private:
     PooledPrefixRecord *findRecord(std::uint64_t namespace_id, std::uint64_t prefix_id);
+    /** @brief §8.4 ordinal clock: monotonic, caller-owned by the flow (no
+     * wall clock; deterministic replay). */
+    std::uint64_t ordinal() noexcept { return ++ordinal_; }
     PooledKVDecodeBinding &requireBindingPtr(PooledKVDecodeBinding &binding);
     PagedKVInstance &instance_;
     RetentionOwner owner_;
+    std::uint64_t ordinal_ = 0;
     RetentionIntentResolver resolver_;
     std::uint64_t trust_domain_ = 0;
     std::vector<PooledPrefixRecord> records_;

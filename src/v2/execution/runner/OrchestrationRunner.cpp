@@ -26813,6 +26813,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                 runner_.setPooledServingBinding(nullptr);
                 return ok;
             }
+            bool pooledConfigured() const override { return pooled_ != nullptr; }
             bool pooledAdmit(int slot, std::uint64_t request_id,
                              std::string_view retention, std::string_view key,
                              const std::vector<int32_t> &prompt,
@@ -26860,6 +26861,17 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         };
     } // namespace
 
+    namespace
+    {
+        /** @brief The local CPU route's authenticated trust domain (the
+         * demotion stamps it; the restore expects the same — a different
+         * route's values never match a record written here). */
+        constexpr std::uint64_t kLocalCPURouteTrustDomain = 1;
+        /** @brief Pooled page granularity: ONE authority for the instance
+         * plan, the binding policy and the geometry probe (F4). */
+        constexpr int kPooledPageTokens = 8;
+    } // namespace
+
     bool OrchestrationRunner::setupPooledServing(int capacity, int supported,
         std::string &error)
     {
@@ -26880,7 +26892,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         const int context = plan_.runtime.max_seq_len > 0
             ? plan_.runtime.max_seq_len
             : config_.max_seq_len;
-        constexpr int kPageTokens = 8; // Pooled page granularity (CPU vertical).
+        const int kPageTokens = kPooledPageTokens; // Single-sourced (F4).
         // The accepted-work envelope covers the request's forwards: prefill
         // chunks (context / kPrefillChunk rounded up) + decode steps
         // (context) + margin.
@@ -26930,7 +26942,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             *pooled_instance_, capacity, kv_heads, head_dim, layers,
             kPageTokens, issuances, /*readers_per_bank=*/4,
             tiers.retention_classes_ceiling,
-            /*trust_domain=*/1 /* the local CPU route's authenticated value */,
+            /*trust_domain=*/kLocalCPURouteTrustDomain,
             static_cast<std::size_t>(capacity), static_cast<std::size_t>(capacity));
         // Re-create the row adapter with the pooled owner (the DGO per-phase
         // wiring and the flow hooks are active for the whole session).
