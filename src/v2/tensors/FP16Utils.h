@@ -16,6 +16,19 @@ namespace llaminar2
 {
 
     /**
+     * @brief FP32 bits of a binary16 infinity or NaN, by bit placement.
+     * @param h Binary16 bits whose exponent field is 31.
+     * @return Sign, an all-ones exponent and the payload shifted to the FP32 position.
+     * @details The one non-finite expansion of fp16_to_fp32(). Kernels that use
+     * hardware conversion for finite values call it directly, so signalling and
+     * quiet NaN payloads are bit-identical to the portable conversion.
+     */
+    [[nodiscard]] constexpr uint32_t fp16NonFiniteToFP32Bits(uint16_t h) noexcept
+    {
+        return ((static_cast<uint32_t>(h) & 0x8000u) << 16) | 0x7F800000u | ((static_cast<uint32_t>(h) & 0x03FFu) << 13);
+    }
+
+    /**
      * @brief Convert FP16 (uint16_t) to FP32
      * @param h FP16 value as uint16_t (IEEE 754 binary16)
      * @return FP32 value
@@ -52,7 +65,7 @@ namespace llaminar2
         else if (exp == 0x1F)
         {
             // Infinity or NaN
-            f = sign | 0x7F800000u | (mantissa << 13);
+            f = fp16NonFiniteToFP32Bits(h);
         }
         else
         {

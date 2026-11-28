@@ -1892,99 +1892,41 @@ namespace
         // Profiling must select the same physical representation as loading.
         // Otherwise a new encoding silently measures an obsolete kernel.
         packed.encoding = preparedEncodingForSource(*metadata);
-        packed.data_stride = preparedDataStride(packed.encoding);
+        packed.data_stride = preparedDataStride(packed.encoding, packed.codebook_id);
         packed.interleaved_block_stride = preparedInterleavedBlockStride(
-            packed.encoding, packed.is_asymmetric);
+            packed.encoding, packed.is_asymmetric, packed.codebook_id);
 
-        const size_t n_chunks =
-            static_cast<size_t>(packed.N_padded / 64);
-        const size_t interleaved_bytes =
-            n_chunks * static_cast<size_t>(packed.blocks_per_row) *
-            static_cast<size_t>(packed.interleaved_block_stride);
+        const auto geometry = packed.geometry();
+        const auto interleaved_bytes = geometry.matrixBytes(packed.N_padded / 64);
         packed.native_interleaved.resize_uninitialized(interleaved_bytes);
-
-        const uint16_t one_fp16 = fp32_to_fp16(1.0f);
-        const uint16_t min_fp16 = fp32_to_fp16(0.125f);
-        // Secondary source-factor words are integer metadata, never FP16
-        // minima. Construct them through the same codecs as the source packer;
-        // their reserved bits must remain zero even for symmetric formats.
-        const uint16_t secondary_word = packed.usesIQ3SExpandedSourceScale()
-            ? native_quantised_iq3s_scale::encodeSourceCoefficient(7)
-            : packed.usesNibbleLUTSourceScale()
-                ? native_quantised_iq4xs_scale::encodeSourceCoefficient(35)
-                : packed.usesQ6KNativeDualScale()
-                    ? native_quantised_q6_scale::pack(1, -1)
-                    : packed.codebook_id == 13 && packed.usesCompactMultiScale()
-                        ? native_quantised_iq2s_scale::pack(0x71)
-                        : min_fp16;
-        uint8_t *const bytes = packed.native_interleaved.beginRewrite().data();
-#pragma omp parallel
-        {
-            // First-touch every page in parallel. The index hash supplies
-            // repeatable non-zero data without a serial random-number stream.
-#pragma omp for schedule(static)
-            for (int64_t byte_index = 0;
-                 byte_index < static_cast<int64_t>(interleaved_bytes);
-                 ++byte_index)
+        auto bytes = packed.native_interleaved.beginRewrite();
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < static_cast<int64_t>(interleaved_bytes); ++i)
+            bytes[i] = static_cast<uint8_t>((uint64_t(i) * 0x9E3779B185EBCA87ULL >> 24) | 1u);
+#pragma omp parallel for schedule(static)
+        for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
+            for (int block = 0; block < packed.blocks_per_row; ++block)
             {
-                const uint64_t mixed =
-                    static_cast<uint64_t>(byte_index) * 0x9E3779B185EBCA87ULL +
-                    static_cast<uint64_t>(packed.codebook_id) *
-                        0xC2B2AE3D27D4EB4FULL;
-                bytes[static_cast<size_t>(byte_index)] =
-                    static_cast<uint8_t>((mixed >> 24) | 1U);
-            }
-
-            // Overwrite inline metadata with finite values at exactly the
-            // offsets consumed by the production kernels. The fixture's
-            // frozen-serial launch is the arithmetic oracle for this timing
-            // cell; source-to-prepared conversion is proved independently by
-            // the real-tensor all-format suite.
-#pragma omp for schedule(static)
-            for (int64_t block_index = 0;
-                 block_index < static_cast<int64_t>(
-                     n_chunks *
-                     static_cast<size_t>(packed.blocks_per_row));
-                 ++block_index)
-            {
-                uint8_t *const block =
-                    bytes + static_cast<size_t>(block_index) *
-                                packed.interleaved_block_stride;
-                auto *const compensation = packed.usesInlineCompensation()
-                    ? reinterpret_cast<int16_t *>(
-                          block + packed.data_stride)
-                    : nullptr;
-                auto *const scales = reinterpret_cast<uint16_t *>(
-                    block + packed.data_stride +
-                    (packed.usesInlineCompensation() ? 128 : 0));
-                auto *const minima = !packed.usesInlineCompensation()
-                    ? reinterpret_cast<uint16_t *>(
-                          block + packed.data_stride + 128)
-                    : (packed.is_asymmetric ||
-                       packed.usesIQ3SExpandedSourceScale() ||
-                       packed.usesNibbleLUTSourceScale())
-                        ? reinterpret_cast<uint16_t *>(
-                              block + packed.data_stride + 256)
-                        : nullptr;
-                for (int column = 0; column < 64; ++column)
+                auto *unit = bytes.data() + geometry.blockOffset(chunk, block);
+                if (geometry.header_bytes)
                 {
-                    if (compensation)
-                        compensation[column] = 0;
-                    scales[column] = one_fp16;
-                    if (minima)
-                        minima[column] = secondary_word;
-                    if (packed.usesCompactMultiScale())
-                    {
-                        // Both Q2_K minima are finite; all other compact
-                        // codebooks reserve these words as deterministic zero.
-                        reinterpret_cast<uint32_t *>(block + packed.data_stride + 256)[column] =
-                            metadata->has_emins
-                                ? static_cast<uint32_t>(min_fp16) | (static_cast<uint32_t>(min_fp16) << 16)
-                                : 0u;
-                    }
+                    if (geometry.closesSuperblock(block))
+                        for (unsigned offset = 0; offset < geometry.header_bytes; offset += 2)
+                        {
+                            constexpr uint16_t scale = 0x3c00;
+                            std::memcpy(bytes.data() + geometry.headerOffset(chunk, block) + offset, &scale, 2);
+                        }
+                }
+                else if (packed.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+                    std::memset(unit + packed.data_stride, 127, 64);
+                else
+                {
+                    auto *scales = reinterpret_cast<uint16_t *>(unit + packed.data_stride);
+                    std::fill_n(scales, 64, fp32_to_fp16(1.0f));
+                    if (packed.is_asymmetric)
+                        std::fill_n(scales + 64, 64, fp32_to_fp16(0.125f));
                 }
             }
-        }
 
         packed.sealPublication();
         return packed;
@@ -2517,8 +2459,6 @@ namespace
     {
         constexpr int N = 65;
         constexpr int K = 256;
-        const uint16_t expected_scale = fp32_to_fp16(1.0f);
-        const uint16_t expected_minimum = fp32_to_fp16(0.125f);
 
         for (const FormatSpec &format : MTP_SMALL_M_FORMATS)
         {
@@ -2554,133 +2494,10 @@ namespace
                     evidence.native_interleaved.data()) % 64,
                 0u);
 
-            const int n_chunks = evidence.N_padded / 64;
-            for (int chunk = 0; chunk < n_chunks; ++chunk)
-            {
-                for (int block = 0;
-                     block < evidence.blocks_per_row;
-                     ++block)
-                {
-                    const int16_t *compensation =
-                        evidence.usesInlineCompensation()
-                            ? evidence.chunkComp(chunk, block)
-                            : nullptr;
-                    const uint16_t *scales =
-                        evidence.chunkScales(chunk, block);
-                    const uint16_t *minima =
-                        (evidence.is_asymmetric ||
-                         evidence.usesQ6KNativeDualScale() ||
-                         evidence.usesIQ3SExpandedSourceScale() ||
-                         evidence.usesNibbleLUTSourceScale() ||
-                         evidence.usesCompactMultiScale())
-                        ? evidence.chunkMins(chunk, block)
-                        : nullptr;
-                    for (int column = 0; column < 64; ++column)
-                    {
-                        if (compensation)
-                            EXPECT_EQ(compensation[column], 0);
-                        EXPECT_EQ(scales[column], expected_scale);
-                        if (minima)
-                        {
-                            const uint16_t expected_secondary =
-                                evidence.usesIQ3SExpandedSourceScale()
-                                    ? native_quantised_iq3s_scale::encodeSourceCoefficient(7)
-                                    : evidence.usesNibbleLUTSourceScale()
-                                        ? native_quantised_iq4xs_scale::encodeSourceCoefficient(35)
-                                        : evidence.usesQ6KNativeDualScale()
-                                            ? native_quantised_q6_scale::pack(1, -1)
-                                            : evidence.codebook_id == 13 && evidence.usesCompactMultiScale()
-                                                ? native_quantised_iq2s_scale::pack(0x71)
-                                                : expected_minimum;
-                            EXPECT_EQ(minima[column], expected_secondary);
-                            EXPECT_TRUE(std::isfinite(
-                                evidence.blockScale(chunk, block, column)));
-                            EXPECT_TRUE(std::isfinite(
-                                evidence.blockMin(chunk, block, column)));
-                        }
-                    }
-                }
-            }
+            EXPECT_NO_THROW((void)evidence.readView());
 
             CPUNativeQuantisedGemmKernel evidence_kernel(std::move(evidence));
             EXPECT_TRUE(evidence_kernel.isValid());
-        }
-    }
-
-    /**
-     * @test Replay synthetic source-factor metadata through real M1 decode.
-     *
-     * IQ3_S and IQ4_XS retain raw integer coefficients even though their
-     * prepared data is symmetric. Every padded output lane must be initialized
-     * before scalar/vector scale loads, repeated decode must match the frozen
-     * serial oracle, and reserved IQ3_S bits must still fail production checks.
-     */
-    TEST_F(
-        CPUNativeQuantisedGemvTest,
-        DispatchEvidenceSourceFactors_DecodeReplayRejectsReservedBits)
-    {
-        constexpr int N = 65;
-        constexpr int K = 256;
-        for (const std::string name : {"IQ3_S", "IQ4_XS"})
-        {
-            SCOPED_TRACE(name);
-            const auto found = std::find_if(
-                MTP_SMALL_M_FORMATS.begin(), MTP_SMALL_M_FORMATS.end(),
-                [&](const FormatSpec &format) { return format.name == name; });
-            ASSERT_NE(found, MTP_SMALL_M_FORMATS.end());
-            auto packed = createDispatchEvidencePackedWeightsForFormat(*found, N, K);
-            ASSERT_EQ(packed.encoding, name == "IQ3_S"
-                ? CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale
-                : CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
-            for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
-                for (int block = 0; block < packed.blocks_per_row; ++block)
-                    for (int column = 0; column < 64; ++column)
-                    {
-                        const auto word = packed.chunkMins(chunk, block)[column];
-                        ASSERT_TRUE(name == "IQ3_S"
-                            ? native_quantised_iq3s_scale::valid(word)
-                            : native_quantised_iq4xs_scale::valid(word));
-                        ASSERT_EQ(packed.blockScale(chunk, block, column),
-                                  name == "IQ3_S" ? 15.0f : 3.0f);
-                    }
-
-            std::vector<float> input(K);
-            for (int k = 0; k < K; ++k)
-                input[k] = static_cast<float>((k % 17) - 8) * 0.125f;
-            std::vector<Q8_1Block> quantized(packed.blocks_per_row);
-            quantize_activations_to_q8_1(
-                input.data(), quantized.data(), 1, K, packed.blocks_per_row);
-            NativeQuantisedTestPartialStorage partial(packed, 1);
-            std::vector<float> oracle(N), replay(N);
-            ASSERT_NO_THROW(gemv_native_quantised_preq(
-                packed, quantized.data(), oracle.data(), partial.span(),
-                ISAPath::AUTO, DecodeSchedulePolicy::FrozenSerialOracle));
-            for (int repeat = 0; repeat < 2; ++repeat)
-            {
-                std::fill(replay.begin(), replay.end(),
-                          std::numeric_limits<float>::quiet_NaN());
-                ASSERT_NO_THROW(gemv_native_quantised_preq(
-                    packed, quantized.data(), replay.data(), partial.span(),
-                    ISAPath::AUTO, DecodeSchedulePolicy::Auto));
-                EXPECT_EQ(std::memcmp(oracle.data(), replay.data(),
-                                      N * sizeof(float)), 0);
-                for (float value : replay)
-                    EXPECT_TRUE(std::isfinite(value));
-            }
-            if (name == "IQ3_S")
-            {
-                auto *const secondary = const_cast<uint16_t *>(packed.chunkMins(0, 0));
-                secondary[0] |= 0x10u;
-                EXPECT_THROW((void)packed.blockScale(0, 0, 0), std::invalid_argument);
-#if defined(__AVX2__)
-                EXPECT_THROW((void)packed.loadScales256(packed.chunkScales(0, 0)),
-                             std::invalid_argument);
-#endif
-#if defined(__AVX512F__)
-                EXPECT_THROW((void)packed.loadScales512(packed.chunkScales(0, 0)),
-                             std::invalid_argument);
-#endif
-            }
         }
     }
 
@@ -2850,7 +2667,7 @@ namespace
     {
         int threads = omp_get_max_threads();
         const NativeQuantisedPreparedFootprint footprint =
-            preparedFootprintForFormat(/*Q8_0 codebook=*/19, false);
+            preparedFootprintForFormat(native_quantised_formats::Q8_0);
 
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
@@ -7058,16 +6875,16 @@ namespace
             {
                 const auto format = getRuntimeFormatInfo(
                     static_cast<uint8_t>(raw_codebook));
-                if (format.payload_bytes <= 0)
+                const auto *source = native_quantised_formats::forSourceIdentity(
+                    static_cast<uint8_t>(raw_codebook), format.is_superblock);
+                if (!source)
                     continue;
 
                 const NativeQuantisedTileConfig serial = computeTileConfig(
                     shape.N,
                     shape.K,
                     1,
-                    preparedFootprintForFormat(
-                        static_cast<uint8_t>(raw_codebook),
-                        format.is_asymmetric),
+                    preparedFootprintForFormat(*source),
                     threads);
                 const bool serial_kpart = serial.k_tiles > 1;
                 std::fprintf(

@@ -45,23 +45,21 @@ static_assert(!CanRebindSeal<CPUNativeQuantisedMetadataSeal>,
 /** @return Byte offset of a unit's secondary metadata word for one column. */
 std::size_t secondaryOffset(const CPUNativeQuantisedWeightView &view, int chunk, int block, int column)
 {
-    const std::size_t unit = (std::size_t(chunk) * view.blocks_per_row + block) * view.interleaved_block_stride;
-    return unit + view.data_stride + (view.usesInlineCompensation() ? 256 : 128) + std::size_t(column) * 2;
+    const std::size_t unit = view.geometry().blockOffset(chunk, block);
+    return unit + view.data_stride + 128 + std::size_t(column) * 2;
 }
 
 /** @return Whether the encoding owns a secondary metadata word. */
 bool hasSecondary(const CPUNativeQuantisedWeightView &view)
 {
-    return view.is_asymmetric || view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
-        view.usesQ6KNativeDualScale() || view.usesCompactMultiScale();
+    return !view.superblockCoded() && (view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
+        view.usesQ6KNativeDualScale());
 }
 
 /** @return Reserved-bit mask the former in-loop check enforced, or zero where none existed. */
 std::uint16_t reservedMask(const CPUNativeQuantisedWeightView &view)
 {
-    if (view.usesIQ3SExpandedSourceScale()) return 0xfff0u;
     if (view.usesNibbleLUTSourceScale()) return 0xffc0u;
-    if (view.usesCompactMultiScale() && view.codebook_id == 13) return 0xff00u;
     return 0;
 }
 
@@ -101,6 +99,21 @@ TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLan
         NativeQuantisedPreparedByteFixture fixture(*source.metadata, 65, 65);
         fixture.seedPayloadAndMetadata();
         const auto view = fixture.view();
+        if (view.superblockCoded())
+        {
+            // Both the highest code and every bit in a source word are data;
+            // neither padding lanes nor live lanes have any reserved half word.
+            for (const auto [chunk, block] : {std::array{0, 0}, std::array{1, 2}})
+            {
+                const auto offset = view.geometry().blockOffset(chunk, block);
+                std::memset(fixture.bytes.data() + offset + view.data_stride, 0xff,
+                            view.interleaved_block_stride - view.data_stride);
+                std::memset(fixture.bytes.data() + view.geometry().headerOffset(chunk, block), 0xff,
+                            view.superblock_header_bytes);
+                EXPECT_NO_THROW((void)fixture.view());
+            }
+            continue;
+        }
         if (!hasSecondary(view))
             continue;
         const std::uint16_t mask = reservedMask(view);
@@ -136,7 +149,7 @@ TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLan
 TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationSeparatesRawFromNormalizedArrivals)
 {
     for (const auto *source : {&native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS, &native_quantised_formats::IQ2_S,
-                               &native_quantised_formats::Q6_K, &native_quantised_formats::Q4_K})
+                               &native_quantised_formats::Q2_K, &native_quantised_formats::Q6_K, &native_quantised_formats::Q4_K})
         for (const int n : {1, 33, 63, 65, 97, 127})
         {
             SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " n=" << n);
@@ -148,6 +161,17 @@ TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationSeparatesRawFromNormali
             const int last = view.N_padded / 64 - 1, live = n % 64;
             // An arrival writes live columns only; the slot's padding holds garbage.
             const auto written = packed.native_interleaved.beginRewrite();
+            if (view.superblockCoded())
+            {
+                for (int column = live; column < 64; ++column)
+                    coded_metadata::storeSuperblockWord(
+                        written.data() + view.geometry().headerOffset(last, 0), view.codebook_id, column, 0xffffu);
+                const std::vector<std::uint8_t> raw(written.begin(), written.end());
+                packed.normalizePaddingMetadata();
+                EXPECT_NO_THROW(packed.sealPublication());
+                EXPECT_TRUE(std::equal(raw.begin(), raw.end(), packed.native_interleaved.begin()));
+                continue;
+            }
             for (int block = 0; block < view.blocks_per_row; ++block)
                 for (int column = live; column < 64; ++column)
                     store(written, secondaryOffset(view, last, block, column), 0xffffu);
@@ -160,7 +184,7 @@ TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationSeparatesRawFromNormali
             {
                 const std::size_t unit = byte / std::size_t(view.interleaved_block_stride);
                 const std::size_t offset = byte % std::size_t(view.interleaved_block_stride);
-                const std::size_t secondary = std::size_t(view.data_stride) + (view.usesInlineCompensation() ? 256 : 128);
+                const std::size_t secondary = std::size_t(view.data_stride) + 128;
                 const bool padding_word = int(unit / std::size_t(view.blocks_per_row)) == last &&
                     offset >= secondary + std::size_t(live) * 2 && offset < secondary + 128;
                 ASSERT_EQ(packed.native_interleaved[byte], padding_word ? 0 : raw[byte]) << "byte " << byte;
@@ -226,7 +250,7 @@ TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationRejectsMalformedOwnersW
 TEST(CPUNativeQuantisedMetadataSeal, AdmittedMetadataAccessIsFatalOutsideThePublication)
 {
     GTEST_FLAG_SET(death_test_style, "fast");
-    NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ3_S, 65, 96);
+    NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::Q4_1, 65, 96);
     fixture.seedPayloadAndMetadata();
     const auto view = fixture.view();
     for (int chunk = 0; chunk < view.N_padded / 64; ++chunk)
@@ -310,15 +334,15 @@ TEST(CPUNativeQuantisedMetadataSeal, EveryMutationWithdrawsAdmission)
     EXPECT_FALSE(moved.publicationSealed());
 }
 
-/** @test Reserved bits written by a rewrite fail the reseal and leave the publication unadmitted. */
+/** @test A truncated coded header fails reseal and leaves the publication unadmitted. */
 TEST(CPUNativeQuantisedMetadataSeal, RejectedResealLeavesThePublicationUnadmitted)
 {
     NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ3_S, 64, 64);
     fixture.seedPayloadAndMetadata();
     auto packed = owner(fixture);
-    const auto view = packed.readView();
-    const auto bytes = packed.native_interleaved.beginRewrite();
-    store(bytes, secondaryOffset(view, 0, 1, 5), 0x0010u);
+    // Coded metadata has no reserved bits; a truncated header must still
+    // invalidate the rewritten publication before any reader can bind it.
+    packed.native_interleaved.resize(packed.native_interleaved.size() - 1);
     EXPECT_THROW(packed.sealPublication(), std::invalid_argument);
     EXPECT_FALSE(packed.publicationSealed());
     EXPECT_DEATH((void)packed.readView(), "not admitted");

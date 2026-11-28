@@ -1455,7 +1455,9 @@ TEST_F(Test__CUDAGemmBatchInvariance, CapturedCanonicalPartialsOverwriteAllForma
                         continue;
                     }
                     if (params.func != producer_resources.kernel_symbol) continue;
-                    constexpr int geometry_argument = 15;
+                    // A, payload, metadata planes, C, scales_A, sums_A, C_existing,
+                    // bias, M, N, K, alpha, beta, geometry, ordered-reducer flag.
+                    constexpr int geometry_argument = 13;
                     auto geometry = *static_cast<const llaminar2::cuda::prefill::CanonicalM1PartitionGeometry *>(
                         params.kernelParams[geometry_argument]);
                     ASSERT_EQ(geometry.count, count);

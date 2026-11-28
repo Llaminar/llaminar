@@ -23,8 +23,20 @@
  * The VNNI operands are intentionally reversed from the older expanded-INT8
  * kernel.  Unsigned raw Q6 values multiply signed Q8_1 activations, followed
  * by a common `32 * activation_half_sum` centering correction.  This removes
- * all per-column compensation bytes and keeps the prepared block at 1792
- * bytes per 64 columns instead of 2304 bytes.
+ * all per-column compensation bytes. Each block holds 1536 payload bytes
+ * and 128 coefficient bytes; 128 base bytes serve the entire superblock.
+ *
+ * `output + contribution` is the running K accumulation. For a GPU-aligned
+ * expert it is also the device tree's ordered partition fold whenever every
+ * partition is one block (K <= 16 blocks, where the tree calls these kernels
+ * for the whole K range), so its NaN precedence is part of the contract: the
+ * earlier block's NaN must win. A plain vector `+` lets the compiler choose
+ * the VADDPS source order, and GCC 14 put the later contribution first in the
+ * second row of the AVX2 two-row tile (and in AVX-512 row tiles), publishing
+ * the later NaN. The GPU-aligned instantiations (`Ordered = true`) therefore
+ * accumulate through addOrderedAVX2()/addOrderedAVX512(); backend-native
+ * instantiations keep the unchanged plain `+` program. Finite results are
+ * identical either way.
  */
 
 #pragma once
@@ -37,6 +49,7 @@
 
 #include <immintrin.h>
 
+#include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedWeightPacker.h"
 #include "VNNIEmulation.h"
@@ -53,6 +66,17 @@ namespace llaminar2::cpu::native_quantised
 
     namespace q6k_detail
     {
+        /** @brief Bind coded Q6_K geometry once before traversing K.
+         * @param blocks Admitted number of logical K blocks in a prepared chunk row.
+         * @return Canonical geometry with fixed Q6_K strides and a clamped final header.
+         */
+        inline CPUNativeQuantisedBlockGeometry q6Geometry(int blocks) noexcept
+        {
+            constexpr auto encoding = CPUNativeQuantisedEncoding::Q6KNativeDualScale;
+            return {preparedInterleavedBlockStride(encoding, true, 8),
+                preparedSuperblockHeaderBytes(encoding, 8), static_cast<std::size_t>(blocks)};
+        }
+
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
         /** @brief Exact original Q6_K factors for sixteen output columns. */
         struct SourceScalesAVX512
@@ -62,10 +86,10 @@ namespace llaminar2::cpu::native_quantised
         };
 
         /**
-         * @brief Widen sixteen original bases and signed coefficient pairs.
-         * @param bases Aligned source FP16 bases, one per output column.
-         * @param coefficients Aligned opaque signed coefficient pairs.
-         * @return Exact FP32 products; finite half times int8 fits FP32 exactly.
+         * @brief Read 16 Q6_K source-scale pairs from the coded planes.
+         * @param bases Aligned FP16 bases from the superblock header.
+         * @param coefficients Aligned packed coefficient pairs from the block.
+         * @return Exact FP32 factors for the low and high 16-weight dots.
          */
         LLAMINAR_Q6K_EXACT_FP inline SourceScalesAVX512 sourceScalesAVX512(
             const uint16_t *bases, const uint16_t *coefficients) noexcept
@@ -90,10 +114,10 @@ namespace llaminar2::cpu::native_quantised
         };
 
         /**
-         * @brief Widen eight original bases and signed coefficient pairs.
-         * @param bases Aligned source FP16 bases, one per output column.
-         * @param coefficients Aligned opaque signed coefficient pairs.
-         * @return Exact FP32 products; finite half times int8 fits FP32 exactly.
+         * @brief Read 8 Q6_K source-scale pairs from the coded planes.
+         * @param bases Aligned FP16 bases from the superblock header.
+         * @param coefficients Aligned packed coefficient pairs from the block.
+         * @return Exact FP32 factors for the low and high 16-weight dots.
          */
         LLAMINAR_Q6K_EXACT_FP inline SourceScalesAVX256 sourceScalesAVX256(
             const uint16_t *bases, const uint16_t *coefficients) noexcept
@@ -188,6 +212,55 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
+         * @brief Append one block contribution to an AVX-512 Q6 accumulator.
+         * @tparam Ordered GPU-aligned operand order (earlier accumulator as VADDPS source one).
+         * @param accumulator Running FP32 output for sixteen columns.
+         * @param contribution This block's rounded contribution.
+         * @return The rounded sum; with @p Ordered the earlier NaN payload wins.
+         */
+        template <bool Ordered>
+        [[gnu::always_inline]] inline __m512 accumulateQ6AVX512(__m512 accumulator, __m512 contribution) noexcept
+        {
+            if constexpr (Ordered)
+                return addOrderedAVX512(accumulator, contribution);
+            else
+                return _mm512_add_ps(accumulator, contribution);
+        }
+#endif
+
+        /**
+         * @brief Append one block contribution to an AVX2 Q6 accumulator.
+         * @tparam Ordered GPU-aligned operand order (earlier accumulator as VADDPS source one).
+         * @param accumulator Running FP32 output for eight columns.
+         * @param contribution This block's rounded contribution.
+         * @return The rounded sum; with @p Ordered the earlier NaN payload wins.
+         * @details In an AVX-512VL build (the AVX2 kernels then serve a forced
+         * AVX2 runtime) the ordered add is the same VADDPS with the same source
+         * order (accumulator as source one), written in place into the
+         * accumulator and free to name ymm16..ymm31 (EVEX encoding), as
+         * addOrderedAVX512() may. With addOrderedAVX2() GCC 14 reloaded a
+         * spilled constant once more per block and row in the two-row tile;
+         * this form keeps that tile's frame accesses equal to the plain-`+`
+         * program's.
+         */
+        template <bool Ordered>
+        [[gnu::always_inline]] inline __m256 accumulateQ6AVX2(__m256 accumulator, __m256 contribution) noexcept
+        {
+            if constexpr (Ordered)
+            {
+#if defined(__AVX512VL__) && (defined(__GNUC__) || defined(__clang__))
+                asm("vaddps {%1, %0, %0|%0, %0, %1}" : "+v"(accumulator) : "v"(contribution));
+                return accumulator;
+#else
+                return addOrderedAVX2(accumulator, contribution);
+#endif
+            }
+            else
+                return _mm256_add_ps(accumulator, contribution);
+        }
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+
+        /**
          * @brief Apply one native-Q6 K-block contribution to one output vector.
          *
          * The helper is shared by the explicit three- and four-row kernels so
@@ -203,8 +276,10 @@ namespace llaminar2::cpu::native_quantised
          * @param activation Source Q8_1 activation block for this row and K.
          * @param scale_low Native Q6 scale for values 0..15.
          * @param scale_high Native Q6 scale for values 16..31.
+         * @tparam Ordered GPU-aligned accumulation order (accumulateQ6AVX512()).
          * @return Updated accumulator with exactly one K-block contribution.
          */
+        template <bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline __m512 addScaledDotsAVX512(
             __m512 accumulator,
@@ -218,6 +293,7 @@ namespace llaminar2::cpu::native_quantised
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
+            const float activation_factor = nativeQuantisedFP16ScaleToFP32(activation.d);
             const int low_sum = activationLowHalfSum(activation);
             const int high_sum =
                 static_cast<int>(activation.sum_qs) - low_sum;
@@ -232,11 +308,10 @@ namespace llaminar2::cpu::native_quantised
             const __m512 high_term = _mm512_mul_ps(
                 scale_high, _mm512_cvtepi32_ps(corrected_high));
             const __m512 dot_term = _mm512_add_ps(low_term, high_term);
-            const __m512 activation_scale = _mm512_set1_ps(
-                nativeQuantisedFP16ScaleToFP32(activation.d));
+            const __m512 activation_scale = _mm512_set1_ps(activation_factor);
             const __m512 contribution =
                 _mm512_mul_ps(activation_scale, dot_term);
-            return _mm512_add_ps(accumulator, contribution);
+            return accumulateQ6AVX512<Ordered>(accumulator, contribution);
         }
 
         /**
@@ -252,7 +327,7 @@ namespace llaminar2::cpu::native_quantised
          * @param kb_end One-past-last logical K block.
          * @param accumulate Load existing outputs before adding this K range.
          */
-        template <int Rows, int ZSpan>
+        template <int Rows, int ZSpan, bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline void rowsChunkAVX512(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -274,6 +349,8 @@ namespace llaminar2::cpu::native_quantised
                 throw std::invalid_argument(
                     "Native Q6_K AVX-512 kernel received another packed encoding");
 
+            const auto geometry = q6Geometry(packed.blocks_per_row);
+            const auto *data = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
             const __m512i nibble_mask = _mm512_set1_epi8(0x0F);
             const __m512i center = _mm512_set1_epi32(32);
 
@@ -293,6 +370,9 @@ namespace llaminar2::cpu::native_quantised
 
                 for (int kb = kb_start; kb < kb_end; ++kb)
                 {
+                    const auto *unit = data + geometry.blockOffset(0, kb);
+                    const auto *coefficients = reinterpret_cast<const std::uint16_t *>(unit + 1536);
+                    const auto *bases = reinterpret_cast<const std::uint16_t *>(data + geometry.headerOffset(0, kb));
                     __m512i dot_low[Rows][ZSpan];
                     __m512i dot_high[Rows][ZSpan];
                     for (int row = 0; row < Rows; ++row)
@@ -339,7 +419,7 @@ namespace llaminar2::cpu::native_quantised
                         {
                             const int z = z_base + zi;
                             const __m512i raw = _mm512_load_si512(
-                                packed.interleavedB(chunk, kb, group, z));
+                                unit + group * 256 + z * 64);
                             const __m512i low_nibbles =
                                 _mm512_and_si512(raw, nibble_mask);
                             const __m512i high_nibbles = _mm512_and_si512(
@@ -347,13 +427,11 @@ namespace llaminar2::cpu::native_quantised
                             const __m512i raw_low =
                                 mergeHighBitplanesAVX512(
                                     low_nibbles,
-                                    packed.q6KHighBitplanes(
-                                        chunk, kb, group, z));
+                                    unit + 1024 + group * 64 + z * 16);
                             const __m512i raw_high =
                                 mergeHighBitplanesAVX512(
                                     high_nibbles,
-                                    packed.q6KHighBitplanes(
-                                        chunk, kb, group + 4, z));
+                                    unit + 1024 + (group + 4) * 64 + z * 16);
 
                             for (int row = 0; row < Rows; ++row)
                             {
@@ -396,8 +474,7 @@ namespace llaminar2::cpu::native_quantised
                                 _mm512_sub_epi32(
                                     dot_high[row][zi], high_center));
                             const auto source_scales = sourceScalesAVX512(
-                                packed.chunkScales(chunk, kb) + z * 16,
-                                packed.chunkMins(chunk, kb) + z * 16);
+                                bases + z * 16, coefficients + z * 16);
                             const __m512 scale_low = source_scales.low;
                             const __m512 scale_high = source_scales.high;
 
@@ -412,7 +489,7 @@ namespace llaminar2::cpu::native_quantised
                                 _mm512_add_ps(low_term, high_term);
                             const __m512 contribution =
                                 _mm512_mul_ps(activation_scale, dot_term);
-                            fp_accumulators[row][zi] = _mm512_add_ps(
+                            fp_accumulators[row][zi] = accumulateQ6AVX512<Ordered>(
                                 fp_accumulators[row][zi], contribution);
                         }
                     }
@@ -457,6 +534,7 @@ namespace llaminar2::cpu::native_quantised
          * @param kb_end One-past-last logical K block.
          * @param accumulate Load existing outputs before adding this K range.
          */
+        template <bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline void twoRowsTwoVectorsChunkAVX512(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -478,6 +556,8 @@ namespace llaminar2::cpu::native_quantised
                     "Native Q6_K AVX-512 two-row kernel received another "
                     "packed encoding");
 
+            const auto geometry = q6Geometry(packed.blocks_per_row);
+            const auto *data = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
             const __m512i nibble_mask = _mm512_set1_epi8(0x0F);
             for (int z_base = 0; z_base < 4; z_base += 2)
             {
@@ -496,6 +576,9 @@ namespace llaminar2::cpu::native_quantised
 
                 for (int kb = kb_start; kb < kb_end; ++kb)
                 {
+                    const auto *unit = data + geometry.blockOffset(0, kb);
+                    const auto *coefficients = reinterpret_cast<const std::uint16_t *>(unit + 1536);
+                    const auto *bases = reinterpret_cast<const std::uint16_t *>(data + geometry.headerOffset(0, kb));
                     __m512i dot_low00 = _mm512_setzero_si512();
                     __m512i dot_high00 = _mm512_setzero_si512();
                     __m512i dot_low01 = _mm512_setzero_si512();
@@ -505,15 +588,12 @@ namespace llaminar2::cpu::native_quantised
                     __m512i dot_low11 = _mm512_setzero_si512();
                     __m512i dot_high11 = _mm512_setzero_si512();
 
-                    // As in wide-row Q6, unroll only the four
-                    // integer groups. A rolled group loop creates redundant
-                    // moves between the eight named dot chains; exposing the
-                    // fixed groups removes that back-edge register shuffle.
-                    // Do not unroll/reassociate the floating-point K reduction.
+                    // Keep decoded groups' live ranges disjoint so the
+                    // superblock-addressed K traversal can retain its dots.
 #if defined(__clang__)
-#pragma clang loop unroll(full)
+#pragma clang loop unroll(disable)
 #elif defined(__GNUC__)
-#pragma GCC unroll 4
+#pragma GCC unroll 1
 #endif
                     for (int group = 0; group < 4; ++group)
                     {
@@ -539,11 +619,10 @@ namespace llaminar2::cpu::native_quantised
 
                         const int z0 = z_base;
                         const __m512i raw0 = _mm512_load_si512(
-                            packed.interleavedB(chunk, kb, group, z0));
+                            unit + group * 256 + z0 * 64);
                         const __m512i raw_low0 = mergeHighBitplanesAVX512(
                             _mm512_and_si512(raw0, nibble_mask),
-                            packed.q6KHighBitplanes(
-                                chunk, kb, group, z0));
+                            unit + 1024 + group * 64 + z0 * 16);
                         dot_low00 = _mm512_dpbusd_epi32(
                             dot_low00,
                             raw_low0,
@@ -562,8 +641,7 @@ namespace llaminar2::cpu::native_quantised
                         const __m512i raw_high0 = mergeHighBitplanesAVX512(
                             _mm512_and_si512(
                                 _mm512_srli_epi16(raw0, 4), nibble_mask),
-                            packed.q6KHighBitplanes(
-                                chunk, kb, group + 4, z0));
+                            unit + 1024 + (group + 4) * 64 + z0 * 16);
                         dot_high00 = _mm512_dpbusd_epi32(
                             dot_high00,
                             raw_high0,
@@ -575,11 +653,10 @@ namespace llaminar2::cpu::native_quantised
 
                         const int z1 = z_base + 1;
                         const __m512i raw1 = _mm512_load_si512(
-                            packed.interleavedB(chunk, kb, group, z1));
+                            unit + group * 256 + z1 * 64);
                         const __m512i raw_low1 = mergeHighBitplanesAVX512(
                             _mm512_and_si512(raw1, nibble_mask),
-                            packed.q6KHighBitplanes(
-                                chunk, kb, group, z1));
+                            unit + 1024 + group * 64 + z1 * 16);
                         dot_low01 = _mm512_dpbusd_epi32(
                             dot_low01,
                             raw_low1,
@@ -592,8 +669,7 @@ namespace llaminar2::cpu::native_quantised
                         const __m512i raw_high1 = mergeHighBitplanesAVX512(
                             _mm512_and_si512(
                                 _mm512_srli_epi16(raw1, 4), nibble_mask),
-                            packed.q6KHighBitplanes(
-                                chunk, kb, group + 4, z1));
+                            unit + 1024 + (group + 4) * 64 + z1 * 16);
                         dot_high01 = _mm512_dpbusd_epi32(
                             dot_high01,
                             raw_high1,
@@ -605,26 +681,24 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     const auto source_scales0 = sourceScalesAVX512(
-                        packed.chunkScales(chunk, kb) + z_base * 16,
-                        packed.chunkMins(chunk, kb) + z_base * 16);
+                        bases + z_base * 16, coefficients + z_base * 16);
                     const __m512 scale_low0 = source_scales0.low;
                     const __m512 scale_high0 = source_scales0.high;
                     const auto source_scales1 = sourceScalesAVX512(
-                        packed.chunkScales(chunk, kb) + (z_base + 1) * 16,
-                        packed.chunkMins(chunk, kb) + (z_base + 1) * 16);
+                        bases + (z_base + 1) * 16, coefficients + (z_base + 1) * 16);
                     const __m512 scale_low1 = source_scales1.low;
                     const __m512 scale_high1 = source_scales1.high;
 
-                    fp00 = addScaledDotsAVX512(
+                    fp00 = addScaledDotsAVX512<Ordered>(
                         fp00, dot_low00, dot_high00, activation0[kb],
                         scale_low0, scale_high0);
-                    fp01 = addScaledDotsAVX512(
+                    fp01 = addScaledDotsAVX512<Ordered>(
                         fp01, dot_low01, dot_high01, activation0[kb],
                         scale_low1, scale_high1);
-                    fp10 = addScaledDotsAVX512(
+                    fp10 = addScaledDotsAVX512<Ordered>(
                         fp10, dot_low10, dot_high10, activation1[kb],
                         scale_low0, scale_high0);
-                    fp11 = addScaledDotsAVX512(
+                    fp11 = addScaledDotsAVX512<Ordered>(
                         fp11, dot_low11, dot_high11, activation1[kb],
                         scale_low1, scale_high1);
                 }
@@ -666,7 +740,7 @@ namespace llaminar2::cpu::native_quantised
          * @param kb_end One-past-last logical K block.
          * @param accumulate Load existing outputs before adding this K range.
          */
-        template <int Rows>
+        template <int Rows, bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline void wideRowsChunkAVX512(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -693,6 +767,8 @@ namespace llaminar2::cpu::native_quantised
                     "Native Q6_K AVX-512 wide-row kernel received another "
                     "packed encoding");
 
+            const auto geometry = q6Geometry(packed.blocks_per_row);
+            const auto *data = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
             const __m512i nibble_mask = _mm512_set1_epi8(0x0F);
             for (int z = 0; z < 4; ++z)
             {
@@ -713,108 +789,116 @@ namespace llaminar2::cpu::native_quantised
                         : _mm512_setzero_ps();
                 }
 
-                for (int kb = kb_start; kb < kb_end; ++kb)
+                // A header serves all live blocks up to the source boundary.
+                // The caller's range may start inside a superblock or end early.
+                constexpr int blocks_per_superblock = native_quantised_superblock::kBlocksPerSuperblock;
+                for (int first = kb_start; first < kb_end;)
                 {
-                    __m512i dot_low0 = _mm512_setzero_si512();
-                    __m512i dot_high0 = _mm512_setzero_si512();
-                    __m512i dot_low1 = _mm512_setzero_si512();
-                    __m512i dot_high1 = _mm512_setzero_si512();
-                    __m512i dot_low2 = _mm512_setzero_si512();
-                    __m512i dot_high2 = _mm512_setzero_si512();
-                    __m512i dot_low3 = _mm512_setzero_si512();
-                    __m512i dot_high3 = _mm512_setzero_si512();
-
-                    // Four fixed groups reuse the same named accumulator
-                    // chains. Expose their boundaries to register allocation;
-                    // a rolled loop otherwise copies every live dot chain at
-                    // its back edge. The K-block and FP32 sum order is unchanged.
-#if defined(__clang__)
-#pragma clang loop unroll(full)
-#elif defined(__GNUC__)
-#pragma GCC unroll 4
-#endif
-                    for (int group = 0; group < 4; ++group)
+                    const int last = first + std::min(blocks_per_superblock - first % blocks_per_superblock, kb_end - first);
+                    const auto *bases = reinterpret_cast<const std::uint16_t *>(data + geometry.headerOffset(0, first));
+                    const auto *unit = data + geometry.blockOffset(0, first);
+                    for (int kb = first; kb < last; ++kb, unit += geometry.block_stride)
                     {
-                        const __m512i raw = _mm512_load_si512(
-                            packed.interleavedB(chunk, kb, group, z));
-                        const __m512i low_nibbles =
-                            _mm512_and_si512(raw, nibble_mask);
-                        const __m512i high_nibbles = _mm512_and_si512(
-                            _mm512_srli_epi16(raw, 4), nibble_mask);
-                        const __m512i raw_low = mergeHighBitplanesAVX512(
-                            low_nibbles,
-                            packed.q6KHighBitplanes(
-                                chunk, kb, group, z));
-                        const __m512i raw_high = mergeHighBitplanesAVX512(
-                            high_nibbles,
-                            packed.q6KHighBitplanes(
-                                chunk, kb, group + 4, z));
+                        const auto *coefficients = reinterpret_cast<const std::uint16_t *>(unit + 1536);
+                        __m512i dot_low0 = _mm512_setzero_si512();
+                        __m512i dot_high0 = _mm512_setzero_si512();
+                        __m512i dot_low1 = _mm512_setzero_si512();
+                        __m512i dot_high1 = _mm512_setzero_si512();
+                        __m512i dot_low2 = _mm512_setzero_si512();
+                        __m512i dot_high2 = _mm512_setzero_si512();
+                        __m512i dot_low3 = _mm512_setzero_si512();
+                        __m512i dot_high3 = _mm512_setzero_si512();
 
-                        dot_low0 = _mm512_dpbusd_epi32(
-                            dot_low0,
-                            raw_low,
-                            _mm512_set1_epi32(packSignedActivationWord(
-                                activation0[kb], group * 4)));
-                        dot_high0 = _mm512_dpbusd_epi32(
-                            dot_high0,
-                            raw_high,
-                            _mm512_set1_epi32(packSignedActivationWord(
-                                activation0[kb], group * 4 + 16)));
-                        dot_low1 = _mm512_dpbusd_epi32(
-                            dot_low1,
-                            raw_low,
-                            _mm512_set1_epi32(packSignedActivationWord(
-                                activation1[kb], group * 4)));
-                        dot_high1 = _mm512_dpbusd_epi32(
-                            dot_high1,
-                            raw_high,
-                            _mm512_set1_epi32(packSignedActivationWord(
-                                activation1[kb], group * 4 + 16)));
-                        dot_low2 = _mm512_dpbusd_epi32(
-                            dot_low2,
-                            raw_low,
-                            _mm512_set1_epi32(packSignedActivationWord(
-                                activation2[kb], group * 4)));
-                        dot_high2 = _mm512_dpbusd_epi32(
-                            dot_high2,
-                            raw_high,
-                            _mm512_set1_epi32(packSignedActivationWord(
-                                activation2[kb], group * 4 + 16)));
-                        if constexpr (Rows == 4)
+                        // Retire one integer group before decoding the next.
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+                        for (int group = 0; group < 4; ++group)
                         {
-                            dot_low3 = _mm512_dpbusd_epi32(
-                                dot_low3,
+                            const __m512i raw = _mm512_load_si512(
+                                unit + group * 256 + z * 64);
+                            const __m512i low_nibbles =
+                                _mm512_and_si512(raw, nibble_mask);
+                            const __m512i high_nibbles = _mm512_and_si512(
+                                _mm512_srli_epi16(raw, 4), nibble_mask);
+                            const __m512i raw_low = mergeHighBitplanesAVX512(
+                                low_nibbles,
+                                unit + 1024 + group * 64 + z * 16);
+                            dot_low0 = _mm512_dpbusd_epi32(
+                                dot_low0,
                                 raw_low,
                                 _mm512_set1_epi32(packSignedActivationWord(
-                                    activation3[kb], group * 4)));
-                            dot_high3 = _mm512_dpbusd_epi32(
-                                dot_high3,
+                                    activation0[kb], group * 4)));
+                            dot_low1 = _mm512_dpbusd_epi32(
+                                dot_low1,
+                                raw_low,
+                                _mm512_set1_epi32(packSignedActivationWord(
+                                    activation1[kb], group * 4)));
+                            dot_low2 = _mm512_dpbusd_epi32(
+                                dot_low2,
+                                raw_low,
+                                _mm512_set1_epi32(packSignedActivationWord(
+                                    activation2[kb], group * 4)));
+                            if constexpr (Rows == 4)
+                            {
+                                dot_low3 = _mm512_dpbusd_epi32(
+                                    dot_low3,
+                                    raw_low,
+                                    _mm512_set1_epi32(packSignedActivationWord(
+                                        activation3[kb], group * 4)));
+                            }
+                            const __m512i raw_high = mergeHighBitplanesAVX512(
+                                high_nibbles,
+                                unit + 1024 + (group + 4) * 64 + z * 16);
+
+                            dot_high0 = _mm512_dpbusd_epi32(
+                                dot_high0,
                                 raw_high,
                                 _mm512_set1_epi32(packSignedActivationWord(
-                                    activation3[kb], group * 4 + 16)));
+                                    activation0[kb], group * 4 + 16)));
+                            dot_high1 = _mm512_dpbusd_epi32(
+                                dot_high1,
+                                raw_high,
+                                _mm512_set1_epi32(packSignedActivationWord(
+                                    activation1[kb], group * 4 + 16)));
+                            dot_high2 = _mm512_dpbusd_epi32(
+                                dot_high2,
+                                raw_high,
+                                _mm512_set1_epi32(packSignedActivationWord(
+                                    activation2[kb], group * 4 + 16)));
+                            if constexpr (Rows == 4)
+                            {
+                                dot_high3 = _mm512_dpbusd_epi32(
+                                    dot_high3,
+                                    raw_high,
+                                    _mm512_set1_epi32(packSignedActivationWord(
+                                        activation3[kb], group * 4 + 16)));
+                            }
+                        }
+
+                        const auto source_scales = sourceScalesAVX512(
+                            bases + z * 16, coefficients + z * 16);
+                        const __m512 scale_low = source_scales.low;
+                        const __m512 scale_high = source_scales.high;
+                        fp0 = addScaledDotsAVX512<Ordered>(
+                            fp0, dot_low0, dot_high0, activation0[kb],
+                            scale_low, scale_high);
+                        fp1 = addScaledDotsAVX512<Ordered>(
+                            fp1, dot_low1, dot_high1, activation1[kb],
+                            scale_low, scale_high);
+                        fp2 = addScaledDotsAVX512<Ordered>(
+                            fp2, dot_low2, dot_high2, activation2[kb],
+                            scale_low, scale_high);
+                        if constexpr (Rows == 4)
+                        {
+                            fp3 = addScaledDotsAVX512<Ordered>(
+                                fp3, dot_low3, dot_high3, activation3[kb],
+                                scale_low, scale_high);
                         }
                     }
-
-                    const auto source_scales = sourceScalesAVX512(
-                        packed.chunkScales(chunk, kb) + z * 16,
-                        packed.chunkMins(chunk, kb) + z * 16);
-                    const __m512 scale_low = source_scales.low;
-                    const __m512 scale_high = source_scales.high;
-                    fp0 = addScaledDotsAVX512(
-                        fp0, dot_low0, dot_high0, activation0[kb],
-                        scale_low, scale_high);
-                    fp1 = addScaledDotsAVX512(
-                        fp1, dot_low1, dot_high1, activation1[kb],
-                        scale_low, scale_high);
-                    fp2 = addScaledDotsAVX512(
-                        fp2, dot_low2, dot_high2, activation2[kb],
-                        scale_low, scale_high);
-                    if constexpr (Rows == 4)
-                    {
-                        fp3 = addScaledDotsAVX512(
-                            fp3, dot_low3, dot_high3, activation3[kb],
-                            scale_low, scale_high);
-                    }
+                    first = last;
                 }
 
                 _mm512_storeu_ps(output0 + z * 16, fp0);
@@ -876,6 +960,18 @@ namespace llaminar2::cpu::native_quantised
                     high_present, _mm256_set1_epi8(0x20)));
         }
 
+        /** @brief Accumulate an exact four-term dot of raw Q6 integers and signed activations.
+         * @param accumulator Running four-term sums per output column.
+         * @param weights Four unsigned six-bit values per output column.
+         * @param activation Broadcast signed activation bytes.
+         * @return Updated 32-bit integer sums. Maddubs pair sums cannot saturate (2 * 63 * 128 < 32768).
+         */
+        inline __m256i dotRawQ6AVX2(__m256i accumulator, __m256i weights, __m256i activation) noexcept
+        {
+            const auto pairs = _mm256_maddubs_epi16(weights, activation);
+            return _mm256_add_epi32(accumulator, _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
+        }
+
         /**
          * @brief Execute one native Q6_K chunk with AVX2-emulated VNNI.
          *
@@ -884,7 +980,7 @@ namespace llaminar2::cpu::native_quantised
          * whole 64-column/two-row tile would force stack spills.  Weight bytes
          * remain sequential and each loaded vector is reused across all rows.
          */
-        template <int Rows>
+        template <int Rows, bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline void rowsChunkAVX2(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -904,6 +1000,8 @@ namespace llaminar2::cpu::native_quantised
                 throw std::invalid_argument(
                     "Native Q6_K AVX2 kernel received another packed encoding");
 
+            const auto geometry = q6Geometry(packed.blocks_per_row);
+            const auto *data = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
             const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
             const __m256i center = _mm256_set1_epi32(32);
 
@@ -919,91 +1017,85 @@ namespace llaminar2::cpu::native_quantised
                         : _mm256_setzero_ps();
                 }
 
-                for (int kb = kb_start; kb < kb_end; ++kb)
+                // A header serves all live blocks up to the source boundary.
+                // The caller's range may start inside a superblock or end early.
+                constexpr int blocks_per_superblock = native_quantised_superblock::kBlocksPerSuperblock;
+                for (int first = kb_start; first < kb_end;)
                 {
-                    __m256i dot_low[Rows];
-                    __m256i dot_high[Rows];
-                    for (int row = 0; row < Rows; ++row)
+                    const int last = first + std::min(blocks_per_superblock - first % blocks_per_superblock, kb_end - first);
+                    const auto *bases = reinterpret_cast<const std::uint16_t *>(data + geometry.headerOffset(0, first));
+                    const auto *unit = data + geometry.blockOffset(0, first);
+                    for (int kb = first; kb < last; ++kb, unit += geometry.block_stride)
                     {
-                        dot_low[row] = _mm256_setzero_si256();
-                        dot_high[row] = _mm256_setzero_si256();
-                    }
+                        const auto *coefficients = reinterpret_cast<const std::uint16_t *>(unit + 1536);
+                        __m256i dot_low[Rows];
+                        __m256i dot_high[Rows];
+                        for (int row = 0; row < Rows; ++row)
+                        {
+                            dot_low[row] = _mm256_setzero_si256();
+                            dot_high[row] = _mm256_setzero_si256();
+                        }
 
-                    for (int group = 0; group < 4; ++group)
-                    {
-                        const uint8_t *const raw_base =
-                            packed.interleavedB(chunk, kb, group, z) +
-                            z_half * 32;
-                        const __m256i raw = _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(raw_base));
-                        const __m256i low_nibbles =
-                            _mm256_and_si256(raw, nibble_mask);
-                        const __m256i high_nibbles = _mm256_and_si256(
-                            _mm256_srli_epi16(raw, 4), nibble_mask);
-                        const uint8_t *const low_high_source =
-                            packed.q6KHighBitplanes(
-                                chunk, kb, group, z);
-                        const uint8_t *const high_high_source =
-                            packed.q6KHighBitplanes(
-                                chunk, kb, group + 4, z);
-                        const __m256i raw_low = _mm256_or_si256(
-                            low_nibbles,
-                            expandHighBitplanesAVX2(
-                                low_high_source, z_half));
-                        const __m256i raw_high = _mm256_or_si256(
-                            high_nibbles,
-                            expandHighBitplanesAVX2(
-                                high_high_source, z_half));
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+                        for (int group = 0; group < 4; ++group)
+                        {
+                            const uint8_t *const raw_base =
+                                unit + group * 256 + z * 64 +
+                                z_half * 32;
+                            const __m256i raw = _mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(raw_base));
+                            const __m256i raw_low = _mm256_or_si256(_mm256_and_si256(raw, nibble_mask),
+                                expandHighBitplanesAVX2(unit + 1024 + group * 64 + z * 16, z_half));
+                            for (int row = 0; row < Rows; ++row)
+                                dot_low[row] = dotRawQ6AVX2(dot_low[row], raw_low,
+                                    _mm256_set1_epi32(packSignedActivationWord(activations[row][kb], group * 4)));
+
+                            const __m256i raw_high = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(raw, 4), nibble_mask),
+                                expandHighBitplanesAVX2(unit + 1024 + (group + 4) * 64 + z * 16, z_half));
+                            for (int row = 0; row < Rows; ++row)
+                                dot_high[row] = dotRawQ6AVX2(dot_high[row], raw_high,
+                                    _mm256_set1_epi32(packSignedActivationWord(activations[row][kb], group * 4 + 16)));
+                        }
 
                         for (int row = 0; row < Rows; ++row)
                         {
-                            const __m256i activation_low =
-                                _mm256_set1_epi32(packSignedActivationWord(
-                                    activations[row][kb], group * 4));
-                            const __m256i activation_high =
-                                _mm256_set1_epi32(packSignedActivationWord(
-                                    activations[row][kb], group * 4 + 16));
-                            dot_low[row] = isa::avx2_dpbusd_epi32(
-                                dot_low[row], raw_low, activation_low);
-                            dot_high[row] = isa::avx2_dpbusd_epi32(
-                                dot_high[row], raw_high, activation_high);
+                            const Q8_1Block &activation = activations[row][kb];
+                            const int low_sum = activationLowHalfSum(activation);
+                            const int high_sum =
+                                static_cast<int>(activation.sum_qs) - low_sum;
+                            const __m256 corrected_low = _mm256_cvtepi32_ps(
+                                _mm256_sub_epi32(
+                                    dot_low[row],
+                                    _mm256_mullo_epi32(
+                                        center, _mm256_set1_epi32(low_sum))));
+                            const __m256 corrected_high = _mm256_cvtepi32_ps(
+                                _mm256_sub_epi32(
+                                    dot_high[row],
+                                    _mm256_mullo_epi32(
+                                        center, _mm256_set1_epi32(high_sum))));
+                            const auto source_scales = sourceScalesAVX256(
+                                bases + segment * 8, coefficients + segment * 8);
+                            const __m256 scale_low = source_scales.low;
+                            const __m256 scale_high = source_scales.high;
+                            const __m256 low_term =
+                                _mm256_mul_ps(scale_low, corrected_low);
+                            const __m256 high_term =
+                                _mm256_mul_ps(scale_high, corrected_high);
+                            const __m256 dot_term =
+                                _mm256_add_ps(low_term, high_term);
+                            const __m256 contribution = _mm256_mul_ps(
+                                _mm256_set1_ps(
+                                    nativeQuantisedFP16ScaleToFP32(activation.d)),
+                                dot_term);
+                            fp_accumulators[row] = accumulateQ6AVX2<Ordered>(
+                                fp_accumulators[row], contribution);
                         }
                     }
-
-                    for (int row = 0; row < Rows; ++row)
-                    {
-                        const Q8_1Block &activation = activations[row][kb];
-                        const int low_sum = activationLowHalfSum(activation);
-                        const int high_sum =
-                            static_cast<int>(activation.sum_qs) - low_sum;
-                        const __m256 corrected_low = _mm256_cvtepi32_ps(
-                            _mm256_sub_epi32(
-                                dot_low[row],
-                                _mm256_mullo_epi32(
-                                    center, _mm256_set1_epi32(low_sum))));
-                        const __m256 corrected_high = _mm256_cvtepi32_ps(
-                            _mm256_sub_epi32(
-                                dot_high[row],
-                                _mm256_mullo_epi32(
-                                    center, _mm256_set1_epi32(high_sum))));
-                        const auto source_scales = sourceScalesAVX256(
-                            packed.chunkScales(chunk, kb) + segment * 8,
-                            packed.chunkMins(chunk, kb) + segment * 8);
-                        const __m256 scale_low = source_scales.low;
-                        const __m256 scale_high = source_scales.high;
-                        const __m256 low_term =
-                            _mm256_mul_ps(scale_low, corrected_low);
-                        const __m256 high_term =
-                            _mm256_mul_ps(scale_high, corrected_high);
-                        const __m256 dot_term =
-                            _mm256_add_ps(low_term, high_term);
-                        const __m256 contribution = _mm256_mul_ps(
-                            _mm256_set1_ps(
-                                nativeQuantisedFP16ScaleToFP32(activation.d)),
-                            dot_term);
-                        fp_accumulators[row] = _mm256_add_ps(
-                            fp_accumulators[row], contribution);
-                    }
+                    first = last;
                 }
 
                 for (int row = 0; row < Rows; ++row)
@@ -1013,6 +1105,22 @@ namespace llaminar2::cpu::native_quantised
                         fp_accumulators[row]);
                 }
             }
+        }
+        /**
+         * @brief Invoke @p body with the arithmetic order of the matrix's numerical policy.
+         * @param packed Prepared Q6_K matrix carrying its typed policy.
+         * @param body Generic callable invoked as body.template operator()<Ordered>().
+         * @details GPU-aligned experts take the ordered instantiation (earlier
+         * NaN wins, see the file comment); backend-native matrices take the
+         * unchanged plain-`+` instantiation. Resolved once per chunk call.
+         */
+        template <class Body>
+        [[gnu::always_inline]] inline void withQ6Order(const CPUNativeQuantisedPackedWeights &packed, Body &&body)
+        {
+            if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                body.template operator()<true>();
+            else
+                body.template operator()<false>();
         }
     } // namespace q6k_detail
 
@@ -1033,14 +1141,10 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate = false)
     {
-        q6k_detail::rowsChunkAVX512<1, 4>(
-            packed,
-            {activation},
-            {output},
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::rowsChunkAVX512<1, 4, Ordered>(
+                packed, {activation}, {output}, chunk, kb_start, kb_end, accumulate);
+        });
     }
 
     /**
@@ -1065,16 +1169,10 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
-        q6k_detail::twoRowsTwoVectorsChunkAVX512(
-            packed,
-            activation0,
-            activation1,
-            output0,
-            output1,
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::twoRowsTwoVectorsChunkAVX512<Ordered>(
+                packed, activation0, activation1, output0, output1, chunk, kb_start, kb_end, accumulate);
+        });
     }
 
     /** @brief Native Q6_K three-row AVX-512 verifier chunk. */
@@ -1091,20 +1189,11 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
-        q6k_detail::wideRowsChunkAVX512<3>(
-            packed,
-            activation0,
-            activation1,
-            activation2,
-            nullptr,
-            output0,
-            output1,
-            output2,
-            nullptr,
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::wideRowsChunkAVX512<3, Ordered>(
+                packed, activation0, activation1, activation2, nullptr, output0, output1, output2, nullptr,
+                chunk, kb_start, kb_end, accumulate);
+        });
     }
 
     /** @brief Native Q6_K four-row AVX-512 verifier chunk. */
@@ -1123,20 +1212,11 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
-        q6k_detail::wideRowsChunkAVX512<4>(
-            packed,
-            activation0,
-            activation1,
-            activation2,
-            activation3,
-            output0,
-            output1,
-            output2,
-            output3,
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::wideRowsChunkAVX512<4, Ordered>(
+                packed, activation0, activation1, activation2, activation3, output0, output1, output2, output3,
+                chunk, kb_start, kb_end, accumulate);
+        });
     }
 #endif
 
@@ -1156,14 +1236,10 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate = false)
     {
-        q6k_detail::rowsChunkAVX2<1>(
-            packed,
-            {activation},
-            {output},
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::rowsChunkAVX2<1, Ordered>(
+                packed, {activation}, {output}, chunk, kb_start, kb_end, accumulate);
+        });
     }
 
     /** @brief Native Q6_K two-row AVX2 verifier chunk. */
@@ -1178,9 +1254,10 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
-        q6k_detail::rowsChunkAVX2<2>(
-            packed, {activation0, activation1}, {output0, output1},
-            chunk, kb_start, kb_end, accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::rowsChunkAVX2<2, Ordered>(
+                packed, {activation0, activation1}, {output0, output1}, chunk, kb_start, kb_end, accumulate);
+        });
     }
 
 #undef LLAMINAR_Q6K_EXACT_FP

@@ -87,6 +87,25 @@ function(llaminar_cpu_instruction_set processor requested flags_output definitio
     set(${definitions_output} "${definitions}" PARENT_SCOPE)
 endfunction()
 
+# @brief Forward the resolved CPU envelope only to GPU compiler host passes.
+# @param flags Space-separated options from the canonical ISA resolver.
+# @param cuda_output Caller variable receiving nvcc host options.
+# @param hip_output Caller variable receiving Clang host-only options.
+function(llaminar_cpu_host_compiler_options flags cuda_output hip_output)
+    separate_arguments(options NATIVE_COMMAND "${flags}")
+    set(cuda "")
+    set(hip "")
+    foreach(option IN LISTS options)
+        if(option MATCHES ",")
+            message(FATAL_ERROR "CPU host option contains an nvcc separator: ${option}")
+        endif()
+        string(APPEND cuda " -Xcompiler=${option}")
+        string(APPEND hip " -Xarch_host ${option}")
+    endforeach()
+    set(${cuda_output} "${cuda}" PARENT_SCOPE)
+    set(${hip_output} "${hip}" PARENT_SCOPE)
+endfunction()
+
 # @brief Configure the project-wide CPU envelope without inheriting native host flags.
 macro(llaminar_configure_cpu_instruction_set)
     set(LLAMINAR_CPU_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
@@ -139,5 +158,9 @@ int main()
     add_compile_definitions(${LLAMINAR_CPU_COMPILE_DEFINITIONS})
     string(APPEND CMAKE_CXX_FLAGS " ${LLAMINAR_CPU_COMPILE_FLAGS}")
     string(APPEND CMAKE_C_FLAGS " ${LLAMINAR_CPU_COMPILE_FLAGS}")
+    llaminar_cpu_host_compiler_options("${LLAMINAR_CPU_COMPILE_FLAGS}"
+        LLAMINAR_CUDA_HOST_OPTIONS LLAMINAR_HIP_HOST_OPTIONS)
+    string(APPEND CMAKE_CUDA_FLAGS "${LLAMINAR_CUDA_HOST_OPTIONS}")
+    string(APPEND CMAKE_HIP_FLAGS "${LLAMINAR_HIP_HOST_OPTIONS}")
     message(STATUS "V2: CPU ISA target: ${LLAMINAR_CPU_ISA_UPPER} (${LLAMINAR_CPU_COMPILE_FLAGS})")
 endmacro()

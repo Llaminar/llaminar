@@ -3,8 +3,8 @@
  * @brief Device-free native CPU execution identity and canonical workspace BOM.
  *
  * Synthetic remote records are explicit typed observations, not borrowed local
- * CPU capabilities. ARM's register-resident K ABI contributes only its named
- * Q8 bank; x86 retains its real cache-derived shared-partial program. Unknown
+ * CPU capabilities. ARM contributes its named Q8 bank and, for qualifying
+ * prefill, a bounded worker slab; x86 retains its cache-derived partial program. Unknown
  * or cross-architecture identities cannot borrow another implementation's BOM.
  */
 #include "backends/CPUExecutionGeometry.h"
@@ -33,7 +33,7 @@ TEST(CPUProjectionNativeWorkspace, CompilerRuntimePairsAreArchitectureExact)
         }
 }
 
-/** @test Every source uses the same actual native Q8-only workspace authority. */
+/** @test Single-row register tiles use the native Q8-only workspace authority for every source. */
 TEST(CPUProjectionNativeWorkspace, NativeRegisterTreesNeverReserveX86SharedPartials)
 {
     constexpr CPUExecutionGeometry native{.maximum_native_row_tile = 4,
@@ -44,19 +44,61 @@ TEST(CPUProjectionNativeWorkspace, NativeRegisterTreesNeverReserveX86SharedParti
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
         for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
         {
-            CPUProjectionWorkspaceGeometry geometry{.rows = 31, .n = 65, .k = 1056, .workers = 10,
+            // One row is below every panel domain (pooled prefill starts at two).
+            CPUProjectionWorkspaceGeometry geometry{.rows = 1, .n = 65, .k = 1056, .workers = 10,
                 .execution = native, .numerical_policy = policy};
             const auto footprint = cpu::native_quantised::preparedFootprintForFormat(*source.metadata);
             const auto requirements = CPUProjectionWorkspaceContract::prepared(footprint, source.metadata->codebook_id, geometry);
             ASSERT_EQ(requirements.buffers.size(), 1u);
             EXPECT_EQ(requirements.buffers[0].name, kCPUProjectionQ8);
-            EXPECT_EQ(requirements.buffers[0].size_bytes, 31u * 33 * sizeof(Q8_1Block));
+            EXPECT_EQ(requirements.buffers[0].size_bytes, 33u * sizeof(Q8_1Block));
             auto unrelated = geometry;
             unrelated.execution.cache = kSyntheticCPUExecutionGeometry.cache;
             const auto same = CPUProjectionWorkspaceContract::prepared(footprint, source.metadata->codebook_id, unrelated);
             ASSERT_EQ(same.buffers.size(), 1u);
             EXPECT_EQ(same.buffers[0].size_bytes, requirements.buffers[0].size_bytes);
         }
+}
+
+/** @test A remote ARM executor gets a panel per worker only in the supported prefill domain.
+ * @details The declaration is purpose-agnostic, so it starts at the pooled
+ * expert-prefill domain (two rows), below the dense domain (sixteen rows).
+ */
+TEST(CPUProjectionNativeWorkspace, PrefillWorkerPanelsAreChargedToTheNamedSlab)
+{
+    constexpr CPUExecutionGeometry native{.maximum_native_row_tile = 4,
+        .projection_abi = CPUProjectionScheduleABI::ARMRegisterK,
+        .compiled_isa = ISALevel::NEONDotProd, .active_isa = ISALevel::NEONDotProd};
+    for (const auto format : {"IQ3_S", "Q5_K", "Q5_0", "Q5_1", "Q8_0"})
+        for (int rows : {1, 2, 15, 16, 19})
+            for (int k : {512, 8224})
+                for (auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+                {
+                    constexpr int workers = 7;
+                    const auto requirements = CPUProjectionWorkspaceContract::sourceNative(format,
+                        {.rows = rows, .n = 67, .k = k, .workers = workers, .execution = native, .numerical_policy = policy});
+                    auto baseline = native;
+                    baseline.compiled_isa = ISALevel::NEON;
+                    baseline.active_isa = ISALevel::NEON;
+                    const auto asimd = CPUProjectionWorkspaceContract::sourceNative(format,
+                        {.rows = rows, .n = 67, .k = k, .workers = workers, .execution = baseline, .numerical_policy = policy});
+                    ASSERT_EQ(asimd.buffers.size(), requirements.buffers.size());
+                    for (std::size_t i = 0; i < requirements.buffers.size(); ++i)
+                    {
+                        EXPECT_EQ(asimd.buffers[i].name, requirements.buffers[i].name);
+                        EXPECT_EQ(asimd.buffers[i].size_bytes, requirements.buffers[i].size_bytes);
+                    }
+                    const std::string_view type = format;
+                    const bool packed = rows >= 2 && (type == "IQ3_S" || type == "Q5_K" || type == "Q5_0");
+                    ASSERT_EQ(requirements.buffers.size(), packed ? 2u : 1u);
+                    EXPECT_EQ(requirements.buffers[0].size_bytes, std::size_t(rows * (k / 32)) * sizeof(Q8_1Block));
+                    if (!packed) continue;
+                    const std::size_t carry = k > 8192 && policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                        ? (std::size_t(rows) * 16 + 63) / 64 * 64 : 0;
+                    EXPECT_EQ(requirements.buffers[1].name, kCPUProjectionPartials);
+                    const int slots = type == "Q5_0" ? 1 : workers;
+                    EXPECT_EQ(requirements.buffers[1].size_bytes, slots * (2560 + carry));
+                }
 }
 
 /** @test Unknown/foreign/native-width metadata is rejected before memory admission. */

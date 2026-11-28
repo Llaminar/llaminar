@@ -74,11 +74,23 @@
 
 namespace llaminar2
 {
+    std::uint8_t MoEOverlayProjectionWeightManifest::gpuSuperblockPhase() const noexcept
+    {
+        if (format.isNativeQuantised())
+        {
+            const auto *source = native_quantised_formats::forSourceIdentity(
+                format.native_quantised.codebook_id, format.native_quantised.is_superblock);
+            if (source && cpu::native_quantised::migrationUsesSuperblockCodes(*source))
+                return static_cast<std::uint8_t>(native_quantised_superblock::superblockPhase(first_column / 32));
+        }
+        return 0;
+    }
+
     bool MoEOverlayProjectionWeightManifest::valid() const noexcept
     {
         const auto role = static_cast<std::size_t>(projection);
-        return role < 3 && N > 0 && K > 0 && format.valid() &&
-               (format.isFloating() || (K % 32) == 0);
+        return role < 3 && N > 0 && K > 0 && first_column >= 0 && format.valid() &&
+               (format.isFloating() || (K % 32 == 0 && first_column % 32 == 0));
     }
 
     bool MoEOverlayLayerWeightManifest::valid() const noexcept
@@ -914,10 +926,14 @@ namespace llaminar2
                     .cpu_is_superblock = uint8_t(root.is_superblock),
                     .cpu_encoding = root.encoding, .cpu_data_stride = uint32_t(root.data_stride),
                     .cpu_block_stride = uint32_t(root.interleaved_block_stride)};
-                const size_t column_bytes = traits.cpu_block_stride / 64;
-                if (!column_bytes || capacity < column_bytes || capacity > UINT32_MAX)
-                    throw std::invalid_argument("CPU native worker capacity cannot contain one exact encoded column");
-                traits.wire_columns_per_unit = unsigned(std::min(size_t(64), capacity / column_bytes));
+                if (capacity > UINT32_MAX)
+                    throw std::invalid_argument("CPU native worker capacity exceeds its wire ABI");
+                for (; traits.wire_columns_per_unit != 0; --traits.wire_columns_per_unit)
+                {
+                    const auto geometry = traits.wireGeometry(traits.wire_columns_per_unit);
+                    if (geometry.block_stride + geometry.header_bytes <= capacity)
+                        break;
+                }
                 return traits;
             };
             if (source.N != intersection.source().rows || source.K != intersection.source().columns ||
@@ -1918,6 +1934,12 @@ namespace llaminar2
                 {
                     throw std::runtime_error(
                         "ExpertOverlay admitted GPU host-relay wave exhausted its pre-materialized parallel lane pool");
+                }
+                std::string error;
+                if (!lane_->lane()->accepts(source_, destination_, intersection_, &error))
+                {
+                    lane_->release(this);
+                    throw std::invalid_argument("ExpertOverlay cannot reserve GPU host-relay projection: " + error);
                 }
                 owns_lane_ = true;
             }
@@ -3197,6 +3219,7 @@ namespace llaminar2
                 .scales_bytes = descriptor.scales_bytes,
                 .mins_bytes = descriptor.mins_bytes,
                 .emins_bytes = descriptor.emins_bytes,
+                .metadata_layout = descriptor.metadata_layout,
             };
         }
 
@@ -3216,6 +3239,7 @@ namespace llaminar2
                 .scales_bytes = descriptor.scales_bytes,
                 .mins_bytes = descriptor.mins_bytes,
                 .emins_bytes = descriptor.emins_bytes,
+                .metadata_layout = descriptor.metadata_layout,
             };
         }
 
@@ -3261,15 +3285,15 @@ namespace llaminar2
             std::size_t staging_capacity_bytes)
         {
             const auto layout = probe.deviceLayout();
-            if (!layout.valid() || layout.cpu_block_stride == 0 ||
-                staging_capacity_bytes < layout.cpu_block_stride)
+            const auto unit_bytes = layout.cpuStorage().maximumWireUnitBytes();
+            if (!layout.valid() || !unit_bytes || staging_capacity_bytes < unit_bytes)
             {
                 throw std::runtime_error(
                     "ExpertOverlay staging capacity cannot hold one CPU NativeQuantised unit");
             }
             return static_cast<std::uint32_t>(std::min<std::size_t>(
                 layout.unit_count,
-                staging_capacity_bytes / layout.cpu_block_stride));
+                staging_capacity_bytes / unit_bytes));
         }
 
         /** @brief Require identical final CPU representations before NUMA copy. */
@@ -3309,7 +3333,7 @@ namespace llaminar2
             if (projection.spec.N != N || projection.spec.K != K ||
                 projection.spec.payload_bytes_per_block < payload_bytes ||
                 (is_asymmetric && !projection.spec.is_asymmetric) ||
-                (has_emins && !projection.spec.has_emins))
+                (has_emins && !projection.spec.has_emins && !projection.slot.metadata_layout))
             {
                 throw std::runtime_error(
                     "ExpertOverlay GPU shadow slot cannot represent an arriving projection");
@@ -3317,11 +3341,13 @@ namespace llaminar2
 
             DeviceNativeQuantisedMatrixDesc descriptor;
             descriptor.payload = projection.slot.d_native_quantised_payload;
-            descriptor.scales = projection.slot.d_native_quantised_scales;
-            descriptor.mins = is_asymmetric
+            descriptor.metadata_layout = projection.slot.metadata_layout;
+            descriptor.scales = descriptor.metadata_layout && native_quantised_superblock::superblockCodeInPayload(execution_codebook)
+                ? descriptor.payload : projection.slot.d_native_quantised_scales;
+            descriptor.mins = (descriptor.metadata_layout || is_asymmetric)
                                   ? projection.slot.d_native_quantised_mins
                                   : nullptr;
-            descriptor.emins = has_emins
+            descriptor.emins = (!descriptor.metadata_layout && has_emins)
                                    ? projection.slot.d_native_quantised_emins
                                    : nullptr;
             descriptor.n = N;
@@ -3388,7 +3414,7 @@ namespace llaminar2
                             descriptor.allocation_payload_bytes_per_block,
                         .has_mins = descriptor.allocation_has_mins,
                         .has_emins = descriptor.allocation_has_emins,
-                    });
+                    }, descriptor.metadata_layout);
             }
 #endif
 #ifdef HAVE_ROCM
@@ -3550,7 +3576,7 @@ namespace llaminar2
             if (a.ptrs.d_vnni != b.ptrs.d_vnni || a.ptrs.d_scales != b.ptrs.d_scales ||
                 a.ptrs.d_mins != b.ptrs.d_mins || a.ptrs.d_emins != b.ptrs.d_emins || a.n != b.n || a.k != b.k ||
                 a.blocks_per_row != b.blocks_per_row || a.codebook_id != b.codebook_id ||
-                a.payload_bytes_per_block != b.payload_bytes_per_block || a.is_asymmetric != b.is_asymmetric ||
+                a.metadata_layout != b.metadata_layout || a.payload_bytes_per_block != b.payload_bytes_per_block || a.is_asymmetric != b.is_asymmetric ||
                 a.has_emins != b.has_emins || a.vnni_bytes != b.vnni_bytes || a.scales_bytes != b.scales_bytes ||
                 a.mins_bytes != b.mins_bytes || a.emins_bytes != b.emins_bytes)
                 throw std::invalid_argument("Physical pieces disagree on one final GPU role allocation/encoding");
@@ -3617,6 +3643,7 @@ namespace llaminar2
          * @param layer Initial participant-local prepared engines.
          * @param device Exact endpoint device.
          * @param epoch Initial residency epoch.
+         * @param geometry Original projection identities of this endpoint's slot family.
          * @return One adopted physical slot for every resident expert.
          */
         std::vector<AdoptedInitialExpertSlotRecycler::InitialSlot>
@@ -3624,7 +3651,8 @@ namespace llaminar2
             const MoEOverlayParticipantLayerBank &layer,
             int layer_idx,
             DeviceId device,
-            std::uint64_t epoch)
+            std::uint64_t epoch,
+            const ExpertGeometryKey &geometry)
         {
             std::vector<AdoptedInitialExpertSlotRecycler::InitialSlot> result;
             result.reserve(residentCount(layer));
@@ -3694,106 +3722,14 @@ namespace llaminar2
                     }
                     else
                     {
-                        if (source.format.isFloating())
-                        {
-                            GpuExpertSlotPool::ProjectionSlot projection_slot;
-                            projection_slot.spec = {
-                                .label = projectionName(projection),
-                                .N = source.floating.n,
-                                .K = source.floating.k,
-                                .format = source.format,
-                            };
-                            projection_slot.slot = {
-                                .d_native_quantised_payload =
-                                    static_cast<std::uint8_t *>(
-                                        const_cast<void *>(
-                                            source.floating.data)),
-                                .payload_bytes = source.floating.bytes,
-                                .staging_bytes = 0,
-                            };
-                            projection_slot.blocks_per_row = 0;
-                            adopted.gpu_destination =
-                                std::move(projection_slot);
-                            slot.projections.push_back(std::move(adopted));
-                            continue;
-                        }
-                        const auto *source_format =
-                            native_quantised_formats::forSourceIdentity(
-                                source.format.native_quantised.codebook_id,
-                                source.format.native_quantised.is_superblock);
-                        if (!source_format)
-                        {
-                            throw std::runtime_error(
-                                "ExpertOverlay initial GPU expert lacks catalogued source provenance");
-                        }
-                        const auto allocation =
-                            reusableDeviceVnniAllocationFormat(*source_format);
-                        if (!source.gpu_packed.valid() ||
-                            source.gpu_packed
-                                    .allocation_payload_bytes_per_block !=
-                                allocation.payload_bytes_per_block ||
-                            source.gpu_packed.allocation_has_mins !=
-                                allocation.has_mins ||
-                            source.gpu_packed.allocation_has_emins !=
-                                allocation.has_emins)
-                        {
-                            throw std::runtime_error(
-                                "ExpertOverlay initial GPU expert lacks the exact reusable allocation charged by capacity admission: device=" +
-                                device.to_string() +
-                                " expert=" + std::to_string(expert) +
-                                " projection=" + projectionName(projection) +
-                                " source_codebook=" +
-                                std::to_string(source.format.native_quantised.codebook_id) +
-                                " observed_payload_bytes_per_block=" +
-                                std::to_string(source.gpu_packed.allocation_payload_bytes_per_block) +
-                                " expected_payload_bytes_per_block=" +
-                                std::to_string(allocation.payload_bytes_per_block) +
-                                " observed_has_mins=" +
-                                std::to_string(source.gpu_packed.allocation_has_mins) +
-                                " expected_has_mins=" +
-                                std::to_string(allocation.has_mins) +
-                                " observed_has_emins=" +
-                                std::to_string(source.gpu_packed.allocation_has_emins) +
-                                " expected_has_emins=" +
-                                std::to_string(allocation.has_emins));
-                        }
-
-                        GpuExpertSlotPool::ProjectionSlot projection_slot;
-                        projection_slot.spec = {
-                            .label = projectionName(projection),
-                            .N = source.gpu_packed.n,
-                            .K = source.gpu_packed.k,
-                            .payload_bytes_per_block =
-                                allocation.payload_bytes_per_block,
-                            .is_asymmetric =
-                                allocation.has_mins,
-                            .has_emins = allocation.has_emins,
-                            .codebook_id = source.gpu_packed.codebook_id,
-                            .scale_plane = nativeQuantisedScalePlaneWidth(source.gpu_packed.codebook_id),
-                            .format = source.format,
-                        };
-                        projection_slot.slot = {
-                            .d_native_quantised_payload =
-                                source.gpu_packed.ptrs.d_vnni,
-                            .d_native_quantised_scales =
-                                source.gpu_packed.ptrs.d_scales,
-                            .d_native_quantised_mins =
-                                source.gpu_packed.ptrs.d_mins,
-                            .d_native_quantised_emins =
-                                source.gpu_packed.ptrs.d_emins,
-                            .payload_bytes =
-                                source.gpu_packed.allocationPayloadBytes(),
-                            .scales_bytes = source.gpu_packed.scales_bytes,
-                            .mins_bytes =
-                                source.gpu_packed.allocationMinsBytes(),
-                            .emins_bytes =
-                                source.gpu_packed.allocationEminsBytes(),
-                            .staging_bytes = 0,
-                        };
-                        projection_slot.blocks_per_row =
-                            source.gpu_packed.blocks_per_row;
-                        adopted.gpu_destination =
-                            std::move(projection_slot);
+                        const auto &signature = geometry.projections[projectionIndex(projection)];
+                        if (source.format != signature.format)
+                            throw std::invalid_argument("Initial GPU expert source differs from its slot family");
+                        auto spec = GpuExpertSlotPool::migrationProjectionSpec(projectionName(projection),
+                            signature.N, signature.K, signature.format, signature.gpu_superblock_phase);
+                        adopted.gpu_destination = source.format.isFloating()
+                            ? GpuExpertSlotPool::adoptResidentProjection(std::move(spec), source.floating)
+                            : GpuExpertSlotPool::adoptResidentProjection(std::move(spec), source.gpu_packed);
                     }
                     slot.projections.push_back(std::move(adopted));
                 }
@@ -4283,7 +4219,8 @@ namespace llaminar2
                         const auto local = family.cohort()->localManifest(family.participantIndex());
                         for (const auto &projection : local.projections)
                             signatures[projectionIndex(projection.projection)] = {
-                                .N = projection.N, .K = projection.K, .format = projection.format};
+                                .N = projection.N, .K = projection.K, .format = projection.format,
+                                .gpu_superblock_phase = projection.gpuSuperblockPhase()};
                     }
                     layers_by_geometry[ExpertGeometryKey{signatures}]
                         .push_back(layer_idx);
@@ -4325,7 +4262,8 @@ namespace llaminar2
                             initial_layer,
                             layer_idx,
                             endpoint->device(),
-                            config.initial_snapshot->epoch);
+                            config.initial_snapshot->epoch,
+                            geometry);
                         adopted_initial_slots.insert(
                             adopted_initial_slots.end(),
                             std::make_move_iterator(layer_slots.begin()),
@@ -4398,26 +4336,14 @@ namespace llaminar2
                             const auto &signature =
                                 geometry.projections[
                                     projectionIndex(projection)];
-                            GpuExpertSlotPool::ProjectionSpec spec{
-                                .label = projectionName(projection),
-                                .N = signature.N,
-                                .K = signature.K,
-                                .format = signature.format,
-                            };
-                            if (signature.format.isNativeQuantised())
+                            auto spec = GpuExpertSlotPool::migrationProjectionSpec(projectionName(projection),
+                                signature.N, signature.K, signature.format, signature.gpu_superblock_phase);
+                            if (signature.format.isNativeQuantised() && !spec.codedDeclaration())
                             {
-                                /*
-                                 * Expanded CPU arrivals need 32 payload bytes;
-                                 * minima and extended minima cover every one of
-                                 * the catalogued formats. Actual descriptors
-                                 * expose only the regions their decoder uses.
-                                 */
+                                // Per-block shadows retain the admitted capacity union.
                                 spec.payload_bytes_per_block = 32;
                                 spec.is_asymmetric = true;
                                 spec.has_emins = true;
-                                spec.codebook_id =
-                                    canonicalDeviceVnniCodebookId(signature.format.native_quantised);
-                                // Shadow slots hold any catalogued format: widest plane.
                                 spec.scale_plane = NativeQuantisedScalePlaneWidth::FP16Word;
                             }
                             specs.push_back(std::move(spec));
@@ -6196,7 +6122,7 @@ namespace llaminar2
                                             source.gpu_packed,
                                             source.format.native_quantised,
                                             static_cast<std::uint32_t>(
-                                                config_.staging_capacity_bytes)).forGPUIntersection(piece.intersection);
+                                                config_.staging_capacity_bytes), piece.intersection);
                                     ++local_remote_gpu_blob_operations;
                                 }
                                 const auto readiness =

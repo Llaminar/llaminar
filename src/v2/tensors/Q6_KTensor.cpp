@@ -679,6 +679,12 @@ namespace llaminar2
         const int8_t *sc = blk->scales;
         const int sc_lo_idx = half * 8 + sub_in_half * 2;
         const int sc_hi_idx = sc_lo_idx + 1;
+        if (vnniCoded(ctx))
+        {
+            vnniStoreCoded(ctx, linear, destination_n, b,
+                           native_quantised_q6_scale::pack(sc[sc_lo_idx], sc[sc_hi_idx]), blk->d);
+            return;
+        }
         // Keep the original factors, not rounded half products. Both metadata
         // planes retain their existing byte extent across CPU/GPU migration.
         ctx.scales_array[linear] = blk->d;

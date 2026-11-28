@@ -141,6 +141,7 @@ class NativeTaskFields {
     unsigned columns_;
     const uint8_t* payload_;
     const unsigned short *scales_, *mins_;
+    uint8_t layout_; ///< Packed metadata layout (per-block or superblock-coded).
 public:
     /**
      * @brief Read the original required fields once for this task.
@@ -151,7 +152,11 @@ public:
     __device__ __forceinline__ explicit NativeTaskFields(const NativeMatrix* matrix)
     {
         native_descriptor_fields<true>(matrix,columns_,payload_,scales_,mins_);
+        layout_=static_cast<uint8_t>(native_weight_uniform(unsigned(matrix->metadata_layout)));
     }
+
+    /** @return The task matrix's packed metadata layout. */
+    __device__ __forceinline__ uint8_t layout() const { return layout_; }
 
     /**
      * @brief Borrow exactly the task's already-read descriptor fields.
@@ -184,6 +189,42 @@ __device__ __forceinline__ void native_descriptor_fields(const NativeTaskFields&
     unsigned& columns,const uint8_t*& payload,const unsigned short*& scales,const unsigned short*& mins)
 {
     fields.borrow<NeedMins>(columns,payload,scales,mins);
+}
+
+/** @brief Wave-uniform metadata layout of a by-value descriptor. */
+__device__ __forceinline__ uint8_t native_descriptor_layout(const NativeMatrix& matrix)
+{
+    return static_cast<uint8_t>(native_weight_uniform(unsigned(matrix.metadata_layout)));
+}
+/** @brief Wave-uniform metadata layout of a retained global descriptor. */
+__device__ __forceinline__ uint8_t native_descriptor_layout(const NativeMatrix* matrix)
+{
+    return static_cast<uint8_t>(native_weight_uniform(unsigned(native_weight_uniform(matrix)->metadata_layout)));
+}
+/** @brief Metadata layout already borrowed by a task. */
+__device__ __forceinline__ uint8_t native_descriptor_layout(const NativeTaskFields& fields)
+{
+    return fields.layout();
+}
+
+/**
+ * @brief One block's packed affine coefficient word (scale bits | min bits << 16).
+ * @tparam CB Physical codebook (5 for Q4_1/Q4_K, 7 for Q5_1/Q5_K).
+ * @param layout Matrix metadata layout (uniform). @param scales Primary/code plane.
+ * @param mins Secondary/superblock plane. @param columns Block-major pitch.
+ * @param linear Block-major index. @param block K32 block. @param row Output row.
+ * @return Identical words for per-block and superblock-coded matrices; per-block
+ *         matrices keep the original global loads.
+ */
+template<uint8_t CB>
+__device__ __forceinline__ unsigned native_coefficient_word(uint8_t layout,const unsigned short* scales,
+    const unsigned short* mins,unsigned columns,size_t linear,unsigned block,unsigned row)
+{
+    if(layout==0)
+        return unsigned(native_global_weight_read<unsigned short>(scales+linear))|
+            (unsigned(native_global_weight_read<unsigned short>(mins+linear))<<16);
+    const auto words=::llaminar2::rocm_native_metadata::blockMetadata<CB>(::llaminar2::rocm_native_metadata::planesFromLayout(scales,mins,nullptr,layout),block,row,columns);
+    return unsigned(words.primary)|(unsigned(words.secondary)<<16);
 }
 
 /** @brief Load the same Q8 pair into seventeen native register words without byte interleaving.
@@ -232,7 +273,7 @@ __device__ __forceinline__ void native_q8_pair(const Descriptor& matrix,int row,
  * @param matrix Exact original native Q5_1 descriptor. @param row Original output row.
  * @param block Original K32 block. @param words Original6-word destination.
  */
-template<bool LoadCoefficients=true,class Descriptor>
+template<bool LoadCoefficients=true,int CodedRepresentation=-1,class Descriptor>
 __device__ __forceinline__ void native_q51_block(const Descriptor& matrix,int row,int block,int (&words)[6],
     unsigned coefficients=0u)
 {
@@ -242,9 +283,19 @@ __device__ __forceinline__ void native_q51_block(const Descriptor& matrix,int ro
     native_descriptor_fields<LoadCoefficients>(matrix,columns,payload,scales,mins);
     const size_t linear=size_t(block)*columns+row;
     const int4 q=native_global_weight_read<int4>(payload+linear*20);
-    if constexpr(LoadCoefficients)
+    // CodedRepresentation: -1 reads the matrix layout per call; 0/1 are
+    // row-level instantiations selected once by a uniform caller branch, so
+    // each loop carries only its own representation's registers.
+    if constexpr(LoadCoefficients && CodedRepresentation==0)
         coefficients=unsigned(native_global_weight_read<unsigned short>(scales+linear))|
             (unsigned(native_global_weight_read<unsigned short>(mins+linear))<<16);
+    else if constexpr(LoadCoefficients && CodedRepresentation==1) {
+        const auto coded_words=::llaminar2::rocm_native_metadata::blockMetadata<7>(::llaminar2::rocm_native_metadata::planesFromLayout(scales,mins,nullptr,
+            native_descriptor_layout(matrix)),unsigned(block),unsigned(row),columns);
+        coefficients=unsigned(coded_words.primary)|(unsigned(coded_words.secondary)<<16);
+    } else if constexpr(LoadCoefficients)
+        coefficients=native_coefficient_word<7>(native_descriptor_layout(matrix),scales,mins,columns,linear,
+            unsigned(block),unsigned(row));
     words[0]=int(coefficients);
     words[1]=native_global_weight_read<int>(payload+linear*20+16);
     words[2]=q.x;words[3]=q.y;words[4]=q.z;words[5]=q.w;
@@ -330,9 +381,29 @@ __device__ __forceinline__ void native_q4_panel_publish(const Descriptor& matrix
 {
     constexpr unsigned Packet=NativeQ4PanelContract::rows_per_packet;
     const unsigned packets=(rows+Packet-1)/Packet;
-    if(rows==0 || tid>=blocks*packets)return;
+    if(rows==0)return;
+    const uint8_t layout=native_descriptor_layout(matrix);
+    // The coded writer owns individual coefficient words, not eight-row
+    // packets. Apply the early exit to the same work extent as its loop so
+    // the subsequent CTA join publishes a fully overwritten live LDS panel.
+    if(tid>=blocks*(layout!=0?rows:packets))return;
     unsigned columns;const uint8_t* payload;const unsigned short *scales,*mins;
     native_descriptor_fields<true>(matrix,columns,payload,scales,mins);
+    if(layout!=0) {
+        const unsigned codebook=native_weight_uniform(unsigned(native_weight_uniform(matrix)->codebook_id));
+        // Superblock-coded Q4_K/Q5_K: reconstruct each real (block,row) word; the
+        // per-block packet path below is unchanged.
+#pragma unroll 1
+        for(unsigned task=tid;task<blocks*rows;task+=threads) {
+            const unsigned block=task/rows,row=task%rows;
+            const size_t source=size_t(block)*columns+first_row+row;
+            // Q4_K (codebook 5) and Q5_K (codebook 7) share this affine panel.
+            panel[native_q4_panel_index(row,block)]=codebook==7
+                ? native_coefficient_word<7>(layout,scales,mins,columns,source,block,first_row+row)
+                : native_coefficient_word<5>(layout,scales,mins,columns,source,block,first_row+row);
+        }
+        return;
+    }
 #pragma unroll 1
     for(unsigned task=tid;task<blocks*packets;task+=threads) {
         const unsigned block=task/packets,row=(task%packets)*Packet;
@@ -408,8 +479,8 @@ __device__ __forceinline__ NativeQKItem native_qk_item(const Descriptor& matrix,
             const unsigned block=unsigned(superblock*8+pair*2+half);
             coefficients=coefficient_panel[native_q4_panel_index(unsigned(row)-panel_first_row,block)];
         } else {
-            coefficients=unsigned(native_global_weight_read<unsigned short>(scales+owned))|
-                (unsigned(native_global_weight_read<unsigned short>(mins+owned))<<16);
+            coefficients=native_coefficient_word<5>(native_descriptor_layout(matrix),scales,mins,columns,owned,
+                unsigned(superblock*8+pair*2+half),unsigned(row));
         }
         return {q,make_int4(int(coefficients),0,0,0),0.0f,0.0f,0.0f,0.0f};
     }
@@ -434,9 +505,12 @@ __device__ __forceinline__ NativeQKItem native_qk_item(const Descriptor& matrix,
             high[j]=h;
         }
     }
+    const uint8_t layout=native_descriptor_layout(matrix);
+    const unsigned word_a=native_coefficient_word<7>(layout,scales,mins,columns,a,unsigned(superblock*8+pair*2),unsigned(row));
+    const unsigned word_b=native_coefficient_word<7>(layout,scales,mins,columns,b,unsigned(superblock*8+pair*2+1),unsigned(row));
     return {make_int4(q[0],q[1],q[2],q[3]),make_int4(high[0],high[1],high[2],high[3]),
-        __half2float(__ushort_as_half(native_global_weight_read<unsigned short>(scales+a))),__half2float(__ushort_as_half(native_global_weight_read<unsigned short>(scales+b))),
-        __half2float(__ushort_as_half(native_global_weight_read<unsigned short>(mins+a))),__half2float(__ushort_as_half(native_global_weight_read<unsigned short>(mins+b)))};
+        __half2float(__ushort_as_half(uint16_t(word_a))),__half2float(__ushort_as_half(uint16_t(word_b))),
+        __half2float(__ushort_as_half(uint16_t(word_a>>16))),__half2float(__ushort_as_half(uint16_t(word_b>>16)))};
 }
 
 

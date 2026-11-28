@@ -73,7 +73,7 @@ namespace llaminar2
                                               [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
                                               {
                                                   return std::make_shared<Qwen35MoEGraph>(cfg, std::move(mpi));
-                                              });
+                                              }, &DeviceMoEArrivalForwardDeclaration::declare);
 
         SchemaFactoryRegistry::registerFactory("qwen35moe",
                                                []()
@@ -81,7 +81,8 @@ namespace llaminar2
 
         GraphBuilderRegistry::registerFactory("qwen4exp",
             [](const GraphConfig &config,std::shared_ptr<IMPIContext> mpi)
-            { return std::make_shared<Qwen4ExpGraph>(config,std::move(mpi)); });
+            { return std::make_shared<Qwen4ExpGraph>(config,std::move(mpi)); },
+            &DeviceMoEArrivalForwardDeclaration::declare);
         SchemaFactoryRegistry::registerFactory("qwen4exp",
             [](){return std::make_unique<Qwen4ExpSchemaFactory>();});
 

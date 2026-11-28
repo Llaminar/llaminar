@@ -1,0 +1,679 @@
+{
+ "baseline": "63b053401",
+ "compact": {
+  "compact:10": {
+   "develop": [
+    "compact:10"
+   ],
+   "formats": [
+    "Q2_K"
+   ]
+  },
+  "compact:12": {
+   "develop": [
+    "1:0:0"
+   ],
+   "formats": [
+    "IQ3_XXS"
+   ]
+  },
+  "compact:13": {
+   "develop": [
+    "compact:13"
+   ],
+   "formats": [
+    "IQ2_S"
+   ]
+  },
+  "compact:14": {
+   "develop": [
+    "compact:14"
+   ],
+   "formats": [
+    "IQ2_XS"
+   ]
+  },
+  "compact:15": {
+   "develop": [
+    "1:0:0"
+   ],
+   "formats": [
+    "IQ2_XXS"
+   ]
+  },
+  "compact:16": {
+   "develop": [
+    "1:0:1"
+   ],
+   "formats": [
+    "IQ1_S"
+   ]
+  },
+  "compact:17": {
+   "develop": [
+    "compact:17"
+   ],
+   "formats": [
+    "IQ1_M"
+   ]
+  },
+  "compact:9": {
+   "develop": [
+    "compact:9"
+   ],
+   "formats": [
+    "Q3_K"
+   ]
+  }
+ },
+ "formats": {
+  "IQ1_M": {
+   "candidate": "compact",
+   "develop": "compact"
+  },
+  "IQ1_S": {
+   "candidate": "compact",
+   "develop": "1:0:1"
+  },
+  "IQ2_S": {
+   "candidate": "compact",
+   "develop": "compact"
+  },
+  "IQ2_XS": {
+   "candidate": "compact",
+   "develop": "compact"
+  },
+  "IQ2_XXS": {
+   "candidate": "compact",
+   "develop": "1:0:0"
+  },
+  "IQ3_S": {
+   "candidate": "3:11:0",
+   "develop": "5:0:0"
+  },
+  "IQ3_XXS": {
+   "candidate": "compact",
+   "develop": "1:0:0"
+  },
+  "IQ4_NL": {
+   "candidate": "0:2:0",
+   "develop": "0:2:0"
+  },
+  "IQ4_XS": {
+   "candidate": "4:2:0",
+   "develop": "4:2:0"
+  },
+  "MXFP4": {
+   "candidate": "0:3:0",
+   "develop": "0:3:0"
+  },
+  "Q2_K": {
+   "candidate": "compact",
+   "develop": "compact"
+  },
+  "Q3_K": {
+   "candidate": "compact",
+   "develop": "compact"
+  },
+  "Q4_0": {
+   "candidate": "0:0:0",
+   "develop": "0:0:0"
+  },
+  "Q4_1": {
+   "candidate": "0:1:1",
+   "develop": "0:1:1"
+  },
+  "Q4_K": {
+   "candidate": "6:1:1",
+   "develop": "0:1:1"
+  },
+  "Q5_0": {
+   "candidate": "7:0:0",
+   "develop": "1:0:0"
+  },
+  "Q5_1": {
+   "candidate": "7:1:1",
+   "develop": "1:0:1"
+  },
+  "Q5_K": {
+   "candidate": "3:7:1",
+   "develop": "1:0:1"
+  },
+  "Q6_K": {
+   "candidate": "2:0:0",
+   "develop": "2:0:0"
+  },
+  "Q8_0": {
+   "candidate": "1:0:0",
+   "develop": "1:0:0"
+  },
+  "Q8_1": {
+   "candidate": "1:0:0",
+   "develop": "1:0:0"
+  },
+  "Q8_K": {
+   "candidate": "1:0:0",
+   "develop": "1:0:0"
+  }
+ },
+ "keys": {
+  "0:0:0": {
+   "develop": [
+    "0:0:0"
+   ],
+   "formats": [
+    "Q4_0"
+   ]
+  },
+  "0:1:1": {
+   "develop": [
+    "0:1:1"
+   ],
+   "formats": [
+    "Q4_1"
+   ]
+  },
+  "0:2:0": {
+   "develop": [
+    "0:2:0"
+   ],
+   "formats": [
+    "IQ4_NL"
+   ]
+  },
+  "0:3:0": {
+   "develop": [
+    "0:3:0"
+   ],
+   "formats": [
+    "MXFP4"
+   ]
+  },
+  "1:0:0": {
+   "develop": [
+    "1:0:0"
+   ],
+   "formats": [
+    "Q8_0",
+    "Q8_1",
+    "Q8_K"
+   ]
+  },
+  "2:0:0": {
+   "develop": [
+    "2:0:0"
+   ],
+   "formats": [
+    "Q6_K"
+   ]
+  },
+  "3:11:0": {
+   "develop": [
+    "5:0:0"
+   ],
+   "formats": [
+    "IQ3_S"
+   ]
+  },
+  "3:7:1": {
+   "develop": [
+    "1:0:1"
+   ],
+   "formats": [
+    "Q5_K"
+   ]
+  },
+  "4:2:0": {
+   "develop": [
+    "4:2:0"
+   ],
+   "formats": [
+    "IQ4_XS"
+   ]
+  },
+  "6:1:1": {
+   "develop": [
+    "0:1:1"
+   ],
+   "formats": [
+    "Q4_K"
+   ]
+  },
+  "7:0:0": {
+   "develop": [
+    "1:0:0"
+   ],
+   "formats": [
+    "Q5_0"
+   ]
+  },
+  "7:1:1": {
+   "develop": [
+    "1:0:1"
+   ],
+   "formats": [
+    "Q5_1"
+   ]
+  }
+ },
+ "note": "Derived mechanically: CPUNativeTileStackFormats.cpp compiled against each tree prints preparedEncodingForSource(source) and source.is_asymmetric per catalogued source format (no rotation); each tree's dispatch() is transcribed as ordered rules over E (encoding), C (codebook), A (asymmetric), bound by the hash of its dispatch() text. A candidate tile key is compared with every develop tile program its formats ran on (strict minimum); a format with no develop tile path adds the zero-K rule.",
+ "probe_sha256": "8df16501e18b03fdc715e3f6cb5f03b2d53b11d288f2b1ef2047cf162c485eb6",
+ "trees": {
+  "candidate": {
+   "dispatch": [
+    {
+     "source": "SignedInt8SingleScale: Centered",
+     "tail": "1:0:0",
+     "when": "E == 1"
+    },
+    {
+     "source": "Q5NativeSingleScale, is_asymmetric: Unsigned, minimum",
+     "tail": "7:1:1",
+     "when": "E == 7 and A"
+    },
+    {
+     "source": "Q5NativeSingleScale: Centered",
+     "tail": "7:0:0",
+     "when": "E == 7"
+    },
+    {
+     "source": "Q6KNativeDualScale: Centered",
+     "tail": "2:0:0",
+     "when": "E == 2"
+    },
+    {
+     "source": "Q4KSuperblockCoded: Unsigned, minimum",
+     "tail": "6:1:1",
+     "when": "E == 6"
+    },
+    {
+     "source": "NibbleLUTSourceScale: NonLinear",
+     "tail": "4:2:0",
+     "when": "E == 4"
+    },
+    {
+     "source": "NibbleLUT codebook 0: Centered",
+     "tail": "0:0:0",
+     "when": "E == 0 and C == 0"
+    },
+    {
+     "source": "NibbleLUT codebook 4: NonLinear",
+     "tail": "0:2:0",
+     "when": "E == 0 and C == 4"
+    },
+    {
+     "source": "NibbleLUT codebook 5: Unsigned, minimum",
+     "tail": "0:1:1",
+     "when": "E == 0 and C == 5"
+    },
+    {
+     "source": "NibbleLUT MXFP4 (admitted scale words): MXFP4 map",
+     "tail": "0:3:0",
+     "when": "E == 0 and C == 25"
+    },
+    {
+     "source": "CompactMultiScale codebook 7: runCoded<7> (coded tile program; key map = codebook, minimum)",
+     "tail": "3:7:1",
+     "when": "E == 3 and C == 7"
+    },
+    {
+     "source": "CompactMultiScale codebook 11: runCoded<11> (coded tile program; key map = codebook)",
+     "tail": "3:11:0",
+     "when": "E == 3 and C == 11"
+    },
+    {
+     "source": "CompactMultiScale: shared compact implementation (no tile program)",
+     "tail": "compact",
+     "when": "E == 3"
+    }
+   ],
+   "dispatch_sha256": "24af5d84fb42adcc758e1db05f3920806318a46fb4c81fc9f20fb4f0f4e40da4",
+   "formats": {
+    "IQ1_M": {
+     "asymmetric": 1,
+     "codebook": 17,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ1_S": {
+     "asymmetric": 1,
+     "codebook": 16,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ2_S": {
+     "asymmetric": 1,
+     "codebook": 13,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ2_XS": {
+     "asymmetric": 1,
+     "codebook": 14,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ2_XXS": {
+     "asymmetric": 0,
+     "codebook": 15,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ3_S": {
+     "asymmetric": 0,
+     "codebook": 11,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ3_XXS": {
+     "asymmetric": 0,
+     "codebook": 12,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ4_NL": {
+     "asymmetric": 0,
+     "codebook": 4,
+     "encoding": 0,
+     "superblock": 0
+    },
+    "IQ4_XS": {
+     "asymmetric": 0,
+     "codebook": 4,
+     "encoding": 4,
+     "superblock": 1
+    },
+    "MXFP4": {
+     "asymmetric": 0,
+     "codebook": 25,
+     "encoding": 0,
+     "superblock": 0
+    },
+    "Q2_K": {
+     "asymmetric": 1,
+     "codebook": 10,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "Q3_K": {
+     "asymmetric": 1,
+     "codebook": 9,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "Q4_0": {
+     "asymmetric": 0,
+     "codebook": 0,
+     "encoding": 0,
+     "superblock": 0
+    },
+    "Q4_1": {
+     "asymmetric": 1,
+     "codebook": 5,
+     "encoding": 0,
+     "superblock": 0
+    },
+    "Q4_K": {
+     "asymmetric": 1,
+     "codebook": 5,
+     "encoding": 6,
+     "superblock": 1
+    },
+    "Q5_0": {
+     "asymmetric": 0,
+     "codebook": 6,
+     "encoding": 7,
+     "superblock": 0
+    },
+    "Q5_1": {
+     "asymmetric": 1,
+     "codebook": 7,
+     "encoding": 7,
+     "superblock": 0
+    },
+    "Q5_K": {
+     "asymmetric": 1,
+     "codebook": 7,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "Q6_K": {
+     "asymmetric": 1,
+     "codebook": 8,
+     "encoding": 2,
+     "superblock": 1
+    },
+    "Q8_0": {
+     "asymmetric": 0,
+     "codebook": 19,
+     "encoding": 1,
+     "superblock": 0
+    },
+    "Q8_1": {
+     "asymmetric": 0,
+     "codebook": 20,
+     "encoding": 1,
+     "superblock": 0
+    },
+    "Q8_K": {
+     "asymmetric": 0,
+     "codebook": 21,
+     "encoding": 1,
+     "superblock": 1
+    }
+   },
+   "headers": {
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedEncoding.h": "aeb07dad407e71c592fc7acaef7a9efa3b26cc40620b003d9bad4c09903a2130",
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h": "3dedbb38fd6a7b1b219ff851093004bde51a08f7f86842fb36914a111ed8e6d2",
+    "src/v2/tensors/NativeQuantisedFormatInfo.h": "24ab4ba864ff917e093bef67f8ec84f32e7eb21e5deae77ab2713c39f8ded0e9"
+   }
+  },
+  "develop": {
+   "dispatch": [
+    {
+     "source": "ExpandedInt8, is_asymmetric: Centered, minimum",
+     "tail": "1:0:1",
+     "when": "E == 1 and A"
+    },
+    {
+     "source": "ExpandedInt8: Centered",
+     "tail": "1:0:0",
+     "when": "E == 1"
+    },
+    {
+     "source": "IQ3SExpandedSourceScale: Centered",
+     "tail": "5:0:0",
+     "when": "E == 5"
+    },
+    {
+     "source": "Q6KNativeDualScale: Centered",
+     "tail": "2:0:0",
+     "when": "E == 2"
+    },
+    {
+     "source": "NibbleLUTSourceScale: NonLinear",
+     "tail": "4:2:0",
+     "when": "E == 4"
+    },
+    {
+     "source": "NibbleLUT codebook 0: Centered",
+     "tail": "0:0:0",
+     "when": "E == 0 and C == 0"
+    },
+    {
+     "source": "NibbleLUT codebook 4: NonLinear",
+     "tail": "0:2:0",
+     "when": "E == 0 and C == 4"
+    },
+    {
+     "source": "NibbleLUT codebook 5: Unsigned, minimum",
+     "tail": "0:1:1",
+     "when": "E == 0 and C == 5"
+    },
+    {
+     "source": "NibbleLUT MXFP4 (admitted scale words): MXFP4 map",
+     "tail": "0:3:0",
+     "when": "E == 0 and C == 25"
+    },
+    {
+     "source": "CompactMultiScale: shared compact implementation (no tile program)",
+     "tail": "compact",
+     "when": "E == 3"
+    }
+   ],
+   "dispatch_sha256": "e3a499e6afb11fd2127443fb999cde51ae264e6946a8ba475254ef3b476d55a3",
+   "formats": {
+    "IQ1_M": {
+     "asymmetric": 1,
+     "codebook": 17,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ1_S": {
+     "asymmetric": 1,
+     "codebook": 16,
+     "encoding": 1,
+     "superblock": 1
+    },
+    "IQ2_S": {
+     "asymmetric": 1,
+     "codebook": 13,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ2_XS": {
+     "asymmetric": 1,
+     "codebook": 14,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "IQ2_XXS": {
+     "asymmetric": 0,
+     "codebook": 15,
+     "encoding": 1,
+     "superblock": 1
+    },
+    "IQ3_S": {
+     "asymmetric": 0,
+     "codebook": 11,
+     "encoding": 5,
+     "superblock": 1
+    },
+    "IQ3_XXS": {
+     "asymmetric": 0,
+     "codebook": 12,
+     "encoding": 1,
+     "superblock": 1
+    },
+    "IQ4_NL": {
+     "asymmetric": 0,
+     "codebook": 4,
+     "encoding": 0,
+     "superblock": 0
+    },
+    "IQ4_XS": {
+     "asymmetric": 0,
+     "codebook": 4,
+     "encoding": 4,
+     "superblock": 1
+    },
+    "MXFP4": {
+     "asymmetric": 0,
+     "codebook": 25,
+     "encoding": 0,
+     "superblock": 0
+    },
+    "Q2_K": {
+     "asymmetric": 1,
+     "codebook": 10,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "Q3_K": {
+     "asymmetric": 1,
+     "codebook": 9,
+     "encoding": 3,
+     "superblock": 1
+    },
+    "Q4_0": {
+     "asymmetric": 0,
+     "codebook": 0,
+     "encoding": 0,
+     "superblock": 0
+    },
+    "Q4_1": {
+     "asymmetric": 1,
+     "codebook": 5,
+     "encoding": 0,
+     "superblock": 0
+    },
+    "Q4_K": {
+     "asymmetric": 1,
+     "codebook": 5,
+     "encoding": 0,
+     "superblock": 1
+    },
+    "Q5_0": {
+     "asymmetric": 0,
+     "codebook": 6,
+     "encoding": 1,
+     "superblock": 0
+    },
+    "Q5_1": {
+     "asymmetric": 1,
+     "codebook": 7,
+     "encoding": 1,
+     "superblock": 0
+    },
+    "Q5_K": {
+     "asymmetric": 1,
+     "codebook": 7,
+     "encoding": 1,
+     "superblock": 1
+    },
+    "Q6_K": {
+     "asymmetric": 1,
+     "codebook": 8,
+     "encoding": 2,
+     "superblock": 1
+    },
+    "Q8_0": {
+     "asymmetric": 0,
+     "codebook": 19,
+     "encoding": 1,
+     "superblock": 0
+    },
+    "Q8_1": {
+     "asymmetric": 0,
+     "codebook": 20,
+     "encoding": 1,
+     "superblock": 0
+    },
+    "Q8_K": {
+     "asymmetric": 0,
+     "codebook": 21,
+     "encoding": 1,
+     "superblock": 1
+    }
+   },
+   "headers": {
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedEncoding.h": "af7ab02e95a57a656438a013876b421048a24eacc2afcc1ac7f7079a3b42d237",
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h": "b6edfd4452cff97a39d062b80dfb137d86591c644962da50e482f1898d655348",
+    "src/v2/tensors/NativeQuantisedFormatInfo.h": "16ef2eec4f6ef9d520b57afb378fc49b452489b5992a897a70cde36a6a3d32dc"
+   },
+   "leaf": {
+    "families": {
+     "ASIMD": 0,
+     "DotProd": 1,
+     "I8MM": 2
+    },
+    "from": 2,
+    "ops_sha256": "d8505b783b0879f9b96d59ba3ede4b90fc1fee7227831c75e13586b8408572f9",
+    "rows": 1,
+    "tile_sha256": "ea63d4063782d8cc9d8fad7ccee93291e3938c5b52db44bdc3ffa307464632c4",
+    "to": 1
+   },
+   "tree": "63b053401"
+  }
+ }
+}

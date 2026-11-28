@@ -14,6 +14,7 @@
  * source bits, independently of the standalone preparation and format helpers.
  */
 #include "planning/PlanningExecutionMeasurement.h"
+#include "loaders/BoundedGPUExpertSource.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "backends/BackendManager.h"
@@ -233,6 +234,10 @@ namespace
         ASSERT_FALSE(weights.empty());
         const auto type = weights.front()->native_type();
         if (type != TensorType::IQ3_S && type != TensorType::IQ4_XS) return;
+        // Superblock-coded slots hold codes + per-superblock words; their exact
+        // reconstruction is proven by V2_Integration_CUDASuperblockCodedMetadata
+        // and the byte-identical GEMM outputs below.
+        if (slot.metadata_layout != 0) return;
         constexpr size_t rows = 256;
         constexpr size_t blocks_per_row = 8;
         const size_t words = weights.size() * rows * blocks_per_row;
@@ -475,8 +480,13 @@ namespace
                         job.format = codebookIdToRepackFormat(source.codebook_id, source.is_superblock).value();
                         job.is_asymmetric = canonicalDeviceVnniFormat(source).is_asymmetric;
                         job.packed_payload_capacity_bytes_per_block = allocation.payload_bytes_per_block;
+                        // The run declares the same metadata representation
+                        // model loading would: coded for an immutable
+                        // source-native CUDA superblock run.
                         owner->planWeight(device.ordinal, job.name, job.N, job.K,
-                            allocation.payload_bytes_per_block, allocation.has_mins, allocation.has_emins, NativeQuantisedScalePlaneWidth::FP16Word, job.raw_bytes);
+                            allocation.payload_bytes_per_block, allocation.has_mins, allocation.has_emins,
+                            nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(source)), job.raw_bytes, {0},
+                            gpuPreparedWeightCodedDeclaration(*weights.front(), layout, device));
                     }
                     // Chunk boundaries deliberately cross expert boundaries;
                     // the loader must preserve each group's standalone layout.

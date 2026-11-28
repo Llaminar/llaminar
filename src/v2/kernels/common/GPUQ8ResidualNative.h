@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "kernels/common/NativeEmbeddingIQTables.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include <limits>
 #include "kernels/common/Q8ResidualCorrection.h"
 namespace llaminar2
@@ -80,9 +81,6 @@ namespace llaminar2
         case 19:
             visitor.template operator()<19>();
             return;
-        case 23:
-            visitor.template operator()<23>();
-            return;
         case 24:
             visitor.template operator()<24>();
             return;
@@ -101,7 +99,7 @@ namespace llaminar2
      * @return Exact consumed physical plane geometry.
      * @throws std::invalid_argument Before publication for an unsupported or malformed descriptor.
      */
-    inline NativeQuantisedMigrationStableDeviceFormat requireQ8ResidualNativeMatrix(
+    inline NativeQuantisedDeviceFormat requireQ8ResidualNativeMatrix(
         const DeviceNativeQuantisedMatrixDesc &d, int m, int n, int k)
     {
         visitQ8ResidualNativeCodebook(d.codebook_id, [&]<std::uint8_t>() {});
@@ -110,18 +108,33 @@ namespace llaminar2
                                      d.source_identity_present != 0},
             m, n, k);
         if (!d.valid() || d.n != n || d.k != k || d.blocks_per_row != static_cast<unsigned>(k / 32) ||
-            !deviceVnniExecutionCompatibleWithSource(source, d.codebook_id) || d.reserved ||
+            !deviceVnniExecutionCompatibleWithSource(source, d.codebook_id) ||
+            !nativeQuantisedLayoutValid(d.codebook_id, d.metadata_layout) ||
             d.reserved_tail || d.source_is_superblock > 1 || d.source_identity_present != 1 ||
             d.allocation_has_mins > 1 || d.allocation_has_emins > 1)
             throw std::invalid_argument("TwoTerm GPU prepared source/execution identity or shape mismatch");
         auto physical = canonicalDeviceVnniFormat(source);
         if (d.codebook_id != physical.codebook_id)
-            physical = {d.codebook_id, 32, d.codebook_id == kNativeQuantisedExpandedInt8MinCodebook, false};
+            physical = {d.codebook_id, 32, false, false};
         // The original constructor permits a declared reusable superset. Its
         // real capacity/plane flags remain authoritative; source geometry only
         // proves that the current live decoder fits, never invents a slot size.
         const bool allocated = d.allocation_payload_bytes_per_block != 0;
-        if ((physical.is_asymmetric && !d.mins) || (physical.has_emins && !d.emins) ||
+        // Coded immutable and reusable matrices use the same exact payload
+        // and code/superblock planes, with no per-block effective minima.
+        if (nativeQuantisedLayoutRepresentation(d.metadata_layout) ==
+            NativeQuantisedMetadataRepresentation::SuperblockCoded)
+        {
+            if (!source.is_superblock || d.codebook_id != canonicalDeviceVnniCodebookId(source) ||
+                !d.mins || d.emins || d.allocation_has_emins ||
+                (native_quantised_superblock::superblockCodeInPayload(d.codebook_id) && d.scales != d.payload) ||
+                (allocated ? d.allocation_payload_bytes_per_block != physical.payload_bytes_per_block ||
+                                 !d.allocation_has_mins
+                           : d.allocation_has_mins != 0))
+                throw std::invalid_argument("TwoTerm GPU superblock-coded source has malformed metadata planes");
+            physical.has_emins = false;
+        }
+        else if ((physical.is_asymmetric && !d.mins) || (physical.has_emins && !d.emins) ||
             (!allocated && (bool(d.mins) != physical.is_asymmetric || bool(d.emins) != physical.has_emins ||
                             d.allocation_has_mins || d.allocation_has_emins)) ||
             (allocated && (d.allocation_payload_bytes_per_block < physical.payload_bytes_per_block ||
@@ -149,6 +162,28 @@ namespace llaminar2
             throw std::invalid_argument("TwoTerm GPU native weight-plane byte extent exceeds addressable storage");
         return physical;
     }
+
+    /**
+     * @brief Byte extents of the admitted metadata regions TwoTerm must protect from scratch.
+     * @param d Descriptor validated by requireQ8ResidualNativeMatrix().
+     * @return Exact code/scale, superblock/secondary and emin byte extents.
+     *         Embedded codes already belong to the payload region.
+     */
+    inline NativeQuantisedMetadataPlaneBytes q8ResidualWeightMetadataBytes(const DeviceNativeQuantisedMatrixDesc &d)
+    {
+        const auto blocks = static_cast<std::size_t>(d.n) * d.blocks_per_row;
+        if (!d.metadata_layout)
+            return NativeQuantisedMetadataPlaneBytes::of(blocks, d.codebook_id, d.mins != nullptr, d.emins != nullptr);
+        namespace sb = native_quantised_superblock;
+        auto bytes = NativeQuantisedMetadataPlaneBytes::coded(d.codebook_id, d.n, d.blocks_per_row,
+                                                               nativeQuantisedLayoutPhase(d.metadata_layout));
+        const auto code_bits = sb::superblockCodePlaneBits(d.codebook_id);
+        if (code_bits)
+            bytes.scales = (blocks * code_bits + nativeQuantisedLayoutCodeBitShift(d.metadata_layout) + 7u) / 8u +
+                           sb::kSuperblockCodePlanePadBytes;
+        return bytes;
+    }
+
     /** @brief Internal launcher retaining a cold generation-bound immutable table view.
      * @param args Unchanged public projection ABI.
      * @param stream Exact non-default producer stream.

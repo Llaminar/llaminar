@@ -11,6 +11,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -31,9 +32,10 @@ namespace llaminar2::cpu::native_quantised
      * @brief Scalar NativeQuantised GEMV for correctness reference.
      *
      * For nibble-LUT formats (Q4_0, IQ4_NL, Q4_1, IQ4_XS): decodes from payload.
-     * For INT8 pre-decoded formats: reads from int8_flat buffer.
-     * Q6 uses the original base/coefficient metadata with separate FP32 edges.
-     * @param packed Prepared source payload and per-block metadata.
+     * For signed Q8: reads from the same interleaved publication as SIMD.
+     * Q6_K and IQ4_XS reconstruct the original half base and coefficients
+     * before applying their respective FP32 contribution programs.
+     * @param packed Prepared source payload and metadata.
      * @param A_q8 Unchanged Q8 activation blocks for one row.
      * @param C Destination for N output values.
      * @param N Live output columns, excluding padded allocation capacity.
@@ -154,7 +156,22 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     int8_t b_vals[32];
-                    if (packed.usesNibbleLUT())
+                    if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+                    {
+                        const auto *unit = packed.interleavedBase() + packed.blockOffset(chunk, kb);
+                        for (int group = 0; group < 4; ++group)
+                        {
+                            const auto *low = unit + Q5NativePayload::nibbleOffset(group, n_local);
+                            const unsigned fifth = unit[Q5NativePayload::fifthOffset(group, n_local)];
+                            const int bias = packed.is_asymmetric ? 0 : 16;
+                            for (int i = 0; i < 4; ++i)
+                            {
+                                b_vals[group * 4 + i] = (low[i] & 15) + 16 * ((fifth >> i) & 1) - bias;
+                                b_vals[group * 4 + 16 + i] = (low[i] >> 4) + 16 * ((fifth >> (i + 4)) & 1) - bias;
+                            }
+                        }
+                    }
+                    else if (packed.usesNibbleLUT())
                     {
                         // Four groups contain the original sixteen native
                         // bytes for this column. Reconstruct only this bounded
@@ -172,33 +189,12 @@ namespace llaminar2::cpu::native_quantised
                     }
                     else
                     {
-                        if (!packed.int8_flat.empty())
+                        const int z = n_local / 16;
+                        const int lane = n_local % 16;
+                        for (int group = 0; group < 8; ++group)
                         {
-                            std::memcpy(b_vals, packed.blockInt8(chunk, kb, n_local), 32);
-                        }
-                        else
-                        {
-                            /*
-                             * Modern packed weights release int8_flat after
-                             * interleaving to avoid carrying two full decoded
-                             * copies.  Reconstruct the scalar reference block
-                             * from the same native_interleaved layout used by
-                             * AVX2/AVX512: group covers four K values, and z
-                             * selects the 16-column lane group inside a chunk.
-                             */
-                            const int z = n_local / 16;
-                            const int lane = n_local % 16;
-                            for (int group = 0; group < 8; ++group)
-                            {
-                                const auto *group_data = reinterpret_cast<const int8_t *>(
-                                    packed.interleavedB(chunk, kb, group, z));
-                                const int src = lane * 4;
-                                const int dst = group * 4;
-                                b_vals[dst + 0] = group_data[src + 0];
-                                b_vals[dst + 1] = group_data[src + 1];
-                                b_vals[dst + 2] = group_data[src + 2];
-                                b_vals[dst + 3] = group_data[src + 3];
-                            }
+                            const auto *group_data = packed.interleavedB(chunk, kb, group, z);
+                            std::memcpy(b_vals + group * 4, group_data + lane * 4, 4);
                         }
                     }
 
@@ -215,6 +211,15 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     int32_t corrected = dot - 128 * b_comp;
+                    if (packed.usesNibbleLUTSourceScale())
+                    {
+                        const float combined = device_fp32_contract::multiply(a_scale, b_scale);
+                        const float dot_fp32 = static_cast<float>(corrected);
+                        acc = packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                            ? device_fp32_contract::add(acc, device_fp32_contract::multiply(combined, dot_fp32))
+                            : std::fma(combined, dot_fp32, acc);
+                        continue;
+                    }
                     acc += static_cast<float>(corrected) * a_scale * b_scale;
 
                     if (packed.is_asymmetric && b_min != 0.0f)

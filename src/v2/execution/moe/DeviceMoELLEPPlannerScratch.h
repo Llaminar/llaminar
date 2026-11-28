@@ -13,6 +13,7 @@
 
 #include "LeastLoadedExpertAssignment.h"
 #include "DeviceMoERuntimeABI.h"
+#include "DeviceMoERebalanceABI.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -130,6 +131,15 @@ namespace llaminar2
         return sizeof(DeviceMoETransferSlotClaimIndex) +
                static_cast<std::size_t>(slot_count) *
                    sizeof(DeviceMoETransferSlotClaimIndexEntry);
+    }
+
+    static_assert(sizeof(DeviceMoETransferSlotClaimIndex) >= sizeof(DeviceMoERebalanceArrivalScratch));
+    static_assert(sizeof(DeviceMoETransferSlotClaimIndexEntry) >= 2u * sizeof(uint32_t));
+
+    /** @return View of the retired claim scratch for the ordered unpack phase. */
+    inline DeviceMoERebalanceArrivalScratch *borrowDeviceMoEArrivalScratch(DeviceMoETransferSlotClaimIndex *claims) noexcept
+    {
+        return reinterpret_cast<DeviceMoERebalanceArrivalScratch *>(claims);
     }
 
     /**

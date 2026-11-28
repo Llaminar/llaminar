@@ -23,63 +23,64 @@
 namespace llaminar2
 {
     class IBackend;
-    class LoadOrchestrator;
     struct MoEOverlayLayerWeightManifest;
+    struct PrefixCacheRuntimeConfig;
+    enum class RoutedExpertAssignmentPolicy : uint8_t;
 
     /**
      * @brief Owns stable device allocations used to receive graph-side MoE arrivals.
      *
-     * A decode-maintenance directory is shared by every MoE layer in a model.
-     * Its allocations must therefore describe capacity, not one layer's active
-     * codebook. The active format is carried by each arriving directory entry
-     * and retargeted onto these stable pointers by the unpack kernel.
+     * Graphs share a stable slot index space. Each layer may lease only the
+     * range belonging to its exact movable projection layout tuple.
      */
     class DeviceMoETransferSlotDirectory
     {
     public:
         using ProjectionSpec = GpuExpertSlotPool::ProjectionSpec;
 
-        /**
-         * @brief Allocation and wire requirements distilled from model layer formats.
-         */
+        /** @brief One exact complete movable projection tuple and its member layers. */
+        struct SlotFamily
+        {
+            std::vector<ProjectionSpec> projections;
+            uint32_t layer_count = 0;
+        };
+
+        /** @brief Exact families in first-use order and their runtime layer membership. */
         struct FormatProfile
         {
-            std::vector<ProjectionSpec> allocation_specs;
-            size_t max_wire_payload_bytes = 0;
-            /// Immutable raw alias capacity, independent of a slot's occupant.
-            DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeQuantised;
-            /// Exact movable family, shared by sizing, materialization and device copy.
+            std::vector<SlotFamily> families;
+            std::vector<uint32_t> layer_families;
+            size_t max_wire_payload_bytes = 0; ///< Exactly the largest family payload; allocationBOM() rejects any other value.
             DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert;
         };
 
-        /**
-         * @brief Exact physical allocation owned by one transfer directory.
-         *
-         * Payload bytes are the single allocator-owned `WeightVRAMPool`
-         * region. Descriptor bytes cover the mutable table and immutable
-         * request-reset baseline. Keeping both terms together makes setup
-         * admission and runtime claims consume one byte-identical contract.
-         */
-        struct AllocationBOM
+        /** @brief Allocator quote for a family's payload, live entries and reset entries. */
+        struct FamilyAllocationBOM
         {
+            DeviceMoETransferSlotRange range;
             size_t payload_bytes = 0;
             size_t descriptor_bytes = 0;
+            /** @return Total physical bytes owned by the family. */
+            size_t totalBytes() const noexcept { return payload_bytes + descriptor_bytes; }
+        };
+
+        /** @brief Exact physical quote with one allocation line per slot family. */
+        struct AllocationBOM
+        {
+            std::vector<FamilyAllocationBOM> families;
+            size_t payload_bytes = 0;
+            size_t descriptor_bytes = 0;
+            size_t layer_range_bytes = 0;
             size_t total_bytes = 0;
+            uint32_t active_slots = 0;
+            uint32_t total_slots = 0;
         };
 
         /**
-         * @brief Merge exact per-layer formats into one reusable allocation profile.
-         *
-         * The returned allocation takes the component-wise maximum payload and
-         * auxiliary-array capacity for each projection. The wire size is the
-         * largest complete expert actually observed in any one layer, avoiding
-         * the waste of transmitting an impossible combination of per-projection
-         * maxima.
-         *
-         * @param layer_formats Exact movable projection specs for each layer.
-         * @param projection_set Complete expert or explicit gate/up-only ownership.
-         * @throws std::invalid_argument when any layer lacks a required projection,
-         *         includes a fixed projection, or mixes incompatible matrix geometry.
+         * @brief Group ordered runtime layers by their exact complete projection tuple.
+         * @param layer_formats One movable tuple per runtime layer, in layer order.
+         * @param projection_set Frozen projection ownership contract.
+         * @throws std::invalid_argument for malformed or unsupported projection tuples.
          */
         static FormatProfile profileForLayerFormats(
             const std::vector<std::vector<ProjectionSpec>> &layer_formats,
@@ -95,7 +96,7 @@ namespace llaminar2
          *
          * @param layer_weight_manifest Contiguous gate/up/down manifest for this stage's owned global layers.
          * @param projection_set The frozen domain's movable projections only.
-         * @return Cross-layer allocation and wire-capacity union.
+         * @return Exact layer families and maximum live wire footprint.
          * @throws std::invalid_argument for malformed, mixed projection, or
          *         uncatalogued projection formats.
          */
@@ -123,6 +124,8 @@ namespace llaminar2
             uint32_t active_slots = 0;
             uint32_t staging_slots = 0;
             uint32_t total_slots = 0;
+            uint32_t active_slots_per_layer = 0; ///< Runtime durable lane policy.
+            uint32_t minimum_active_slots = 0; ///< Non-durable demand per family.
         };
 
         /**
@@ -194,13 +197,27 @@ namespace llaminar2
          * @param capacity Typed active/staging directory capacity.
          * @param format_profile Exact reusable projection profile.
          * @return Payload, descriptor, and total physical bytes.
-         * @throws std::invalid_argument for incoherent capacity or format data.
+         * @throws std::invalid_argument for incoherent capacity or format data,
+         *         a family whose projections differ from the profile's
+         *         projection set, or a wire capacity other than the largest
+         *         family payload that profileForLayerFormats() derives.
          * @throws std::overflow_error when the complete allocation cannot be
          *         represented by `size_t`.
          */
         static AllocationBOM allocationBOM(
             BufferedCapacity capacity,
             const FormatProfile &format_profile);
+
+        /** @return Per-family live demand for the admitted native prefill/prefix transport. */
+        static uint32_t runtimeMinimumActiveSlots(bool native_gpu_transport,
+            RoutedExpertAssignmentPolicy prefill_assignment, const PrefixCacheRuntimeConfig &prefix_cache,
+            uint32_t compact_payload_slots) noexcept;
+
+        /** @return Complete capture identity, including exact layouts, membership and range policy. */
+        static std::string captureIdentity(const FormatProfile &profile, BufferedCapacity capacity);
+
+        /** @brief Reject a second layout for the same retained runtime domain. */
+        void requireCaptureIdentity(const FormatProfile &profile, BufferedCapacity capacity) const;
 
         /**
          * @brief Materialize one production directory against admitted VRAM.
@@ -209,7 +226,7 @@ namespace llaminar2
          * @param device_ordinal Backend-local ordinal matching @p device.
          * @param participant_id Stable routed-expert participant identity.
          * @param capacity Exact active and arrival-wave slot capacity.
-         * @param format_profile Allocation union for every runtime layer.
+         * @param format_profile Exact slot families for every runtime layer.
          * @param memory_authority Canonical admitted physical-memory ledger.
          * @return Model-lifetime owner of all payload and descriptor storage.
          * @throws std::invalid_argument for incomplete topology or admission.
@@ -287,12 +304,15 @@ namespace llaminar2
             uint32_t expected_participant_id) const;
 
         uint32_t slotCount() const { return slot_count_; }
-        /** @return Typed active/staging capacity admitted for production use. */
-        BufferedCapacity capacity() const noexcept { return capacity_; }
+        /** @return Active claims admitted across all families. */
+        uint32_t activeSlotCount() const noexcept { return active_slot_count_; }
+        /** @return Immutable range table indexed by runtime layer, owned by this device. */
+        const DeviceMoETransferSlotRange *deviceLayerRanges() const noexcept { return device_layer_ranges_; }
+        /** @return Complete physical quote verified during materialization. */
+        const AllocationBOM &materializedBOM() const noexcept { return bom_; }
         const std::vector<DeviceMoEExpertDirectoryEntry> &hostEntriesForTest() const { return host_entries_; }
         size_t plannedBytes() const { return planned_bytes_; }
         size_t wirePayloadBytes() const { return wire_payload_bytes_; }
-        size_t slotStorageCapacityBytes() const { return slot_storage_capacity_bytes_; }
         /**
          * @brief Retire every request-owned logical occupant on an explicit stream.
          *
@@ -324,6 +344,7 @@ namespace llaminar2
          *         gate/up/down NativeQuantised payload descriptors.
          */
         bool descriptorForSlot(uint32_t slot_index,
+                               uint32_t layer,
                                uint32_t logical_expert,
                                DeviceMoEExpertDescriptor &out) const;
 
@@ -334,17 +355,17 @@ namespace llaminar2
             DeviceId device,
             int device_ordinal,
             uint32_t participant_id,
-            BufferedCapacity capacity,
-            std::vector<ProjectionSpec> specs,
-            std::shared_ptr<LoadOrchestrator> orchestrator,
+            AllocationBOM bom,
+            FormatProfile profile,
+            std::string capture_identity,
+            std::vector<PhysicalMemoryAllocationLease> payload_leases,
+            std::vector<std::unique_ptr<WeightVRAMPool>> pools,
             DeviceMoEExpertDirectoryEntry *device_entries,
             DeviceMoEExpertDirectoryEntry *device_baseline_entries,
+            DeviceMoETransferSlotRange *device_layer_ranges,
             std::vector<DeviceMoEExpertDirectoryEntry> host_entries,
             std::optional<PhysicalMemoryAllocationLease>
-                directory_entries_lease,
-            size_t planned_bytes,
-            size_t wire_payload_bytes,
-            size_t slot_storage_capacity_bytes);
+                directory_entries_lease);
 
         /**
          * @brief Shared implementation for admitted and named test setup.
@@ -362,28 +383,26 @@ namespace llaminar2
             std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
             bool explicit_test_allocation);
 
-        /** @return Stable allocator key for one slot/projection pair. */
-        static std::string slotName(
-            uint32_t slot_index,
-            const std::string &label);
-
         IBackend *backend_ = nullptr;
         DeviceId device_;
         int device_ordinal_ = -1;
         uint32_t participant_id_ = 0;
         uint32_t slot_count_ = 0;
-        BufferedCapacity capacity_;
-        std::vector<ProjectionSpec> specs_;
-        std::shared_ptr<LoadOrchestrator> orchestrator_;
+        uint32_t active_slot_count_ = 0;
+        AllocationBOM bom_;
+        FormatProfile profile_;
+        std::string capture_identity_;
+        std::vector<PhysicalMemoryAllocationLease> payload_leases_;
+        std::vector<std::unique_ptr<WeightVRAMPool>> pools_;
         DeviceMoEExpertDirectoryEntry *device_entries_ = nullptr;
         DeviceMoEExpertDirectoryEntry *device_baseline_entries_ = nullptr;
+        DeviceMoETransferSlotRange *device_layer_ranges_ = nullptr;
         std::vector<DeviceMoEExpertDirectoryEntry> host_entries_;
         /** Live authority claim paired with both device descriptor arrays. */
         std::optional<PhysicalMemoryAllocationLease>
             directory_entries_lease_;
         size_t planned_bytes_ = 0;
         size_t wire_payload_bytes_ = 0;
-        size_t slot_storage_capacity_bytes_ = 0;
     };
 
 } // namespace llaminar2

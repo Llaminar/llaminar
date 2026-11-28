@@ -51,6 +51,7 @@
 
 #include <omp.h>
 
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
@@ -86,9 +87,7 @@ extern "C"
     bool rocmGemm_native_quantised_fp32(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const void *d_block_scales,
-        const void *d_block_mins,
-        const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
         float *d_output,
         const float *d_scales_A,
         const float *d_scales_A_blockwise,
@@ -100,9 +99,7 @@ extern "C"
     bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums(
         const int8_t *d_A_int8,
         const uint8_t *const *d_payloads,
-        const uint16_t *const *d_block_scales,
-        const uint16_t *const *d_block_mins,
-        const uint32_t *const *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes *d_metas,
         const float *const *d_biases,
         float *const *d_outputs,
         const float *d_scale_A_blockwise,
@@ -1104,10 +1101,7 @@ namespace
 
                 return rocmGemm_native_quantised_fp32(
                     d_A_int8,
-                    desc.payload,
-                    desc.scales,
-                    desc.mins,
-                    desc.emins,
+                    desc.payload, ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     d_output,
                     d_scales_A,
                     d_scales_A_blockwise,
@@ -1442,9 +1436,7 @@ namespace
             std::array<HipBuffer, 8> refs;
             std::array<HipBuffer, 8> partials;
             std::array<const uint8_t *, 8> payload_ptrs{};
-            std::array<const uint16_t *, 8> scale_ptrs{};
-            std::array<const uint16_t *, 8> min_ptrs{};
-            std::array<const uint32_t *, 8> emin_ptrs{};
+            std::array<::llaminar2::rocm_native_metadata::MetadataPlanes, 8> meta_planes{};
             std::array<const float *, 8> bias_ptrs{};
             std::array<float *, 8> output_ptrs{};
             std::array<float *, 8> partial_ptrs{};
@@ -1468,9 +1460,8 @@ namespace
                 }
 
                 payload_ptrs[i] = descs[i].payload;
-                scale_ptrs[i] = static_cast<const uint16_t *>(descs[i].scales);
-                min_ptrs[i] = static_cast<const uint16_t *>(descs[i].mins);
-                emin_ptrs[i] = static_cast<const uint32_t *>(descs[i].emins);
+                // The prepared descriptor's own representation (per-block or coded).
+                meta_planes[i] = ::llaminar2::native_quantised_scale::metadataPlanes(descs[i]);
                 bias_ptrs[i] = nullptr;
                 output_ptrs[i] = outputs[i].as<float>();
                 partial_ptrs[i] = partials[i].as<float>();
@@ -1496,9 +1487,7 @@ namespace
                 return rocmGemv_native_quantised_small_m_batched_fp32_with_sums(
                     d_A_int8.as<int8_t>(),
                     payload_ptrs.data(),
-                    scale_ptrs.data(),
-                    min_ptrs.data(),
-                    emin_ptrs.data(),
+                    meta_planes.data(),
                     bias_ptrs.data(),
                     output_ptrs.data(),
                     d_scales_A_blockwise.as<float>(),
@@ -1566,9 +1555,7 @@ namespace
             if (!rocmGemv_native_quantised_small_m_batched_fp32_with_sums(
                     d_A_int8.as<int8_t>(),
                     payload_ptrs.data(),
-                    scale_ptrs.data(),
-                    min_ptrs.data(),
-                    emin_ptrs.data(),
+                    meta_planes.data(),
                     bias_ptrs.data(),
                     output_ptrs.data(),
                     d_scales_A_blockwise.as<float>(),
@@ -1604,10 +1591,7 @@ namespace
                 {
                     if (!rocmGemm_native_quantised_fp32(
                             d_A_int8.as<int8_t>() + static_cast<size_t>(row) * static_cast<size_t>(K),
-                            descs[i].payload,
-                            descs[i].scales,
-                            descs[i].mins,
-                            descs[i].emins,
+                            descs[i].payload, ::llaminar2::native_quantised_scale::metadataPlanes(descs[i]),
                             refs[i].as<float>() + static_cast<size_t>(row) * static_cast<size_t>(N),
                             d_scales_A.as<float>() + row,
                             d_scales_A_blockwise.as<float>() +

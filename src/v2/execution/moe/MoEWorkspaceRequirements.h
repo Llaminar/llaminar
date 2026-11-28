@@ -201,10 +201,26 @@ namespace llaminar2
          * expert stage to happen to request them makes capture readiness depend
          * on graph ordering instead of the router's own contract.
          */
+        /**
+         * @brief Whether a CUDA router owns the immutable Q8 copy of its gate.
+         *
+         * The Q8 decode/verifier router quantizes only an FP32 prepared gate
+         * (CUDAMoEKernel::getOrCreateQ8RouterGateCache). BF16/FP16 gates are
+         * consumed natively and never bind the cache, so declaring it for them
+         * reserved kRouterGateCacheSlots x experts x d_model bytes of dead
+         * device memory (144 MiB for 256 experts at d_model 4096).
+         */
+        enum class CUDARouterGateCache : bool
+        {
+            None, ///< Prepared gate is BF16/FP16, or the Q8 router is disabled.
+            Q8,   ///< FP32 prepared gate with the Q8 router enabled.
+        };
+
         inline WorkspaceRequirements cudaRouting(
             int max_seq_len,
             int d_model,
-            int num_experts)
+            int num_experts,
+            CUDARouterGateCache gate_cache = CUDARouterGateCache::Q8)
         {
             WorkspaceRequirements reqs =
                 routing(max_seq_len, num_experts);
@@ -219,6 +235,8 @@ namespace llaminar2
             add(reqs, DECODE_HIDDEN_SCALES,
                 static_cast<std::size_t>(max_seq_len) *
                     static_cast<std::size_t>(d_model_blocks) * sizeof(float));
+            if (gate_cache == CUDARouterGateCache::None)
+                return reqs;
             add(reqs, CUDA_ROUTER_Q8_GATE_WEIGHTS,
                 static_cast<std::size_t>(kRouterGateCacheSlots) *
                     static_cast<std::size_t>(num_experts) *
@@ -344,10 +362,11 @@ namespace llaminar2
             int d_model,
             int intermediate,
             int num_experts,
-            int top_k)
+            int top_k,
+            CUDARouterGateCache gate_cache = CUDARouterGateCache::Q8)
         {
             WorkspaceRequirements reqs =
-                cudaRouting(max_seq_len, d_model, num_experts);
+                cudaRouting(max_seq_len, d_model, num_experts, gate_cache);
             reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
             num_experts = std::max(1, num_experts);
             const std::size_t table_descs =

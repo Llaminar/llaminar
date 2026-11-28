@@ -388,6 +388,11 @@ namespace llaminar2
                static_cast<size_t>(params_.config.participant_count);
     }
 
+    size_t MoEDeviceRebalanceStage::localHistogramWords() const
+    {
+        return workspaceCapacity().localHistogramWords();
+    }
+
     size_t MoEDeviceRebalanceStage::localDirectoryEntries() const
     {
         return static_cast<size_t>(params_.config.num_layers) *
@@ -717,6 +722,11 @@ namespace llaminar2
         {
             LOG_ERROR("[" << label << "] GPU device required, got "
                           << params_.device_id.to_string());
+            return false;
+        }
+        if (!workspaceCapacity().matchesHistogramConfig(params_.config))
+        {
+            LOG_ERROR("[" << label << "] Histogram layout and immutable transfer family ranges must match the admitted transport");
             return false;
         }
         if (!validateDeviceMoERebalanceConfig(params_.config))
@@ -1105,9 +1115,9 @@ namespace llaminar2
                 const size_t local_histogram_entries = localHistogramEntries();
                 const size_t gathered_histogram_entries = gatheredHistogramEntries();
                 const size_t local_histogram_bytes =
-                    local_histogram_entries * sizeof(uint64_t);
+                    localHistogramWords() * sizeof(uint32_t);
                 const size_t gathered_histogram_bytes =
-                    gathered_histogram_entries * sizeof(uint64_t);
+                    local_histogram_bytes * params_.config.participant_count;
                 PerfStatsCollector::addCounter(
                     "moe_rebalance",
                     "device_rebalance_histogram_payload_bytes",
@@ -1539,7 +1549,7 @@ namespace llaminar2
                     params_.local_transfer_slot_count,
                     params_.config,
                     copy_status,
-                    controller_state,
+                    borrowDeviceMoEArrivalScratch(transfer_slot_claim_index),
                     static_cast<uint32_t>(commandBufferCount())))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Collective rebalance payload unpack failed");
@@ -1638,7 +1648,7 @@ namespace llaminar2
                     params_.local_transfer_slot_count,
                     params_.config,
                     copy_status,
-                    controller_state,
+                    borrowDeviceMoEArrivalScratch(transfer_slot_claim_index),
                     static_cast<uint32_t>(commandBufferCount())))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Sideband collective rebalance payload unpack failed");
@@ -1719,7 +1729,7 @@ namespace llaminar2
             if (gathersStateInline())
             {
                 static_assert(sizeof(uint64_t) == 2 * sizeof(int32_t));
-                const size_t int32_words = localHistogramEntries() * 2u;
+                const size_t int32_words = localHistogramWords();
                 if (!params_.tp_ctx->allgatherRawOnStream(
                         local,
                         gathered,

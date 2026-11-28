@@ -475,20 +475,20 @@ namespace
         const auto mpi=MPIContextFactory::global();
         const auto inventory=mpi->clusterInventory();
         ASSERT_NE(inventory,nullptr);
-        const bool present=std::any_of(inventory->ranks.begin(),inventory->ranks.end(),[&](const auto &rank) {
-            return std::any_of(rank.gpus.begin(),rank.gpus.end(),[&](const auto &gpu) {
-                return gpu.type==backend && rankOwnsGPUDevice(rank,gpu);
-            });
-        });
-        ASSERT_TRUE(present)<<"Required original NUMA-local backend executor is absent";
+        const AutomaticOrchestrationRequest selection({.only_backends = std::vector{backend}});
+        const auto observers=PlanningKernelServiceCatalog::observers(*inventory,selection);
+        ASSERT_FALSE(observers.empty())<<"Required original NUMA-local backend executor is absent";
+        std::set<std::pair<int,std::string>> physical;
+        for(const auto &rank:inventory->ranks)
+            for(const auto &gpu:rank.gpus)
+                if(gpu.type==backend && rankOwnsGPUDevice(rank,gpu))
+                    physical.emplace(inventory->connectionBetweenRanks(rank.rank,rank.rank).sourceNode(),gpu.uuid);
+        std::uint64_t executed=0;
         const auto &original=inventory->getRank(mpi->rank());
-        std::optional<DeviceId> selected;
-        for(const auto &gpu:original.gpus)
-            if(gpu.type==backend && rankOwnsGPUDevice(original,gpu)) {
-                selected=DeviceId(backend,gpu.local_device_id);break;
-            }
-        if(!selected)return; // This original rank has no role for this backend.
-        const auto device=*selected;
+        for(const auto &observer:observers) {
+        if(observer.discoveryRank()!=mpi->rank())continue;
+        const auto device=observer.device();
+        requireRankLocalGPUOwnership(original,device,"prepared arithmetic lifecycle reporter");
         const auto host=planningObservedResource(original,DeviceId::cpu());
         const auto execution=planningObservedResource(original,device);
         auto &worker=GPUDeviceContextPool::instance().getContext(device);
@@ -570,6 +570,12 @@ namespace
             });
             requireRetired();
         }
+        ++executed;
+        }
+        std::uint64_t global_executed=0;
+        ASSERT_EQ(MPI_Allreduce(&executed,&global_executed,1,MPI_UINT64_T,MPI_SUM,mpi->communicator()),MPI_SUCCESS);
+        EXPECT_GT(global_executed,0u);
+        EXPECT_EQ(global_executed,physical.size());
     }
 
     /** @brief Join real FP32/streaming observations without another sample or model warmup. */

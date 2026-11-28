@@ -6,14 +6,11 @@
  * production packer therefore parallelizes direct source-codebook decoding into
  * its permanent VNNI byte stream.  These tests independently reconstruct that
  * stream from the public IINT8Unpackable contract and require exact equality for
- * every Expanded-INT8 codebook. Single-scale integer grids use the native
+ * every signed Q8 source. Coded integer grids use the native
  * prepared payload and exact metadata, not the older lossy INT8 export.
- * IQ3_S independently reads original GGUF blocks: primary is source half d,
- * secondary is its raw nibble, and encoding5 stays arithmetically symmetric.
- * Multi-scale sources retain every native payload/metadata bit and are checked
- * against independently addressed whole-row GPU preparation. The complete
- * 21-format catalog additionally
- * proves that every physical encoding is deterministic across OpenMP team sizes.
+ * The compact multi-scale oracle places coded payloads and shared metadata
+ * independently of the production window packer, including ragged headers.
+ * The 22-format catalog checks deterministic packing across teams.
  *
  * The geometry deliberately combines a nonzero tensor-parallel row slice, a
  * partial 64-column output chunk, complete 256-value superblocks, and a trailing
@@ -44,6 +41,7 @@
 #include <thread>
 #include <barrier>
 
+#include "kernels/cpu/gemm/CPUNativeQuantisedCodedMetadata.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "kernels/cpu/gemm/CPUPreparedWeightWriter.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
@@ -169,229 +167,30 @@ namespace llaminar2::cpu::native_quantised::test
         }
 
         /**
-         * @brief Independent scalar decode of one exact single-scale IQ grid.
-         *
-         * The source's native preparation contract is also consumed by the GPU.
-         * Read it with whole-row addressing (not the packer's bounded tile),
-         * then expand one value at a time without calling decode_native_block.
-         * This checks both the optimized decoder and its windowed destination
-         * addressing, while leaving the source's metadata untouched. IQ3_S
-         * takes a separate original-block oracle: neither its scale/coefficient
-         * nor signed-grid payload is obtained from production preparation.
-         *
-         * @param original Original quantized tensor and source-byte authority.
-         * @param source Quantized source implementation for the other IQ grids.
-         * @param packed Destination geometry and source codebook identity.
-         * @param source_row Original source row, including the TP slice offset.
-         * @param kb Logical 32-value block within that row.
-         * @param values Output signed grid values, before scale or minimum.
-         * @param scale Output original FP16 scale/base bits.
-         * @param minimum Output raw IQ3 nibble or other original FP16 minimum bits.
-         * @return Whether this source belongs to the lossless single-scale grid family.
-         */
-        bool decodeSingleScaleGridOracle(
-            const TensorBase &original,
-            const IINT8Unpackable &source,
-            const CPUNativeQuantisedPackedWeights &packed,
-            int source_row,
-            int kb,
-            std::array<int8_t, 32> &values,
-            uint16_t &scale,
-            uint16_t &minimum)
-        {
-            const uint8_t codebook = packed.codebook_id;
-            if (codebook != 11 && codebook != 12 &&
-                codebook != 15 && codebook != 16)
-                return false;
-
-            if (codebook == 11)
-            {
-                // Decode the original GGUF row/superblock directly, independently
-                // of packVnniBlock, native metadata helpers and optimized decoders.
-                if (original.native_type() != TensorType::IQ3_S || source_row < 0 ||
-                    kb < 0 || kb >= packed.blocks_per_row || packed.K <= 0)
-                    throw std::invalid_argument("IQ3 scalar oracle requires exact original source geometry");
-                const size_t superblocks_per_row=(static_cast<size_t>(packed.K)+255u)/256u;
-                const size_t offset=(static_cast<size_t>(source_row)*superblocks_per_row+
-                    static_cast<size_t>(kb/8))*sizeof(IQ3_SBlock);
-                const auto *raw=static_cast<const uint8_t*>(original.raw_data());
-                if (!raw || offset>original.size_bytes() || sizeof(IQ3_SBlock)>original.size_bytes()-offset)
-                    throw std::invalid_argument("IQ3 scalar oracle source block exceeds original bytes");
-                IQ3_SBlock block{};std::memcpy(&block,raw+offset,sizeof(block));
-                const int sub=kb%8;
-                scale=block.d;
-                minimum=static_cast<uint16_t>((block.scales[sub/2]>>(4*(sub%2)))&15u);
-                for(int element=0;element<32;++element)
-                {
-                    const int group=element/4;
-                    const unsigned index=block.qs[sub*8+group] |
-                        (((unsigned(block.qh[sub])>>group)&1u)<<8);
-                    const int magnitude=int((iq3s_grid[index]>>(8*(element%4)))&255u);
-                    const unsigned signs=unsigned(block.signs[sub*4+group/2])>>(4*(group%2));
-                    values[element]=static_cast<int8_t>((signs&(1u<<(element%4)))?-magnitude:magnitude);
-                }
-                return true;
-            }
-
-            // Full-row storage deliberately has no destination origin override.
-            // Only one block is populated, at its absolute source K index.
-            std::vector<uint8_t> payload(packed.blocks_per_row * packed.payload_bytes);
-            std::vector<uint16_t> scales(packed.blocks_per_row);
-            std::vector<uint16_t> minima(packed.blocks_per_row);
-            const VnniPackContext context{
-                .raw_bytes = nullptr,
-                .N = 1,
-                .K = packed.K,
-                .blocks_per_row = packed.blocks_per_row,
-                .payload_bytes = packed.payload_bytes,
-                .payload_array = payload.data(),
-                .scales_array = scales.data(),
-                .mins_array = minima.data(),
-                .emins_array = nullptr,
-                .primary_layout = packed.primaryScaleLayout(),
-            };
-            source.packVnniBlock(context, source_row, 0, kb);
-            const uint8_t *const block = payload.data() + kb * packed.payload_bytes;
-            scale = scales[kb];
-            minimum = minima[kb];
-
-            for (int element = 0; element < 32; ++element)
-            {
-                if (codebook == 11 || codebook == 12)
-                {
-                    const int grid_index = block[element / 4] |
-                        (codebook == 11
-                             ? ((block[8] >> (element / 4)) & 1) * 256
-                             : 0);
-                    const uint32_t grid = codebook == 11
-                        ? iq3s_grid[grid_index] : iq3xxs_grid[grid_index];
-                    const int magnitude = (grid >> (8 * (element % 4))) & 255;
-                    const int sign_byte = (codebook == 11 ? 9 : 8) + element / 8;
-                    values[element] = static_cast<int8_t>(
-                        (block[sign_byte] & (1 << (element % 8)))
-                            ? -magnitude : magnitude);
-                }
-                else if (codebook == 15)
-                {
-                    const uint64_t grid = iq2xxs_grid[block[element / 8]];
-                    const int magnitude = (grid >> (8 * (element % 8))) & 255;
-                    values[element] = static_cast<int8_t>(
-                        (block[4 + element / 8] & (1 << (element % 8)))
-                            ? -magnitude : magnitude);
-                }
-                else
-                {
-                    const unsigned high = block[4] | (unsigned(block[5]) << 8);
-                    const unsigned grid_index = block[element / 8] |
-                        (((high >> (3 * (element / 8))) & 7) << 8);
-                    const uint8_t bits = static_cast<uint8_t>(
-                        iq1s_grid[grid_index] >> (8 * (element % 8)));
-                    values[element] = std::bit_cast<int8_t>(bits);
-                }
-            }
-            return true;
-        }
-
-        /**
-         * @brief Reconstruct final Expanded-INT8 bytes without using the packer.
-         *
-         * Each source block is decoded through the scalar public interface,
-         * except exact IQ grids whose native integer/metadata contract is used.
-         * This intentionally avoids both the optimized superblock decoder and
-         * `packExpandedInt8Direct`, so the test does not share the implementation
-         * whose byte layout it certifies.
-         *
-         * @param source Original quantized source tensor.
-         * @param packed Production metadata describing destination geometry.
+         * @brief Construct the native Q8 interleave independently of the CPU writer.
+         * @param source Original Q8 tensor and signed-byte authority.
+         * @param packed Geometry published by the production writer.
          * @param row_start First source row represented by destination row zero.
-         * @return Independently constructed interleaved byte stream.
+         * @return Padded native Q8 bytes with one FP16 scale per column.
          */
-        std::vector<uint8_t> buildExpandedInt8Oracle(
-            const TensorBase &source,
-            const CPUNativeQuantisedPackedWeights &packed,
-            int row_start)
+        std::vector<uint8_t> buildSignedInt8SingleScaleOracle(
+            const TensorBase &source, const CPUNativeQuantisedPackedWeights &packed, int row_start)
         {
-            const auto *unpackable =
-                dynamic_cast<const IINT8Unpackable *>(&source);
-            if (unpackable == nullptr)
-                throw std::invalid_argument(
-                    "Expanded-INT8 oracle requires IINT8Unpackable source");
-            if (!packed.usesExpandedInt8() || packed.data_stride != 2048)
-                throw std::invalid_argument(
-                    "Expanded-INT8 oracle received another physical encoding");
-
-            const bool iq3_source_tuple=packed.codebook_id==11;
-            if (iq3_source_tuple &&
-                (packed.encoding!=CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
-                 packed.is_asymmetric || packed.data_stride!=2048 || packed.interleaved_block_stride!=2432))
-                throw std::invalid_argument("IQ3 scalar oracle requires source-tuple encoding5 geometry");
-            const int chunks = packed.N_padded / 64;
-            std::vector<uint8_t> expected(
-                static_cast<size_t>(chunks) * packed.blocks_per_row *
-                    static_cast<size_t>(packed.interleaved_block_stride),
-                0);
-
-            for (int chunk = 0; chunk < chunks; ++chunk)
-            {
-                const int valid_columns =
-                    std::min(64, packed.N - chunk * 64);
+            const auto &unpackable = dynamic_cast<const IINT8Unpackable &>(source);
+            constexpr int stride = 64 * 34;
+            std::vector<uint8_t> expected(size_t(packed.N_padded / 64) * packed.blocks_per_row * stride);
+            for (int n = 0; n < packed.N; ++n)
                 for (int kb = 0; kb < packed.blocks_per_row; ++kb)
                 {
-                    uint8_t *const block = expected.data() +
-                        (static_cast<size_t>(chunk) * packed.blocks_per_row +
-                         static_cast<size_t>(kb)) *
-                            static_cast<size_t>(packed.interleaved_block_stride);
-                    auto *const compensation =
-                        reinterpret_cast<int16_t *>(
-                            block + packed.data_stride);
-                    auto *const scales = reinterpret_cast<uint16_t *>(
-                        block + packed.data_stride + 128);
-                    // Raw secondary presence is a physical encoding fact, not
-                    // additive-minimum arithmetic. Keep all padded words zero.
-                    auto *const mins = (packed.is_asymmetric || iq3_source_tuple)
-                        ? reinterpret_cast<uint16_t *>(
-                              block + packed.data_stride + 256)
-                        : nullptr;
-
-                    for (int column = 0; column < valid_columns; ++column)
-                    {
-                        const size_t source_row = static_cast<size_t>(
-                            row_start + chunk * 64 + column);
-                        std::array<int8_t, 32> values{};
-                        uint16_t scale = 0;
-                        uint16_t minimum = 0;
-                        if (!decodeSingleScaleGridOracle(
-                                source, *unpackable, packed, static_cast<int>(source_row),
-                                kb, values, scale, minimum))
-                        {
-                            unpackable->unpack_block_to_int8(
-                                source_row, static_cast<size_t>(kb), values.data());
-                            scale = fp32_to_fp16(unpackable->get_block_scale(
-                                source_row, static_cast<size_t>(kb)));
-                            minimum = fp32_to_fp16(unpackable->get_block_min(
-                                source_row, static_cast<size_t>(kb)));
-                        }
-
-                        for (int group = 0; group < 8; ++group)
-                        {
-                            const int zmm = column / 16;
-                            const int lane = column % 16;
-                            std::memcpy(
-                                block + group * 256 + zmm * 64 + lane * 4,
-                                values.data() + group * 4,
-                                4);
-                        }
-
-                        int32_t sum = 0;
-                        for (int value = 0; value < 32; ++value)
-                            sum += values[value];
-                        compensation[column] = static_cast<int16_t>(sum);
-                        scales[column] = scale;
-                        if (mins != nullptr)
-                            mins[column] = minimum;
-                    }
+                    auto *unit = expected.data() + (size_t(n / 64) * packed.blocks_per_row + kb) * stride;
+                    const int column = n % 64;
+                    std::array<int8_t, 32> values{};
+                    unpackable.unpack_block_to_int8(row_start + n, kb, values.data());
+                    for (int group = 0; group < 8; ++group)
+                        std::memcpy(unit + group * 256 + column * 4, values.data() + group * 4, 4);
+                    const auto scale = fp32_to_fp16(unpackable.get_block_scale(row_start + n, kb));
+                    std::memcpy(unit + 2048 + column * 2, &scale, sizeof(scale));
                 }
-            }
             return expected;
         }
 
@@ -401,10 +200,10 @@ namespace llaminar2::cpu::native_quantised::test
          * @param rhs Second packed byte stream.
          * @param context Format-specific assertion context.
          */
-        template <typename Bytes>
+        template <typename LeftBytes, typename RightBytes>
         void expectIdenticalBytes(
-            const Bytes &lhs,
-            const Bytes &rhs,
+            const LeftBytes &lhs,
+            const RightBytes &rhs,
             std::string_view context)
         {
             ASSERT_EQ(lhs.size(), rhs.size()) << context;
@@ -412,6 +211,28 @@ namespace llaminar2::cpu::native_quantised::test
                 << context;
         }
     } // namespace
+
+    /** @test All three Q8 sources emit the original bytes and one scale across ragged K and N. */
+    TEST(CPUNativeQuantisedWeightPacking, SignedInt8SingleScaleRetainsNativeQ8Bytes)
+    {
+        for (const auto *name : {"Q8_0", "Q8_1", "Q8_K"})
+        {
+            SCOPED_TRACE(name);
+            auto source = createSourceTensor(name, {73u, 544u});
+            ASSERT_TRUE(source);
+            for (const int workers : {1, 4})
+            {
+                ScopedOMPThreadCount scoped_workers(workers);
+                CPUNativeQuantisedPackedWeights packed;
+                ASSERT_TRUE(packWeightsCPUNativeQuantised(source.get(), packed, 3, 70));
+                ASSERT_TRUE(packed.usesSignedInt8SingleScale());
+                ASSERT_TRUE(packed.publicationSealed());
+                EXPECT_EQ(packed.interleaved_block_stride, 64 * 34);
+                const auto oracle = buildSignedInt8SingleScaleOracle(*source, packed, 3);
+                expectIdenticalBytes(packed.native_interleaved, oracle, name);
+            }
+        }
+    }
 
     TEST(CPUNativeQuantisedWeightPacking,
          EveryCodebookIsByteExactAndThreadDeterministic)
@@ -424,7 +245,7 @@ namespace llaminar2::cpu::native_quantised::test
         static_assert(kK % 256 != 0);
 
         ASSERT_EQ(native_quantised_formats::kAllSourceFormats.size(), 22u);
-        size_t expanded_formats = 0;
+        size_t signed_q8_formats = 0;
         size_t compact_formats = 0;
 
         for (const NativeQuantisedSourceFormat &format :
@@ -450,8 +271,8 @@ namespace llaminar2::cpu::native_quantised::test
                     source.get(), parallel, kRowStart, kRowEnd));
             }
 
-            EXPECT_EQ(serial.N, kRowEnd - kRowStart);
-            EXPECT_EQ(serial.N_padded, 128);
+            ASSERT_EQ(serial.N, kRowEnd - kRowStart);
+            ASSERT_EQ(serial.N_padded, 128);
             EXPECT_EQ(serial.blocks_per_row, kK / 32);
             EXPECT_EQ(serial.encoding, parallel.encoding);
             EXPECT_EQ(serial.is_asymmetric, format.metadata->is_asymmetric);
@@ -469,43 +290,65 @@ namespace llaminar2::cpu::native_quantised::test
                 ++compact_formats;
                 const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(source.get());
                 ASSERT_NE(unpackable, nullptr);
-                const int blocks = serial.blocks_per_row;
-                const int bytes = format.metadata->payload_bytes;
-                std::vector<uint8_t> oracle(serial.native_interleaved.size(), 0);
+                constexpr int columns = 64;
+                constexpr int blocks = kK / 32;
+                constexpr int blocks_per_superblock = native_quantised_superblock::kBlocksPerSuperblock;
+                constexpr int superblocks = (blocks + blocks_per_superblock - 1) / blocks_per_superblock;
+                const auto codebook = format.metadata->codebook_id;
+                const int bytes = preparedCompactPayloadBytes(codebook);
+                const int words = preparedCompactPayloadWords(codebook);
+                const int tail = preparedCompactPayloadTailBytes(codebook);
+                const int code_bits = preparedCompactCodeBits(codebook);
+                const int data_stride = columns * bytes;
+                const int unit_stride = data_stride + columns * code_bits / 8;
+                const int header_stride = columns * native_quantised_superblock::superblockFieldBytes(codebook);
+                const int chunk_stride = blocks * unit_stride + superblocks * header_stride;
+                ASSERT_EQ(serial.data_stride, data_stride);
+                ASSERT_EQ(serial.interleaved_block_stride, unit_stride);
+                ASSERT_EQ(serial.superblockHeaderBytes(), header_stride);
+                std::vector<uint8_t> oracle(serial.N_padded / columns * chunk_stride, 0);
                 std::vector<uint8_t> payload(blocks * bytes);
-                std::vector<uint16_t> scales(blocks), secondary(blocks);
-                std::vector<uint32_t> minima(blocks);
-                // The oracle packs whole source rows. It does not reuse the
-                // production CPU packer's one-block destination window.
+                std::vector<uint32_t> codes(blocks), headers(superblocks);
+                // Drive the source codec over a whole row independently of the
+                // production CPU packer's per-superblock destination window.
                 const VnniPackContext context{
                     .raw_bytes = nullptr, .N = 1, .K = kK,
                     .blocks_per_row = blocks, .payload_bytes = bytes,
-                    .payload_array = payload.data(), .scales_array = scales.data(),
-                    .mins_array = secondary.data(), .emins_array = minima.data(),
+                    .payload_array = payload.data(),
+                    .codes_array = codes.data(), .superblocks_array = headers.data(),
                 };
                 for (int column = 0; column < serial.N; ++column)
                 {
                     for (int kb = 0; kb < blocks; ++kb)
                         unpackable->packVnniBlock(context, column + kRowStart, 0, kb);
+                    auto *chunk = oracle.data() + (column / columns) * chunk_stride;
+                    const int lane = column % columns;
                     for (int kb = 0; kb < blocks; ++kb)
                     {
-                        auto *unit = oracle.data() + ((column / 64) * blocks + kb) * 1536;
-                        const int local = column % 64;
-                        for (int byte = 0; byte < bytes; ++byte)
-                            unit[(byte / 4) * 256 + local * 4 + byte % 4] = payload[kb * bytes + byte];
-                        std::memcpy(unit + 1024 + local * 2, &scales[kb], 2);
-                        std::memcpy(unit + 1152 + local * 2, &secondary[kb], 2);
-                        if (format.metadata->has_emins)
-                            std::memcpy(unit + 1280 + local * 4, &minima[kb], 4);
+                        auto *unit = chunk + kb * unit_stride + (kb / blocks_per_superblock) * header_stride;
+                        const auto *source_payload = payload.data() + kb * bytes;
+                        for (int word = 0; word < words; ++word)
+                            std::memcpy(unit + (word * columns + lane) * 4, source_payload + word * 4, 4);
+                        if (tail)
+                            std::memcpy(unit + words * columns * 4 + lane * tail, source_payload + words * 4, tail);
+                        if (codebook == native_quantised_formats::Q5_K.codebook_id)
+                            coded_metadata::storeQ5HighBits(unit + words * columns * 4, lane, source_payload + words * 4);
+                        if (code_bits)
+                            coded_metadata::storeCode(unit + data_stride, codebook, lane, codes[kb]);
+                    }
+                    for (int sb = 0; sb < superblocks; ++sb)
+                    {
+                        const int end = std::min((sb + 1) * blocks_per_superblock, blocks);
+                        coded_metadata::storeSuperblockWord(
+                            chunk + end * unit_stride + sb * header_stride, codebook, lane, headers[sb]);
                     }
                 }
-                EXPECT_EQ(std::memcmp(serial.native_interleaved.data(), oracle.data(), oracle.size()), 0)
-                    << "native payload/metadata or padded columns differ from whole-row preparation";
+                expectIdenticalBytes(serial.native_interleaved, oracle, format.quant_type);
             }
-            if (!serial.usesExpandedInt8())
+            if (!serial.usesSignedInt8SingleScale())
                 continue;
-            ++expanded_formats;
-            const std::vector<uint8_t> oracle = buildExpandedInt8Oracle(
+            ++signed_q8_formats;
+            const std::vector<uint8_t> oracle = buildSignedInt8SingleScaleOracle(
                 *source, serial, kRowStart);
             ASSERT_EQ(serial.native_interleaved.size(), oracle.size());
             EXPECT_EQ(
@@ -518,12 +361,8 @@ namespace llaminar2::cpu::native_quantised::test
                 << " direct packing differs from the scalar block oracle";
         }
 
-        // Eleven source formats retain native nibble/Q6/multi-scale payloads.
-        // This count
-        // makes a future encoding-policy change update the independent oracle
-        // deliberately rather than silently shrinking its coverage.
-        EXPECT_EQ(expanded_formats, 10u);
-        EXPECT_EQ(compact_formats, 5u);
+        EXPECT_EQ(signed_q8_formats, 3u);
+        EXPECT_EQ(compact_formats, 10u);
     }
     namespace
     {

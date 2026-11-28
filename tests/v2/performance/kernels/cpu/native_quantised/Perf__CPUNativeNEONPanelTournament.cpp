@@ -15,7 +15,8 @@
  * interval is one team barrier, the workshare and its closing barrier.
  *
  * Candidates: a cell runs only when every row tile executes the requested
- * width. Compact multi-scale encodings (own column walk) and I8MM cells whose
+ * width. Compact multi-scale encodings retain their own column walk and accept
+ * only Strips = 1 for production-path timing. I8MM cells whose
  * row pairs run the SMMLA strip walk (M >= 2 with Strips > 1) are rejected
  * rather than mislabelled.
  *
@@ -37,10 +38,12 @@
  * numbers are canonical decimals, so list entries are unique by value):
  * - LLAMINAR_PANEL_STRIPS: 1, 2 or 4 (default 1); panels tile a 64-column chunk
  * - LLAMINAR_PANEL_ISA: asimd | dotprod | i8mm (default dotprod when compiled)
- * - LLAMINAR_PANEL_FORMATS: unique source labels (default Q4_K,Q6_K,IQ3_S,IQ4_XS,Q8_0)
+ * - LLAMINAR_PANEL_FORMATS: unique source labels (default Q4_K,Q6_K,IQ4_XS,Q8_0)
  * - LLAMINAR_PANEL_SHAPES: unique NxK, 1 <= N, K <= 65536 (default 2048x4096,17408x5120,512x2048)
  * - LLAMINAR_PANEL_M: unique rows in 1..64 (default 1,2,4)
  * - LLAMINAR_PANEL_WARMUP: 0..10000 (default 5); LLAMINAR_PANEL_ITERS: 1..100000 (default 31)
+ * - LLAMINAR_PANEL_POLICY: native (contiguous BackendNative K fold, default) or aligned
+ *   (ordered GPUAlignedExpert partition tree)
  *
  * Output: one CSV line per cell:
  * format,n,k,m,threads,isa,strips,median_us,p95_us,min_us,iters
@@ -153,12 +156,13 @@ struct Workload
     std::vector<Shape> shapes;
     std::vector<int> rows;
     int warmup = 5, iters = 31;
+    CPUProjectionNumericalPolicy policy = CPUProjectionNumericalPolicy::BackendNative;
 };
 
 /**
  * @brief Admit every selection before any allocation or timing.
  * @throws std::invalid_argument For malformed, empty, duplicate or out-of-range input,
- * unknown or compact formats, uncompiled families and candidates a tile would not run.
+ * unknown formats, uncompiled families and candidates a tile would not run.
  */
 Workload admit(const std::function<std::string(const char *, const char *)> &get)
 {
@@ -180,11 +184,11 @@ Workload admit(const std::function<std::string(const char *, const char *)> &get
 #endif
     if (!compiled)
         throw std::invalid_argument("LLAMINAR_PANEL_ISA names a family this binary does not contain: " + w.isa);
-    w.formats = fields(get("LLAMINAR_PANEL_FORMATS", "Q4_K,Q6_K,IQ3_S,IQ4_XS,Q8_0"), "LLAMINAR_PANEL_FORMATS");
+    w.formats = fields(get("LLAMINAR_PANEL_FORMATS", "Q4_K,Q6_K,IQ4_XS,Q8_0"), "LLAMINAR_PANEL_FORMATS");
     for (const auto &label : w.formats)
-        if (preparedEncodingForSource(format(label)) == CPUNativeQuantisedEncoding::CompactMultiScale)
+        if (preparedEncodingForSource(format(label)) == CPUNativeQuantisedEncoding::CompactMultiScale && w.strips != 1)
             throw std::invalid_argument("Compact multi-scale format " + label +
-                " keeps its own column walk; it has no panel candidate");
+                " keeps its own column walk; only Strips=1 executes its production program");
     // Numbers are canonical decimals, so the fields' textual uniqueness is
     // uniqueness of the parsed rows and N x K cells.
     for (const auto &text : fields(get("LLAMINAR_PANEL_SHAPES", "2048x4096,17408x5120,512x2048"), "LLAMINAR_PANEL_SHAPES"))
@@ -194,6 +198,11 @@ Workload admit(const std::function<std::string(const char *, const char *)> &get
     for (const int m : w.rows)
         if (w.isa == "i8mm" && m >= 2 && w.strips > 1)
             throw std::invalid_argument("I8MM row pairs run the SMMLA strip walk: M >= 2 has no Strips > 1 candidate");
+    const auto policy = get("LLAMINAR_PANEL_POLICY", "native");
+    if (policy == "aligned")
+        w.policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    else if (policy != "native")
+        throw std::invalid_argument("LLAMINAR_PANEL_POLICY must be native or aligned");
     w.warmup = integer(get("LLAMINAR_PANEL_WARMUP", "5"), 0, 10000, "LLAMINAR_PANEL_WARMUP");
     w.iters = integer(get("LLAMINAR_PANEL_ITERS", "31"), 1, 100000, "LLAMINAR_PANEL_ITERS");
     return w;
@@ -396,7 +405,21 @@ int selfTest()
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
         if (!compact_found && preparedEncodingForSource(*source.metadata) == CPUNativeQuantisedEncoding::CompactMultiScale)
         {
-            rejects({{"LLAMINAR_PANEL_FORMATS", std::string(source.quant_type)}}, "compact format");
+            const std::string label(source.quant_type);
+            for (const std::string strips : {"2", "4"})
+                rejects({{"LLAMINAR_PANEL_FORMATS", label}, {"LLAMINAR_PANEL_STRIPS", strips}},
+                    "compact format with a forced panel");
+            try
+            {
+                const auto w = admit([&](const char *name, const char *fallback) {
+                    if (std::string_view(name) == "LLAMINAR_PANEL_FORMATS") return label;
+                    if (std::string_view(name) == "LLAMINAR_PANEL_STRIPS") return std::string("1");
+                    return std::string(fallback);
+                });
+                expect(w.strips == 1 && w.formats == std::vector<std::string>{label},
+                    "compact production program admitted without a panel override");
+            }
+            catch (const std::exception &) { expect(false, "compact Strips=1 admitted"); }
             compact_found = true;
         }
     expect(compact_found, "a registered compact format exists for the control");
@@ -406,6 +429,7 @@ int selfTest()
 #endif
 
     rejects({{"LLAMINAR_PANEL_M", "1,01"}}, "rows repeated through a leading zero");
+    rejects({{"LLAMINAR_PANEL_POLICY", "ordered"}}, "unknown numerical policy");
     rejects({{"LLAMINAR_PANEL_SHAPES", "64x32,064x032"}}, "shape repeated through leading zeros");
     rejects({{"LLAMINAR_PANEL_SHAPES", "64x32,64x32"}}, "repeated shape text");
 
@@ -514,7 +538,7 @@ int main()
             {
                 test::NativeQuantisedPreparedByteFixture fixture(format(label), geometry.n, geometry.k,
                     std::size_t(1) << 31);
-                fixture.descriptor.numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
+                fixture.descriptor.numerical_policy = w.policy;
                 fixture.seedPayloadAndMetadata();
                 const auto weights = fixture.view();
                 const std::vector<std::uint8_t> weights_before(weights.bytes().begin(), weights.bytes().end());

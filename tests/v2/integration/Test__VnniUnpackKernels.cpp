@@ -1242,7 +1242,7 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_0) {
         /*is_asymmetric=*/false, /*is_superblock=*/false, /*has_emins=*/false,
         N, K);
 
-    ASSERT_TRUE(validateGpuPackedHeader(header, gpuPackedTotalSize(header)));
+    ASSERT_EQ(validateGpuPackedHeader(header, gpuPackedTotalSize(header)), GpuPackedParseStatus::Success);
 
     auto packed_buf = WeightTranslator::packGpuWeightsForTransfer(
         *backend_, device_id_,
@@ -1254,8 +1254,8 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_0) {
 
     // 3. Parse the buffer
     GpuPackedWeightsView view;
-    ASSERT_TRUE(parseGpuPackedBuffer(packed_buf.data(), packed_buf.size(), view))
-        << "parseGpuPackedBuffer failed";
+    const auto status = parseGpuPackedBuffer(packed_buf.data(), packed_buf.size(), view);
+    ASSERT_EQ(status, GpuPackedParseStatus::Success) << gpuPackedParseDiagnostic(status, view.header);
     EXPECT_EQ(view.header.N, static_cast<uint32_t>(N));
     EXPECT_EQ(view.header.K, static_cast<uint32_t>(K));
     EXPECT_EQ(view.header.format, static_cast<uint8_t>(RepackFormat::Q4_0));
@@ -1324,7 +1324,7 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_1_Asymmetric) {
         RepackFormat::Q4_1, /*codebook_id=*/5, payload_bytes,
         /*is_asymmetric=*/true, /*is_superblock=*/false, /*has_emins=*/false,
         N, K);
-    ASSERT_TRUE(validateGpuPackedHeader(header, gpuPackedTotalSize(header)));
+    ASSERT_EQ(validateGpuPackedHeader(header, gpuPackedTotalSize(header)), GpuPackedParseStatus::Success);
 
     auto packed_buf = WeightTranslator::packGpuWeightsForTransfer(
         *backend_, device_id_,
@@ -1334,7 +1334,8 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_1_Asymmetric) {
     ASSERT_EQ(packed_buf.size(), gpuPackedTotalSize(header));
 
     GpuPackedWeightsView view;
-    ASSERT_TRUE(parseGpuPackedBuffer(packed_buf.data(), packed_buf.size(), view));
+    const auto status = parseGpuPackedBuffer(packed_buf.data(), packed_buf.size(), view);
+    ASSERT_EQ(status, GpuPackedParseStatus::Success) << gpuPackedParseDiagnostic(status, view.header);
     EXPECT_NE(view.mins, nullptr) << "Asymmetric format should have mins";
 
     GpuMem d_payload2(backend_, device_id_, total_output * payload_bytes);
@@ -1368,9 +1369,9 @@ TEST_P(VnniUnpackTest, HeaderValidation) {
         /*is_asymmetric=*/false, /*is_superblock=*/false, /*has_emins=*/false,
         /*N=*/256, /*K=*/4096);
 
-    EXPECT_TRUE(validateGpuPackedHeader(header, gpuPackedTotalSize(header)));
+    EXPECT_EQ(validateGpuPackedHeader(header, gpuPackedTotalSize(header)), GpuPackedParseStatus::Success);
     EXPECT_EQ(header.magic, 0x54575047u); // "GPWT"
-    EXPECT_EQ(header.version, 1u);
+    EXPECT_EQ(header.version, GPU_PACKED_WEIGHTS_VERSION);
     EXPECT_EQ(header.N, 256u);
     EXPECT_EQ(header.K, 4096u);
     EXPECT_EQ(header.blocks_per_row, 4096u / 32);
@@ -1382,12 +1383,12 @@ TEST_P(VnniUnpackTest, HeaderValidation) {
     // Corrupted magic should fail
     auto bad = header;
     bad.magic = 0xDEADBEEF;
-    EXPECT_FALSE(validateGpuPackedHeader(bad, gpuPackedTotalSize(bad)));
+    EXPECT_EQ(validateGpuPackedHeader(bad, gpuPackedTotalSize(bad)), GpuPackedParseStatus::MalformedInput);
 
     // Wrong version should fail
     bad = header;
     bad.version = 99;
-    EXPECT_FALSE(validateGpuPackedHeader(bad, gpuPackedTotalSize(bad)));
+    EXPECT_EQ(validateGpuPackedHeader(bad, gpuPackedTotalSize(bad)), GpuPackedParseStatus::UnsupportedVersion);
 }
 
 TEST_P(VnniUnpackTest, GpuPackedTotalSize) {
@@ -1444,7 +1445,8 @@ TEST_P(VnniUnpackTest, FullPipeline_Q4_0) {
 
     // 4. Parse and upload to fresh GPU buffers
     GpuPackedWeightsView view;
-    ASSERT_TRUE(parseGpuPackedBuffer(packed.data(), packed.size(), view));
+    const auto status = parseGpuPackedBuffer(packed.data(), packed.size(), view);
+    ASSERT_EQ(status, GpuPackedParseStatus::Success) << gpuPackedParseDiagnostic(status, view.header);
 
     GpuMem d_payload2(backend_, device_id_, total_output * payload_bytes);
     GpuMem d_scales2(backend_, device_id_, total_output * sizeof(uint16_t));

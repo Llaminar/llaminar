@@ -7,7 +7,7 @@
  * Prepared ownership follows MoEProjectionPipeline: sparse initial gate/up
  * payloads in the ordinary runtime and every original-source fixed down slice.
  * Extra full-H oracle engines cover only the actually routed source experts.
- * An explicit promoted23 fixture publishes genuine completed CPU transfer
+ * An explicit cpu-migration fixture publishes genuine completed CPU transfer
  * storage through the production borrowed-storage GEMM and prepared-arrival API;
  * the original compact engines remain the independent numerical oracle.
  * Runtime-mutable format reachability is certified from prepared/setup metadata;
@@ -29,14 +29,14 @@ using Json = nlohmann::json;
 
 /**
  * @param spec Explicit immutable prepared-representation declaration.
- * @return Whether local resident gate/up must be genuine expanded-asymmetric CPU arrivals.
+ * @return Whether local resident gate/up must be canonical CPU arrivals.
  * @throws std::invalid_argument For an unknown enum; no prepared representation substitution.
  */
-inline bool promoted23Fixture(const Diagnostic &spec)
+inline bool migrationFixture(const Diagnostic &spec)
 {
     using namespace test::native_quantised_dispatch;
     (void)moeProjectionPreparedRepresentationName(spec.prepared_representation);
-    return spec.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedPromoted23;
+    return spec.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedMigrated;
 }
 
 /**
@@ -96,7 +96,7 @@ inline bool partitionContest(const Diagnostic &spec)
  */
 inline const char *evidenceGeneration(const Diagnostic &spec)
 {
-    if (promoted23Fixture(spec)) return "rocm-moe-owner-compact-promoted23-automatic-partition-diagnostic-v1";
+    if (migrationFixture(spec)) return "rocm-moe-owner-compact-cpu-migration-automatic-partition-diagnostic-v1";
     if (automaticContest(spec)) return "rocm-moe-owner-compact-automatic-partition-diagnostic-v1";
     return partitionContest(spec) ? "rocm-moe-owner-compact-source-partition-diagnostic-v1"
                                  : "rocm-moe-owner-compact-diagnostic-v2";
@@ -116,7 +116,7 @@ inline std::string ownerCandidateId(const Diagnostic &spec, rocm::MoERouteOwnedG
     const auto base = "rocm.moe.route_owned.gate_up.tn" +
         std::to_string(rocm::moeRouteOwnedGateUpColumns(geometry)) + ".k1";
     const auto *name = partitionExecutionName(execution);
-    const std::string prepared_suffix = promoted23Fixture(spec) ? ".prepared.cpu-prepared-promoted23" : "";
+    const std::string prepared_suffix = migrationFixture(spec) ? ".prepared.cpu-prepared-migrated" : "";
     if (automaticContest(spec) && execution == rocm::MoERouteOwnedGateUpPartitionExecution::Serial)
         return "rocm.moe.route_owned.gate_up.automatic-production.n" + std::to_string(spec.source.routed_expert_width) +
             ".k" + std::to_string(spec.source.hidden_size) + prepared_suffix;
@@ -137,7 +137,7 @@ inline Json descriptorIdentity(const DeviceNativeQuantisedMatrixDesc &d)
     return {{"n", d.n}, {"k", d.k}, {"execution_codebook", d.codebook_id},
         {"source_codebook", d.source_codebook_id}, {"source_is_superblock", bool(d.source_is_superblock)},
         {"source_identity_present", bool(d.source_identity_present)}, {"blocks_per_row", d.blocks_per_row},
-        {"descriptor_abi_bytes", sizeof(d)}, {"payload", reinterpret_cast<std::uintptr_t>(d.payload)},
+        {"metadata_layout", d.metadata_layout}, {"descriptor_abi_bytes", sizeof(d)}, {"payload", reinterpret_cast<std::uintptr_t>(d.payload)},
         {"scales", reinterpret_cast<std::uintptr_t>(d.scales)},
         {"mins", reinterpret_cast<std::uintptr_t>(d.mins)}, {"emins", reinterpret_cast<std::uintptr_t>(d.emins)}};
 }
@@ -200,7 +200,7 @@ struct PreparedOwner final
 
     /**
      * @brief Prepare one distinct original projection through the real CPU transfer and GPU engine path.
-     * @param spec Original source/owner declaration; no authored physical23 source alias.
+     * @param spec Original source/owner declaration; no authored physical decoder alias.
      * @param expert Actual original logical expert, preserved in the transfer manifest.
      * @param projection Actual gate/up role; fixed down never enters this movable family.
      * @param source Original immutable tensor already retained for the independent compact oracle.
@@ -215,20 +215,19 @@ struct PreparedOwner final
         const DeviceNativeQuantisedMatrixDesc &original)
     {
         using namespace test::native_quantised_transfer_parity_detail;
-        require(promoted23Fixture(spec) && source && original.valid() && original.source_identity_present &&
+        require(migrationFixture(spec) && source && original.valid() && original.source_identity_present &&
             original.n == spec.source.routed_expert_width && original.k == spec.source.hidden_size &&
             expert >= 0 && expert < spec.source.expert_count &&
             (projection == ExpertTierWeightProjection::Gate || projection == ExpertTierWeightProjection::Up),
-            "promoted23 requires a complete original local gate/up source");
+            "cpu-migration requires a complete original local gate/up source");
         auto storage = std::make_shared<PromotedProjectionStorage>();
         require(cpu::native_quantised::packWeightsCPUNativeQuantised(source.get(), storage->cpu) &&
-            storage->cpu.usesExpandedInt8() && storage->cpu.is_asymmetric &&
             storage->cpu.codebook_id == original.source_codebook_id &&
             storage->cpu.is_superblock == bool(original.source_is_superblock) &&
             storage->cpu.N == original.n && storage->cpu.N_padded == original.n && storage->cpu.K == original.k,
-            "original source did not produce the declared genuine expanded asymmetric CPU bytes");
+            "original source did not produce the declared canonical CPU preparation");
         auto *backend = getBackendFor(device);
-        require(backend != nullptr, "promoted23 backend is absent");
+        require(backend != nullptr, "cpu-migration backend is absent");
         const auto lane_identity = std::uint64_t{930000} + std::uint64_t(expert) * 2u +
             static_cast<std::uint64_t>(projection);
         const auto probe = makeCpuToGpuExpertTierWeightStreamManifest(storage->cpu, 1, 0, expert, projection, 1);
@@ -238,10 +237,15 @@ struct PreparedOwner final
         storage->gpu.emplace(promoteCPUProjection(backend, device, storage->cpu, projection, lane_identity, options));
         const auto &arrived = *storage->gpu;
         const auto &d = arrived.descriptor;
-        require(arrived.payload && arrived.scales && arrived.mins && d.valid() &&
-            d.payload == arrived.payload->as<std::uint8_t>() && d.scales == arrived.scales->get() &&
-            d.mins == arrived.mins->get() && d.emins == (arrived.emins ? arrived.emins->get() : nullptr) &&
-            d.codebook_id == kNativeQuantisedExpandedInt8MinCodebook && d.mins &&
+        const auto &metadata = spec.descriptor_evidence.at("original_source_roles").at(
+            projection == ExpertTierWeightProjection::Gate ? "gate" : "up");
+        require(arrived.payload && d.valid() &&
+            d.payload == arrived.payload->as<std::uint8_t>() &&
+            d.scales == (arrived.scales ? arrived.scales->get() : arrived.payload->get()) &&
+            d.mins == (arrived.mins ? arrived.mins->get() : nullptr) &&
+            d.emins == (arrived.emins ? arrived.emins->get() : nullptr) &&
+            d.codebook_id == metadata.at("migration_execution_codebook").get<uint8_t>() &&
+            (d.metadata_layout != 0) == metadata.at("migration_superblock_coded").get<bool>() &&
             d.n == original.n && d.k == original.k && d.blocks_per_row == std::uint32_t(original.k / 32) &&
             d.source_identity_present && d.source_codebook_id == original.source_codebook_id &&
             d.source_is_superblock == original.source_is_superblock &&
@@ -252,18 +256,12 @@ struct PreparedOwner final
             arrived.manifest.gpu_source_codebook_id == d.source_codebook_id &&
             arrived.manifest.gpu_source_is_superblock == d.source_is_superblock &&
             arrived.manifest.maximum_units_per_chunk == options.maximum_units_per_chunk,
-            "completed promoted23 storage/manifest contradicts its exact original source");
-        auto engine = std::make_shared<rocm::ROCmQuantisedGemmKernel>(d.n, d.k, device.ordinal,
-            arrived.payload->as<std::uint8_t>(), arrived.scales->get(), arrived.mins->get(),
-            arrived.emins ? arrived.emins->get() : nullptr, d.codebook_id, d.blocks_per_row, storage,
-            NativeQuantisedSourceIdentity{.codebook_id = d.source_codebook_id,
-                .is_superblock = d.source_is_superblock != 0, .present = true},
-            NativeQuantisedReusableDeviceAllocationFormat{.payload_bytes_per_block = d.allocation_payload_bytes_per_block,
-                .has_mins = d.allocation_has_mins != 0, .has_emins = d.allocation_has_emins != 0});
+            "completed cpu-migration storage/manifest contradicts its exact original source");
+        auto engine = promotedEngine(device, d, storage);
         DeviceNativeQuantisedMatrixDesc exported{};
         require(engine->exportNativeQuantisedMatrixDesc(exported) && exported.valid() &&
             exported.payload == d.payload && exported.scales == d.scales && exported.mins == d.mins && exported.emins == d.emins &&
-            exported.n == d.n && exported.k == d.k && exported.blocks_per_row == d.blocks_per_row &&
+            exported.metadata_layout == d.metadata_layout && exported.n == d.n && exported.k == d.k && exported.blocks_per_row == d.blocks_per_row &&
             exported.codebook_id == d.codebook_id && exported.source_identity_present == d.source_identity_present &&
             exported.source_codebook_id == d.source_codebook_id && exported.source_is_superblock == d.source_is_superblock &&
             exported.allocation_payload_bytes_per_block == d.allocation_payload_bytes_per_block &&
@@ -273,7 +271,7 @@ struct PreparedOwner final
             {"lane_identity", lane_identity}, {"epoch", arrived.manifest.residency_epoch},
             {"layer", arrived.manifest.layer_idx}, {"maximum_units_per_chunk", arrived.manifest.maximum_units_per_chunk},
             {"source_codebook", storage->cpu.codebook_id}, {"source_is_superblock", storage->cpu.is_superblock},
-            {"cpu_expanded_asymmetric", true}, {"actual_descriptor", descriptorIdentity(exported)},
+            {"cpu_encoding", static_cast<unsigned>(storage->cpu.encoding)}, {"actual_descriptor", descriptorIdentity(exported)},
             {"allocation_format", {{"payload_bytes_per_block", d.allocation_payload_bytes_per_block},
                 {"has_mins", bool(d.allocation_has_mins)}, {"has_emins", bool(d.allocation_has_emins)}}},
             {"transfers_completed", arrived.stats.transfers_completed}, {"chunks_submitted", arrived.stats.chunks_submitted},
@@ -379,7 +377,7 @@ struct PreparedOwner final
                 local_gate_up[expert] = MoEOverlayPreparedExpertPayload::gateUp(handle(indices[expert][0]), handle(indices[expert][1]));
                 entry["gate"] = descriptorIdentity(descriptor(indices[expert][0], gate_format, source.routed_expert_width, source.hidden_size));
                 entry["up"] = descriptorIdentity(descriptor(indices[expert][1], gate_format, source.routed_expert_width, source.hidden_size));
-                if (promoted23Fixture(spec))
+                if (migrationFixture(spec))
                 {
                     const auto original_gate = descriptor(indices[expert][0], gate_format, source.routed_expert_width, source.hidden_size);
                     const auto original_up = descriptor(indices[expert][1], gate_format, source.routed_expert_width, source.hidden_size);
@@ -393,13 +391,17 @@ struct PreparedOwner final
                         throw std::runtime_error("completed promoted gate/up arrival publication failed: " + error);
                     DeviceMoEExpertDescriptor actual{};
                     require(exportDeviceMoEPreparedPayload(local_gate_up[expert], actual) &&
-                        actual.gate.codebook_id == kNativeQuantisedExpandedInt8MinCodebook &&
-                        actual.up.codebook_id == kNativeQuantisedExpandedInt8MinCodebook,
-                        "promoted gate/up payload did not export its actual resident23 engines");
+                        actual.gate.valid() && actual.up.valid() &&
+                        actual.gate.source_identity_present && actual.up.source_identity_present &&
+                        actual.gate.source_codebook_id == original_gate.source_codebook_id &&
+                        actual.up.source_codebook_id == original_up.source_codebook_id &&
+                        actual.gate.source_is_superblock == original_gate.source_is_superblock &&
+                        actual.up.source_is_superblock == original_up.source_is_superblock,
+                        "migrated gate/up payload did not export its original source identities");
                     entry["original_compact_gate_oracle"] = entry["gate"];
                     entry["original_compact_up_oracle"] = entry["up"];
                     entry["gate"] = descriptorIdentity(actual.gate); entry["up"] = descriptorIdentity(actual.up);
-                    entry["prepared_representation"] = "cpu-prepared-promoted23";
+                    entry["prepared_representation"] = "cpu-prepared-migrated";
                 }
             }
             inventory.push_back(std::move(entry));
@@ -1224,7 +1226,7 @@ inline void run(const Diagnostic &spec)
     if (partition_contest) std::fputs(partition_columns, raw.get());
     if (automatic_contest) std::fputs(",gate_k_lanes_min,gate_k_lanes_max,gate_physical_control", raw.get());
     std::fputc('\n', raw.get());
-    Json evidence{{"schema", promoted23Fixture(spec) ? "native-quantised-moe-projection-promoted23-evidence-v1" : automatic_contest ? "native-quantised-moe-projection-automatic-partition-evidence-v1" : partition_contest ? "native-quantised-moe-projection-source-partition-evidence-v1" :
+    Json evidence{{"schema", migrationFixture(spec) ? "native-quantised-moe-projection-cpu-migration-evidence-v1" : automatic_contest ? "native-quantised-moe-projection-automatic-partition-evidence-v1" : partition_contest ? "native-quantised-moe-projection-source-partition-evidence-v1" :
             "native-quantised-moe-projection-diagnostic-evidence-v2"},
         {"contest", test::native_quantised_dispatch::moeProjectionContestName(spec.contest)},
         {"evidence_generation", evidenceGeneration(spec)}, {"owner_contender_count", contenders}, {"complete", false}, {"passed", false},
@@ -1242,7 +1244,7 @@ inline void run(const Diagnostic &spec)
             "synthetic-source-fixture" : "retained-descriptors-synthetic-seeded";
         evidence["format_coverage_authority"] = "prepared-resident-physical-codebooks-with-positive-timed-owner-live-routes";
         evidence["reachable_only_leaf_is_active_coverage"] = false;
-        evidence["cpu_promoted_codebook23_timing_included"] = false;
+        evidence["cpu_migrated_timing_included"] = false;
     }
     const auto finish = [&] {
         const auto text = evidence.dump(2);
@@ -1263,15 +1265,16 @@ inline void run(const Diagnostic &spec)
         const auto base_hidden = makeHiddenValues(1, spec.source.hidden_size);
         State state(spec, base_ids); state.prepare(); state.trials.reserve(contenders + 2);
         evidence["gateup_setup_identity"] = state.gateup_setup_identity;
-        if (promoted23Fixture(spec))
+        if (migrationFixture(spec))
         {
-            evidence["prepared_representation"] = "cpu-prepared-promoted23";
+            evidence["prepared_representation"] = "cpu-prepared-migrated";
             evidence["completed_promotion_inventory"] = state.prepared.promotion_inventory;
             require(!state.prepared.promoted_storage.empty() &&
                 state.prepared.promotion_inventory.size() == state.prepared.promoted_storage.size() &&
                 state.gateup_setup_identity.at("prepared_execution_mask").get<std::uint32_t>() ==
-                    nativeQuantisedCodebookMaskBit(kNativeQuantisedExpandedInt8MinCodebook),
-                "promoted23 timing requires actual resident23 prepared gate/up engines");
+                    nativeQuantisedCodebookMaskBit(spec.descriptor_evidence.at("original_source_roles").at("gate")
+                        .at("migration_execution_codebook").get<uint8_t>()),
+                "cpu-migration timing requires actual migrated gate/up engines");
         }
         std::vector<rocm::MoERouteOwnedGateUpAdmission> admissions;
         bool resource_rejection = false;
@@ -1411,10 +1414,10 @@ inline void run(const Diagnostic &spec)
         evidence["timed_device_compact_bytes"] = timed_bytes;
         evidence["timed_owner_live_routes"] = timed_bytes / record_bytes;
         evidence["timed_owner_has_work"] = timed_bytes > 0;
-        if (promoted23Fixture(spec))
-            require(timed_bytes > 0, "promoted23 timing has no active owner routes; reachable-only leaves are not coverage");
+        if (migrationFixture(spec))
+            require(timed_bytes > 0, "cpu-migration timing has no active owner routes; reachable-only leaves are not coverage");
         timeOwners(state, raw.get(), contenders);
-        if (promoted23Fixture(spec)) evidence["cpu_promoted_codebook23_timing_included"] = true;
+        if (migrationFixture(spec)) evidence["cpu_migrated_timing_included"] = true;
         for (std::size_t index = 1; index <= contenders; ++index)
             writeEvidence(aggregate.get(), spec, state.trials[index]);
         // Owner captures mutate grouping/scratch. Restore all routes and import

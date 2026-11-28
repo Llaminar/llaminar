@@ -16,6 +16,7 @@
 #ifdef HAVE_CUDA
 
 #include "../IGPUGraphCapture.h"
+#include "CUDADeferredKernelLaunch.h"
 #include "../NativeParallelGraphBranch.h"
 #include "../IWorkerGPUContext.h"
 #include <optional>
@@ -390,7 +391,7 @@ namespace llaminar2
         GraphUpdateResult tryUpdate() override;
         [[nodiscard]] bool supportsExecutableUpdate() const noexcept override
         {
-            return recording_role_ == RecordingRole::Owner && !timeline_recording_;
+            return recording_role_ == RecordingRole::Owner && !timeline_recording_ && deferred_launches_.empty() && lowered_live_launch_sites_ == 0u;
         }
         bool hasExecutable() const override;
         [[nodiscard]] std::size_t residentMemoryBytes() const noexcept override
@@ -409,16 +410,52 @@ namespace llaminar2
         void reset() override;
         const char *backendName() const override { return "CUDA"; }
 
-        /// @return The underlying CUDA graph (may be nullptr)
-        cudaGraph_t graph() const { return graph_; }
+        /// @return The unbound cloneable definition, never an in-place lowered native owner.
+        cudaGraph_t graph() const { return definition_consumed_ ? nullptr : graph_; }
         /// @return The underlying CUDA graph executable (may be nullptr)
         cudaGraphExec_t executable() const { return exec_; }
         /// @return The immutable CUDA device owning this capture.
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
+        /** @return Incremental pool quote for the actual final-owner import inventory. */
+        [[nodiscard]] std::size_t liveLaunchReservationBytes() const;
+        /** @return Distinct native update bindings authenticated during instantiation of this executable. */
+        [[nodiscard]] std::size_t loweredLiveLaunchSiteCount() const noexcept { return lowered_live_launch_sites_; }
+
+        /** @brief Import a template into an exact native scope of this unfinished owner. */
+        [[nodiscard]] cudaError_t importKernelLaunchTemplate(cudaGraphNode_t *node, cudaGraph_t destination,
+            const cudaGraphNode_t *dependencies, std::size_t count, const CUDAGraphCapture &source);
+
     private:
         /** @copydoc IGPUGraphCapture::appendActiveCaptureChild */
         [[nodiscard]] bool appendActiveCaptureChild(const IGPUGraphCapture &child) override;
+
+        friend cudaError_t appendCUDADeferredKernelLaunch(cudaStream_t,
+            const cudaKernelNodeParams &, std::size_t, const cudaKernelNodeParams &);
+
+        /** @brief One authenticated child path, relative to a root or a native conditional body. */
+        struct DeferredLaunchSite
+        {
+            cudaGraph_t scope;
+            std::vector<cudaGraphNode_t> path;
+            std::size_t control_argument_count;
+        };
+
+        /** @return Deferred sites owned with the native graph definition, including timeline views. */
+        std::vector<DeferredLaunchSite> &deferredLaunchSites() noexcept;
+        /** @return Immutable deferred launch sites for a reusable source definition. */
+        const std::vector<DeferredLaunchSite> &deferredLaunchSites() const noexcept;
+        /** @brief Translate the exact child path through a native CUDA clone. */
+        static cudaError_t mapDeferredLaunchSite(const DeferredLaunchSite &site,
+            cudaGraph_t destination, DeferredLaunchSite &mapped);
+        /** @brief Instantiate and upload a complete graph with fresh, owner-local update bindings. */
+        cudaError_t instantiateDeferredLaunches();
+        /** @brief Move the exact thread-local active registration along with a capture. */
+        void moveActiveCaptureRegistration(CUDAGraphCapture &source) noexcept;
+
+        std::vector<DeferredLaunchSite> deferred_launches_;
+        std::size_t lowered_live_launch_sites_ = 0u; ///< Native update bindings on the current executable.
+        bool definition_consumed_ = false; ///< Conditional-containing graphs are lowered in their original native scope.
 
         /** Unique cold recording lifetime, invalidated by reset/re-recording. */
         mutable std::shared_ptr<const void> definition_scope_;

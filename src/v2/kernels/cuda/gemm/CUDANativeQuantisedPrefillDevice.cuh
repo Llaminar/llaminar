@@ -203,9 +203,7 @@ namespace llaminar2::cuda::prefill
      * @tparam STAGING Compile-time operand publication policy; never arithmetic.
      * @param A Persistent quantized activations, row-major [M,K].
      * @param payload Native packed weights, block-major [K/32,N,payload_bytes].
-     * @param scales_B Native per-block weight scales.
-     * @param mins_B Per-block offset or second scale when required by the format.
-     * @param emins_B Packed subgroup offsets for dual-scale asymmetric formats.
+     * @param meta_B Typed metadata planes (per-block words or superblock-coded) and phase.
      * @param C Disjoint output or persistent canonical-partition workspace.
      * @param scales_A Row-major activation scales [M,K/32].
      * @param sums_A Optional block-major activation sums [K/32,M].
@@ -230,9 +228,7 @@ namespace llaminar2::cuda::prefill
     __global__ __launch_bounds__(BLOCK_SIZE_, MIN_BLOCKS_HINT) void nativeQuantisedTC_BK64(
         const int8_t *__restrict__ A,
         const uint8_t *__restrict__ payload,
-        const uint16_t *__restrict__ scales_B,
-        const uint16_t *__restrict__ mins_B,
-        const uint32_t *__restrict__ emins_B,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta_B,
         float *__restrict__ C,
         const float *__restrict__ scales_A,
         const int32_t *__restrict__ sums_A,
@@ -310,6 +306,12 @@ namespace llaminar2::cuda::prefill
         constexpr bool IS_DUAL_SCALE_ASYM = Traits::is_dual_scale_asym;
         constexpr bool IS_IQ1_M = Traits::is_iq1_m;
         constexpr bool NEEDS_MINS = Traits::requires_secondary_metadata;
+        // Async metadata schedules copy per-block words verbatim; for a coded
+        // matrix (uniform per launch) load_B_metadata_tile instead reconstructs
+        // the identical words through the single typed loader.
+        [[maybe_unused]] const bool coded_metadata = meta_B.coded();
+        [[maybe_unused]] const uint16_t *const scales_B = meta_B.primary;
+        [[maybe_unused]] const uint16_t *const mins_B = static_cast<const uint16_t *>(meta_B.secondary);
 
         // Shared memory: no smem_B_raw staging buffer needed.
         // STAGES_=1 (single-buffered) halves smem → potential 3 blocks/SM.
@@ -533,6 +535,30 @@ namespace llaminar2::cuda::prefill
                 const size_t source_index = static_cast<size_t>(kb) * N + gcol;
                 const bool vector_valid = kb < num_q40_blocks && gcol + 8 <= N &&
                                           (source_index & 7) == 0;
+                if constexpr (::llaminar2::nativeQuantisedSuperblockCodable(CODEBOOK_ID) && !BYTE_STAGED_SCALES)
+                {
+                    if (coded_metadata)
+                    {
+                        // Same slots and zero-fill as the async copies below,
+                        // with words reconstructed from codes and superblocks.
+                        uint16_t *scale_slot = &smem_scales_B[stage][metadata_index(col, half)];
+                        [[maybe_unused]] uint16_t *min_slot = &smem_mins_B[stage][metadata_index(col, half)];
+#pragma unroll
+                        for (int i = 0; i < 8; ++i)
+                        {
+                            const bool live = kb < num_q40_blocks && gcol + i < N;
+                            const auto words = live
+                                ? ::llaminar2::native_quantised_scale::loadBlockMetadata<CODEBOOK_ID>(
+                                      meta_B, ::llaminar2::native_quantised_scale::blockMajorAddress(
+                                                  meta_B, kb, gcol + i, N))
+                                : ::llaminar2::native_quantised_scale::StagedBlockMetadata{};
+                            scale_slot[i] = words.primary;
+                            if constexpr (NEEDS_MINS)
+                                min_slot[i] = words.secondary;
+                        }
+                        return;
+                    }
+                }
                 auto stage_metadata = [&](const uint16_t *source, uint16_t *destination) {
                     if (vector_valid)
                         cp_async_cg_16_zfill_128(destination, source + source_index, 16);
@@ -599,95 +625,113 @@ namespace llaminar2::cuda::prefill
 
                 if (gcol < N && has_this_block)
                 {
-                    constexpr int PAYLOAD_BYTES = Traits::payload_bytes;
-                    const size_t base = (static_cast<size_t>(kb) * N + gcol) * PAYLOAD_BYTES;
-                    const uint16_t s = ASYNC_RAW_MODE >= 2 ? uint16_t{0}
-                        : ::llaminar2::native_quantised_scale::loadStagedPrimary<CODEBOOK_ID>(
-                              scales_B, static_cast<size_t>(kb) * N + gcol);
-                    const uint8_t *raw_source = ASYNC_RAW_MODE == 0 ? payload + base
-                        : reinterpret_cast<const uint8_t *>(&dst_words[word_offset]);
-
-                    [[maybe_unused]] uint16_t m = 0;
-                    if constexpr (NEEDS_MINS && ASYNC_RAW_MODE < 2)
-                        m = mins_B[static_cast<size_t>(kb) * N + gcol];
-
-                    [[maybe_unused]] uint32_t em = 0;
-                    if constexpr (IS_DUAL_SCALE_ASYM)
-                        em = emins_B[static_cast<size_t>(kb) * N + gcol];
-
-                    [[maybe_unused]] uint16_t qh_packed = 0;
-                    if constexpr (IS_IQ1_M)
+                    // One uniform representation branch per decoded block, not one per
+                    // metadata read: the metadata and payload loads below then share one
+                    // straight-line block and overlap (loadBlockMetadataAs()). A coded
+                    // read inside its own branch serialized a global-load latency ahead
+                    // of the payload loads (PR #73 GB10 prefill regression).
+                    const auto decode_block = [&](auto metadata_form) __attribute__((always_inline))
                     {
-                        qh_packed = static_cast<uint16_t>(payload[base + 4]) |
-                                    (static_cast<uint16_t>(payload[base + 5]) << 8);
-                    }
+                        constexpr auto kMetadataForm = decltype(metadata_form)::value;
+                        constexpr int PAYLOAD_BYTES = Traits::payload_bytes;
+                        const size_t base = (static_cast<size_t>(kb) * N + gcol) * PAYLOAD_BYTES;
+                        // Per-block words, or words reconstructed from codes; async
+                        // metadata schedules publish their words in load_B_metadata_tile.
+                        const auto block_meta = ASYNC_RAW_MODE >= 2
+                            ? ::llaminar2::native_quantised_scale::StagedBlockMetadata{}
+                            : ::llaminar2::native_quantised_scale::loadBlockMetadataAs<CODEBOOK_ID, kMetadataForm>(
+                                  meta_B, ::llaminar2::native_quantised_scale::blockMajorAddress(meta_B, kb, gcol, N));
+                        const uint16_t s = block_meta.primary;
+                        const uint8_t *raw_source = ASYNC_RAW_MODE == 0 ? payload + base
+                            : reinterpret_cast<const uint8_t *>(&dst_words[word_offset]);
 
-                    // ── Decode one Q-block ──────────────────────────────
-                    if constexpr (PAYLOAD_BYTES == 16)
-                    {
-                        const int4 raw = *reinterpret_cast<const int4 *>(raw_source);
-                        const uint32_t r0 = static_cast<uint32_t>(raw.x);
-                        const uint32_t r1 = static_cast<uint32_t>(raw.y);
-                        const uint32_t r2 = static_cast<uint32_t>(raw.z);
-                        const uint32_t r3 = static_cast<uint32_t>(raw.w);
-                        if constexpr (CODEBOOK_ID == 0)
+                        [[maybe_unused]] uint16_t m = 0;
+                        if constexpr (NEEDS_MINS && ASYNC_RAW_MODE < 2)
+                            m = block_meta.secondary;
+
+                        [[maybe_unused]] uint32_t em = 0;
+                        if constexpr (IS_DUAL_SCALE_ASYM)
+                            em = block_meta.emin;
+
+                        [[maybe_unused]] uint16_t qh_packed = 0;
+                        if constexpr (IS_IQ1_M)
                         {
-                            *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
-                                static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
-                                static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
-                                static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
-                                static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
-                            *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
-                                static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
-                                static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
-                                static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
-                                static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
+                            qh_packed = static_cast<uint16_t>(payload[base + 4]) |
+                                        (static_cast<uint16_t>(payload[base + 5]) << 8);
                         }
-                        else if constexpr (Traits::is_nibble_lut)
+
+                        // ── Decode one Q-block ──────────────────────────────
+                        if constexpr (PAYLOAD_BYTES == 16)
                         {
-                            using llaminar2::cuda_native_quantised::nibble_lut_decode_word;
-                            uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
-                            nibble_lut_decode_word<CODEBOOK_ID>(r0, lo0, hi0);
-                            nibble_lut_decode_word<CODEBOOK_ID>(r1, lo1, hi1);
-                            nibble_lut_decode_word<CODEBOOK_ID>(r2, lo2, hi2);
-                            nibble_lut_decode_word<CODEBOOK_ID>(r3, lo3, hi3);
-                            *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
-                                static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
-                                static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
-                            *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
-                                static_cast<int32_t>(hi0), static_cast<int32_t>(hi1),
-                                static_cast<int32_t>(hi2), static_cast<int32_t>(hi3));
+                            const int4 raw = *reinterpret_cast<const int4 *>(raw_source);
+                            const uint32_t r0 = static_cast<uint32_t>(raw.x);
+                            const uint32_t r1 = static_cast<uint32_t>(raw.y);
+                            const uint32_t r2 = static_cast<uint32_t>(raw.z);
+                            const uint32_t r3 = static_cast<uint32_t>(raw.w);
+                            if constexpr (CODEBOOK_ID == 0)
+                            {
+                                *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
+                                    static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
+                                    static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
+                                    static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
+                                    static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
+                                *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
+                                    static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                    static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                    static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                    static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
+                            }
+                            else if constexpr (Traits::is_nibble_lut)
+                            {
+                                using llaminar2::cuda_native_quantised::nibble_lut_decode_word;
+                                uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
+                                nibble_lut_decode_word<CODEBOOK_ID>(r0, lo0, hi0);
+                                nibble_lut_decode_word<CODEBOOK_ID>(r1, lo1, hi1);
+                                nibble_lut_decode_word<CODEBOOK_ID>(r2, lo2, hi2);
+                                nibble_lut_decode_word<CODEBOOK_ID>(r3, lo3, hi3);
+                                *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
+                                    static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
+                                    static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
+                                *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
+                                    static_cast<int32_t>(hi0), static_cast<int32_t>(hi1),
+                                    static_cast<int32_t>(hi2), static_cast<int32_t>(hi3));
+                            }
+                            else
+                            {
+                                int32_t groups[8];
+                                llaminar2::cuda_native_quantised::decode_groups_vec<CODEBOOK_ID>(
+                                    raw_source, groups);
+                                *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
+                                    groups[0], groups[1], groups[2], groups[3]);
+                                *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
+                                    groups[4], groups[5], groups[6], groups[7]);
+                            }
                         }
                         else
                         {
                             int32_t groups[8];
-                            llaminar2::cuda_native_quantised::decode_groups_vec<CODEBOOK_ID>(
+                            llaminar2::cuda_native_quantised::decode_groups<CODEBOOK_ID>(
                                 raw_source, groups);
                             *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
                                 groups[0], groups[1], groups[2], groups[3]);
                             *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
                                 groups[4], groups[5], groups[6], groups[7]);
                         }
-                    }
-                    else
-                    {
-                        int32_t groups[8];
-                        llaminar2::cuda_native_quantised::decode_groups<CODEBOOK_ID>(
-                            raw_source, groups);
-                        *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
-                            groups[0], groups[1], groups[2], groups[3]);
-                        *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
-                            groups[4], groups[5], groups[6], groups[7]);
-                    }
 
-                    if constexpr (ASYNC_RAW_MODE < 2)
-                        smem_scales_B[stage][metadata_index(col, scale_slot)] = s;
-                    if constexpr (NEEDS_MINS && ASYNC_RAW_MODE < 2)
-                        smem_mins_B[stage][metadata_index(col, scale_slot)] = m;
-                    if constexpr (IS_DUAL_SCALE_ASYM)
-                        smem_emins_B[stage][metadata_index(col, scale_slot)] = em;
-                    if constexpr (IS_IQ1_M)
-                        smem_iq1m_qh[stage][metadata_index(col, scale_slot)] = qh_packed;
+                        if constexpr (ASYNC_RAW_MODE < 2)
+                            smem_scales_B[stage][metadata_index(col, scale_slot)] = s;
+                        if constexpr (NEEDS_MINS && ASYNC_RAW_MODE < 2)
+                            smem_mins_B[stage][metadata_index(col, scale_slot)] = m;
+                        if constexpr (IS_DUAL_SCALE_ASYM)
+                            smem_emins_B[stage][metadata_index(col, scale_slot)] = em;
+                        if constexpr (IS_IQ1_M)
+                            smem_iq1m_qh[stage][metadata_index(col, scale_slot)] = qh_packed;
+                    };
+                    if constexpr (ASYNC_RAW_MODE >= 2)
+                        decode_block(::llaminar2::native_quantised_scale::NativeQuantisedMetadataReadFormTag<
+                            ::llaminar2::native_quantised_scale::NativeQuantisedMetadataReadForm::PerBlock>{});
+                    else
+                        ::llaminar2::native_quantised_scale::withMetadataRepresentation<CODEBOOK_ID>(meta_B, decode_block);
                 }
                 else
                 {
@@ -720,124 +764,68 @@ namespace llaminar2::cuda::prefill
 
                     if (gcol < N)
                     {
-                        constexpr int PAYLOAD_BYTES = Traits::payload_bytes;
-                        const size_t base0 = (static_cast<size_t>(kb0) * N + gcol) * PAYLOAD_BYTES;
-                        const size_t base1 = has_block1
-                                                 ? (static_cast<size_t>(kb0 + 1) * N + gcol) * PAYLOAD_BYTES
-                                                 : size_t{0};
-
-                        // Staged words; store_staged_scale keeps raw bytes only under BYTE_STAGED_SCALES.
-                        const uint16_t s0 = ::llaminar2::native_quantised_scale::loadStagedPrimary<CODEBOOK_ID>(
-                            scales_B, static_cast<size_t>(kb0) * N + gcol);
-                        const uint16_t s1 = has_block1
-                                                ? ::llaminar2::native_quantised_scale::loadStagedPrimary<CODEBOOK_ID>(
-                                                      scales_B, static_cast<size_t>(kb0 + 1) * N + gcol)
-                                                : uint16_t{0};
-
-                        [[maybe_unused]] uint16_t m0 = 0, m1 = 0;
-                        if constexpr (NEEDS_MINS)
+                        // Same uniform representation branch as the split schedule above.
+                        const auto decode_block = [&](auto metadata_form) __attribute__((always_inline))
                         {
-                            m0 = mins_B[static_cast<size_t>(kb0) * N + gcol];
-                            if (has_block1)
-                                m1 = mins_B[static_cast<size_t>(kb0 + 1) * N + gcol];
-                        }
+                            constexpr auto kMetadataForm = decltype(metadata_form)::value;
+                            constexpr int PAYLOAD_BYTES = Traits::payload_bytes;
+                            const size_t base0 = (static_cast<size_t>(kb0) * N + gcol) * PAYLOAD_BYTES;
+                            const size_t base1 = has_block1
+                                                     ? (static_cast<size_t>(kb0 + 1) * N + gcol) * PAYLOAD_BYTES
+                                                     : size_t{0};
 
-                        [[maybe_unused]] uint32_t em0 = 0, em1 = 0;
-                        if constexpr (IS_DUAL_SCALE_ASYM)
-                        {
-                            em0 = emins_B[static_cast<size_t>(kb0) * N + gcol];
-                            if (has_block1)
-                                em1 = emins_B[static_cast<size_t>(kb0 + 1) * N + gcol];
-                        }
+                            // Staged words; store_staged_scale keeps raw bytes only under BYTE_STAGED_SCALES.
+                            const auto meta0 = ::llaminar2::native_quantised_scale::loadBlockMetadataAs<CODEBOOK_ID, kMetadataForm>(
+                                meta_B, ::llaminar2::native_quantised_scale::blockMajorAddress(meta_B, kb0, gcol, N));
+                            const auto meta1 = has_block1
+                                ? ::llaminar2::native_quantised_scale::loadBlockMetadataAs<CODEBOOK_ID, kMetadataForm>(
+                                      meta_B, ::llaminar2::native_quantised_scale::blockMajorAddress(meta_B, kb0 + 1, gcol, N))
+                                : ::llaminar2::native_quantised_scale::StagedBlockMetadata{};
+                            const uint16_t s0 = meta0.primary;
+                            const uint16_t s1 = meta1.primary;
 
-                        [[maybe_unused]] uint16_t qh_packed0 = 0, qh_packed1 = 0;
-                        if constexpr (IS_IQ1_M)
-                        {
-                            qh_packed0 = static_cast<uint16_t>(payload[base0 + 4]) |
-                                         (static_cast<uint16_t>(payload[base0 + 5]) << 8);
-                            if (has_block1)
+                            [[maybe_unused]] uint16_t m0 = 0, m1 = 0;
+                            if constexpr (NEEDS_MINS)
                             {
-                                qh_packed1 = static_cast<uint16_t>(payload[base1 + 4]) |
-                                             (static_cast<uint16_t>(payload[base1 + 5]) << 8);
+                                m0 = meta0.secondary;
+                                m1 = meta1.secondary;
                             }
-                        }
 
-                        // ── Decode block 0 ──────────────────────────────────
-                        if constexpr (PAYLOAD_BYTES == 16)
-                        {
-                            const int4 raw0 = *reinterpret_cast<const int4 *>(payload + base0);
-                            const uint32_t r0 = static_cast<uint32_t>(raw0.x);
-                            const uint32_t r1 = static_cast<uint32_t>(raw0.y);
-                            const uint32_t r2 = static_cast<uint32_t>(raw0.z);
-                            const uint32_t r3 = static_cast<uint32_t>(raw0.w);
-                            if constexpr (CODEBOOK_ID == 0)
+                            [[maybe_unused]] uint32_t em0 = 0, em1 = 0;
+                            if constexpr (IS_DUAL_SCALE_ASYM)
                             {
-                                *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
-                                    static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
-                                    static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
-                                    static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
-                                    static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
-                                *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
-                                    static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
-                                    static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
-                                    static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
-                                    static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
+                                em0 = meta0.emin;
+                                em1 = meta1.emin;
                             }
-                            else if constexpr (Traits::is_nibble_lut)
-                            {
-                                using llaminar2::cuda_native_quantised::nibble_lut_decode_word;
-                                uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
-                                nibble_lut_decode_word<CODEBOOK_ID>(r0, lo0, hi0);
-                                nibble_lut_decode_word<CODEBOOK_ID>(r1, lo1, hi1);
-                                nibble_lut_decode_word<CODEBOOK_ID>(r2, lo2, hi2);
-                                nibble_lut_decode_word<CODEBOOK_ID>(r3, lo3, hi3);
-                                *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
-                                    static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
-                                    static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
-                                *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
-                                    static_cast<int32_t>(hi0), static_cast<int32_t>(hi1),
-                                    static_cast<int32_t>(hi2), static_cast<int32_t>(hi3));
-                            }
-                            else
-                            {
-                                int32_t groups0[8];
-                                llaminar2::cuda_native_quantised::decode_groups_vec<CODEBOOK_ID>(
-                                    payload + base0, groups0);
-                                *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
-                                    groups0[0], groups0[1], groups0[2], groups0[3]);
-                                *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
-                                    groups0[4], groups0[5], groups0[6], groups0[7]);
-                            }
-                        }
-                        else
-                        {
-                            int32_t groups0[8];
-                            llaminar2::cuda_native_quantised::decode_groups<CODEBOOK_ID>(
-                                payload + base0, groups0);
-                            *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
-                                groups0[0], groups0[1], groups0[2], groups0[3]);
-                            *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
-                                groups0[4], groups0[5], groups0[6], groups0[7]);
-                        }
 
-                        // ── Decode block 1 (K-tail: zero-fill if no second block) ──
-                        if (has_block1)
-                        {
+                            [[maybe_unused]] uint16_t qh_packed0 = 0, qh_packed1 = 0;
+                            if constexpr (IS_IQ1_M)
+                            {
+                                qh_packed0 = static_cast<uint16_t>(payload[base0 + 4]) |
+                                             (static_cast<uint16_t>(payload[base0 + 5]) << 8);
+                                if (has_block1)
+                                {
+                                    qh_packed1 = static_cast<uint16_t>(payload[base1 + 4]) |
+                                                 (static_cast<uint16_t>(payload[base1 + 5]) << 8);
+                                }
+                            }
+
+                            // ── Decode block 0 ──────────────────────────────────
                             if constexpr (PAYLOAD_BYTES == 16)
                             {
-                                const int4 raw1 = *reinterpret_cast<const int4 *>(payload + base1);
-                                const uint32_t r0 = static_cast<uint32_t>(raw1.x);
-                                const uint32_t r1 = static_cast<uint32_t>(raw1.y);
-                                const uint32_t r2 = static_cast<uint32_t>(raw1.z);
-                                const uint32_t r3 = static_cast<uint32_t>(raw1.w);
+                                const int4 raw0 = *reinterpret_cast<const int4 *>(payload + base0);
+                                const uint32_t r0 = static_cast<uint32_t>(raw0.x);
+                                const uint32_t r1 = static_cast<uint32_t>(raw0.y);
+                                const uint32_t r2 = static_cast<uint32_t>(raw0.z);
+                                const uint32_t r3 = static_cast<uint32_t>(raw0.w);
                                 if constexpr (CODEBOOK_ID == 0)
                                 {
-                                    *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                    *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
                                         static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
                                         static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
                                         static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
                                         static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
-                                    *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                    *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
                                         static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                         static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                         static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
@@ -851,61 +839,123 @@ namespace llaminar2::cuda::prefill
                                     nibble_lut_decode_word<CODEBOOK_ID>(r1, lo1, hi1);
                                     nibble_lut_decode_word<CODEBOOK_ID>(r2, lo2, hi2);
                                     nibble_lut_decode_word<CODEBOOK_ID>(r3, lo3, hi3);
-                                    *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                    *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
                                         static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
                                         static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
-                                    *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                    *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
                                         static_cast<int32_t>(hi0), static_cast<int32_t>(hi1),
                                         static_cast<int32_t>(hi2), static_cast<int32_t>(hi3));
                                 }
                                 else
                                 {
-                                    int32_t groups1[8];
+                                    int32_t groups0[8];
                                     llaminar2::cuda_native_quantised::decode_groups_vec<CODEBOOK_ID>(
+                                        payload + base0, groups0);
+                                    *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
+                                        groups0[0], groups0[1], groups0[2], groups0[3]);
+                                    *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
+                                        groups0[4], groups0[5], groups0[6], groups0[7]);
+                                }
+                            }
+                            else
+                            {
+                                int32_t groups0[8];
+                                llaminar2::cuda_native_quantised::decode_groups<CODEBOOK_ID>(
+                                    payload + base0, groups0);
+                                *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
+                                    groups0[0], groups0[1], groups0[2], groups0[3]);
+                                *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
+                                    groups0[4], groups0[5], groups0[6], groups0[7]);
+                            }
+
+                            // ── Decode block 1 (K-tail: zero-fill if no second block) ──
+                            if (has_block1)
+                            {
+                                if constexpr (PAYLOAD_BYTES == 16)
+                                {
+                                    const int4 raw1 = *reinterpret_cast<const int4 *>(payload + base1);
+                                    const uint32_t r0 = static_cast<uint32_t>(raw1.x);
+                                    const uint32_t r1 = static_cast<uint32_t>(raw1.y);
+                                    const uint32_t r2 = static_cast<uint32_t>(raw1.z);
+                                    const uint32_t r3 = static_cast<uint32_t>(raw1.w);
+                                    if constexpr (CODEBOOK_ID == 0)
+                                    {
+                                        *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                            static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
+                                            static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
+                                            static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
+                                            static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
+                                        *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                            static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                            static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                            static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                            static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
+                                    }
+                                    else if constexpr (Traits::is_nibble_lut)
+                                    {
+                                        using llaminar2::cuda_native_quantised::nibble_lut_decode_word;
+                                        uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
+                                        nibble_lut_decode_word<CODEBOOK_ID>(r0, lo0, hi0);
+                                        nibble_lut_decode_word<CODEBOOK_ID>(r1, lo1, hi1);
+                                        nibble_lut_decode_word<CODEBOOK_ID>(r2, lo2, hi2);
+                                        nibble_lut_decode_word<CODEBOOK_ID>(r3, lo3, hi3);
+                                        *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                            static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
+                                            static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
+                                        *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                            static_cast<int32_t>(hi0), static_cast<int32_t>(hi1),
+                                            static_cast<int32_t>(hi2), static_cast<int32_t>(hi3));
+                                    }
+                                    else
+                                    {
+                                        int32_t groups1[8];
+                                        llaminar2::cuda_native_quantised::decode_groups_vec<CODEBOOK_ID>(
+                                            payload + base1, groups1);
+                                        *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                            groups1[0], groups1[1], groups1[2], groups1[3]);
+                                        *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                            groups1[4], groups1[5], groups1[6], groups1[7]);
+                                    }
+                                }
+                                else
+                                {
+                                    int32_t groups1[8];
+                                    llaminar2::cuda_native_quantised::decode_groups<CODEBOOK_ID>(
                                         payload + base1, groups1);
                                     *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
                                         groups1[0], groups1[1], groups1[2], groups1[3]);
                                     *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
                                         groups1[4], groups1[5], groups1[6], groups1[7]);
                                 }
-                            }
+                            } // has_block1
                             else
                             {
-                                int32_t groups1[8];
-                                llaminar2::cuda_native_quantised::decode_groups<CODEBOOK_ID>(
-                                    payload + base1, groups1);
-                                *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
-                                    groups1[0], groups1[1], groups1[2], groups1[3]);
-                                *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
-                                    groups1[4], groups1[5], groups1[6], groups1[7]);
+                                *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(0, 0, 0, 0);
+                                *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(0, 0, 0, 0);
                             }
-                        } // has_block1
-                        else
-                        {
-                            *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(0, 0, 0, 0);
-                            *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(0, 0, 0, 0);
-                        }
 
-                        store_staged_scale(stage, metadata_index(col, 0), s0);
-                        store_staged_scale(stage, metadata_index(col, 1), s1);
+                            store_staged_scale(stage, metadata_index(col, 0), s0);
+                            store_staged_scale(stage, metadata_index(col, 1), s1);
 
-                        if constexpr (NEEDS_MINS)
-                        {
-                            smem_mins_B[stage][metadata_index(col, 0)] = m0;
-                            smem_mins_B[stage][metadata_index(col, 1)] = m1;
-                        }
+                            if constexpr (NEEDS_MINS)
+                            {
+                                smem_mins_B[stage][metadata_index(col, 0)] = m0;
+                                smem_mins_B[stage][metadata_index(col, 1)] = m1;
+                            }
 
-                        if constexpr (IS_DUAL_SCALE_ASYM)
-                        {
-                            smem_emins_B[stage][metadata_index(col, 0)] = em0;
-                            smem_emins_B[stage][metadata_index(col, 1)] = em1;
-                        }
+                            if constexpr (IS_DUAL_SCALE_ASYM)
+                            {
+                                smem_emins_B[stage][metadata_index(col, 0)] = em0;
+                                smem_emins_B[stage][metadata_index(col, 1)] = em1;
+                            }
 
-                        if constexpr (IS_IQ1_M)
-                        {
-                            smem_iq1m_qh[stage][metadata_index(col, 0)] = qh_packed0;
-                            smem_iq1m_qh[stage][metadata_index(col, 1)] = qh_packed1;
-                        }
+                            if constexpr (IS_IQ1_M)
+                            {
+                                smem_iq1m_qh[stage][metadata_index(col, 0)] = qh_packed0;
+                                smem_iq1m_qh[stage][metadata_index(col, 1)] = qh_packed1;
+                            }
+                        };
+                        ::llaminar2::native_quantised_scale::withMetadataRepresentation<CODEBOOK_ID>(meta_B, decode_block);
                     }
                     else
                     {
@@ -1342,7 +1392,7 @@ namespace llaminar2::cuda::prefill
 #else
         (void)A;
         (void)payload;
-        (void)scales_B;
+        (void)meta_B;
         (void)C;
         (void)scales_A;
         (void)C_existing;

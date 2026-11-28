@@ -1,12 +1,12 @@
 /**
  * @file Test__ROCmMoEGroupedWmmaPromotion.cpp
- * @brief Captured physical23 matrix execution after genuine CPU expert promotion.
+ * @brief Captured coded Q5_K execution after genuine CPU expert promotion.
  *
  * The unchanged compact Q5_K Dot4 transaction is the arithmetic authority.
- * Production CPU packing and tier transfer supply the expanded candidate bytes;
+ * Production CPU packing and tier transfer supply the candidate’s original superblock planes;
  * retained WMMA graphs must reproduce both canonical routes and final outputs
  * across dirty full/partial/empty replays and replacement activation data.
- * Mixed3/31 expert counts exercise both adaptive branches for genuine physical23
+ * Mixed3/31 expert counts exercise both adaptive branches for genuine migrated
  * storage; the wide candidate adds cold13/15 against hot31. Suppressing either
  * selected down branch must preserve the other.
  */
@@ -22,7 +22,7 @@ namespace llaminar2::test
 /** @brief Independently registered microtile and wide-candidate promotion evidence. */
 enum class GroupedPromotionMode { Micro, Wide };
 
-/** @brief Preserve compact-source arithmetic through captured expanded WMMA tiles.
+/** @brief Preserve compact-source arithmetic through captured WMMA tiles reading migrated Q5_K.
  * @param mode Exact candidate roster and threshold histograms to qualify. */
 void runGroupedWmmaPromotion(GroupedPromotionMode mode)
 {
@@ -59,13 +59,18 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
                 ModelContextId{2930000u + static_cast<unsigned>(role)},sources,prepared);
             ASSERT_EQ(compact[role].codebook_id,7u);
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(sources[role].get(),cpu_weights[role]));
-            ASSERT_TRUE(cpu_weights[role].usesExpandedInt8());
+            ASSERT_TRUE(cpu::native_quantised::preparedSuperblockCoded(cpu_weights[role].encoding));
             promoted[role] = promoteCPUProjection(backend,device,cpu_weights[role],roles[role],2930100u + role);
             const auto &desc = promoted[role].descriptor;
-            ASSERT_EQ(desc.codebook_id,kNativeQuantisedExpandedInt8MinCodebook);
+            ASSERT_EQ(desc.codebook_id,compact[role].codebook_id);
             ASSERT_TRUE(desc.source_identity_present);
-            ASSERT_EQ(desc.source_codebook_id,7u);
+            ASSERT_EQ(desc.source_codebook_id,compact[role].source_codebook_id);
+            ASSERT_EQ(desc.source_is_superblock,1u);
+            ASSERT_NE(desc.metadata_layout,0u);
+            ASSERT_EQ(desc.metadata_layout,compact[role].metadata_layout);
+            ASSERT_EQ(desc.allocation_payload_bytes_per_block,native_quantised_formats::Q5_K.payload_bytes);
             ASSERT_NE(desc.mins,nullptr);
+            ASSERT_EQ(desc.emins,nullptr);
         }
         auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
         ASSERT_NE(kernel,nullptr);
@@ -134,7 +139,7 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
         {
             rocm::ScopedMoEGroupedPrefillEngine engine(policies[path].engine,policies[path].minimum_expert_rows);
             ASSERT_TRUE(enqueue(path != 0));
-            ScopedBackendGraphCapture recording(context,*graphs[path],"promoted physical23 grouped WMMA");
+            ScopedBackendGraphCapture recording(context,*graphs[path],"migrated Q5_K grouped WMMA");
             ASSERT_TRUE(recording.begin());
             ASSERT_TRUE(enqueue(path != 0));
             recording.finish();
@@ -151,7 +156,7 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
                 if (node.name.find("grouped_wmma_detail") != std::string::npos)
                 {
                     ++native_count;
-                    ASSERT_NE(node.name.find("NativeQuantisedGemmFormat23E"),std::string::npos) << node.name;
+                    ASSERT_NE(node.name.find("NativeQuantisedGemmFormat" + std::to_string(unsigned(compact[0].codebook_id)) + "E"),std::string::npos) << node.name;
                     const bool wide = policies[path].engine == Engine::WideDot4Wmma;
                     ASSERT_EQ(node.block_x,wide ? (node.grid_z == 2 ? 256u : 128u) :
                         policies[path].engine == Engine::WmmaM16N32 ? 128u : 256u);
@@ -266,8 +271,8 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
                     ASSERT_NE(std::memcmp(actual.data(),reference.data(),actual.size()*sizeof(float)),0);
                     ASSERT_TRUE(graphs[path]->launch());
                     ASSERT_NO_FATAL_FAILURE(observe(actual,actual_routes));
-                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("expanded WMMA output",actual,reference,hidden_width));
-                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("expanded WMMA canonical",actual_routes,reference_routes,hidden_width));
+                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("migrated WMMA output",actual,reference,hidden_width));
+                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("migrated WMMA canonical",actual_routes,reference_routes,hidden_width));
                 }
             }
             const std::vector<int> cold_counts = mode == GroupedPromotionMode::Wide
@@ -290,8 +295,8 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
                 ASSERT_NO_FATAL_FAILURE(poison());
                 ASSERT_TRUE(graphs[path]->launch());
                 ASSERT_NO_FATAL_FAILURE(observe(actual,actual_routes));
-                ASSERT_NO_FATAL_FAILURE(expectByteEqual("mixed expanded output",actual,expected,hidden_width));
-                ASSERT_NO_FATAL_FAILURE(expectByteEqual("mixed expanded routes",actual_routes,expected_routes,hidden_width));
+                ASSERT_NO_FATAL_FAILURE(expectByteEqual("mixed migrated output",actual,expected,hidden_width));
+                ASSERT_NO_FATAL_FAILURE(expectByteEqual("mixed migrated routes",actual_routes,expected_routes,hidden_width));
                 if (policies[path].minimum_expert_rows == Floor::EveryExpert) continue;
                 auto *capture = dynamic_cast<HIPGraphCapture *>(graphs[path].get());
                 ASSERT_NE(capture,nullptr);
@@ -313,7 +318,7 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
                         if (mixed_ids[slot] == omitted_expert) changed += comparison != 0;
                         else
                         {
-                            ASSERT_EQ(comparison,0) << "surviving expanded route=" << slot;
+                            ASSERT_EQ(comparison,0) << "surviving migrated route=" << slot;
                             surviving += mixed_ids[slot] >= 0;
                         }
                     }
@@ -321,8 +326,8 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
                     ASSERT_NO_FATAL_FAILURE(poison());
                     ASSERT_TRUE(graphs[path]->launch());
                     ASSERT_NO_FATAL_FAILURE(observe(actual,actual_routes));
-                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("restored expanded output",actual,expected,hidden_width));
-                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("restored expanded routes",actual_routes,expected_routes,hidden_width));
+                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("restored migrated output",actual,expected,hidden_width));
+                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("restored migrated routes",actual_routes,expected_routes,hidden_width));
                 }
             }
             }
@@ -331,10 +336,10 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
 }
 
 /** @test Retain the original complete microtile promotion inventory. */
-TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
+TEST(ROCmMoEGroupedWmmaPromotion, CapturedCodedQ5KReplay)
 { runGroupedWmmaPromotion(GroupedPromotionMode::Micro); }
 
 /** @test Qualify wide cold second tiles and hot WMMA against compact source bytes. */
-TEST(ROCmMoEGroupedWmmaPromotion, CapturedWideExpandedReplay)
+TEST(ROCmMoEGroupedWmmaPromotion, CapturedWideCodedQ5KReplay)
 { runGroupedWmmaPromotion(GroupedPromotionMode::Wide); }
 }

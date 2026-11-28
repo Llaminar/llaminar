@@ -10,8 +10,11 @@
  * Retained original rank-bank publication guards all route/bank/guard bytes
  * at QFN prefill geometry, including nonfinite copies and dirty live prefixes.
  * Disabled paired events and event-free profile modes isolate one real bridge.
+ * CPU router references bind the production-declared Q8_1 publication root at
+ * each routed shape before routing, exactly as the CPU routing stage does.
  */
 #include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
+#include "../../../utils/CUDAMoEArrivalCapture.h"
 #include <gtest/gtest.h>
 
 #ifdef HAVE_CUDA
@@ -54,6 +57,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
+#include "../../../utils/CPURouterKernelTestAdmission.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/MoEOverlayServiceTelemetryCoverageTest.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -2166,6 +2170,26 @@ namespace
         bool old_cuda_moe_router_q8_ = true;
         bool old_cuda_moe_reuse_router_q8_hidden_ = true;
 #endif
+        /**
+         * @brief Bind the CPU reference router's publication root for one routed shape.
+         *
+         * The CPU router quantizes every routed hidden row into a declared Q8_1
+         * root and never grows it while routing. `MoERoutingStage::bindWorkspace`
+         * declares that root with `CPURouterQ8StorageLayout::declare(rows, width)`
+         * before any route; the reference kernel receives the same declaration,
+         * admitted by its own physical-memory authority.
+         * @param rows Rows the next reference route publishes.
+         * @param width Hidden width of that route.
+         * @throws std::logic_error If the fixture's CPU kernel is not the CPU MoE kernel.
+         */
+        void admitCPUReferenceRouter(int rows, int width)
+        {
+            auto *cpu_router = dynamic_cast<llaminar2::CPUMoEKernel *>(cpu_kernel_);
+            if (!cpu_router)
+                throw std::logic_error("CPU reference router is not the CPU MoE kernel");
+            llaminar2::test::admitCPURouterKernelForTest(*cpu_router, rows, width);
+        }
+
         std::unique_ptr<llaminar2::IMoEKernel> cuda_kernel_owner_;
         std::unique_ptr<llaminar2::IMoEKernel> cpu_kernel_owner_;
         llaminar2::CUDAMoEKernel *cuda_kernel_ = nullptr;
@@ -7741,6 +7765,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGatherScatter_ZeroCountExpertNoOps)
         true, cuda_indices.get(), cuda_weights.get(), true, true, nullptr,
         llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -9383,7 +9408,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansMissingReplicaArrivals
 }
 
 TEST_F(Test__CUDAMoEKernel,
-       DeviceRebalanceDeferredPlannerUsesScratchAndPlansCapacityReleasingOwnershipTransfers)
+       DeviceRebalanceDeferredPlannerHonorsOddFamilyStrideAndSaturation)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -9394,7 +9419,7 @@ TEST_F(Test__CUDAMoEKernel,
     using llaminar2::DeviceMoERuntimeTable;
     DeviceMoERuntimeTable::Config table_config;
     table_config.device_id = llaminar2::DeviceId::cuda(0);
-    table_config.num_layers = 1;
+    table_config.num_layers = 2;
     table_config.num_experts = 4;
     table_config.top_k = 2;
     table_config.mirror_to_device = true;
@@ -9405,7 +9430,8 @@ TEST_F(Test__CUDAMoEKernel,
     ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream_));
 
     llaminar2::DeviceMoERebalanceConfig config;
-    config.num_layers = 1;
+    config.num_layers = 2;
+    config.layer_wave_count = 1;
     config.num_experts = 4;
     config.top_k = 2;
     config.participant_id = 0;
@@ -9416,29 +9442,40 @@ TEST_F(Test__CUDAMoEKernel,
     config.dynamic_max_plan_entries_per_wave = 2;
     config.min_wave_spread_improvement_per_payload_slot = 30;
     config.active_transfer_slot_capacity = 1;
-    config.transfer_slot_directory_capacity = 1;
+    config.transfer_slot_directory_capacity = 2;
     config.flags = 0;
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::HotReplicaCache);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::PlanMissingArrivals);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::CollectLoadStats);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::DeferRuntimeApply);
 
-    std::vector<uint64_t> gathered(static_cast<size_t>(config.participant_count) *
-                                       config.num_layers * config.num_experts,
-                                   0);
-    gathered[0] = llaminar2::moe_rebalance_policy::packCollectedState(
-        70, 1, /*physically_resident=*/true, /*transfer_backed=*/false);
-    gathered[1] = llaminar2::moe_rebalance_policy::packCollectedState(
-        30, 0, /*physically_resident=*/true, /*transfer_backed=*/true);
-    gathered[config.num_experts] =
-        llaminar2::moe_rebalance_policy::packCollectedState(
-            0, 1, /*physically_resident=*/false, /*transfer_backed=*/false);
-    gathered[config.num_experts + 2] =
-        llaminar2::moe_rebalance_policy::packCollectedState(
-            1, 0, /*physically_resident=*/true, /*transfer_backed=*/false);
-    gathered[config.num_experts + 3] =
-        llaminar2::moe_rebalance_policy::packCollectedState(
-            9, 0, /*physically_resident=*/true, /*transfer_backed=*/true);
+    using llaminar2::moe_rebalance_abi::HistogramLayout;
+    config.histogram_layout = HistogramLayout::TransferFamilyOccupancy;
+    constexpr std::array ranges{llaminar2::DeviceMoETransferSlotRange{0u, 2u, 1u},
+                                llaminar2::DeviceMoETransferSlotRange{0u, 2u, 1u}};
+    llaminar2::DeviceMoETransferSlotRange *d_ranges = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_ranges), sizeof(ranges)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_ranges, ranges.data(), sizeof(ranges), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+    config.transfer_slot_layer_ranges = d_ranges;
+
+    // Two participants, one live layer: participant 1 begins at an odd word.
+    // The second layer shares the same family but is outside this replay wave.
+    constexpr std::size_t words_per_participant = 9;
+    std::array<uint32_t, 2 * words_per_participant> gathered{};
+    const auto setEvidence = [&](std::size_t participant, std::size_t expert,
+                                 uint32_t count, bool resident, bool transfer_backed) {
+        const uint64_t evidence = llaminar2::moe_rebalance_policy::packCollectedState(
+            count, /*active_transfer_slots=*/0, resident, transfer_backed);
+        const auto first = participant * words_per_participant + 2u * expert;
+        gathered[first] = static_cast<uint32_t>(evidence);
+        gathered[first + 1u] = static_cast<uint32_t>(evidence >> 32u);
+    };
+    setEvidence(0, 0, 70, true, false);
+    setEvidence(0, 1, 30, true, true);
+    setEvidence(1, 2, 1, true, false);
+    setEvidence(1, 3, 9, true, true);
+    gathered[words_per_participant - 1u] = 1u;
+    gathered.back() = 1u;
 
     uint64_t *d_gathered = nullptr;
     llaminar2::DeviceMoERebalanceStatus *d_status = nullptr;
@@ -9450,7 +9487,7 @@ TEST_F(Test__CUDAMoEKernel,
     llaminar2::DeviceMoEPlacementBank *d_placement_plan_scratch = nullptr;
     const auto controller_state = makeControllerDueOnNextBoundary(config);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered),
-                         gathered.size() * sizeof(uint64_t)),
+                         sizeof(gathered)),
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_status),
                          sizeof(llaminar2::DeviceMoERebalanceStatus)),
@@ -9474,7 +9511,7 @@ TEST_F(Test__CUDAMoEKernel,
                          sizeof(llaminar2::DeviceMoEPlacementBank)),
               cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(d_gathered, gathered.data(),
-                              gathered.size() * sizeof(uint64_t),
+                              sizeof(gathered),
                               cudaMemcpyHostToDevice, stream_),
               cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(d_controller_state,
@@ -9491,24 +9528,30 @@ TEST_F(Test__CUDAMoEKernel,
                          cudaMemcpyDeviceToHost),
               cudaSuccess);
 
-    ASSERT_TRUE(cuda_kernel_->runDeviceRebalanceController(
-        launchContext(),
-        runtime_table.deviceLayerState(0),
-        d_gathered,
-        d_status,
-        config,
-        d_plan,
-        d_plan_count,
-        2,
-        1,
-        d_command_header,
-        d_wave_state,
-        d_controller_state,
-        1u,
-        nullptr,
-        0u,
-        nullptr,
-        d_placement_plan_scratch));
+    const llaminar2::DeviceMoERebalanceWaveState initial_wave{.participant_count = 2u};
+    const auto runPlanner = [&] {
+        if (cudaMemcpyAsync(d_wave_state, &initial_wave, sizeof(initial_wave), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return false;
+        return cuda_kernel_->runDeviceRebalanceController(
+            launchContext(),
+            runtime_table.deviceLayerState(0),
+            d_gathered,
+            d_status,
+            config,
+            d_plan,
+            d_plan_count,
+            2,
+            1,
+            d_command_header,
+            d_wave_state,
+            d_controller_state,
+            1u,
+            nullptr,
+            0u,
+            nullptr,
+            d_placement_plan_scratch);
+    };
+    ASSERT_TRUE(runPlanner());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceStatus status;
@@ -9603,6 +9646,20 @@ TEST_F(Test__CUDAMoEKernel,
         0)
         << "deferred planning must never use either durable RCU bank as speculative scratch";
 
+    // Move participant 1's existing family claim to the other layer.
+    // Whole-family occupancy is still one; this layer no longer releases it.
+    setEvidence(1, 3, 9, true, false);
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered, gathered.data(), sizeof(gathered), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_controller_state, &controller_state, sizeof(controller_state), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+    ASSERT_TRUE(runPlanner());
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&status, d_status, sizeof(status), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&plan_count, d_plan_count, sizeof(plan_count), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(status.pre_policy_load_total, 110u);
+    EXPECT_GT(status.dynamic_ownership_swap_rejections, 0u);
+    EXPECT_EQ(plan_count, 0u) << "A saturated family cannot accept a swap that does not free its existing claim";
+
+    cudaFree(d_ranges);
     cudaFree(d_gathered);
     cudaFree(d_status);
     cudaFree(d_plan);
@@ -12863,21 +12920,26 @@ TEST_F(Test__CUDAMoEKernel,
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plan,
-        nullptr,
-        plan_capacity,
-        d_command_header,
-        d_gathered_payload,
-        local_payload_slot_count,
-        payload_slot_bytes,
-        d_transfer_slots,
-        1,
-        config,
-        d_copy_status,
-        d_controller_state,
-        command_buffer_count));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_0_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_0_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(1)), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_0(arrival_scratch_0_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plan,
+            nullptr,
+            plan_capacity,
+            d_command_header,
+            d_gathered_payload,
+            local_payload_slot_count,
+            payload_slot_bytes,
+            d_transfer_slots,
+            1,
+            config,
+            d_copy_status,
+            arrival_scratch_0.get(),
+            command_buffer_count);
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceApplyStatus copy_status{};
@@ -13026,21 +13088,26 @@ TEST_F(Test__CUDAMoEKernel,
                               stream_),
               cudaSuccess);
 
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plans,
-        nullptr,
-        plan_capacity,
-        d_command_headers,
-        d_gathered_payload,
-        local_payload_slot_count,
-        payload_slot_bytes,
-        d_transfer_slots,
-        local_transfer_slot_count,
-        config,
-        d_copy_status,
-        d_controller_state,
-        command_buffer_count));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_1_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_1_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(local_transfer_slot_count)), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_1(arrival_scratch_1_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plans,
+            nullptr,
+            plan_capacity,
+            d_command_headers,
+            d_gathered_payload,
+            local_payload_slot_count,
+            payload_slot_bytes,
+            d_transfer_slots,
+            local_transfer_slot_count,
+            config,
+            d_copy_status,
+            arrival_scratch_1.get(),
+            command_buffer_count);
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     ASSERT_EQ(cudaMemcpy(&copy_status,
@@ -13504,19 +13571,25 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plan,
-        d_plan_count,
-        plan_capacity,
-        d_command_header,
-        d_gathered_payload,
-        static_cast<uint32_t>(local_payload_slot_count),
-        payload_slot_bytes,
-        d_transfer_slots,
-        static_cast<uint32_t>(transfer_slots.size()),
-        config,
-        d_copy_status));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_2_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_2_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(static_cast<uint32_t>(transfer_slots.size()))), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_2(arrival_scratch_2_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            d_command_header,
+            d_gathered_payload,
+            static_cast<uint32_t>(local_payload_slot_count),
+            payload_slot_bytes,
+            d_transfer_slots,
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            d_copy_status,
+            arrival_scratch_2.get());
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceApplyStatus copy_status;
@@ -13781,19 +13854,25 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plan,
-        d_plan_count,
-        plan_capacity,
-        d_command_header,
-        d_gathered_payload,
-        static_cast<uint32_t>(local_payload_slot_count),
-        payload_slot_bytes,
-        d_transfer_slots,
-        static_cast<uint32_t>(transfer_slots.size()),
-        config,
-        d_copy_status));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_3_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_3_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(static_cast<uint32_t>(transfer_slots.size()))), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_3(arrival_scratch_3_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            d_command_header,
+            d_gathered_payload,
+            static_cast<uint32_t>(local_payload_slot_count),
+            payload_slot_bytes,
+            d_transfer_slots,
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            d_copy_status,
+            arrival_scratch_3.get());
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(&copy_status, d_copy_status, sizeof(copy_status), cudaMemcpyDeviceToHost), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(transfer_slots.data(), d_transfer_slots,
@@ -13957,19 +14036,25 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plan,
-        d_plan_count,
-        plan_capacity,
-        d_command_header,
-        d_gathered_payload,
-        static_cast<uint32_t>(local_payload_slot_count),
-        payload_slot_bytes,
-        d_transfer_slots,
-        static_cast<uint32_t>(transfer_slots.size()),
-        config,
-        d_copy_status));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_4_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_4_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(static_cast<uint32_t>(transfer_slots.size()))), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_4(arrival_scratch_4_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            d_command_header,
+            d_gathered_payload,
+            static_cast<uint32_t>(local_payload_slot_count),
+            payload_slot_bytes,
+            d_transfer_slots,
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            d_copy_status,
+            arrival_scratch_4.get());
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(
                   &copy_status,
@@ -14140,20 +14225,26 @@ TEST_F(Test__CUDAMoEKernel,
                   d_status.get(), &status, sizeof(status), cudaMemcpyHostToDevice, stream_),
               cudaSuccess);
 
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        static_cast<llaminar2::DeviceMoERebalancePlanEntry *>(d_plan.get()),
-        nullptr,
-        /*plan_capacity=*/1,
-        static_cast<llaminar2::DeviceMoERebalanceCommandBufferHeader *>(
-            d_header.get()),
-        static_cast<const uint8_t *>(d_gathered_payload.get()),
-        /*local_payload_slot_count=*/1,
-        payload_slot_bytes,
-        static_cast<llaminar2::DeviceMoEExpertDirectoryEntry *>(d_slot.get()),
-        /*local_transfer_slot_count=*/1,
-        config,
-        static_cast<llaminar2::DeviceMoERebalanceApplyStatus *>(d_status.get())));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_5_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_5_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(/*local_transfer_slot_count=*/1)), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_5(arrival_scratch_5_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            static_cast<llaminar2::DeviceMoERebalancePlanEntry *>(d_plan.get()),
+            nullptr,
+            /*plan_capacity=*/1,
+            static_cast<llaminar2::DeviceMoERebalanceCommandBufferHeader *>(
+                d_header.get()),
+            static_cast<const uint8_t *>(d_gathered_payload.get()),
+            /*local_payload_slot_count=*/1,
+            payload_slot_bytes,
+            static_cast<llaminar2::DeviceMoEExpertDirectoryEntry *>(d_slot.get()),
+            /*local_transfer_slot_count=*/1,
+            config,
+            static_cast<llaminar2::DeviceMoERebalanceApplyStatus *>(d_status.get()),
+            arrival_scratch_5.get());
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(
                   &status, d_status.get(), sizeof(status), cudaMemcpyDeviceToHost),
@@ -16170,6 +16261,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectBF16GateMatchesCPU)
         true, cuda_indices.get(), cuda_weights.get(), true, true, nullptr,
         llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), cpu_gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -16289,6 +16381,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeOnlyDoesNotRequireLegacyOutp
         nullptr, llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -16787,6 +16880,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU)
         llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -16929,6 +17023,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectUsesWorkspaceAcrossRebind)
         llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17062,6 +17157,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsMatchesCPU)
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17142,6 +17238,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsAcceptsMappedActivationBuffers)
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(cpu_hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17190,6 +17287,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsTiledPrefillMatchesCPU)
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17283,6 +17381,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsTiledPrefillCapturesAfterWarmup)
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17389,6 +17488,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsEffectiveSeqLenMasksPaddedRowsAcross
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_result;
+    admitCPUReferenceRouter(bucket_seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), bucket_seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_result));
@@ -17836,6 +17936,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenQwenScaleKeepsOutputsDevi
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17908,6 +18009,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenIsCudaGraphCapturableDevi
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17989,6 +18091,7 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -18370,6 +18473,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsBF16GateMatchesCPU)
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate_bf16.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), cpu_gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -28216,7 +28320,7 @@ TEST_F(Test__CUDAMoEKernel, CapturedGateUpTransfersExcludeFixedDownStorage)
 }
 
 /** @brief Complete experts retain their existing all-format transfer contract. */
-TEST_F(Test__CUDAMoEKernel, CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases)
+TEST_F(Test__CUDAMoEKernel, CapturedExactSlotFamiliesMoveMixedFormatsAndRejectStaleLeases)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -28251,16 +28355,15 @@ TEST_F(
 }
 
 /**
- * @brief Prove CPU-cold asymmetric experts remain exact after CUDA promotion.
+ * @brief Prove CPU-cold Q5_K experts retain exact CUDA grouped output.
  *
- * The shared regression streams real CPU ExpandedInt8 gate, up, and down
- * projections through the production transfer lane. It then compares compact
- * codebook-7 execution with promoted codebook-23 execution through the actual
- * grouped sparse-MoE kernels at verifier and long-prefill row counts.
+ * The shared regression moves real coded Q5_K through the production transfer
+ * lane, then compares grouped execution with independent source-native weights
+ * at verifier and long-prefill row counts.
  */
 TEST_F(
     Test__CUDAMoEKernel,
-    CPUColdPromotedAsymmetricGroupedDecodeAndPrefillMatchCompactBytes)
+    CPUColdMigratedQ5KGroupedDecodeAndPrefillMatchOriginalBytes)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -28268,7 +28371,7 @@ TEST_F(
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
-    llaminar2::test::runExpandedAsymmetricGroupedMoEParity(
+    llaminar2::test::runMigratedQ5KGroupedMoEParity(
         "CUDA",
         llaminar2::DeviceId::cuda(0),
         stream_);

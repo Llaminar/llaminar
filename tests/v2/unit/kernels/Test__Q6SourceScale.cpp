@@ -172,8 +172,8 @@ TEST_F(Q6SourceScale, ScalarAndSIMDUseOriginalFactorsWithQ8Activations)
     CPUNativeQuantisedPackedWeights packed;
     ASSERT_TRUE(packWeightsCPUNativeQuantised(&tensor, packed, kStart, kStart + kN));
     ASSERT_TRUE(packed.usesQ6KNativeDualScale());
-    EXPECT_EQ(packed.interleaved_block_stride, 1792);
-    EXPECT_EQ(packed.native_interleaved.size(), size_t(2 * kBlocks * 1792));
+    EXPECT_EQ(packed.interleaved_block_stride, 1664);
+    EXPECT_EQ(packed.native_interleaved.size(), size_t(2 * (kBlocks * 1664 + kSuperblocks * 128)));
     std::array<std::array<Q8_1Block, kBlocks>, 4> activations{};
     for (int row = 0; row < 4; ++row)
     for (int kb = 0; kb < kBlocks; ++kb)

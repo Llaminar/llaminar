@@ -12,31 +12,19 @@
 
 namespace llaminar2
 {
-    /**
-     * @brief Publish host IQ codebook tables into this kernel translation unit.
-     * @param device_id ROCm device whose constant memory receives the tables.
-     * @param iq3s_grid Host array of 512 packed IQ3_S entries.
-     * @param iq3xxs_grid Host array of 256 packed IQ3_XXS entries.
-     * @param iq2s_grid Host array of 1024 packed IQ2_S entries.
-     * @param iq2xs_grid Host array of 512 packed IQ2_XS entries.
-     * @param iq2xxs_grid Host array of 256 packed IQ2_XXS entries.
-     * @param iq1s_grid Host array of 2048 packed IQ1_S/IQ1_M entries.
-     * @return Whether device selection and all six synchronous publications
-     *         succeeded.
-     *
-     * HIP does not enable relocatable device code for `rocm_backend`, so each
-     * kernel translation unit owns the constant symbols it reads. The central
-     * ROCm weight-packer initialization authority calls this once per device,
-     * before an IQ source can be streamed or a graph can be captured.
-     */
-    [[nodiscard]] bool initializeExpertTierIQGridTablesROCm(
-        int device_id,
-        const void *iq3s_grid,
-        const void *iq3xxs_grid,
-        const void *iq2s_grid,
-        const void *iq2xs_grid,
-        const void *iq2xxs_grid,
-        const void *iq1s_grid) noexcept;
+    /** @brief Root views and live K32/N intersection for a coded HIP peer copy. */
+    struct ROCmCodedPeerProjectionRectangle
+    {
+        unsigned rows, blocks, payload_bytes;
+        std::uint8_t codebook;
+        unsigned src_n, dst_n, src_row, dst_row, src_block, dst_block;
+        ExpertTierGpuConstProjectionView source;
+        ExpertTierGpuMutableProjectionView destination;
+    };
+
+    /** @brief Copy the exact live rectangle, preserving adjacent destination code bits. */
+    [[nodiscard]] bool launchROCmCodedPeerProjectionRectangle(ROCmCodedPeerProjectionRectangle rectangle,
+                                                             void *stream) noexcept;
 
     /**
      * @brief Convert common GPU packed bytes into final CPU NativeQuantised units.

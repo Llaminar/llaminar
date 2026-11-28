@@ -21,6 +21,7 @@ if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
         RESOURCE_LOCK "ShmemSpin"
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=3" "OMP_DYNAMIC=FALSE"
     )
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPURootedGatherParallelCopyReplay)
     list(APPEND V2_ROOTED_TRANSPORT_SOCKET_REPLAY_TESTS V2_Integration_CPURootedGatherParallelCopyReplay)
 
     # Terminal epoch replay runs the original admitted owner without payload timing.
@@ -31,6 +32,7 @@ if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
         MPI_PROCS 2 NO_MODELS TIMEOUT 60
         RESOURCE_LOCK "ShmemSpin"
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=3" "OMP_DYNAMIC=FALSE")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ShmemSpinAbsorbingAbortReplay)
     list(APPEND V2_ROOTED_TRANSPORT_SOCKET_REPLAY_TESTS V2_Integration_ShmemSpinAbsorbingAbortReplay)
 else()
     message(STATUS "CPU rooted transport socket replays: unqualified (requires two discovered physical sockets; found ${V2_TEST_SOCKETS}); no MPI launch")

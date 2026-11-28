@@ -9,7 +9,7 @@
  */
 
 /** @brief Closed diagnostic physical decoder scope, including native CPU promotions. */
-static constexpr std::uint32_t kPersistentMoEFFNDecoders=(1u<<5)|(1u<<7)|(1u<<19)|(1u<<23);
+static constexpr std::uint32_t kPersistentMoEFFNDecoders=(1u<<5)|(1u<<7)|(1u<<19);
 
 /** @brief One CTA's reusable partition plane; no global partial publication exists. */
 struct PersistentMoEFFNShared
@@ -36,18 +36,16 @@ __device__ __forceinline__ float persistentMoEFFNPartial(const DeviceNativeQuant
     const int blocks=K/32,width=(blocks+partitions-1)/partitions;
     const int first=part*width,last=min(blocks,first+width);
     const auto* payload=descriptor->payload;
-    const auto* weight_scales=static_cast<const uint16_t*>(descriptor->scales);
-    const auto* mins=static_cast<const uint16_t*>(descriptor->mins);
-    const auto* emins=static_cast<const uint32_t*>(descriptor->emins);
+    // Per-block or superblock-coded metadata of this immutable expert matrix.
+    const auto meta=::llaminar2::native_quantised_scale::metadataPlanes(*descriptor);
     float accumulator=0.f;
     #pragma unroll 1
     for(int block=first;block<last;++block)
     {
         const auto* activation=reinterpret_cast<const int32_t*>(codes+size_t(block)*32);
-        const size_t linear=size_t(block)*N+n;
         // This is the same source decoder and complete rounded-block commit
         // used by the original producer. Integer summation has no overflow.
-        moePairedK32CommitPlanes<FMT>(payload,weight_scales,mins,emins,linear,
+        moePairedK32CommitPlanes<FMT>(payload,meta,::llaminar2::rocm_native_metadata::blockAddress(meta,uint32_t(block),uint32_t(n),uint32_t(N)),
             activation,scales[block],sums[block],accumulator);
     }
     return accumulator;
@@ -62,7 +60,6 @@ __device__ __forceinline__ float persistentMoEFFNPartial(const DeviceNativeQuant
     case 5:return persistentMoEFFNPartial<static_cast<NativeQuantisedFormat>(5)>(descriptor,n,codes,scales,sums,N,K,part,partitions);
     case 7:return persistentMoEFFNPartial<static_cast<NativeQuantisedFormat>(7)>(descriptor,n,codes,scales,sums,N,K,part,partitions);
     case 19:return persistentMoEFFNPartial<static_cast<NativeQuantisedFormat>(19)>(descriptor,n,codes,scales,sums,N,K,part,partitions);
-    case 23:return persistentMoEFFNPartial<static_cast<NativeQuantisedFormat>(23)>(descriptor,n,codes,scales,sums,N,K,part,partitions);
     default:__builtin_trap();return 0.f;
     }
 }

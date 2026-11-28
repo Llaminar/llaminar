@@ -40,6 +40,7 @@ namespace llaminar2
         CpuNativeQuantisedInterleaved = 1, ///< Live native CPU column planes; resident padding is excluded.
         GpuSeparatedNativeQuantised = 2,   ///< Payload/scales/mins/emins blobs.
         ContiguousFloating = 3,       ///< One raw FP16/BF16/FP32 matrix blob.
+        GpuCodedProjectionUnits = 4,  ///< Compact payload, source codes and superblock words, repacked at each GPU endpoint.
     };
 
     /**
@@ -90,9 +91,8 @@ namespace llaminar2
     struct MoEOverlayRemoteProjectionManifest
     {
         static constexpr std::uint32_t kMagic = 0x50524F4Du; // "MORP"
-        // ABI 5: codebook-25 (MXFP4) CPU units carry BF16 power-of-two scale
-        // words and GPU planes native E8M0 bytes (#26).
-        static constexpr std::uint16_t kABIVersion = 5u;
+        // ABI 7 identifies coded projection wire packing between GPU endpoints.
+        static constexpr std::uint16_t kABIVersion = 7u;
         static constexpr std::size_t kWireBytes = 244u;
 
         std::uint32_t magic = kMagic;
@@ -121,7 +121,7 @@ namespace llaminar2
         std::uint8_t gpu_is_asymmetric = 0;
         std::uint8_t gpu_has_emins = 0;
         cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
-            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+            cpu::native_quantised::CPUNativeQuantisedEncoding::SignedInt8SingleScale;
         std::uint8_t reserved_format[2]{};
 
         std::uint32_t cpu_data_stride = 0;
@@ -224,6 +224,12 @@ namespace llaminar2
                                   GpuSeparatedNativeQuantised;
         }
 
+        /** @return Whether GPU endpoints exchange compact source-coded units, not raw plane byte runs. */
+        [[nodiscard]] bool carriesCodedGpuUnits() const noexcept
+        {
+            return packing == MoEOverlayRemoteProjectionPacking::GpuCodedProjectionUnits;
+        }
+
         /** @return Whether region zero is one contiguous floating matrix. */
         [[nodiscard]] bool carriesFloatingBytes() const noexcept
         {
@@ -278,14 +284,16 @@ namespace llaminar2
      * @param source Current separated GPU execution descriptor.
      * @param source_identity Original mathematical GGUF provenance.
      * @param maximum_chunk_bytes Persistent network staging capacity.
-     * @return Authenticated four-region GPU blob contract.
+     * @param intersection Original overlap for independent roots, if not the whole source.
+     * @return Authenticated separated GPU blob or compact coded GPU wire contract.
      */
     [[nodiscard]] MoEOverlayRemoteProjectionManifest
     makeMoEOverlayRemoteGpuProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
         const GpuExpertPackedDescriptor &source,
         NativeQuantisedSourceIdentity source_identity,
-        std::uint32_t maximum_chunk_bytes);
+        std::uint32_t maximum_chunk_bytes,
+        std::optional<ExpertTierWeightProjectionIntersection> intersection = std::nullopt);
 
     /**
      * @brief Construct a byte-preserving contiguous floating manifest.
@@ -348,6 +356,35 @@ namespace llaminar2
      */
     [[nodiscard]] ExpertTierWeightDeviceLayout remoteCpuProjectionDeviceLayout(
         const MoEOverlayRemoteProjectionManifest &manifest);
+
+    /** @brief One exact compact wire with independently phased GPU roots. */
+    struct CodedGpuProjectionRelayLayouts
+    {
+        ExpertTierWeightDeviceLayout pack;
+        ExpertTierWeightDeviceLayout unpack;
+    };
+
+    /**
+     * @brief Bind the local host relay to the same coded wire geometry as the MPI relay.
+     * @param source Original GPU source descriptor.
+     * @param destination Original GPU destination descriptor, including its bit placement.
+     * @param intersection Equal original-coordinate extent of both roots.
+     * @param capacity Retained pinned bytes per relay slot.
+     * @return Matching wire units with independent source/destination GPU coordinates.
+     * @throws std::invalid_argument For incompatible formats or insufficient capacity.
+     */
+    [[nodiscard]] CodedGpuProjectionRelayLayouts makeCodedGpuProjectionRelayLayouts(
+        const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity);
+
+    /**
+     * @brief Recover one endpoint's repack layout for authenticated coded GPU relay.
+     * @param manifest Complete same-backend GPU endpoint manifest carrying compact source-coded units.
+     * @param direction Pack from the source GPU, or unpack into the destination GPU.
+     * @return Layout borrowing the endpoint's original geometry and the shared compact wire addressing.
+     */
+    [[nodiscard]] ExpertTierWeightDeviceLayout remoteCodedGpuProjectionDeviceLayout(
+        const MoEOverlayRemoteProjectionManifest &manifest, ExpertTierWeightConversionDirection direction);
 
     /**
      * @brief Encode a manifest in canonical little-endian wire order.

@@ -44,4 +44,5 @@ if(HAVE_ROCM AND HAVE_RCCL AND V2_RCCL_PROOF_SELECTED)
     endforeach()
     set_property(TEST V2_Integration_RCCLProtocolDefaults APPEND PROPERTY LABELS
         ProductionTestPreflight)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RCCLProtocolDefaults)
 endif()

@@ -25,18 +25,6 @@
 
 namespace llaminar2
 {
-    /**
-     * @brief Execution codebook for a normalized signed-INT8 block with a
-     *        per-block asymmetric minimum.
-     *
-     * This is an accelerator execution format, not a GGUF source format. A
-     * CPU tier expands several compact asymmetric source codebooks to signed
-     * INT8. Promotion keeps those 32 payload bytes and the FP16 minimum as-is,
-     * so CUDA and ROCm consume this identifier to select direct INT8 decode
-     * plus the ordinary activation-sum correction.
-     */
-    inline constexpr std::uint8_t kNativeQuantisedExpandedInt8MinCodebook = 23;
-
     /** @brief IQ4_XS physical tuple: nibble payload, original half base, raw six-bit coefficient. */
     inline constexpr std::uint8_t kNativeQuantisedIQ4XSSourceScaleCodebook = 24;
 
@@ -98,8 +86,9 @@ namespace llaminar2
     [[nodiscard]] inline constexpr bool hasCompactMultiScaleVnniPayload(
         uint8_t codebook) noexcept
     {
-        return codebook == 9 || codebook == 10 || codebook == 13 ||
-               codebook == 14 || codebook == 17;
+        return codebook == 9 || codebook == 10 || codebook == 12 ||
+               codebook == 13 || codebook == 14 || codebook == 15 ||
+               codebook == 16 || codebook == 17;
     }
 
     /**
@@ -357,14 +346,10 @@ namespace llaminar2
     /**
      * @brief GPU execution representation that survives a CPU-tier round trip.
      *
-     * CPU NativeQuantised preserves nibble and multi-scale native payloads, including
-     * Q6_K bitplanes, Q2_K effective minima, and IQ1_M signed deltas. Single-scale
-     * sources expand to one signed byte per value without changing quantization;
-     * asymmetric sources retain a separate FP16 minimum. Source provenance is
-     * deliberately not part of this structure because the prepared engine
-     * carries it independently for arithmetic-policy selection.
+     * Physical decoder and metadata describe the native stored bytes, not the
+     * source identity used to select arithmetic policy.
      */
-    struct NativeQuantisedMigrationStableDeviceFormat
+    struct NativeQuantisedDeviceFormat
     {
         std::uint8_t codebook_id = 0;
         std::uint8_t payload_bytes_per_block = 0;
@@ -377,7 +362,7 @@ namespace llaminar2
      * @return Device decoder and plane-presence metadata; is_asymmetric here names
      *         the historical secondary-plane storage flag, not additive-minimum math.
      */
-    [[nodiscard]] inline constexpr NativeQuantisedMigrationStableDeviceFormat
+    [[nodiscard]] inline constexpr NativeQuantisedDeviceFormat
     canonicalDeviceVnniFormat(const NativeQuantisedFormatInfo &source) noexcept
     {
         const bool iq4xs = source.codebook_id == 4 && source.is_superblock;
@@ -417,10 +402,7 @@ namespace llaminar2
     /**
      * @brief Physical capacity required by a recyclable GPU expert slot.
      *
-     * A loader-owned slot initially contains the source's canonical compact
-     * representation, but a later CPU-to-GPU arrival may contain the normalized
-     * migration representation. The slot therefore owns the union of both
-     * layouts while its current descriptor names only the live encoding.
+     * Movement preserves the original physical decoder and exact payload extent.
      */
     struct NativeQuantisedReusableDeviceAllocationFormat
     {
@@ -429,96 +411,25 @@ namespace llaminar2
         bool has_emins = false;
     };
 
-    /**
-     * @brief Derive the one accelerator format produced by CPU-tier promotion.
-     * @param source Exact GGUF source-format metadata.
-     * @return CUDA/ROCm execution metadata stable across repeated tier cycles.
-     */
-    [[nodiscard]] inline constexpr NativeQuantisedMigrationStableDeviceFormat
-    migrationStableDeviceVnniFormat(
-        const NativeQuantisedFormatInfo &source) noexcept
-    {
-        if (source.codebook_id == 0 || source.codebook_id == 4 ||
-            source.codebook_id == 5 || source.codebook_id == 11 ||
-            source.codebook_id == kNativeQuantisedMXFP4Codebook)
-        {
-            // Nibble payloads, including MXFP4 codes with their exact FP16
-            // scale, survive a CPU-tier round trip unchanged.
-            return canonicalDeviceVnniFormat(source);
-        }
-        if (source.codebook_id == 8 ||
-            hasCompactMultiScaleVnniPayload(source.codebook_id))
-        {
-            return {
-                .codebook_id = source.codebook_id,
-                .payload_bytes_per_block = static_cast<uint8_t>(source.payload_bytes),
-                .is_asymmetric = true,
-                .has_emins = source.has_emins,
-            };
-        }
-        return {
-            .codebook_id = source.is_asymmetric
-                               ? kNativeQuantisedExpandedInt8MinCodebook
-                               : static_cast<std::uint8_t>(19),
-            .payload_bytes_per_block = 32,
-            .is_asymmetric = source.is_asymmetric,
-            .has_emins = false,
-        };
-    }
-
-    /**
-     * @brief Derive the allocation union for initial and migrated GPU bytes.
-     * @param source Exact GGUF source-format metadata.
-     * @return Per-block capacities that make a loader slot recyclable.
-     */
+    /** @return Exact reusable payload and planes of native expert storage. */
     [[nodiscard]] inline constexpr NativeQuantisedReusableDeviceAllocationFormat
-    reusableDeviceVnniAllocationFormat(
-        const NativeQuantisedFormatInfo &source) noexcept
+    reusableDeviceVnniAllocationFormat(const NativeQuantisedFormatInfo &source) noexcept
     {
-        const auto migrated = migrationStableDeviceVnniFormat(source);
-        return {
-            .payload_bytes_per_block = static_cast<std::uint8_t>(
-                source.payload_bytes > migrated.payload_bytes_per_block
-                    ? source.payload_bytes
-                    : migrated.payload_bytes_per_block),
-            .has_mins = source.is_asymmetric || migrated.is_asymmetric,
-            .has_emins = source.has_emins || migrated.has_emins,
-        };
+        const auto physical = canonicalDeviceVnniFormat(source);
+        return {physical.payload_bytes_per_block, physical.is_asymmetric, physical.has_emins};
     }
 
     /**
-     * @brief Test whether an execution representation preserves one source's
-     *        value semantics.
-     * @param source Original GGUF NativeQuantised format descriptor.
-     * @param execution_codebook Codebook carried by prepared device bytes.
-     * @return Whether the source can be represented by that execution format.
-     *
-     * The canonical compact representation is always compatible. A fully
-     * expanded representation is also compatible when its correction kind
-     * matches the source: codebook 19 stores signed INT8 plus scale, while
-     * codebook 23 additionally stores one FP16 minimum. Source provenance is
-     * retained separately and is never inferred from these normalized IDs.
+     * @brief Authenticate decoder compatibility with the original GGUF format.
+     * @param source Original source format, not the prepared storage format.
+     * @param execution_codebook Decoder selected by the prepared bytes.
+     * @return Whether the decoder names native storage or explicitly expanded symmetric INT8.
      */
     [[nodiscard]] inline constexpr bool deviceVnniExecutionCompatibleWithSource(
-        const NativeQuantisedFormatInfo &source,
-        uint8_t execution_codebook) noexcept
+        const NativeQuantisedFormatInfo &source, uint8_t execution_codebook) noexcept
     {
-        // Retire only the lossy native alias. Explicit existing ExpandedInt8
-        // preparation remains representable by physical19 below; no loader or
-        // migration factory automatically selects it for native IQ4_XS.
-        if (source.codebook_id == 4 && source.is_superblock && execution_codebook == 4)
-            return false;
-        if (execution_codebook ==
-            canonicalDeviceVnniCodebookId(source))
-        {
-            return true;
-        }
-        if (execution_codebook == 19)
-            return !source.is_asymmetric;
-        return execution_codebook == kNativeQuantisedExpandedInt8MinCodebook &&
-               source.is_asymmetric &&
-               !hasCompactMultiScaleVnniPayload(source.codebook_id) &&
-               source.codebook_id != 8;
+        return execution_codebook == canonicalDeviceVnniCodebookId(source) ||
+               (execution_codebook == 19 && !source.is_asymmetric);
     }
 
     /**
@@ -526,8 +437,7 @@ namespace llaminar2
      *
      * Immutable grouped tables contain only the execution codebooks present at
      * graph setup. A runtime-placement table may later receive the canonical
-     * compact GPU representation or the migration-stable representation of the
-     * same source tensor. Both launch masks must therefore be certified before
+     * GPU representation of the same source tensor. Both launch masks must be certified before
      * capture; discovering a new codebook after publication would otherwise
      * leave a valid runtime descriptor with no owning grouped kernel.
      */
@@ -553,6 +463,14 @@ namespace llaminar2
                    : 0u;
     }
 
+    /** @brief Exact physical decoder inventory derived from the original source catalog. */
+    inline constexpr uint32_t kNativeQuantisedPhysicalCodebooks = [] {
+        uint32_t mask = 0;
+        for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+            mask |= nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(*entry.metadata));
+        return mask;
+    }();
+
     /**
      * @brief Add one prepared projection to its capture-time format envelope.
      *
@@ -564,11 +482,8 @@ namespace llaminar2
      * @return True when the current representation and every reachable runtime
      *         representation have a complete, supported identity.
      *
-     * Runtime-mutability requires source provenance. The canonical compact GPU
-     * codebook and the CPU-round-trip migration codebook are both included even
-     * when the current bytes use only one of them. This makes promotion,
-     * demotion, and GPU-to-GPU movement format-total without widening immutable
-     * static tables or consulting mutable host state during inference.
+     * Mutable expert slots require source provenance and canonical physical
+     * format. A tier arrival keeps these same capture-time identities.
      */
     [[nodiscard]] inline constexpr bool addNativeQuantisedExecutionFormat(
         NativeQuantisedExecutionFormatEnvelope &envelope,
@@ -578,7 +493,7 @@ namespace llaminar2
     {
         const uint32_t execution_bit =
             nativeQuantisedCodebookMaskBit(execution_codebook);
-        if (execution_bit == 0u)
+        if ((execution_bit & kNativeQuantisedPhysicalCodebooks) == 0u)
             return false;
 
         if (!source.present)
@@ -594,34 +509,15 @@ namespace llaminar2
             native_quantised_formats::forSourceIdentity(
                 source.codebook_id,
                 source.is_superblock);
-        if (!source_format ||
-            !deviceVnniExecutionCompatibleWithSource(
-                *source_format,
-                execution_codebook))
+        if (!source_format || !deviceVnniExecutionCompatibleWithSource(*source_format, execution_codebook) ||
+            (runtime_mutable && execution_codebook != canonicalDeviceVnniCodebookId(*source_format)))
         {
             return false;
         }
 
-        const uint32_t canonical_bit = nativeQuantisedCodebookMaskBit(
-            canonicalDeviceVnniCodebookId(*source_format));
         const uint32_t policy_bit = nativeQuantisedCodebookMaskBit(
             canonicalDeviceVnniCodebookId(source.codebook_id));
-        if (canonical_bit == 0u)
-            return false;
-
-        uint32_t reachable_execution = execution_bit;
-        if (runtime_mutable)
-        {
-            const auto migration =
-                migrationStableDeviceVnniFormat(*source_format);
-            const uint32_t migration_bit =
-                nativeQuantisedCodebookMaskBit(migration.codebook_id);
-            if (migration_bit == 0u)
-                return false;
-            reachable_execution |= canonical_bit | migration_bit;
-        }
-
-        envelope.execution_codebook_mask |= reachable_execution;
+        envelope.execution_codebook_mask |= execution_bit;
         envelope.policy_codebook_mask |= policy_bit;
         return true;
     }

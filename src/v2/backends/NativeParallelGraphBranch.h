@@ -180,10 +180,10 @@ namespace llaminar2::detail
      * The graph's normal terminal closure joins the new child. There is no edge
      * back to the producer fragment or to a subsequent LocalRead unit.
      */
-    template<class API>
+    template<class API, class Import = decltype(&API::child)>
     NativeFiniteBodyAppendResult<typename API::Error, typename API::Node> appendNativeFiniteBodyAfterFrontier(
         typename API::Graph parent, typename API::Graph child,
-        std::span<const typename API::Node> producer)
+        std::span<const typename API::Node> producer, Import import = &API::child)
     {
         using Node=typename API::Node;
         using Result=NativeFiniteBodyAppendResult<typename API::Error, Node>;
@@ -204,7 +204,7 @@ namespace llaminar2::detail
         if(error!=API::success)return Result{error,"query finite auxiliary"};
         if(!count)return Result{API::invalid,"nonempty finite auxiliary"};
         Node appended{};
-        error=API::child(&appended,parent,producer.data(),producer.size(),child);
+        error=import(&appended,parent,producer.data(),producer.size(),child);
         if (error != API::success) return Result{error,"fork finite auxiliary after original producers"};
         if (!appended) return Result{API::invalid,"native finite append returned no child exit"};
         return Result{API::success,"fork finite auxiliary after original producers",appended};
@@ -219,9 +219,9 @@ namespace llaminar2::detail
      * @note Native graph completion waits for every terminal. No artificial
      * Open/Close/progress operation is needed when native SDMA owns progress.
      */
-    template<class API>
+    template<class API, class Import = decltype(&API::child)>
     NativeParallelGraphResult<typename API::Error> appendNativeFiniteBodySiblings(
-        typename API::Graph body,std::span<const typename API::Graph> siblings)
+        typename API::Graph body,std::span<const typename API::Graph> siblings, Import import = &API::child)
     {
         using Result=NativeParallelGraphResult<typename API::Error>;
         using Node=typename API::Node;
@@ -241,7 +241,7 @@ namespace llaminar2::detail
             if(!count)return Result{API::invalid,"nonempty finite sibling body"};
         }
         for(const auto sibling:siblings){
-            Node node{};error=API::child(&node,body,nullptr,0u,sibling);
+            Node node{};error=import(&node,body,nullptr,0u,sibling);
             if(error!=API::success)return Result{error,"append finite sibling root/terminal"};
         }
         return Result{API::success,"finite sibling roots/terminals complete"};
@@ -256,11 +256,11 @@ namespace llaminar2::detail
      *        A sibling must never require Close or parent completion to finish.
      * @return Exact native status; failed partial assembly must be discarded.
      */
-    template <typename API>
+    template <typename API, class Import = decltype(&API::child)>
     NativeParallelGraphResult<typename API::Error> appendNativeParallelBranch(
         typename API::Graph body,
         const std::array<typename API::Graph, 3> &fragments,
-        std::span<const typename API::Graph> body_siblings = {})
+        std::span<const typename API::Graph> body_siblings = {}, Import import = &API::child)
     {
         using Node = typename API::Node;
         using Result = NativeParallelGraphResult<typename API::Error>;
@@ -298,14 +298,14 @@ namespace llaminar2::detail
         for (const auto sibling : body_siblings)
         {
             Node node{};
-            error = API::child(&node, body, nullptr, 0u, sibling);
+            error = import(&node, body, nullptr, 0u, sibling);
             if (error != API::success) return Result{error, "append finite body sibling"};
             roots.push_back(node);
             leaves.push_back(node);
         }
 
         Node open{};
-        error = API::child(&open, body, nullptr, 0u, fragments[0]);
+        error = import(&open, body, nullptr, 0u, fragments[0]);
         if (error != API::success) return Result{error, "append Open"};
         // Every original root consumes Open. Never depend on the worker here:
         // a bounded worker is allowed to wait for the original body's Close.
@@ -313,10 +313,10 @@ namespace llaminar2::detail
         error = API::edges(body, opens.data(), roots.data(), roots.size());
         if (error != API::success) return Result{error, "order body after Open"};
         Node worker{};
-        error = API::child(&worker, body, &open, 1u, fragments[1]);
+        error = import(&worker, body, &open, 1u, fragments[1]);
         if (error != API::success) return Result{error, "append parallel worker"};
         Node close{};
-        error = API::child(&close, body, leaves.data(), leaves.size(), fragments[2]);
+        error = import(&close, body, leaves.data(), leaves.size(), fragments[2]);
         if (error != API::success) return Result{error, "append Close"};
         const Node terminals[] = {close, worker};
         Node join{};

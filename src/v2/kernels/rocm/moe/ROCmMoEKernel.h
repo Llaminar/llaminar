@@ -906,7 +906,7 @@ namespace llaminar2
             uint32_t local_transfer_slot_count,
             const DeviceMoERebalanceConfig &config,
             DeviceMoERebalanceApplyStatus *status,
-            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            DeviceMoERebalanceArrivalScratch *arrival_scratch,
             uint32_t command_buffer_count = 1) override;
 
         bool initializeDeviceRebalanceGraphController(

@@ -14,7 +14,7 @@
  *
  *   CPU interleaved:
  *     Per K-block across 64 rows (N-chunk): [1024B payload (4 groups × 4 ZMMs,
- *     transposed)] [128B comp_int16] [128B scales_fp16] [128B mins_fp16]
+ *     transposed)] [128B scales_fp16] [128B mins_fp16]
  *     - Payload bytes are transposed into VNNI register layout for AVX-512
  *     - stride = 1280B (symmetric) or 1408B (asymmetric)
  *
@@ -22,25 +22,20 @@
  *     Flat arrays: all_native_quantised[linear_block * payload_bytes], one scale per block,
  *     one min per block. Payload bytes are in per-row linear order.
  *
- * Metadata granularity is IDENTICAL (1 FP16 scale, 1 FP16 min per 32-element block).
- * The payload bytes are the SAME raw quantized bytes, but stored in different
- * transposition order (VNNI group/ZMM/lane layout vs. linear per-row). Conversion
- * is a pure byte-level scatter/gather (no mathematical transformation), but the
- * transposition across 64-row N-chunks adds non-trivial complexity.
- *
- * GPU↔GPU transfer does NOT require format conversion since both ROCm (and CUDA)
- * devices use the identical separated layout. CPU↔GPU transfer requires the
- * existing serialize → deserialize → repack path until deinterleave kernels are
- * implemented.
+ * Coded slots carry the original payload and source-scale codes, plus one
+ * original word per source superblock. Transfer lengths are live plane bytes;
+ * allocation-only guard bytes are not part of an expert transfer.
  */
 
 #pragma once
 
 #include "../../backends/DeviceId.h"
 #include "../../tensors/TensorKernels.h"
+#include "../../tensors/NativeQuantisedScalePlane.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2 {
@@ -68,16 +63,16 @@ struct GpuExpertPackedDescriptor {
     /**
      * Physical capacity of the persistent allocation backing this live view.
      *
-     * These fields are deliberately distinct from the execution fields above:
-     * an initially compact expert can occupy a slot large enough for a later
-     * CPU-normalized promotion without changing the bytes consumed by GEMM.
-     * Zero identifies an ordinary immutable allocation with no recycling
-     * contract.
+     * A recyclable slot reserves the canonical device layout for its original
+     * source format, independently of the live execution view above. CPU-tier
+     * promotion preserves that layout. Zero identifies an immutable allocation
+     * with no recycling contract.
      */
     uint8_t allocation_payload_bytes_per_block = 0;
     bool allocation_has_mins = false;
     bool allocation_has_emins = false;
 
+    uint8_t metadata_layout = 0; ///< Exact representation, source phase and code bit offset.
     size_t vnni_bytes = 0;
     size_t scales_bytes = 0;
     size_t mins_bytes = 0;
@@ -92,7 +87,9 @@ struct GpuExpertPackedDescriptor {
                blocks_per_row > 0 &&
                payload_bytes_per_block > 0 &&
                vnni_bytes > 0 &&
-               scales_bytes > 0;
+               nativeQuantisedLayoutValid(codebook_id, metadata_layout) &&
+               (metadata_layout ? (ptrs.d_mins && mins_bytes && !emins_bytes &&
+                    (scales_bytes || native_quantised_superblock::superblockCodeInPayload(codebook_id))) : scales_bytes > 0);
     }
 
     size_t totalBytes() const
@@ -117,17 +114,13 @@ struct GpuExpertPackedDescriptor {
     /** @return Bytes physically reserved for minima, or zero when absent. */
     [[nodiscard]] size_t allocationMinsBytes() const
     {
-        return allocation_has_mins
-                   ? blockCount() * sizeof(uint16_t)
-                   : 0;
+        return metadata_layout ? mins_bytes : (allocation_has_mins ? blockCount() * sizeof(uint16_t) : 0);
     }
 
     /** @return Bytes physically reserved for extended minima, or zero when absent. */
     [[nodiscard]] size_t allocationEminsBytes() const
     {
-        return allocation_has_emins
-                   ? blockCount() * sizeof(uint32_t)
-                   : 0;
+        return !metadata_layout && allocation_has_emins ? blockCount() * sizeof(uint32_t) : 0;
     }
 };
 
@@ -143,6 +136,8 @@ inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
     bool is_asymmetric,
     bool has_emins)
 {
+    if (!nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout))
+        throw std::invalid_argument("Invalid GPU expert metadata layout");
     const size_t block_count =
         static_cast<size_t>(desc.blocks_per_row) * static_cast<size_t>(desc.n);
 
@@ -155,6 +150,7 @@ inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
     out.k = desc.k;
     out.blocks_per_row = desc.blocks_per_row;
     out.codebook_id = desc.codebook_id;
+    out.metadata_layout = desc.metadata_layout;
     out.payload_bytes_per_block = payload_bytes_per_block;
     out.is_asymmetric = is_asymmetric;
     out.has_emins = has_emins;
@@ -163,6 +159,15 @@ inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
     out.allocation_has_mins = desc.allocation_has_mins != 0;
     out.allocation_has_emins = desc.allocation_has_emins != 0;
     out.vnni_bytes = block_count * payload_bytes_per_block;
+    if (desc.metadata_layout)
+    {
+        namespace sb = native_quantised_superblock;
+        const auto bits = block_count * sb::superblockCodePlaneBits(desc.codebook_id);
+        out.scales_bytes = bits ? (bits + nativeQuantisedLayoutCodeBitShift(desc.metadata_layout) + 7) / 8 : 0;
+        out.mins_bytes = sb::planeBytes(desc.codebook_id, desc.n, desc.blocks_per_row,
+            nativeQuantisedLayoutPhase(desc.metadata_layout)).superblock;
+        return out;
+    }
     // Plane widths come from the single metadata-plane authority; the
     // secondary plane is never assumed to be as wide as the primary scales.
     const auto planes = NativeQuantisedMetadataPlaneBytes::of(
@@ -183,11 +188,13 @@ inline bool gpuExpertPackedDescriptorsCompatible(
            src.k == dst.k &&
            src.blocks_per_row == dst.blocks_per_row &&
            src.codebook_id == dst.codebook_id &&
+           nativeQuantisedLayoutRepresentation(src.metadata_layout) == nativeQuantisedLayoutRepresentation(dst.metadata_layout) &&
+           nativeQuantisedLayoutPhase(src.metadata_layout) == nativeQuantisedLayoutPhase(dst.metadata_layout) &&
            src.payload_bytes_per_block == dst.payload_bytes_per_block &&
            src.is_asymmetric == dst.is_asymmetric &&
            src.has_emins == dst.has_emins &&
            src.vnni_bytes == dst.vnni_bytes &&
-           src.scales_bytes == dst.scales_bytes &&
+           (src.metadata_layout || src.scales_bytes == dst.scales_bytes) &&
            src.mins_bytes == dst.mins_bytes &&
            src.emins_bytes == dst.emins_bytes;
 }

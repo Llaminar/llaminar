@@ -9,7 +9,7 @@
  * Explicit synthetic source fixtures preserve every canonical original alias
  * without borrowing model, descriptor-file or prepared-payload identity.
  * Promoted representation admission preserves the original source family and
- * accepts only its canonical expanded-asymmetric CPU migration contract.
+ * checks canonical file-density CPU migration for all authored source aliases.
  */
 #include <gtest/gtest.h>
 #include "../../performance/kernels/native_quantised_dispatch/NativeQuantisedMoEProjectionDiagnostic.h"
@@ -245,80 +245,75 @@ TEST(MoEProjectionDiagnostic, AutomaticContestRejectsMultirowAndOversizedRouteCa
 
 
 /** Original requests retain their exact identity; genuine promoted preparation is explicitly distinct. */
-TEST(MoEProjectionDiagnostic, Promoted23RepresentationPreservesDefaultAndOriginalSource)
+TEST(MoEProjectionDiagnostic, CpuMigrationRepresentationPreservesDefaultAndOriginalSource)
 {
     auto authored = syntheticRequest("Q5_K");
     const auto original = parseMoEProjectionDiagnostic(authored, Json::object());
     EXPECT_EQ(original.prepared_representation, MoEProjectionPreparedRepresentation::OriginalGpu);
     authored["prepared_representation"] = "original-gpu-prepared";
     EXPECT_EQ(parseMoEProjectionDiagnostic(authored, Json::object()).evidenceId(), original.evidenceId());
-    authored["prepared_representation"] = "cpu-prepared-promoted23";
+    authored["prepared_representation"] = "cpu-prepared-migrated";
     const auto promoted = parseMoEProjectionDiagnostic(authored, Json::object());
-    EXPECT_EQ(promoted.prepared_representation, MoEProjectionPreparedRepresentation::CpuPreparedPromoted23);
+    EXPECT_EQ(promoted.prepared_representation, MoEProjectionPreparedRepresentation::CpuPreparedMigrated);
     EXPECT_EQ(promoted.source.evidenceId(), original.source.evidenceId());
     EXPECT_EQ(promoted.source.routed.gate, "Q5_K");
     EXPECT_NE(promoted.evidenceId(), original.evidenceId());
-    EXPECT_NE(promoted.evidenceId().find("cpu-prepared-promoted23"), std::string::npos);
+    EXPECT_NE(promoted.evidenceId().find("cpu-prepared-migrated"), std::string::npos);
     const auto &gate = promoted.descriptor_evidence.at("original_source_roles").at("gate");
     EXPECT_EQ(gate.at("source_codebook").get<int>(), 7);
     EXPECT_TRUE(gate.at("source_is_superblock").get<bool>());
     EXPECT_EQ(gate.at("canonical_execution_codebook").get<int>(), 7);
-    EXPECT_EQ(gate.at("migration_execution_codebook").get<int>(), 23);
+    EXPECT_EQ(gate.at("migration_execution_codebook").get<int>(), 7);
+    EXPECT_TRUE(gate.at("migration_superblock_coded").get<bool>());
 }
 
-/** Supported original asymmetric sources derive from the canonical CPU migration contract, not a fake23 source. */
-TEST(MoEProjectionDiagnostic, Promoted23SourcesUseCanonicalMigrationContract)
+/** @test Migration diagnostics retain every original source alias, never a physical decoder alias. */
+TEST(MoEProjectionDiagnostic, CpuMigrationSourcesUseCanonicalMigrationContract)
 {
-    std::set<std::string> accepted;
-    for (const auto &source : llaminar2::native_quantised_formats::kAllSourceFormats)
+    using namespace llaminar2;
+    ASSERT_EQ(native_quantised_formats::kAllSourceFormats.size(), 22u);
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
-        const bool expected = source.metadata->is_asymmetric &&
-            llaminar2::migrationStableDeviceVnniFormat(*source.metadata).codebook_id ==
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
-        EXPECT_EQ(moeProjectionSupportsPromoted23(source.quant_type), expected);
+        SCOPED_TRACE(source.quant_type);
         auto authored = syntheticRequest(std::string(source.quant_type));
-        authored["prepared_representation"] = "cpu-prepared-promoted23";
-        if (expected)
-        {
-            accepted.emplace(source.quant_type);
-            const auto spec = parseMoEProjectionDiagnostic(authored, Json::object());
-            EXPECT_EQ(spec.source.routed.gate, source.quant_type);
-            EXPECT_EQ(spec.descriptor_evidence.at("original_source_roles").at("gate").at("source_codebook").get<int>(),
-                source.metadata->codebook_id);
-        }
-        else EXPECT_THROW((void)parseMoEProjectionDiagnostic(authored, Json::object()), std::invalid_argument);
+        authored["prepared_representation"] = "cpu-prepared-migrated";
+        const auto spec = parseMoEProjectionDiagnostic(authored, Json::object());
+        EXPECT_EQ(spec.source.routed.gate, source.quant_type);
+        const auto &gate = spec.descriptor_evidence.at("original_source_roles").at("gate");
+        EXPECT_EQ(gate.at("source_codebook").get<int>(), source.metadata->codebook_id);
+        EXPECT_EQ(gate.at("source_is_superblock").get<bool>(), source.metadata->is_superblock);
+        EXPECT_EQ(gate.at("migration_execution_codebook").get<int>(), canonicalDeviceVnniCodebookId(*source.metadata));
+        EXPECT_EQ(gate.at("migration_superblock_coded").get<bool>(),
+            cpu::native_quantised::migrationUsesSuperblockCodes(*source.metadata));
     }
-    EXPECT_EQ(accepted, (std::set<std::string>{"Q5_1", "Q5_K", "IQ1_S"}));
-    EXPECT_FALSE(moeProjectionSupportsPromoted23("23"));
-    EXPECT_FALSE(moeProjectionSupportsPromoted23("Q4_K"));
 }
 
 /** Unknown or mixed preparation authority fails before synthetic weights, allocation or transfer setup. */
-TEST(MoEProjectionDiagnostic, Promoted23RejectsUnknownAndMixedPreparationAuthority)
+TEST(MoEProjectionDiagnostic, CpuMigrationRejectsUnknownAndMixedPreparationAuthority)
 {
-    for (const Json invalid : {Json("23"), Json("cpu"), Json(""), Json(true), Json(23), Json(nullptr)})
+    for (const Json invalid : {Json("23"), Json("cpu"), Json("cpu-prepared-promoted23"), Json(""), Json(true), Json(23), Json(nullptr)})
     {
         auto bad = syntheticRequest("Q5_K"); bad["prepared_representation"] = invalid;
         EXPECT_THROW((void)parseMoEProjectionDiagnostic(bad, Json::object()), std::invalid_argument);
     }
-    auto bad = request(); bad["prepared_representation"] = "cpu-prepared-promoted23";
+    auto bad = request(); bad["prepared_representation"] = "cpu-prepared-migrated";
     EXPECT_THROW((void)parseMoEProjectionDiagnostic(bad, descriptors()), std::invalid_argument);
     for (const auto *contest : {"gate-up-geometry", "inline64-vs-parallel-partitions64"})
     {
         bad = syntheticRequest("Q5_K"); bad["contest"] = contest;
-        bad["prepared_representation"] = "cpu-prepared-promoted23";
+        bad["prepared_representation"] = "cpu-prepared-migrated";
         EXPECT_THROW((void)parseMoEProjectionDiagnostic(bad, Json::object()), std::invalid_argument);
     }
-    bad = syntheticRequest("23"); bad["prepared_representation"] = "cpu-prepared-promoted23";
+    bad = syntheticRequest("23"); bad["prepared_representation"] = "cpu-prepared-migrated";
     EXPECT_THROW((void)parseMoEProjectionDiagnostic(bad, Json::object()), std::invalid_argument);
     EXPECT_THROW((void)moeProjectionPreparedRepresentationName(static_cast<MoEProjectionPreparedRepresentation>(255)),
         std::invalid_argument);
 }
 
 /** Promotion does not widen the original M1/topK oracle or add authored staging/environment controls. */
-TEST(MoEProjectionDiagnostic, Promoted23KeepsBoundedSyntheticOperation)
+TEST(MoEProjectionDiagnostic, CpuMigrationKeepsBoundedSyntheticOperation)
 {
-    auto authored = syntheticRequest("IQ1_S"); authored["prepared_representation"] = "cpu-prepared-promoted23";
+    auto authored = syntheticRequest("Q5_K"); authored["prepared_representation"] = "cpu-prepared-migrated";
     for (const auto &[field, invalid] : std::vector<std::pair<std::string, Json>>{{"m", 2}, {"top_k", 17},
              {"promotion_chunk_units", 64}, {"promotion_epoch", 2}})
     {
@@ -329,7 +324,7 @@ TEST(MoEProjectionDiagnostic, Promoted23KeepsBoundedSyntheticOperation)
     // padded columns merely because an allocation could retain them.
     auto padded = syntheticRequest("Q5_1"); padded["source_fixture"]["expert_width"] = 32;
     EXPECT_NO_THROW((void)parseMoEProjectionDiagnostic(padded, Json::object()));
-    padded["prepared_representation"] = "cpu-prepared-promoted23";
+    padded["prepared_representation"] = "cpu-prepared-migrated";
     EXPECT_THROW((void)parseMoEProjectionDiagnostic(padded, Json::object()), std::invalid_argument);
     authored["source_fixture"]["expert_count"] = 4; authored["top_k"] = 4;
     const auto smoke = parseMoEProjectionDiagnostic(authored, Json::object());

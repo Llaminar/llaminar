@@ -130,10 +130,14 @@ namespace llaminar2::cpu::native_quantised
          * Each task writes only its own output tile with the same full-K
          * arithmetic, so pooling changes no byte.
          * @param task Index in [0, taskCount()).
+         * @details FPCR is per thread, so every task admits its executing
+         * worker's floating-point profile (one system-register read) and fails
+         * fatally under any profile other than cpu::ARMFloatingPointProfile's.
          */
         template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD, int Strips = 0>
         void runTask(std::int64_t task) const noexcept
         {
+            ARMFloatingPointProfile::require("Native NEON quantized projection batch");
             const int chunks = weights_.N_padded / 64;
             const auto n_blocks = chunkGroups();
             const auto span = grid_.tileSpan(static_cast<int>(task / n_blocks), width_);
@@ -155,6 +159,10 @@ namespace llaminar2::cpu::native_quantised
         }
 
     private:
+        // Packed prefill retains the same checked input/output spans and
+        // original row authorization; it supplies its own column workshare.
+        friend class CPUNativeNEONPackedPrefill;
+
         /** @return Ceil(physical 64-column chunks / chunks per task). */
         [[nodiscard]] std::int64_t chunkGroups() const noexcept
         {

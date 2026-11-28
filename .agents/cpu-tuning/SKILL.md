@@ -304,7 +304,7 @@ variants must not be eligible in compute-bound dispatch domains.
 ### Keep compact-format ILP while shortening decode live ranges
 
 Compact formats such as Q6_K can need more decode state than nibble-LUT or
-expanded-INT8 formats. When grouped M=2 work is under-filled, first widen the
+signed-INT8 (Q8) formats. When grouped M=2 work is under-filled, first widen the
 column span so one worker owns enough independent dot products; do not create
 two separate row launches. Then reduce register pressure inside that wider
 tile without collapsing its independent accumulator chains:
@@ -336,8 +336,8 @@ live data owned by one physical microkernel tile:
   optional minima;
 - the Q8 activation blocks for every simultaneously live physical row;
 - the FP32 output chunks that remain live while K is accumulated;
-- the prepared encoding and asymmetry, because nibble decode, expanded INT8,
-  and native dual-scale Q6 have different reuse/compute balances.
+- the prepared encoding and asymmetry, because nibble decode, signed INT8
+  (Q8) and native dual-scale Q6 have different reuse/compute balances.
 
 Derive capacity and associativity from `CacheInfo`, reserve explicit
 associativity headroom, and keep the residency fraction a typed, testable
@@ -347,7 +347,7 @@ bytes-per-weight ratio or let a benchmark-host cache size become a constant.
 
 Treat cache residency as a tournament parameter, not as a folklore percentage:
 
-1. Cover symmetric/asymmetric nibble, symmetric/asymmetric expanded INT8, and
+1. Cover symmetric/asymmetric nibble, signed INT8 (Q8, always symmetric), and
    native Q6. Source codebooks that map to the same prepared encoding still
    belong in the final all-format correctness sweep.
 2. Measure grouped depths on both sides of any proposed mode transition and

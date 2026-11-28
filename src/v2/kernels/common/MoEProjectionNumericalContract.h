@@ -27,6 +27,16 @@ namespace llaminar2
      * dynamically placed, must use @ref GPUAlignedExpert so that CPU, CUDA,
      * and ROCm execute one immutable numerical program.
      *
+     * On one admitted CPU ISA, serial and grouped execution must be byte
+     * identical, including inputs with multiple quiet-NaN payloads within a
+     * block. Separate compiler copies are not exempt from this requirement.
+     * Specified accumulation operand order remains authoritative; signaling
+     * NaNs follow the admitted ISA's native semantics. This does not promise
+     * NaN payload identity across CPU ISAs or CPU/CUDA/ROCm vendors. CUDA and
+     * ROCm native NaN propagation is outside cross-vendor payload byte equality;
+     * a shared finite arithmetic tree alone does not prove payload precedence.
+     * Unwitnessed CPU cases remain qualification gaps, not contract exclusions.
+     *
      * Production expert callers do not choose this policy: typed expert
      * preparation APIs bind @ref GPUAlignedExpert unconditionally.
      */

@@ -107,8 +107,8 @@ class OpenMPForkNotePolicyCliTest(unittest.TestCase):
     def test_whole_file_exemption_never_admits_new_sites(self) -> None:
         # A named exempt function coexists with an unlisted one in the same
         # real file: only the named function's sites are exempt.
-        self.write("src/v2/kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h",
-                   "inline bool packWeightsCPUNativeQuantised() {\n"
+        self.write("src/v2/kernels/rocm/gemm/ROCmWeightPacker.cpp",
+                   "inline bool packWeightsToROCm() {\n"
                    "#pragma omp parallel for\n"
                    "for (int i = 0; i < n; ++i) {}\n"
                    "}\n"

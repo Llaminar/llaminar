@@ -12,6 +12,7 @@
  */
 #pragma once
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
@@ -152,10 +153,12 @@ public:
         MoEGroupedWmmaRowFloor floor, uint32_t physical_codebooks = UINT32_MAX,
         uint32_t source_codebooks = UINT32_MAX)
     {
+        if (physical_codebooks == UINT32_MAX)
+            physical_codebooks = kNativeQuantisedPhysicalCodebooks;
         if ((role != MoEPrefillProjectionRole::GateUp && role != MoEPrefillProjectionRole::Down) ||
             source_n <= 0 || physical_n <= 0 || physical_n > source_n || k <= 0 || k % 32 ||
             (role == MoEPrefillProjectionRole::GateUp && physical_n != source_n) ||
-            !physical_codebooks || !source_codebooks)
+            !physical_codebooks || (physical_codebooks & ~kNativeQuantisedPhysicalCodebooks) || !source_codebooks)
             throw std::invalid_argument("incomplete grouped dot admission geometry or codebooks");
         if (!validMoEGroupedWmmaRowFloor(floor))
             throw std::invalid_argument("unknown grouped WMMA expert-row floor");
@@ -219,7 +222,7 @@ public:
     {
         constexpr uint32_t all_sources = UINT32_MAX & ~((uint32_t{1} << 20) | (uint32_t{1} << 21));
         return !native_ || row_plan_.floor() != MoEGroupedWmmaRowFloor::EveryExpert ||
-            physical_codebooks_ != UINT32_MAX || source_codebooks_ != all_sources;
+            physical_codebooks_ != kNativeQuantisedPhysicalCodebooks || source_codebooks_ != all_sources;
     }
 
     /**
@@ -235,7 +238,8 @@ public:
         uint8_t source = desc.source_identity_present ? desc.source_codebook_id : desc.codebook_id;
         if (source == 20 || source == 21) source = 19;
         if (whole_expert_rows <= 0 || desc.n != physical_n_ || desc.k != k_ ||
-            desc.codebook_id >= 32 || source >= 32)
+            desc.codebook_id >= 32 || source >= 32 ||
+            !(kNativeQuantisedPhysicalCodebooks & (uint32_t{1} << desc.codebook_id)))
             return MoEGroupedDotProducer::Invalid;
         if (row_plan_.isColumn() && (!desc.source_identity_present || !desc.source_is_superblock ||
             desc.source_codebook_id != (row_plan_.role()==MoEPrefillProjectionRole::GateUp ? 13 : 4) ||

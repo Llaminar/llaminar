@@ -15,10 +15,10 @@
 namespace llaminar2
 {
 
-    std::unordered_map<std::string, GraphBuilderRegistry::FactoryFn> &
+    std::unordered_map<std::string, GraphBuilderRegistry::Registration> &
     GraphBuilderRegistry::registry()
     {
-        static std::unordered_map<std::string, FactoryFn> s_registry;
+        static std::unordered_map<std::string, Registration> s_registry;
         return s_registry;
     }
 
@@ -37,7 +37,8 @@ namespace llaminar2
         return result;
     }
 
-    void GraphBuilderRegistry::registerFactory(const std::string &architecture, FactoryFn factory)
+    void GraphBuilderRegistry::registerFactory(const std::string &architecture, FactoryFn factory,
+                                               ArrivalDeclarationFn arrival_declaration)
     {
         std::lock_guard<std::mutex> lock(mutex());
         std::string key = normalize(architecture);
@@ -48,7 +49,7 @@ namespace llaminar2
             LOG_WARN("[GraphBuilderRegistry] Overwriting existing factory for '" << key << "'");
         }
 
-        reg[key] = std::move(factory);
+        reg[key] = {std::move(factory), arrival_declaration};
         LOG_DEBUG("[GraphBuilderRegistry] Registered graph builder for '" << key << "'");
     }
 
@@ -86,7 +87,19 @@ namespace llaminar2
                             "REGISTER_GRAPH_BUILDER(\"your_arch\", factory_fn).");
         }
 
-        return it->second(config, std::move(mpi_ctx));
+        return it->second.factory(config, std::move(mpi_ctx));
+    }
+
+    GraphBuilderRegistry::ArrivalDeclarationFn
+    GraphBuilderRegistry::requireArrivalDeclaration(const std::string &architecture)
+    {
+        ensureBuiltins();
+        std::lock_guard<std::mutex> lock(mutex());
+        const auto registration = registry().find(normalize(architecture));
+        if (registration == registry().end() || !registration->second.arrival_declaration)
+            throw std::invalid_argument("CUDA ExpertOverlay graph builder '" + architecture +
+                "' has no native arrival-site declaration for physical-memory admission");
+        return registration->second.arrival_declaration;
     }
 
     bool GraphBuilderRegistry::isSupported(const std::string &architecture)

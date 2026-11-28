@@ -410,9 +410,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
             --resume-retries 3 --break-system-packages -r requirements.txt; \
     fi
 
-FROM toolchain AS builder
+FROM toolchain AS builder-integration-operation
 
 ARG TARGETARCH
+
+# ARM64: the NEON tile-register proof binds the exact compiler, assembler and
+# headers, and the separate test-runner re-checks them. Repack the toolchain's
+# installed compiler packages so the test-runner installs the same bytes
+# instead of whatever the archive serves later.
+RUN --mount=type=bind,source=scripts/docker/arm64-compiler-debs.sh,target=/tmp/arm64-compiler-debs.sh \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        sh /tmp/arm64-compiler-debs.sh save /src/arm64-compiler-debs; \
+    else \
+        mkdir -p /src/arm64-compiler-debs; \
+    fi
 
 # An admitted OCI toolchain is an external image, so build arguments must be
 # declared here rather than relying on inheritance from an in-file stage.
@@ -483,63 +494,17 @@ COPY benchmarks/production ./benchmarks/production
 # stack traces from gtest / gdb attach still resolve function names.
 # Removing .o / .d / .gch files is safe: ctest never re-invokes the
 # compiler at test time.
+ARG LLAMINAR_SOURCE_TREE
+ARG LLAMINAR_TOOLCHAIN_CONTEXT
 RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
-    if [ "${LLAMINAR_SKIP_INTEGRATION}" = "1" ]; then \
-        echo "==> [integration] skipped (LLAMINAR_SKIP_INTEGRATION=1)"; \
-    else \
-        integration_started_epoch="$(date +%s)"; \
-        arm64_cmake_args=""; \
-        if [ "${TARGETARCH}" = "arm64" ]; then \
-            export CCACHE_MAXSIZE=5G; \
-            arm64_cmake_args="-DUSE_ONNX_HEURISTIC=OFF"; \
-        fi; \
-        rocm_gpu_targets="$(bash scripts/docker/rocm-image-targets.sh "${ROCM_RUNTIME_GPU_TARGETS}")" || exit 1; \
-        RCCL_CMAKE_ARGS=""; \
-        if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
-            RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_PROTOCOL_BUILD_DIR=/src/external/rccl/build -DRCCL_INCLUDE_DIR=/src/external/rccl/build/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1 -DRCCL_FINAL_ALLOCATION_REPORT=/src/rccl-allocation-evidence/final-allocation.json -DRCCL_FINAL_ALLOCATION_RECEIPT=/src/rccl-allocation-evidence/build.txt"; \
-        fi; \
-        echo "==> [integration] cmake configure" \
-     && cmake -B build_v2_integration -S src/v2 -G Ninja \
-            -DCMAKE_MAKE_PROGRAM:FILEPATH="$(command -v ninja)" \
-            -DCMAKE_BUILD_TYPE=Integration \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            -DHAVE_CUDA="${LLAMINAR_ENABLE_CUDA}" \
-            -DHAVE_ROCM="${LLAMINAR_ENABLE_ROCM}" \
-            -DLLAMINAR_CPU_ISA="${LLAMINAR_CPU_ISA}" \
-            -DLLAMINAR_SHARED_CORE=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
-            -DCMAKE_HIP_ARCHITECTURES="${rocm_gpu_targets}" \
-            ${RCCL_CMAKE_ARGS} ${arm64_cmake_args} \
-     && case "${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
-            full-matrix) integration_targets="v2_unit_gate v2_production_test_preflight_gate v2_model_parity_matrices" ;; \
-            model-free) integration_targets="v2_unit_gate v2_production_test_preflight_gate" ;; \
-            unit-only) integration_targets="v2_unit_gate" ;; \
-            arm64-pr) integration_targets="v2_arm64_pr_gate" ;; \
-            *) echo "Unsupported test-runner inventory: ${LLAMINAR_TEST_RUNNER_INVENTORY}" >&2; exit 1 ;; \
-        esac \
-     && echo "==> [integration] cmake build (parallel; matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES})" \
-     && cmake --build build_v2_integration --parallel \
-            --target ${integration_targets} \
-     && echo "==> [integration] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
-     && { find build_v2_integration \
-              \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
-              -not -path '*/CMakeFiles/*' \
-              -print0 \
-          | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true; } \
-     && echo "==> [integration] removing intermediates (.o/.d/.gch/CMakeFiles)" \
-     && mv build_v2_integration/CMakeFiles/rules.ninja build_v2_integration/installed-rules.ninja \
-     # The NEON preflight re-disassembles the register-allocation witness.
-     && find build_v2_integration \
-            ! -path '*/cpu_native_tile_registers/proof.o' \
-            \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
-            -delete \
-     && find build_v2_integration -depth -type d -name CMakeFiles -exec rm -rf {} + \
-     # Retain the compiler-launcher rules used by the build-contract Unit test.
-     && mkdir build_v2_integration/CMakeFiles \
-     && mv build_v2_integration/installed-rules.ninja build_v2_integration/CMakeFiles/rules.ninja \
-     && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles \
-     && echo "==> [integration] done; elapsed_seconds=$(( $(date +%s) - integration_started_epoch )); final size: $(du -sh build_v2_integration | cut -f1)"; \
-    fi
+    python3 scripts/ci/arm_native_build_evidence.py capture -- sh scripts/ci/arm_native_integration_operation.sh
+
+FROM scratch AS arm64-build-evidence
+COPY --from=builder-integration-operation /src/native-build-evidence/ /
+
+FROM builder-integration-operation AS builder
+ARG LLAMINAR_EXPECTED_BUILD_NONCE
+RUN python3 scripts/ci/arm_native_build_evidence.py assert
 
 # This receipt permits the campaign driver to use installed binaries without
 # reconstructing stripped objects. Its scope cannot substitute for broader gates.
@@ -670,6 +635,7 @@ RUN set -e; \
         cp /src/external/rccl/build/.llaminar-rccl-commit "${rccl_receipt}"; \
     fi; \
     rm -rf /src/build_v2_release \
+           /src/arm64-compiler-debs \
            /src/runtime-bin \
            /src/runtime-libs \
            /src/runtime-licenses \
@@ -836,17 +802,18 @@ ARG LLAMINAR_SOURCE_TREE
 # production toolchain, SDK headers, or build objects. The runtime already
 # provides Python and OpenMPI; these are the only host tools absent from its
 # production closure.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      build-essential \
-      git \
-      jq \
- # The NEON register proof authenticates the GCC driver, compiler, assembler \
- # and system headers before re-disassembling the retained witness. \
+#
+# On ARM64 the NEON register proof authenticates the GCC driver, compiler,
+# assembler and system headers, so the compilers are the exact .debs the
+# builder compiled with (arm64-compiler-debs.sh), not a later archive state.
+RUN --mount=type=bind,from=builder,source=/src/arm64-compiler-debs,target=/tmp/arm64-compiler-debs \
+    --mount=type=bind,source=scripts/docker/arm64-compiler-debs.sh,target=/tmp/arm64-compiler-debs.sh \
+    apt-get update \
+ && apt-get install -y --no-install-recommends git jq \
  && if [ "${TARGETARCH}" = "arm64" ]; then \
-        apt-get install -y --no-install-recommends g++-14 \
-        && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
-              --slave /usr/bin/g++ g++ /usr/bin/g++-14; \
+        sh /tmp/arm64-compiler-debs.sh install /tmp/arm64-compiler-debs; \
+    else \
+        apt-get install -y --no-install-recommends build-essential; \
     fi \
  && rm -rf /var/lib/apt/lists/*
 

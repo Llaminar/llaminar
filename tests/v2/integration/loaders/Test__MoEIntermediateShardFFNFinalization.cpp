@@ -581,8 +581,8 @@ struct PublishedFFNEpoch final {
     std::shared_ptr<DeviceMoERuntimeTable> runtime;
     std::shared_ptr<DeviceMoEOverlayEpochArena> arena;
     MoEOverlayParticipantBankLease bank;
-    std::vector<int> promoted_experts; ///< Actual CPU-arrival IDs whose down descriptors are physical23.
-    std::vector<int> canonical_experts; ///< Retained original GPU residents required in the same observed EB4 packet.
+    std::vector<int> promoted_experts; ///< Actual expert IDs that arrived from another original GPU source.
+    std::vector<int> canonical_experts; ///< Unchanged original GPU residents retained beside the arrived experts.
     /** @return Exact completed source epoch, or zero for an empty borrow. */
     uint64_t epoch() const noexcept { return bank ? bank->epoch : 0; }
 };
@@ -1458,6 +1458,11 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 receipt<<"M4_SOURCE_DESCRIPTORS,case="<<shape.grouped_matrix_case;
                 const auto report=[&](std::string_view role,const DeviceNativeQuantisedMatrixDesc& desc) {
                     require(desc.valid() && desc.source_identity_present,"Recorded native descriptor has original source policy");
+                    if (shape.grouped_schedule!=GroupedFFNFixtureSchedule::SourceMatrix &&
+                        desc.source_is_superblock && nativeQuantisedSuperblockCodable(desc.codebook_id))
+                        require(nativeQuantisedLayoutRepresentation(desc.metadata_layout)==
+                                    NativeQuantisedMetadataRepresentation::SuperblockCoded,
+                                "Native architecture replay must consume coded " + std::string(role));
                     receipt<<','<<role<<'='<<unsigned(desc.codebook_id)<<'/'<<unsigned(desc.source_codebook_id)
                         <<'/'<<unsigned(desc.source_is_superblock)<<'/'<<desc.n<<'/'<<desc.k;
                 };
@@ -1837,8 +1842,13 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         const int k=relocateDown?shape.routed:shape.hidden;
                         const auto blocks=std::size_t(n)*(k/32);
                         const auto payload=blocks*(relocateDown?20:16);
-                        const auto coefficients=blocks*2;
-                        const auto roleBytes=payload+2*coefficients;
+                        const auto& originalProjection=relocateDown?update.experts.front().down:update.experts.front().gate;
+                        const auto codedPlanes=native_quantised_superblock::planeBytes(originalProjection.codebook_id,n,k/32,
+                            nativeQuantisedLayoutPhase(originalProjection.metadata_layout));
+                        const auto scaleBytes=originalProjection.metadata_layout?codedPlanes.code:
+                            nativeQuantisedScalePlaneStorageWords(originalProjection.codebook_id,blocks)*sizeof(std::uint16_t);
+                        const auto minBytes=originalProjection.metadata_layout?codedPlanes.superblock:blocks*sizeof(std::uint16_t);
+                        const auto roleBytes=payload+scaleBytes+minBytes;
                         clonedBytes=(relocateDown?1:2)*source.expert_count*roleBytes;
                         auto* allocation=static_cast<std::uint8_t*>(backend->allocate(clonedBytes,device.ordinal));
                         require(allocation,"allocate independent fixture-owned copies of original weight planes");
@@ -1851,13 +1861,13 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                                     !projection.source_is_superblock,"only original plain Q5_1 Down can use this witness");
                             auto* base=allocation+team*roleBytes;
                             require(backend->deviceToDevice(base,projection.payload,payload,device.ordinal,stream) &&
-                                backend->deviceToDevice(base+payload,projection.scales,coefficients,device.ordinal,stream) &&
-                                backend->deviceToDevice(base+payload+coefficients,projection.mins,coefficients,device.ordinal,stream),
+                                backend->deviceToDevice(base+payload,projection.scales,scaleBytes,device.ordinal,stream) &&
+                                backend->deviceToDevice(base+payload+scaleBytes,projection.mins,minBytes,device.ordinal,stream),
                                 "copy original prepared physical planes on the captured lane's transfer stream");
                             require(base!=projection.payload,"physical plane address changed");
                             projection.payload=base;
                             projection.scales=base+payload;
-                            projection.mins=base+payload+coefficients;
+                            projection.mins=base+payload+scaleBytes;
                         };
                         for(std::size_t expert=0;expert<source.expert_count;++expert)
                             if(update.local_compute_mask[expert]) {
@@ -1979,8 +1989,8 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
 #if defined(HAVE_ROCM)
 #include "FullNativeHCFFNReplay.inc"
 #include "FullNativeHCFFNEpochReplay.inc"
+#include "MoERetainedGpuEpochReplay.inc"
 #endif
-#include "MoEPromoted23NativeLayoutReplay.inc"
 #if defined(LLAMINAR_CASTAGNA_KERNEL_AB)
 #include "CastagnaFullRegionABReplay.inc"
 #endif
@@ -2184,7 +2194,9 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                         primary_plan.planWeight(binding.identity.canonical_name, binding.tensor->rows(), binding.tensor->cols(),
                             native->payload_bytes, canonicalDeviceVnniFormat(*native).is_asymmetric,
                             native->has_emins, nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*native)),
-                            source_bytes);
+                            source_bytes, {0},
+                            gpuPreparedWeightCodedDeclaration(*binding.tensor, GPUPreparedWeightPoolLayout::SourceNative,
+                                                              device));
                     else
                     {
                         const auto type = binding.tensor->native_type();
@@ -2379,7 +2391,7 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                             shared[member],*manager.tensorParallelConfig(),*store,
                             qualification==OriginalSourceQualification::NativeLayoutRouterFFNEconomy?ResidentFFNObservation::PairedEvents:
                             qualification==OriginalSourceQualification::NativeLayoutRouterFFNParentReplay?ResidentFFNObservation::RepeatedParent:ResidentFFNObservation::Replay,
-                            format.name,LocalFFNReplayCandidate::Resident,LocalFFNProgram::Original,shape,true,nullptr,
+                            format.name,LocalFFNReplayCandidate::Resident,LocalFFNProgram::Original,shape,true,
                             format.expected_native_layout_groups);
                     else if(qualification==OriginalSourceQualification::ResidentFFN || qualification==OriginalSourceQualification::ResidentFFNEconomy ||
                        qualification==OriginalSourceQualification::GateUpLastProducer || qualification==OriginalSourceQualification::GateUpPairedK32 ||
@@ -2762,8 +2774,8 @@ TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionWindowEpoch)
             require(!owners[index].empty(),"real window movement PCI is nonempty");
             if(separator!=std::string_view::npos)list.remove_prefix(separator+1);
         }
-        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,owners,
-            promoted23_replay::EpochSource::GPUNative5_7,&window);
+        retained_gpu_epoch_replay::run(owners,
+            retained_gpu_epoch_replay::EpochSource::GPUNative5_7,&window);
         if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
     } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
 }
@@ -2780,8 +2792,8 @@ TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionTP4Epoch)
         const auto inventory=mpi->clusterInventory();
         require(inventory!=nullptr,"real TP4 movement uses actual MPI rank inventory");
         const auto pci=originalRetainedClosedMovementPCIs(scope,*inventory);
-        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,pci.views(),
-            promoted23_replay::EpochSource::GPUNativeRealTP4,&source);
+        retained_gpu_epoch_replay::run(pci.views(),
+            retained_gpu_epoch_replay::EpochSource::GPUNativeRealTP4,&source);
         if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
     } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
 }

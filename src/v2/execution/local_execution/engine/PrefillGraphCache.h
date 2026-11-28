@@ -237,6 +237,7 @@ namespace llaminar2
          * @param dependency_ledger Optional frozen arena dependency plan. The
          *        production prefill executor always supplies one; controller unit
          *        tests without tensors may omit it.
+         * @param expected_cuda_arrival_sites Original declared live-update sites; ordinary graphs declare zero.
          * @return true only when recording, capture closure, and graph
          *         instantiation all succeed. A false body result leaves the entry
          *         Cold and is never retried through eager execution.
@@ -246,7 +247,8 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             void *stream,
             const std::function<bool()> &record_graph_body,
-            GraphCaptureDependencyLedger *dependency_ledger = nullptr);
+            GraphCaptureDependencyLedger *dependency_ledger = nullptr,
+            std::size_t expected_cuda_arrival_sites = 0u);
 
         /// Launch (replay) the cached graph.
         /// Returns false if not Ready or launch fails.

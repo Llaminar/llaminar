@@ -10,6 +10,7 @@
  * retain exact live output, activation-byte, scale and sums extents across
  * full/partial/empty replay; empty work cannot write native partial scratch.
  */
+#include "../../utils/NativeQuantisedLegacyPlanes.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/PerfStatsCollector.h"
 #include "moe/NativeQuantisedExpertTransferParityTest.h"
@@ -169,34 +170,36 @@ struct Planes {
   std::vector<uint32_t> emins;
   bool operator==(const Planes &) const = default;
 };
-/** @brief Download exactly the live primary plane (one E8M0 byte per block for
- * native MXFP4) and return one staged word per block. */
-std::vector<uint16_t> stagedPrimaryWords(Storage &s, const DeviceNativeQuantisedMatrixDesc &d,
-                                         std::size_t blocks) {
-  const auto bytes = s.download(static_cast<const uint8_t *>(d.scales),
-                                nativeQuantisedScalePlaneLiveBytes(d.codebook_id, blocks));
-  // Re-home the bytes in word storage so loadStagedPrimary reads the same plane layout.
-  std::vector<uint16_t> plane((bytes.size() + 1) / 2, 0);
-  std::memcpy(plane.data(), bytes.data(), bytes.size());
-  std::vector<uint16_t> words(blocks);
-  for (std::size_t i = 0; i < blocks; ++i)
-    words[i] = native_quantised_scale::loadStagedPrimary(d.codebook_id, plane.data(), i);
-  return words;
-}
 /** @brief Terminal snapshot of actual source allocations, never a hot-path
- * source mirror. */
+ * source mirror. A superblock-coded matrix is read as the identical legacy
+ * per-block words (and restored per-block payload) through the production
+ * codec, so the scalar oracle below is representation independent. */
 Planes readPlanes(Storage &s, const DeviceNativeQuantisedMatrixDesc &d) {
   const auto physical = requireQ8ResidualNativeMatrix(d, 1, d.n, d.k);
   const auto blocks = std::size_t(d.n) * d.blocks_per_row;
-  return {
-      s.download(d.payload, blocks * (d.allocation_payload_bytes_per_block
-                                          ? d.allocation_payload_bytes_per_block
-                                          : physical.payload_bytes_per_block)),
-      stagedPrimaryWords(s, d, blocks),
-      d.mins ? s.download(static_cast<const uint16_t *>(d.mins), blocks)
-             : std::vector<uint16_t>{},
-      d.emins ? s.download(static_cast<const uint32_t *>(d.emins), blocks)
-              : std::vector<uint32_t>{}};
+  const auto payload_bytes = d.allocation_payload_bytes_per_block
+                                 ? d.allocation_payload_bytes_per_block
+                                 : physical.payload_bytes_per_block;
+  auto legacy = test::nativeQuantisedLegacyPlanes(
+      d, payload_bytes,
+      [&](void *dst, const void *src, std::size_t bytes) {
+        const auto host = s.download(static_cast<const uint8_t *>(src), bytes);
+        std::memcpy(dst, host.data(), bytes);
+      },
+      [&](const std::vector<uint8_t> &bytes, std::size_t count) {
+        std::vector<uint16_t> plane((bytes.size() + 1) / 2, 0);
+        std::memcpy(plane.data(), bytes.data(), bytes.size());
+        std::vector<uint16_t> words(count);
+        for (std::size_t i = 0; i < count; ++i)
+          words[i] = native_quantised_scale::loadStagedPrimary(d.codebook_id, plane.data(), i);
+        return words;
+      });
+  // Per-block oracle semantics: a secondary/emin word exists only where the
+  // physical decoder reads one.
+  if (legacy.coded && !physical.is_asymmetric)
+    legacy.secondary.clear();
+  return {std::move(legacy.payload), std::move(legacy.primary), std::move(legacy.secondary),
+          std::move(legacy.emins)};
 }
 /** @brief Scalar coefficient interpretation independent of GPU integer dots and
  * FP32 contribution/reduction helpers. */
@@ -251,7 +254,7 @@ void rejectMissingIQ(Storage &s, const DeviceNativeQuantisedMatrixDesc &d,
 }
 /**
  * @brief Prepare a genuine cold CPU expert, then adopt its real promoted GPU engine.
- * @param source Original authored Q5_1 tensor; its source bytes are never repacked by the test.
+ * @param source Original authored Q5_1 or Q5_K tensor, packed only by the production CPU engine.
  * @param device Exact GPU receiving the production persistent migration stream.
  * @param backend Existing backend owner for that endpoint.
  * @return Store-owned prepared engine retaining the promoted separated allocation.
@@ -260,7 +263,7 @@ void rejectMissingIQ(Storage &s, const DeviceNativeQuantisedMatrixDesc &d,
  * HC dense replicas do not participate in expert movement; the test neither
  * enables expert TwoTerm by default nor claims an HC migration production path.
  */
-test::GpuPreparedGemm preparePromotedAsymmetric(TensorBase *source, DeviceId device,
+test::GpuPreparedGemm prepareCpuMigrated(TensorBase *source, DeviceId device,
                                                 IBackend *backend) {
   namespace transfer = test::native_quantised_transfer_parity_detail;
   namespace factory = llaminar::v2::kernels;
@@ -270,8 +273,11 @@ test::GpuPreparedGemm preparePromotedAsymmetric(TensorBase *source, DeviceId dev
       dynamic_cast<cpu::native_quantised::CPUNativeQuantisedGemmKernel *>(cold.store->gemmKernel(cold.ref));
   require(coldEngine && coldEngine->isValid(), "Actual cold CPU prepared expert is absent");
   const auto &packed = coldEngine->packedWeights();
-  require(packed.usesExpandedInt8() && packed.is_asymmetric,
-          "Authored asymmetric source must reach real expanded CPU storage");
+  const auto *sourceFormat = native_quantised_formats::forSourceIdentity(packed.codebook_id, packed.is_superblock);
+  require(sourceFormat && packed.is_asymmetric &&
+              packed.encoding == cpu::native_quantised::preparedEncodingForSource(*sourceFormat),
+          "Cold expert must retain its canonical asymmetric CPU storage");
+  const bool coded = cpu::native_quantised::migrationUsesSuperblockCodes(*sourceFormat);
   const std::vector<uint8_t> before(packed.native_interleaved.begin(),
                                     packed.native_interleaved.end());
   auto allocation =
@@ -280,11 +286,13 @@ test::GpuPreparedGemm preparePromotedAsymmetric(TensorBase *source, DeviceId dev
   require(std::equal(before.begin(), before.end(), packed.native_interleaved.begin()),
           "Actual promotion mutated its cold CPU execution source");
   const auto &descriptor = allocation->descriptor;
-  require(descriptor.codebook_id == kNativeQuantisedExpandedInt8MinCodebook &&
-              descriptor.source_codebook_id == native_quantised_formats::Q5_1.codebook_id &&
-              descriptor.source_is_superblock == 0 && descriptor.source_identity_present == 1 &&
-              descriptor.mins && !descriptor.emins,
-          "Production CPU promotion did not publish the original asymmetric physical23 contract");
+  require(descriptor.codebook_id == canonicalDeviceVnniCodebookId(*sourceFormat) &&
+              descriptor.source_codebook_id == sourceFormat->codebook_id &&
+              bool(descriptor.source_is_superblock) == sourceFormat->is_superblock &&
+              descriptor.source_identity_present == 1 &&
+              descriptor.allocation_payload_bytes_per_block == sourceFormat->payload_bytes &&
+              (descriptor.metadata_layout != 0) == coded && descriptor.mins && !descriptor.emins,
+          "Production CPU migration did not publish the original Q5 storage contract");
   auto engine = transfer::promotedEngine(device, descriptor, allocation);
   const auto kind = device.is_cuda()
                         ? factory::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
@@ -371,7 +379,7 @@ std::vector<PerfStatRecord> projectionSubmissions() {
     return records;
 }
 /** @brief Explicit test setup choice; inference arithmetic is unchanged. */
-enum class SourcePreparation { NativeGpu, PromotedCpuAsymmetric };
+enum class SourcePreparation { NativeGpu, CpuMigrated };
 /** @brief Serial oracle choice only; every tested production capture uses the actual GEMMStage. */
 enum class SerialProjectionReference { Production, OriginalColumn };
 /**
@@ -414,7 +422,7 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
            int m, int n, int k, bool tile, bool concurrentCold = false,
            SourcePreparation sourcePreparation = SourcePreparation::NativeGpu,
            SerialProjectionReference reference = SerialProjectionReference::Production) {
-  const bool promotedAsymmetric = sourcePreparation == SourcePreparation::PromotedCpuAsymmetric;
+  const bool cpuMigrated = sourcePreparation == SourcePreparation::CpuMigrated;
   SCOPED_TRACE(format.label);
   SCOPED_TRACE(::testing::Message() << device.toString() << " M=" << m << " N="
                                     << n << " K=" << k << " tile=" << tile);
@@ -430,8 +438,8 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
         auto weight = oracle::source(format, n, k);
         const auto raw = oracle::originalBytes(*weight);
         const auto original = oracle::originalWeights(*weight);
-        auto prepared = promotedAsymmetric
-                            ? preparePromotedAsymmetric(weight.get(), device, backend)
+        auto prepared = cpuMigrated
+                            ? prepareCpuMigrated(weight.get(), device, backend)
                             : test::makeGpuPreparedGemm(weight.get(), device,
                                                         "blk.2.hc_ffn_up.weight", ModelContextId{871002});
         auto *kernel = prepared.kernel;
@@ -444,8 +452,9 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
         ASSERT_EQ(desc.k, k);
         EXPECT_EQ(desc.source_codebook_id, format.source_codebook_id);
         EXPECT_EQ(bool(desc.source_is_superblock), format.source_is_superblock);
-        EXPECT_EQ(desc.codebook_id, promotedAsymmetric ? kNativeQuantisedExpandedInt8MinCodebook
-                                                       : format.device_execution_codebook_id);
+        EXPECT_EQ(desc.codebook_id, format.device_execution_codebook_id);
+        if (cpuMigrated)
+            EXPECT_EQ(desc.metadata_layout != 0, format.source_is_superblock);
         EXPECT_EQ(desc.source_identity_present, 1);
         // Per-engine publication starts cold even when another earlier engine
         // has already initialized the original backend's global codebook
@@ -954,6 +963,15 @@ void shortK(DeviceId device) {
     ASSERT_FALSE(::testing::Test::HasFailure());
   }
 }
+/** @brief Compare explicit native TwoTerm after real ordinary and coded Q5 arrivals. */
+void migratedQ5(DeviceId device) {
+  for (const auto &format : {test::quantizedVerifierFormat("Q5_1"), test::quantizedVerifierFormat("Q5_K")})
+    for (int m : {1, 15, 65}) {
+      prove(device, format, m, 64, format.source_is_superblock ? 256 : 96,
+            false, false, SourcePreparation::CpuMigrated);
+      ASSERT_FALSE(::testing::Test::HasFailure());
+    }
+}
 } // namespace
 #ifdef HAVE_CUDA
 TEST(Q8ResidualAllFormatsDevice, CUDAOrderedShortK) { shortK(DeviceId::cuda(0)); }
@@ -970,14 +988,8 @@ TEST(Q8ResidualAllFormatsDevice, CUDAUntiledLarge) {
 TEST(Q8ResidualAllFormatsDevice, CUDAOriginalBlock32) {
   block32(DeviceId::cuda(0));
 }
-/** @brief Actual CPU-cold Q5_1 promotion remains exact under explicit native TwoTerm. */
-TEST(Q8ResidualAllFormatsDevice, CUDAExpandedMinimumPromotion) {
-  for (int m : {1, 15, 65}) {
-    prove(DeviceId::cuda(0), test::quantizedVerifierFormat("Q5_1"), m, 64, 96,
-          false, false, SourcePreparation::PromotedCpuAsymmetric);
-    ASSERT_FALSE(::testing::Test::HasFailure());
-  }
-}
+/** @test TwoTerm consumes the exact production CPU-migrated Q5 descriptor. */
+TEST(Q8ResidualAllFormatsDevice, CUDACpuMigratedQ5) { migratedQ5(DeviceId::cuda(0)); }
 TEST(Q8ResidualAllFormatsDevice, CUDAConcurrentColdIQ) {
   prove(DeviceId::cuda(0), test::quantizedVerifierFormat("IQ2_S"), 3, 5, 256,
         false, true);
@@ -998,14 +1010,8 @@ TEST(Q8ResidualAllFormatsDevice, ROCmUntiledLarge) {
 TEST(Q8ResidualAllFormatsDevice, ROCmOriginalBlock32) {
   block32(DeviceId::rocm(0));
 }
-/** @brief Equivalent ROCm coverage for genuine physical23 CPU-cold promotion. */
-TEST(Q8ResidualAllFormatsDevice, ROCmExpandedMinimumPromotion) {
-  for (int m : {1, 15, 65}) {
-    prove(DeviceId::rocm(0), test::quantizedVerifierFormat("Q5_1"), m, 64, 96,
-          false, false, SourcePreparation::PromotedCpuAsymmetric);
-    ASSERT_FALSE(::testing::Test::HasFailure());
-  }
-}
+/** @test TwoTerm consumes the exact production CPU-migrated Q5 descriptor. */
+TEST(Q8ResidualAllFormatsDevice, ROCmCpuMigratedQ5) { migratedQ5(DeviceId::rocm(0)); }
 TEST(Q8ResidualAllFormatsDevice, ROCmConcurrentColdIQ) {
   prove(DeviceId::rocm(0), test::quantizedVerifierFormat("IQ2_S"), 3, 5, 256,
         false, true);

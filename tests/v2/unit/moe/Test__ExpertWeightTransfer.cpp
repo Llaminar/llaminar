@@ -60,7 +60,7 @@ CPUNativeQuantisedPackedWeights buildTestPacked(
     packed.payload_bytes            = payload_bytes_val;
     packed.encoding = is_nibble_lut
                           ? CPUNativeQuantisedEncoding::NibbleLUT
-                          : CPUNativeQuantisedEncoding::ExpandedInt8;
+                          : CPUNativeQuantisedEncoding::SignedInt8SingleScale;
     packed.is_asymmetric            = is_asymmetric;
     packed.is_superblock            = is_superblock;
     packed.data_stride              = data_stride;

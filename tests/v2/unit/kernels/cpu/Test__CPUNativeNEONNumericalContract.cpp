@@ -63,6 +63,29 @@ int32x4_t dotColumns(int32x4_t sums, int8x16_t activation, int8x16_t weights)
 } // namespace
 
 /** @test Every signed-byte product avoids a saturating INT16 pair sum. */
+/**
+ * @brief Every binary16 activation scale widens to the portable conversion's exact bits.
+ * @details Finite encodings take the ASIMD conversion; exponent-31 encodings
+ * (infinities, quiet and signalling NaNs with every payload) take the shared
+ * fp16NonFiniteToFP32Bits() expansion. Comparing FP32 bytes covers signed zero
+ * and every NaN payload, which floating-point equality would hide.
+ */
+TEST(CPUNativeNEONNumericalContract, EveryBinary16ScaleMatchesPortableBytes)
+{
+    for (std::uint32_t raw = 0; raw <= 0xffffu; ++raw)
+    {
+        const auto half = static_cast<std::uint16_t>(raw);
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(nativeQuantisedFP16ScaleToFP32(half)),
+                  std::bit_cast<std::uint32_t>(fp16_to_fp32(half)))
+            << "binary16 encoding 0x" << std::hex << raw;
+    }
+    // Spot values of the non-finite domain: +/-inf, a quiet and a signalling NaN payload.
+    EXPECT_EQ(std::bit_cast<std::uint32_t>(nativeQuantisedFP16ScaleToFP32(0x7c00u)), 0x7f800000u);
+    EXPECT_EQ(std::bit_cast<std::uint32_t>(nativeQuantisedFP16ScaleToFP32(0xfc00u)), 0xff800000u);
+    EXPECT_EQ(std::bit_cast<std::uint32_t>(nativeQuantisedFP16ScaleToFP32(0x7e01u)), 0x7fc02000u);
+    EXPECT_EQ(std::bit_cast<std::uint32_t>(nativeQuantisedFP16ScaleToFP32(0x7c01u)), 0x7f802000u);
+}
+
 TEST(CPUNativeNEONNumericalContract, AllSignedBytePairsAccumulateWithoutSaturation)
 {
     const std::array<std::int32_t, 4> initial{7, -17, 911, -43};

@@ -7,8 +7,14 @@
  * grouped MTP and ExpertOverlay additionally require serial-row byte identity.
  * Compact-format ordered reductions have an independent scalar decoder oracle
  * for one-block, multi-block and trailing-empty partitions on both x86 CPU ISAs.
+ * Coded source metadata must reject incomplete headers before publication;
+ * SIMD readers must also isolate live outputs from inactive columns in a sealed
+ * partial chunk.
  * Opaque source words must reject reserved bits instead of masking them into
- * valid coefficients. Rejection is fatal, not rollback of earlier vector stores;
+ * valid coefficients. Model-free publication admission has its own executable
+ * (Test__CPUNativeQuantisedPublicationAdmission.cpp) so its death children do not
+ * initialize this model-backed test owner's MPI environment.
+ * Rejection is fatal, not rollback of earlier vector stores;
  * the outer stage may publish only a successfully completed operation.
  *
  * @note Run with Integration build: ctest -R V2_Integration_CPUNativeQuantised_GEMV
@@ -39,6 +45,7 @@
 #ifdef HAVE_ONEDNN
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #endif
+#include "kernels/cpu/gemm/CPUNativeOrderedKTile.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"
@@ -60,14 +67,14 @@ using namespace llaminar2::test;
 
 namespace
 {
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-    /** @test Every x86 vector/lane rejects corrupt source words without hiding partial writes. */
-    TEST(CPUNativeSourceMetadata, ReservedBitsRejectAtEveryVectorLane)
+    /** @brief Borrow fixture geometry into a producer-owned, unsealed byte generation.
+     * @param fixture Original canonical source and complete seeded bytes.
+     * @param extent Byte extent to publish, including deliberately malformed cases.
+     * @return Owner suitable for exercising the actual publication seal.
+     */
+    CPUNativeQuantisedPackedWeights codedMetadataOwner(
+        const NativeQuantisedPreparedByteFixture &fixture, std::size_t extent)
     {
-        NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ2_S, 64, 32);
-        fixture.seedPayloadAndMetadata();
-        // x86 kernels consume the owner type, not a sealed view: the owner
-        // retains the per-block reserved-bit checks this test certifies.
         const auto layout = fixture.view();
         CPUNativeQuantisedPackedWeights packed;
         packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
@@ -76,159 +83,105 @@ namespace
         packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
         packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
         packed.interleaved_block_stride = layout.interleaved_block_stride;
-        packed.native_interleaved.resize(fixture.bytes.size());
+        packed.native_interleaved.resize(extent);
         const auto owned = packed.native_interleaved.beginRewrite();
-        std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
-        Q8_1Block activation{};
-        activation.d = 0x3c00;
-        activation.sum_qs = 32;
-        std::fill(std::begin(activation.qs), std::end(activation.qs), std::int8_t{1});
-        const std::array<const Q8_1Block *, 1> input{&activation};
-        const auto verify = [&]<int Lanes>() {
-            std::array<float, 64> result;
-            const std::array<float *, 1> output{result.data()};
-            multi_scale::dispatch<Lanes, 1>(packed, input, output, 0, 0, 1, false);
-            const auto reference = result;
-            for (int bad_column = 0; bad_column < 64; ++bad_column)
-            {
-                SCOPED_TRACE(::testing::Message() << "lanes=" << Lanes << " bad_column=" << bad_column);
-                auto *word = owned.data() + packed.data_stride + 128 + bad_column * 2;
-                std::uint16_t original = 0;
-                std::memcpy(&original, word, sizeof(original));
-                const std::uint16_t invalid = 0xffff;
-                std::memcpy(word, &invalid, sizeof(invalid));
-                result.fill(123.0f);
-                EXPECT_THROW((multi_scale::dispatch<Lanes, 1>(packed, input, output, 0, 0, 1, false)), std::invalid_argument);
-                const int failed_vector = bad_column / Lanes * Lanes;
-                for (int column = 0; column < 64; ++column)
-                    if (column < failed_vector)
-                        EXPECT_EQ(std::bit_cast<std::uint32_t>(result[column]), std::bit_cast<std::uint32_t>(reference[column]));
-                    else
-                        EXPECT_EQ(result[column], 123.0f);
-                std::memcpy(word, &original, sizeof(original));
-            }
-        };
-        verify.template operator()<8>();
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-        verify.template operator()<16>();
-#endif
-        // IQ4_XS source-scale owners must reject all ten reserved bits as well;
-        // the historic SIMD accessors masked them into a plausible coefficient.
-        CPUNativeQuantisedPackedWeights source_scale;
-        source_scale.codebook_id = native_quantised_formats::IQ4_XS.codebook_id;
-        source_scale.is_superblock = true;
-        source_scale.encoding = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
-        alignas(64) std::array<std::uint16_t, 128> words;
-        words.fill(0x3c00);
-        std::fill(words.begin() + 64, words.end(), 32);
-        for (int bit = 6; bit < 16; ++bit)
-            for (int lane = 0; lane < 8; ++lane)
-            {
-                words[64 + lane] = std::uint16_t(32 | (1u << bit));
-                EXPECT_THROW((void)source_scale.loadScales256(words.data()), std::invalid_argument);
-                words[64 + lane] = 32;
-            }
-#if defined(__AVX512F__)
-        for (int bit = 6; bit < 16; ++bit)
-            for (int lane = 0; lane < 16; ++lane)
-            {
-                words[64 + lane] = std::uint16_t(32 | (1u << bit));
-                EXPECT_THROW((void)source_scale.loadScales512(words.data()), std::invalid_argument);
-                words[64 + lane] = 32;
-            }
-#endif
+        std::copy_n(fixture.bytes.begin(), std::min(extent, fixture.bytes.size()), owned.begin());
+        return packed;
     }
 
-
-    /**
-     * @test x86 readers load whole 64-column vectors, so a partial final chunk's
-     * padding is part of the publication contract. Two complementary fixtures:
-     * an owner whose padding words are raw poison, and an owner of the same
-     * bytes after producer normalization. Each compiled reader (IQ2_S dispatch
-     * at 8 and 16 lanes, IQ3_S/IQ4_XS scale loaders at 8 and 16 lanes) is
-     * invoked separately on the padding-bearing vector of every block: every
-     * one rejects the raw owner and accepts the normalized one; the seal agrees.
-     */
-    TEST(CPUNativeSourceMetadata, PartialChunkPaddingIsNormalizedForX86Readers)
+    /** @test Exact-width codes have no reserved bits to poison; the seal must
+     * reject a truncated, absent or oversized coded header extent instead. */
+    TEST(CPUNativeSourceMetadata, CodedHeadersRequireExactExtent)
     {
-        for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
+        for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S,
+                                   &native_quantised_formats::IQ4_XS})
+            for (const int n : {64, 97})
+                for (const int k : {32, 256, 288})
+                {
+                    SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " N=" << n << " K=" << k);
+                    NativeQuantisedPreparedByteFixture fixture(*source, n, k);
+                    fixture.seedPayloadAndMetadata();
+                    const auto layout = fixture.view();
+                    ASSERT_TRUE(layout.superblockCoded());
+                    const auto size = fixture.bytes.size();
+                    const auto header = layout.geometry().headerOffset(layout.N_padded / 64 - 1, layout.blocks_per_row - 1);
+                    ASSERT_LT(header, size);
+                    for (const auto invalid : {header, size - 1, size + 1})
+                    {
+                        auto malformed = codedMetadataOwner(fixture, invalid);
+                        EXPECT_THROW(malformed.sealPublication(), std::invalid_argument);
+                        EXPECT_FALSE(malformed.publicationSealed());
+                    }
+                    auto valid = codedMetadataOwner(fixture, size);
+                    EXPECT_NO_THROW(valid.sealPublication());
+                    EXPECT_TRUE(valid.publicationSealed());
+                }
+    }
+
+    /** @test Nonzero, in-domain padding codes and headers must not affect any live
+     * column or output guard. Exercise both x86 reader widths when compiled. */
+    TEST(CPUNativeSourceMetadata, CodedPaddingCannotInfluenceLiveColumns)
+    {
+        for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S,
+                                   &native_quantised_formats::IQ4_XS})
             for (const int n : {33, 61, 97})
             {
-                SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " n=" << n);
-                constexpr int k = 64;
+                SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " N=" << n);
+                // One full K superblock followed by a ragged one.
+                constexpr int k = 288, blocks = k / 32;
                 NativeQuantisedPreparedByteFixture fixture(*source, n, k);
                 fixture.seedPayloadAndMetadata();
-                const auto layout = fixture.view();
-                const int last = layout.N_padded / 64 - 1, live = n % 64;
-                const auto make = [&](bool normalized, int poisoned_block = -1) {
-                    CPUNativeQuantisedPackedWeights packed;
-                    packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
-                    packed.blocks_per_row = layout.blocks_per_row; packed.payload_bytes = layout.source_payload_bytes;
-                    packed.codebook_id = layout.codebook_id; packed.is_superblock = layout.is_superblock;
-                    packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
-                    packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
-                    packed.interleaved_block_stride = layout.interleaved_block_stride;
-                    packed.native_interleaved.resize(fixture.bytes.size());
-                    const auto owned = packed.native_interleaved.beginRewrite();
-                    std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
-                    const std::size_t secondary = std::size_t(layout.data_stride) + (layout.usesInlineCompensation() ? 256 : 128);
-                    for (int block = 0; block < layout.blocks_per_row; ++block)
-                        for (int column = live; column < 64; ++column)
-                        {
-                            if (poisoned_block >= 0 && block != poisoned_block)
-                                continue;
-                            const std::uint16_t poison = 0xffff;
-                            std::memcpy(owned.data() + (std::size_t(last) * layout.blocks_per_row + block) *
-                                layout.interleaved_block_stride + secondary + std::size_t(column) * 2, &poison, sizeof(poison));
-                        }
-                    if (normalized) packed.normalizePaddingMetadata();
-                    return packed;
-                };
-                auto raw = make(false);
-                auto normalized = make(true);
-                EXPECT_THROW(raw.sealPublication(), std::invalid_argument);
-                EXPECT_NO_THROW(normalized.sealPublication());
-
-                Q8_1Block activation[k / 32]{};
-                for (auto &a : activation) { a.d = 0x3c00; std::fill(std::begin(a.qs), std::end(a.qs), std::int8_t{1}); a.sum_qs = 32; }
-                std::array<float, 64> result{};
-                const std::array<const Q8_1Block *, 1> input{activation};
-                const std::array<float *, 1> output{result.data()};
-                if (source == &native_quantised_formats::IQ2_S)
-                {
-                    // Dispatch walks blocks in order, so each block is poisoned
-                    // alone: rejection is proved at every K block, not the first.
-                    for (int block = 0; block < layout.blocks_per_row; ++block)
+                auto clean = codedMetadataOwner(fixture, fixture.bytes.size());
+                clean.sealPublication();
+                const auto layout = clean.readView();
+                ASSERT_TRUE(layout.superblockCoded());
+                const auto book = superblockMetadataCodebook(layout.encoding, layout.codebook_id);
+                const auto code_offset = preparedCodedPlaneOffset(layout.encoding, layout.data_stride);
+                const auto last = layout.N_padded / 64 - 1;
+                for (int b = 0; b < blocks; ++b)
+                    for (int col = n % 64; col < 64; ++col)
                     {
-                        SCOPED_TRACE(block);
-                        const auto single = make(false, block);
-                        EXPECT_THROW((multi_scale::dispatch<8, 1>(single, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                        EXPECT_THROW((multi_scale::dispatch<16, 1>(single, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
-#endif
+                        coded_metadata::storeCode(fixture.bytes.data() + layout.geometry().blockOffset(last, b) + code_offset,
+                            book, col, 0xff);
+                        coded_metadata::storeSuperblockWord(fixture.bytes.data() + layout.geometry().headerOffset(last, b),
+                            book, col, 0x38003c00u); // Both half words finite.
                     }
-                    EXPECT_NO_THROW((multi_scale::dispatch<8, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                    EXPECT_NO_THROW((multi_scale::dispatch<16, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
-#endif
-                    continue;
-                }
-                for (int block = 0; block < layout.blocks_per_row; ++block)
+                auto dirty = codedMetadataOwner(fixture, fixture.bytes.size());
+                dirty.sealPublication();
+                Q8_1Block activation[blocks]{};
+                for (auto &a : activation)
                 {
-                    SCOPED_TRACE(block);
-                    EXPECT_THROW((void)raw.loadScales256(raw.chunkScales(last, block) + live / 8 * 8), std::invalid_argument);
-                    EXPECT_NO_THROW((void)normalized.loadScales256(normalized.chunkScales(last, block) + live / 8 * 8));
-#if defined(__AVX512F__)
-                    EXPECT_THROW((void)raw.loadScales512(raw.chunkScales(last, block) + live / 16 * 16), std::invalid_argument);
-                    EXPECT_NO_THROW((void)normalized.loadScales512(normalized.chunkScales(last, block) + live / 16 * 16));
-#endif
+                    a.d = 0x3c00;
+                    std::fill(std::begin(a.qs), std::end(a.qs), std::int8_t{1});
+                    a.sum_qs = 32;
                 }
+                const auto project = [&](ISAPath isa) {
+                    std::array<float, 2 * 64> clean_out, dirty_out;
+                    clean_out.fill(123.0f);
+                    dirty_out.fill(123.0f);
+                    std::array<float, 2 * 64 * blocks> partial{};
+                    gemv_native_quantised_preq(clean, activation, clean_out.data(), partial, isa);
+                    gemv_native_quantised_preq(dirty, activation, dirty_out.data(), partial, isa);
+                    EXPECT_EQ(std::memcmp(clean_out.data(), dirty_out.data(), sizeof(clean_out)), 0);
+                    for (std::size_t col = n; col < clean_out.size(); ++col)
+                    {
+                        EXPECT_EQ(clean_out[col], 123.0f);
+                        EXPECT_EQ(dirty_out[col], 123.0f);
+                    }
+                };
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                project(ISAPath::AUTO);
+#else
+                project(ISAPath::AVX2);
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                project(ISAPath::AVX512);
+#endif
+#endif
             }
     }
-#endif
 
 #if !defined(__aarch64__)
-    // x86 VNNI consumes unsigned activation words; ARM signed dots need no packing.
+    // x86 dots broadcast four original signed activation bytes without requantization.
     /** Prove integer activation packing independently of serial/grouped kernel agreement. */
     TEST(CPUActivationWordPacking, AllSignedBytesAndOffsetsMatchScalar)
     {
@@ -245,16 +198,9 @@ namespace
                 block.qs[i] = static_cast<int8_t>((i * 73 + 19) % 256 - 128);
             block.qs[offset + lane] = static_cast<int8_t>(value);
             const auto before = block;
-            std::array<uint8_t, 4> expected{};
-            for (int i = 0; i < 4; ++i)
-                expected[i] = static_cast<uint8_t>(static_cast<int>(block.qs[offset + i]) + 128);
-            const int32_t avx2 = pack_q8_1_unsigned_word_avx2(block, offset);
-            ASSERT_EQ(std::memcmp(&avx2, expected.data(), expected.size()), 0)
+            const int32_t word = nativeActivationWord(block, offset);
+            ASSERT_EQ(std::memcmp(&word, block.qs + offset, sizeof(word)), 0)
                 << "offset=" << offset << " lane=" << lane << " value=" << value;
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-            const int32_t avx512 = pack_q8_1_unsigned_word(block, offset);
-            ASSERT_EQ(std::memcmp(&avx512, expected.data(), expected.size()), 0);
-#endif
             ASSERT_EQ(std::memcmp(&block, &before, sizeof(block)), 0);
         }
     }
@@ -1549,11 +1495,27 @@ namespace
                 FusedVerifierRowsDesc descriptor{.packed = &packed, .N = 64, .ldc = 64, .rows = rows};
                 const auto decode = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
 #if defined(__aarch64__)
-                // ARM shared-row tiles follow only the verifier schedule, never the purpose.
+                // ARM register tiles follow only the verifier schedule. An ordinary
+                // Prefill member takes the prefill panel program instead: when its
+                // source and rows admit packed panels it streams them from the
+                // admitted slab (decode once per weight strip for all rows). An
+                // equally large MTP batch never acquires that prompt scheduling.
                 descriptor.purpose = ProjectionRowsPurpose::Prefill;
                 const auto prefill = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
-                EXPECT_EQ(prefill.tiles[0], decode.tiles[0]);
-                EXPECT_EQ(prefill.sharedPartialFloats(), 0u);
+                const bool panel = llaminar2::cpu::native_quantised::neon_execution::usesPooledPackedPrefill(packed, rows, 7);
+                // Seven workers: only the measured parallel panel sources qualify (Q5_0 serializes).
+                EXPECT_EQ(panel, rows >= llaminar2::cpu::native_quantised::neon_panel::min_pooled_rows &&
+                    (std::string(format.label) == "Q5_K" || std::string(format.label) == "IQ3_S"));
+                EXPECT_EQ(prefill.panels[0], panel);
+                EXPECT_EQ(prefill.tiles[0], panel ? NEONProjectionRowTile::Pair : decode.tiles[0]);
+                EXPECT_EQ(prefill.sharedPartialFloats(), panel
+                    ? 7u * llaminar2::cpu::native_quantised::neon_panel::workerFloats(rows, packed.K, packed.numerical_policy)
+                    : 0u);
+                descriptor.purpose = ProjectionRowsPurpose::MTPVerifier;
+                const auto verifier = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
+                EXPECT_FALSE(verifier.panels[0]);
+                EXPECT_EQ(verifier.tiles[0], decode.tiles[0]);
+                EXPECT_EQ(verifier.sharedPartialFloats(), 0u);
                 descriptor.purpose = static_cast<ProjectionRowsPurpose>(-1);
                 EXPECT_THROW(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7), std::invalid_argument);
 #else
@@ -1569,9 +1531,31 @@ namespace
                     packed.usesCompactMultiScale()
                         ? selectSerialKPartPrefillRowsPolicy(prefill.use_avx512, rows)
                         : expected_decode);
+                // An ordinary Prefill member with an x86 panel source streams
+                // pooled packed panels from two rows whenever its route borrows
+                // no partial bank: one slot of a whole 64-column chunk (AVX-512)
+                // or eight columns (AVX2) per worker. Decode and an equally large
+                // MTP batch never acquire that prompt scheduling.
+                namespace panel = llaminar2::cpu::native_quantised::x86_panel;
+                const auto panel_format = panel::formatFor(packed.encoding, packed.codebook_id);
+                const bool bankless = prefill.partial_route == NativeQuantisedFusedPartialRoute::FullK ||
+                    prefill.partial_route == NativeQuantisedFusedPartialRoute::OutputTileLocal;
+                const bool pooled = panel_format != panel::Format::None && rows >= panel::min_pooled_rows && bankless;
+                EXPECT_EQ(prefill.projections[0].packed_panel, pooled);
+                EXPECT_FALSE(decode.projections[0].packed_panel);
+                if (pooled)
+                    EXPECT_EQ(prefill.sharedPartialFloats(), 7u * panel::workerFloats(panel_format,
+                        panel::pooledStrip(prefill.use_avx512 ? 16 : 8), rows, packed.blocks_per_row,
+                        std::max(1, prefill.projections[0].k_tiles)));
+                descriptor.purpose = ProjectionRowsPurpose::MTPVerifier;
+                const auto verifier = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
+                EXPECT_FALSE(verifier.projections[0].packed_panel);
+                EXPECT_EQ(verifier.panel_workers, 0);
+                descriptor.purpose = ProjectionRowsPurpose::Prefill;
                 descriptor.verifier_schedule = VerifierRowsPolicy::Pairwise;
                 EXPECT_EQ(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7)
                     .projections[0].effective_verifier_schedule, VerifierRowsPolicy::Pairwise);
+                EXPECT_FALSE(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7).projections[0].packed_panel);
                 descriptor.purpose = static_cast<ProjectionRowsPurpose>(-1);
                 EXPECT_THROW(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7), std::invalid_argument);
 #endif
@@ -1686,9 +1670,9 @@ namespace
 
     /**
      * Fixed-count K tiles leave empty trailing tiles on a short K: their start
-     * lies at or beyond the matrix while the clamped end does not. Such a span
-     * must publish zero (or retain the accumulator) without a weight read;
-     * a nonempty span outside the matrix remains fatal.
+     * is clamped to the matrix end by orderedKTileBegin(). That empty interval
+     * must publish zero (or retain the accumulator) without reading activation
+     * or weights. Reversed and out-of-matrix intervals must still be rejected.
      */
     TEST_F(CPUNativeQuantisedGemvTest, CompactEmptyTrailingKTilePublishesWithoutReading)
     {
@@ -1702,27 +1686,48 @@ namespace
                 continue;
             SCOPED_TRACE(format.label);
             const int blocks = packed.blocks_per_row;
-            std::vector<Q8_1Block> activation(static_cast<size_t>(blocks));
-            std::array<float, 64> output{};
-            const auto run = [&](int begin, int end, bool accumulate) {
-                multi_scale::dispatch<kCompactLanes>(packed,
-                    std::array<const Q8_1Block *, 1>{activation.data()},
-                    std::array<float *, 1>{output.data()}, 0, begin, end, accumulate);
+            const auto prove_empty = [&]<int Lanes, size_t Rows>() {
+                SCOPED_TRACE(Lanes);
+                SCOPED_TRACE(Rows);
+                std::array<float, 64 * Rows> output{};
+                std::array<const Q8_1Block *, Rows> activation{};
+                std::array<float *, Rows> outputs{};
+                for (size_t row = 0; row < Rows; ++row)
+                    outputs[row] = output.data() + row * 64;
+                const auto run = [&](int begin, int end, bool accumulate) {
+                    multi_scale::dispatch<Lanes>(packed, activation, outputs,
+                        0, begin, end, accumulate);
+                };
+                // K=768 has 24 blocks: fixed-width tiles 12..15 are empty.
+                // Use the production producer's clamp, never a reversed range.
+                // Null activation rows make any accidental input read fatal.
+                for (const int tile : {12, 13, 15})
+                {
+                    const int begin = orderedKTileBegin(tile, 2, blocks);
+                    ASSERT_EQ(begin, blocks);
+                    output.fill(-7.0f);
+                    ASSERT_NO_THROW(run(begin, blocks, false));
+                    for (const float value : output)
+                        ASSERT_EQ(std::bit_cast<uint32_t>(value), 0u);
+                    output.fill(-0.0f);
+                    ASSERT_NO_THROW(run(begin, blocks, true));
+                    for (const float value : output)
+                        ASSERT_EQ(std::bit_cast<uint32_t>(value), 0x80000000u);
+                }
+                EXPECT_THROW(run(blocks + 2, blocks, false), std::invalid_argument);
+                EXPECT_THROW(run(1, 0, false), std::invalid_argument);
+                EXPECT_THROW(run(blocks + 1, blocks + 1, false), std::invalid_argument);
+                EXPECT_THROW(run(blocks - 1, blocks + 1, false), std::invalid_argument);
+                EXPECT_THROW(run(-1, 1, false), std::invalid_argument);
             };
-            // A 24-block K split into 16 tiles of 2 yields tiles [26, 24) etc.
-            for (const int begin : {blocks, blocks + 2, blocks + 6})
-            {
-                output.fill(-7.0f);
-                ASSERT_NO_THROW(run(begin, blocks, false));
-                for (const float value : output)
-                    ASSERT_EQ(std::bit_cast<uint32_t>(value), 0u);
-                output.fill(-7.0f);
-                ASSERT_NO_THROW(run(begin, blocks, true));
-                for (const float value : output)
-                    ASSERT_EQ(value, -7.0f);
-            }
-            EXPECT_THROW(run(blocks - 1, blocks + 1, false), std::invalid_argument);
-            EXPECT_THROW(run(-1, 1, false), std::invalid_argument);
+            // AVX2 single-row Q5_K uses the single-scale leaf; multiple rows
+            // use the generic multi-scale traversal. Both admit the same empty.
+            prove_empty.template operator()<kCompactLanes, 1>();
+            prove_empty.template operator()<kCompactLanes, 2>();
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+            prove_empty.template operator()<16, 1>();
+            prove_empty.template operator()<16, 2>();
+#endif
         }
     }
 
@@ -3115,7 +3120,14 @@ namespace
             EXPECT_TRUE(
                 record.tags.at("route") == "row_chunk_grid" ||
                 record.tags.at("route") == "two_row_n_major" ||
-                record.tags.at("route") == "two_row_pair_grid");
+                record.tags.at("route") == "two_row_pair_grid" ||
+                record.tags.at("route") == "packed_panel");
+            if (record.tags.at("route") == "packed_panel")
+            {
+                EXPECT_EQ(record.tags.at("requested_policy"), "Auto");
+                EXPECT_EQ(record.tags.at("task_grid"), "n_strip_all_rows");
+                EXPECT_GE(std::stoi(record.tags.at("m")), x86_panel::min_rows);
+            }
             EXPECT_GT(std::stoi(record.tags.at("parallel_tasks")), 0);
             if (record.tags.at("route") == "two_row_pair_grid")
                 EXPECT_EQ(record.tags.at("row_tile"), "2");
@@ -3476,6 +3488,10 @@ namespace
                 test_case.active_rows == test_case.bucket_rows ? 1u : 2u;
         }
 
+        // Formats whose prepared encoding has an x86 decode-once panel. Every
+        // launch here has at least 17 live rows and one worker, so Auto must
+        // select the dense packed panel for exactly these formats.
+        [[maybe_unused]] size_t panel_formats = 0;
         for (const auto &format : ALL_FORMATS)
         {
             SCOPED_TRACE(format.name);
@@ -3483,6 +3499,10 @@ namespace
             ASSERT_NE(weights, nullptr) << format.name;
             CPUNativeQuantisedGemmKernel kernel(weights.get());
             ASSERT_TRUE(kernel.isValid()) << format.name;
+#if !defined(__aarch64__)
+            panel_formats += x86_panel::formatFor(kernel.packedWeights().encoding,
+                kernel.packedWeights().codebook_id) != x86_panel::Format::None;
+#endif
 
             std::vector<float> serial(
                 static_cast<size_t>(maximum_bucket_rows) * N,
@@ -3550,6 +3570,7 @@ namespace
 #if !defined(__aarch64__)
         // x86 prefill launch telemetry; the byte-exact sweep above is ISA-neutral.
         uint64_t observed_prefill_launches = 0;
+        uint64_t observed_panel_launches = 0;
         for (const auto &record : PerfStatsCollector::snapshot(
                  {"kernel.cpu_native_quantised_prefill_gemm_launch"}))
         {
@@ -3562,11 +3583,21 @@ namespace
             EXPECT_EQ(record.tags.at("n"), std::to_string(N));
             EXPECT_EQ(record.tags.at("k"), std::to_string(K));
             EXPECT_GE(std::stoi(record.tags.at("m")), 17);
-            EXPECT_TRUE(
-                record.tags.at("route") == "row_chunk_grid" ||
-                record.tags.at("route") == "two_row_n_major" ||
-                record.tags.at("route") == "two_row_pair_grid" ||
-                record.tags.at("route") == "decode_equivalent_kpart_rows");
+            if (record.tags.at("route") == "packed_panel")
+            {
+                // The decode-once panel replaces only ordinary Auto prefill.
+                EXPECT_EQ(record.tags.at("requested_policy"), "Auto");
+                EXPECT_EQ(record.tags.at("task_grid"), "n_strip_all_rows");
+                EXPECT_EQ(record.tags.at("threads"), "1");
+                observed_panel_launches += record.count;
+            }
+            else
+                EXPECT_TRUE(
+                    record.tags.at("route") == "row_chunk_grid" ||
+                    record.tags.at("route") == "two_row_n_major" ||
+                    record.tags.at("route") == "two_row_pair_grid" ||
+                    record.tags.at("route") == "decode_equivalent_kpart_rows")
+                    << "route=" << record.tags.at("route");
             observed_prefill_launches += record.count;
         }
         EXPECT_EQ(
@@ -3574,6 +3605,9 @@ namespace
             ALL_FORMATS.size() * expected_prefill_launches_per_format)
             << "Every CPU all-format M-totality cell must execute one real "
                "production grouped prefill route";
+        EXPECT_GT(panel_formats, 0u);
+        EXPECT_EQ(observed_panel_launches, panel_formats * expected_prefill_launches_per_format)
+            << "Exactly the panel formats' launches (all >= 16 live rows, one worker) take the packed panel";
 
         #endif
         PerfStatsCollector::reset();
@@ -3803,6 +3837,12 @@ namespace
         constexpr int N = 1536;
         constexpr int K = 8960;
         constexpr std::array<int, 4> runtime_rows = {2, 5, 15, 64};
+        // The 24 N tasks must be fewer than the team in either cache regime
+        // so the serial control actually splits K. CMake binds this width to
+        // every selecting CTest registration's processor reservation.
+        constexpr int kpart_workers = LLAMINAR_TEST_NATIVE_PAYLOAD_KPART_THREADS;
+        static_assert(kpart_workers > N / 64);
+        ScopedOMPThreadCount kpart_team(kpart_workers);
         constexpr std::array<VerifierRowsPolicy, 7> full_k_policies = {{
             VerifierRowsPolicy::FullKRowChunkGrid,
             VerifierRowsPolicy::FullKTwoRowNbc1,
@@ -3926,6 +3966,7 @@ namespace
         uint64_t kpart_launches = 0;
         uint64_t pairwise_launches = 0;
         uint64_t wide_rows_launches = 0;
+        uint64_t packed_panel_launches = 0;
         for (const auto &record : records)
         {
             if (record.domain != "kernel" ||
@@ -3934,10 +3975,19 @@ namespace
             {
                 continue;
             }
-            EXPECT_EQ(
-                record.tags.at("route"),
-                "decode_equivalent_kpart_rows");
             EXPECT_GT(std::stoi(record.tags.at("k_tiles")), 1);
+            if (record.tags.at("route") == "packed_panel")
+            {
+                // Only ordinary Auto prefill may substitute an N strip and
+                // fold the same serial K partitions in its worker slot.
+                EXPECT_EQ(record.tags.at("requested_policy"), "Auto");
+                EXPECT_EQ(record.tags.at("task_grid"), "n_strip_all_rows");
+                EXPECT_EQ(record.tags.at("m"), "64");
+                packed_panel_launches += record.count;
+                kpart_launches += record.count;
+                continue;
+            }
+            EXPECT_EQ(record.tags.at("route"), "decode_equivalent_kpart_rows");
             EXPECT_TRUE(
                 record.tags.at("effective_policy") == "Pairwise" ||
                 record.tags.at("effective_policy") == "WideRows");
@@ -3952,9 +4002,8 @@ namespace
         if (activeISALevel() >= ISALevel::AVX512)
         {
             const uint64_t m2_cells = ALL_FORMATS.size();
-            EXPECT_EQ(wide_rows_launches, cells - m2_cells)
-                << "Every forceable native-AVX512 Auto cell is exhaustively "
-                   "trained to the WideRows winner";
+            EXPECT_EQ(wide_rows_launches + packed_panel_launches, cells - m2_cells)
+                << "Auto uses the packed panel for eligible formats or the existing AVX-512 WideRows route";
             EXPECT_EQ(pairwise_launches, cells + m2_cells)
                 << "The diagnostic call exercises Pairwise for every cell, and "
                    "M2 explicitly selects its unique forceable Pairwise route";
@@ -3963,8 +4012,8 @@ namespace
 #endif
         {
             EXPECT_EQ(wide_rows_launches, 0u);
-            EXPECT_EQ(pairwise_launches, cells * 2u)
-                << "Pairwise is the unique forceable AVX2 K-part schedule";
+            EXPECT_EQ(pairwise_launches + packed_panel_launches, cells * 2u)
+                << "Packed panels may replace only Auto; explicit AVX2 K-part schedules remain Pairwise";
         }
         EXPECT_EQ(
             kpart_launches,
@@ -5441,83 +5490,6 @@ namespace
     }
 #endif // x86 NativeQuantised scheduler contract
 
-    TEST_F(CPUNativeQuantisedGemvTest, MTP_FusedProjectionWithActivationRotationMatchesSerialDecodeRows)
-    {
-        const int K = 128;
-        const int M = 2;
-        const int N0 = 384;
-        const int N1 = 256;
-
-        ActivationRotation rotation(K, 128);
-        auto weights0 = createWeightsForFormat("Q4_0", N0, K);
-        auto weights1 = createWeightsForFormat("Q4_0", N1, K);
-        ASSERT_NE(weights0, nullptr);
-        ASSERT_NE(weights1, nullptr);
-        weights0->setActivationRotation(&rotation);
-        weights1->setActivationRotation(&rotation);
-
-        CPUNativeQuantisedGemmKernel kernel0(weights0.get());
-        CPUNativeQuantisedGemmKernel kernel1(weights1.get());
-        ASSERT_TRUE(kernel0.isValid());
-        ASSERT_TRUE(kernel1.isValid());
-
-        auto input = TestTensorFactory::createFP32Random(
-            {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f, 3101);
-        ASSERT_NE(input, nullptr);
-
-        FP32Tensor grouped0({static_cast<size_t>(M), static_cast<size_t>(N0)});
-        FP32Tensor grouped1({static_cast<size_t>(M), static_cast<size_t>(N1)});
-        std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
-            {&kernel0, &grouped0, N0, nullptr, "proj0"},
-            {&kernel1, &grouped1, N1, nullptr, "proj1"}};
-
-        CPUProjectionTestWorkspace workspace(M, K, kernel0.getWorkspaceRequirements(M));
-        ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
-            input.get(), grouped_projections, M, K, nullptr, workspace.get()))
-            << "Grouped verifier projection should support rotated CPU NativeQuantised weights";
-
-        std::vector<float> serial0(static_cast<size_t>(M) * static_cast<size_t>(N0), 0.0f);
-        std::vector<float> serial1(static_cast<size_t>(M) * static_cast<size_t>(N1), 0.0f);
-        for (int row = 0; row < M; ++row)
-        {
-            FP32Tensor row_input({1, static_cast<size_t>(K)});
-            std::memcpy(
-                row_input.mutable_data(),
-                input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
-                static_cast<size_t>(K) * sizeof(float));
-
-            FP32Tensor row0({1, static_cast<size_t>(N0)});
-            FP32Tensor row1({1, static_cast<size_t>(N1)});
-            std::vector<ITensorGemm::TensorProjectionDesc> row_projections = {
-                {&kernel0, &row0, N0, nullptr, "proj0"},
-                {&kernel1, &row1, N1, nullptr, "proj1"}};
-
-            ASSERT_TRUE(kernel0.multiply_fused_tensor(&row_input, row_projections, 1, K, nullptr, workspace.get()))
-                << "Serial decode projection failed for row " << row;
-            std::memcpy(
-                serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
-                row0.data(),
-                static_cast<size_t>(N0) * sizeof(float));
-            std::memcpy(
-                serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
-                row1.data(),
-                static_cast<size_t>(N1) * sizeof(float));
-        }
-
-        expectBitwiseEqualFloatRows(
-            "CPU rotated grouped verifier projection 0",
-            grouped0.data(),
-            serial0.data(),
-            static_cast<size_t>(M) * static_cast<size_t>(N0),
-            static_cast<size_t>(N0));
-        expectBitwiseEqualFloatRows(
-            "CPU rotated grouped verifier projection 1",
-            grouped1.data(),
-            serial1.data(),
-            static_cast<size_t>(M) * static_cast<size_t>(N1),
-            static_cast<size_t>(N1));
-    }
-
     TEST_F(CPUNativeQuantisedGemvTest, MTP_SmallM_Qwen36ShapesMatchSerialDecodeRows)
     {
         struct Shape
@@ -6143,81 +6115,5 @@ namespace
     }
 
 
-    /**
-     * @test Every CPU NativeQuantised execution entry admits its publication
-     * before reading it: each entry executes sealed MXFP4 weights, and dies on
-     * stale or never-sealed bytes on the selected runtime ISA (scalar, AVX2,
-     * AVX512 or NEON) instead of reading them.
-     */
-    TEST(CPUNativeQuantisedPublicationAdmission, EveryEntryRejectsUnsealedAndStaleBytes)
-    {
-        // Threadsafe death children re-execute the binary and this body up to
-        // their own check, so each one costs a process start. The checks run
-        // before any sealed execution, and each entry is probed once: with
-        // never-sealed bytes, which proves the entry consults the admission.
-        // Stale-generation rejection is a property of that one admission and
-        // is checked once here (and exhaustively by CPUNativeQuantisedMetadataSeal).
-        GTEST_FLAG_SET(death_test_style, "threadsafe");
-        constexpr int N = 128, K = 256, M = 4;
-        const auto weights = TestTensorFactory::createMXFP4Random({(size_t)N, (size_t)K});
-        CPUNativeQuantisedGemmKernel kernel(weights.get());
-        ASSERT_TRUE(kernel.isValid());
-        const auto &sealed = *kernel.exportCPUNativeQuantisedPackedWeights();
-        ASSERT_TRUE(sealed.publicationSealed());
 
-        CPUNativeQuantisedPackedWeights stale = sealed; // A current seal carries over to the copy.
-        ASSERT_TRUE(stale.publicationSealed());
-        (void)stale.native_interleaved.beginRewrite();
-
-        CPUNativeQuantisedPackedWeights never;
-        never.N = sealed.N; never.K = sealed.K; never.N_padded = sealed.N_padded;
-        never.blocks_per_row = sealed.blocks_per_row; never.payload_bytes = sealed.payload_bytes;
-        never.codebook_id = sealed.codebook_id; never.is_superblock = sealed.is_superblock;
-        never.encoding = sealed.encoding; never.data_stride = sealed.data_stride;
-        never.interleaved_block_stride = sealed.interleaved_block_stride;
-        never.native_interleaved.resize(sealed.native_interleaved.size());
-
-        std::vector<float> input(static_cast<size_t>(M) * K, 0.25f), out(static_cast<size_t>(M) * N),
-            product(static_cast<size_t>(M) * N);
-        std::vector<Q8_1Block> activation(static_cast<size_t>(M) * (K / 32)), q8(activation.size());
-        quantize_activations_to_q8_1(input.data(), q8.data(), M, K, K / 32);
-        std::vector<float> partial(4 * nativeQuantisedProjectionPartialEnvelopeFloats(sealed, M) + 4096);
-        const std::span<float> partials{partial};
-
-        using Entry = std::function<void(const CPUNativeQuantisedPackedWeights &)>;
-        const std::vector<std::pair<const char *, Entry>> entries{
-            {"gemv_preq", [&](const auto &w) { gemv_native_quantised_preq(w, q8.data(), out.data(), partials); }},
-            {"gemv", [&](const auto &w) { gemv_native_quantised(w, input.data(), out.data(), partials, activation); }},
-            {"gemm_preq", [&](const auto &w) { gemm_native_quantised_preq(w, q8.data(), out.data(), partials, M, N); }},
-            {"gemm_preq_rows", [&](const auto &w) {
-                gemm_native_quantised_preq_decode_equivalent_rows(w, q8.data(), out.data(), partials, M, N); }},
-            {"gemm", [&](const auto &w) { gemm_native_quantised(w, input.data(), out.data(), partials, M, N, activation); }},
-            {"multiply", [&](const auto &w) {
-                multiply_native_quantised_with_epilogue(w, input.data(), out.data(), M, N, 1.0f, 0.0f,
-                    activation, product, partials); }},
-            {"fused_gemv", [&](const auto &w) {
-                FusedGemvDesc d{};
-                d.packed = &w; d.output = out.data(); d.N = N;
-                gemv_native_quantised_fused_preq(q8.data(), &d, partials, 1); }},
-            {"fused_multi_input", [&](const auto &w) {
-                FusedGemvMultiInputDesc d{};
-                d.A_q8 = q8.data(); d.packed = &w; d.output = out.data(); d.N = N;
-                gemv_fused_multi_input_preq(&d, partials, 1); }},
-            {"fused_verifier_rows", [&](const auto &w) {
-                FusedVerifierRowsDesc d{};
-                d.packed = &w; d.output = out.data(); d.N = N; d.ldc = N; d.rows = M; d.input = q8.data();
-                ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(q8.data(), &d, partials, 1, M, K / 32)); }},
-        };
-        EXPECT_DEATH(entries.front().second(stale), "stale generation");
-        for (const auto &[name, entry] : entries)
-        {
-            SCOPED_TRACE(name);
-            EXPECT_DEATH(entry(never), "never sealed");
-        }
-        for (const auto &[name, entry] : entries)
-        {
-            SCOPED_TRACE(name);
-            EXPECT_NO_THROW(entry(sealed));
-        }
-    }
 } // anonymous namespace

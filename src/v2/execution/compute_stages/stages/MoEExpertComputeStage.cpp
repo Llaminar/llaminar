@@ -7483,7 +7483,7 @@ namespace llaminar2
                 params_.prefill_llep_transfer_slot_count,
                 config,
                 apply_status,
-                nullptr,
+                borrowDeviceMoEArrivalScratch(transfer_slot_claim_index),
                 1))
         {
             LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill payload unpack failed");
@@ -9194,7 +9194,9 @@ namespace llaminar2
                 params_.d_model,
                 params_.expert_intermediate,
                 workspace_experts,
-                workspace_top_k));
+                workspace_top_k,
+                // The routing stage alone owns the router gate cache.
+                MoEWorkspaceBuffers::CUDARouterGateCache::None));
         }
         else if (params_.device_id.is_rocm())
         {
@@ -11185,7 +11187,9 @@ namespace llaminar2
                     params_.d_model,
                     params_.intermediate,
                     /*num_experts=*/1,
-                    /*top_k=*/1));
+                    /*top_k=*/1,
+                    // The routing stage alone owns the router gate cache.
+                    MoEWorkspaceBuffers::CUDARouterGateCache::None));
             }
             else if (params_.device_id.is_rocm())
             {

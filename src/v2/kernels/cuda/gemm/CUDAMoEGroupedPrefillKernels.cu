@@ -118,8 +118,7 @@ namespace
         (uint32_t{1} << 15) |
         (uint32_t{1} << 16) |
         (uint32_t{1} << 17) |
-        (uint32_t{1} << 19) |
-        (uint32_t{1} << llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
+        (uint32_t{1} << 19);
 
     /** Abort the captured graph when device-owned grouping metadata is invalid. */
     __device__ __forceinline__ void failFastInvalidGroupedImmaState()
@@ -237,9 +236,12 @@ namespace
                desc.n == N && desc.k == K &&
                desc.blocks_per_row == static_cast<uint32_t>(K / kQuantBlock) &&
                llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
-               (!Traits::requires_secondary_metadata ||
-                (Traits::is_iq4_source_scale && desc.codebook_id == 4) || desc.mins) &&
-               (!Traits::is_dual_scale_asym || desc.emins);
+               ::llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+               // A coded matrix keeps its superblock plane in `mins` and has no emins plane.
+               ((desc.metadata_layout & 0x80u) ? desc.mins != nullptr
+                : ((!Traits::requires_secondary_metadata ||
+                    (Traits::is_iq4_source_scale && desc.codebook_id == 4) || desc.mins) &&
+                   (!Traits::is_dual_scale_asym || desc.emins)));
     }
 
     /**
@@ -268,34 +270,42 @@ namespace
      * sums, scale/minimum metadata, IQ1 delta terms, and every FP32 rounding
      * boundary remain identical to serial DP4A decode.
      * @param physical_codebook Actual operand identity within the IQ4 payload family.
+     * @tparam MetadataForm `void` reads the block metadata through the runtime
+     *         representation branch; a NativeQuantisedMetadataReadFormTag reads
+     *         it with that compile-time form (see loadBlockMetadataAs()).
      */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, class MetadataForm = void>
     __device__ __forceinline__ float contributionFromMma(
         const int8_t *activation_values,
         int32_t dot_lo,
         int32_t dot_hi,
         const uint8_t *payload,
-        const uint16_t *scales,
-        const uint16_t *mins,
-        const uint32_t *emins,
-        size_t linear,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta,
+        ::llaminar2::native_quantised_scale::BlockAddress address,
         float activation_scale,
         uint8_t physical_codebook = CodebookId)
     {
         using Traits =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+        // Per-block words for either metadata representation (one authority).
+        const auto words = [&]
+        {
+            if constexpr (std::is_void_v<MetadataForm>)
+                return ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(meta, address);
+            else
+                return ::llaminar2::native_quantised_scale::loadBlockMetadataAs<CodebookId, MetadataForm::value>(
+                    meta, address);
+        }();
         if constexpr (Traits::is_iq4_lut)
         {
             const float scale = physical_codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
-                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear), mins[linear])
-                : llaminar2::cuda_native_quantised::fp16_bits_to_float(::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear));
+                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(words.primary, words.secondary)
+                : llaminar2::cuda_native_quantised::fp16_bits_to_float(words.primary);
             return llaminar2::device_native_quantised_contract::singleScaleBlock(
                 dot_lo, scale, activation_scale);
         }
-        const uint16_t secondary_bits =
-            mins ? mins[linear] : uint16_t{0};
-        const uint32_t emin_bits =
-            emins ? emins[linear] : uint32_t{0};
+        const uint16_t secondary_bits = words.secondary;
+        const uint32_t emin_bits = words.emin;
         const uint16_t iq1m_qh = Traits::is_iq1_m
             ? static_cast<uint16_t>(payload[4]) |
                   (static_cast<uint16_t>(payload[5]) << 8)
@@ -322,7 +332,7 @@ namespace
                 dot_lo,
                 dot_hi,
                 activation_scale,
-                ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear),
+                words.primary,
                 secondary_bits,
                 emin_bits,
                 activation_sum_lo + activation_sum_hi,
@@ -734,18 +744,16 @@ namespace
      * column and reused across all valid rows. K work is processed partition by
      * partition in one CTA; no global partial buffer or cross-CTA reduction is
      * required, and the final FP32 tree is exactly the public serial-M1 tree.
-     * The narrow IQ4/IQ2S 12.x kernels retain ten resident CTAs per SM; this
+     * The narrow IQ4/IQ2S kernels target ten resident CTAs per SM; this
      * compiler scheduling bound limits live registers without changing storage
      * or the integer/FP contribution order.
      */
     template <uint8_t CodebookId, int ColumnsPerBlock>
     __global__ __launch_bounds__(
         GroupedImmaGeometry<ColumnsPerBlock>::projection_threads,
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
         (ColumnsPerBlock == 32 &&
          (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut ||
           CodebookId == 13)) ? 10 :
-#endif
         GroupedImmaGeometry<ColumnsPerBlock>::
             projection_minimum_blocks_per_sm)
     void groupedImmaProjectionKernel(
@@ -809,6 +817,20 @@ namespace
             (static_cast<int>(blockIdx.x) * Geometry::projection_warps + warp) *
             kColumnsPerWarp;
 
+        // Stream the narrow dominant formats through lane-owned shared slots.
+        // The partition totals and integer MMA results must not stay live across
+        // metadata decoding; the 128-lane plane stride keeps accesses bank-local.
+        constexpr bool kStreamContributions =
+            ColumnsPerBlock == 32 && (CodebookId == 4 || CodebookId == 13);
+        constexpr int kStreamThreads = Geometry::projection_threads;
+        // CB13 reuses the retired warp-private B tile for two high-dot planes;
+        // only the remaining two high-dot planes need dedicated storage.
+        constexpr int kStreamDotPlanes = CodebookId == 13 ? 6 : 4;
+        __shared__ float streamed_sums[
+            kStreamContributions ? 8 * kStreamThreads : 1];
+        __shared__ int32_t streamed_dots[
+            kStreamContributions ? kStreamDotPlanes * kStreamThreads : 1];
+        const int stream_lane = static_cast<int>(threadIdx.x);
         constexpr bool kStageIQ4Metadata =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut && ColumnsPerBlock == 32;
         constexpr int kScaleColumns =
@@ -832,20 +854,28 @@ namespace
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
-        const uint16_t *weight_scales =
-            static_cast<const uint16_t *>(descriptor.scales);
-        const uint16_t *weight_mins =
-            static_cast<const uint16_t *>(descriptor.mins);
-        const uint32_t *weight_emins =
-            static_cast<const uint32_t *>(descriptor.emins);
+        const auto weight_meta = ::llaminar2::native_quantised_scale::metadataPlanes(descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
         float total[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+        if constexpr (kStreamContributions)
+        {
+#pragma unroll
+            for (int element = 0; element < 4; ++element)
+                streamed_sums[element * kStreamThreads + stream_lane] = 0.0f;
+        }
+
         for (int partition = 0; partition < k_partitions; ++partition)
         {
             float partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if constexpr (kStreamContributions)
+            {
+#pragma unroll
+                for (int element = 0; element < 4; ++element)
+                    streamed_sums[(4 + element) * kStreamThreads + stream_lane] = 0.0f;
+            }
             const int block_begin = partition * blocks_per_partition;
             const int block_end = min(
                 blocks_per_row,
@@ -891,14 +921,13 @@ namespace
                         uint32_t scale_bits = 0;
                         if (column < N)
                         {
-                            const size_t linear =
-                                static_cast<size_t>(block) * N + column;
                             // The slot carries the normalized staged word (low 16 bits).
-                            scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(
-                                weight_scales, linear);
+                            const auto words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
+                                weight_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N));
+                            scale_bits = words.primary;
                             if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_source_scale)
                                 if (descriptor.codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook)
-                                    scale_bits |= uint32_t{weight_mins[linear]} << 16;
+                                    scale_bits |= uint32_t{words.secondary} << 16;
                         }
                         shared_weight_scales[
                             warp * kColumnsPerWarp + lane] = scale_bits;
@@ -932,61 +961,114 @@ namespace
                     mmaM16N8K32(dot_lo, a_fragment, b_fragment);
                 }
 
-#pragma unroll
-                for (int element = 0; element < 4; ++element)
+                if constexpr (kStreamContributions)
                 {
-                    const int local_row = mmaFragmentRow(lane, element);
-                    const int column =
-                        column_base + mmaFragmentColumn(lane, element);
-                    if (local_row >= active_rows || column >= N)
-                        continue;
-
-                    const int grouped_row = grouped_row_base + local_row;
-                    const float activation_scale = scales_A[
-                        static_cast<size_t>(grouped_row) * blocks_per_row +
-                        block];
-                    if constexpr (kStageIQ4Metadata)
+                    if constexpr (CodebookId == 13)
                     {
-                        const int scale_index =
-                            warp * kColumnsPerWarp +
-                            mmaFragmentColumn(lane, element);
-                        partial[element] = __fadd_rn(
-                            partial[element],
-                            contributionFromStagedSymmetricMma<CodebookId>(
-                                dot_lo[element],
-                                activation_scale,
-                                shared_weight_scales[scale_index], descriptor.codebook_id));
+                        // All lanes have loaded B into registers before any lane
+                        // overwrites it. Each warp owns a disjoint aligned 256B
+                        // tile: exactly two planes of 32 signed int32 dots. A is
+                        // separate and remains live for the contribution helper.
+                        __syncwarp();
                     }
-                    else
+#pragma unroll
+                    for (int element = 0; element < 4; ++element)
                     {
-                        const size_t linear =
-                            static_cast<size_t>(block) * N + column;
-                        const uint8_t *payload =
-                            descriptor.payload + linear * kPayloadBytes;
-                        partial[element] = __fadd_rn(
-                            partial[element],
-                            contributionFromMma<CodebookId>(
-                                shared_a + local_row * kQuantBlock,
-                                dot_lo[element],
-                                dot_hi[element],
-                                payload,
-                                weight_scales,
-                                weight_mins,
-                                weight_emins,
-                                linear,
-                                activation_scale, descriptor.codebook_id));
+                        streamed_dots[element * kStreamThreads + stream_lane] = dot_lo[element];
+                        if constexpr (CodebookId == 13)
+                        {
+                            if (element < 2)
+                                reinterpret_cast<int32_t *>(shared_b)[element * 32 + lane] = dot_hi[element];
+                            else
+                                streamed_dots[(2 + element) * kStreamThreads + stream_lane] = dot_hi[element];
+                        }
                     }
                 }
+
+                // The four fragment elements read their metadata under one uniform
+                // representation branch, so their loads overlap instead of each
+                // element waiting behind its own branch (loadBlockMetadataAs()).
+                const auto accumulate_elements = [&](auto metadata_form)
+                {
+    #pragma unroll (kStreamContributions ? 1 : 4)
+                    for (int element = 0; element < 4; ++element)
+                    {
+                        const int local_row = mmaFragmentRow(lane, element);
+                        const int column =
+                            column_base + mmaFragmentColumn(lane, element);
+                        if (local_row >= active_rows || column >= N)
+                            continue;
+
+                        const int grouped_row = grouped_row_base + local_row;
+                        const float activation_scale = scales_A[
+                            static_cast<size_t>(grouped_row) * blocks_per_row +
+                            block];
+                        const int32_t low_dot = kStreamContributions
+                            ? streamed_dots[element * kStreamThreads + stream_lane]
+                            : dot_lo[element];
+                        int32_t high_dot = 0;
+                        if constexpr (kStreamContributions && CodebookId == 13)
+                            high_dot = element < 2
+                                ? reinterpret_cast<const int32_t *>(shared_b)[element * 32 + lane]
+                                : streamed_dots[(2 + element) * kStreamThreads + stream_lane];
+                        else if constexpr (!kStreamContributions)
+                            high_dot = dot_hi[element];
+                        const float previous = kStreamContributions
+                            ? streamed_sums[(4 + element) * kStreamThreads + stream_lane]
+                            : partial[element];
+                        float contribution;
+                        if constexpr (kStageIQ4Metadata)
+                        {
+                            const int scale_index =
+                                warp * kColumnsPerWarp +
+                                mmaFragmentColumn(lane, element);
+                            contribution = contributionFromStagedSymmetricMma<CodebookId>(
+                                    low_dot,
+                                    activation_scale,
+                                    shared_weight_scales[scale_index], descriptor.codebook_id);
+                        }
+                        else
+                        {
+                            const size_t linear =
+                                static_cast<size_t>(block) * N + column;
+                            const uint8_t *payload =
+                                descriptor.payload + linear * kPayloadBytes;
+                            contribution = contributionFromMma<CodebookId, decltype(metadata_form)>(
+                                    shared_a + local_row * kQuantBlock,
+                                    low_dot,
+                                    high_dot,
+                                    payload,
+                                    weight_meta,
+                                    ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N),
+                                    activation_scale, descriptor.codebook_id);
+                        }
+                        const float next = __fadd_rn(previous, contribution);
+                        if constexpr (kStreamContributions)
+                            streamed_sums[(4 + element) * kStreamThreads + stream_lane] = next;
+                        else
+                            partial[element] = next;
+                    }
+                };
+                if constexpr (kStageIQ4Metadata)
+                    accumulate_elements(::llaminar2::native_quantised_scale::NativeQuantisedMetadataReadFormTag<
+                                        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataReadForm::PerBlock>{});
+                else
+                    ::llaminar2::native_quantised_scale::withMetadataRepresentation<CodebookId>(weight_meta,
+                                                                                               accumulate_elements);
+                // Retire every contribution read (including CB13's aliased B
+                // dots) before the next block decodes fresh operand bytes.
                 __syncthreads();
             }
 
 #pragma unroll
             for (int element = 0; element < 4; ++element)
             {
-                const int local_row = mmaFragmentRow(lane, element);
-                total[element] = __fadd_rn(
-                    total[element],
-                    partial[element]);
+                if constexpr (kStreamContributions)
+                    streamed_sums[element * kStreamThreads + stream_lane] = __fadd_rn(
+                        streamed_sums[element * kStreamThreads + stream_lane],
+                        streamed_sums[(4 + element) * kStreamThreads + stream_lane]);
+                else
+                    total[element] = __fadd_rn(total[element], partial[element]);
             }
         }
 
@@ -998,7 +1080,9 @@ namespace
                 column_base + mmaFragmentColumn(lane, element);
             if (local_row < active_rows && column < N)
             {
-                float value = total[element];
+                float value = kStreamContributions
+                    ? streamed_sums[element * kStreamThreads + stream_lane]
+                    : total[element];
                 if (route_weights)
                 {
                     value = __fmul_rn(
@@ -1132,12 +1216,7 @@ namespace
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
-        const uint16_t *weight_scales =
-            static_cast<const uint16_t *>(descriptor.scales);
-        const uint16_t *weight_mins =
-            static_cast<const uint16_t *>(descriptor.mins);
-        const uint32_t *weight_emins =
-            static_cast<const uint32_t *>(descriptor.emins);
+        const auto weight_meta = ::llaminar2::native_quantised_scale::metadataPlanes(descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -1225,10 +1304,8 @@ namespace
                         dot_lo[element],
                         dot_hi[element],
                         payload,
-                        weight_scales,
-                        weight_mins,
-                        weight_emins,
-                        linear,
+                        weight_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N),
                         activation_scale, descriptor.codebook_id);
                     partial[element] = __fadd_rn(
                         partial[element],
@@ -1458,18 +1535,8 @@ namespace
                 payload_bytes;
         const uint8_t *gate_payload_base = gate_descriptor.payload;
         const uint8_t *up_payload_base = up_descriptor.payload;
-        const auto *gate_scales =
-            static_cast<const uint16_t *>(gate_descriptor.scales);
-        const auto *gate_mins =
-            static_cast<const uint16_t *>(gate_descriptor.mins);
-        const auto *gate_emins =
-            static_cast<const uint32_t *>(gate_descriptor.emins);
-        const auto *up_scales =
-            static_cast<const uint16_t *>(up_descriptor.scales);
-        const auto *up_mins =
-            static_cast<const uint16_t *>(up_descriptor.mins);
-        const auto *up_emins =
-            static_cast<const uint32_t *>(up_descriptor.emins);
+        const auto gate_meta = ::llaminar2::native_quantised_scale::metadataPlanes(gate_descriptor);
+        const auto up_meta = ::llaminar2::native_quantised_scale::metadataPlanes(up_descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -1544,15 +1611,26 @@ namespace
                         uint32_t up_scale_pair = 0;
                         if (column < N)
                         {
-                            const size_t linear =
-                                static_cast<size_t>(block) * N + column;
-                            gate_scale_pair =
-                                static_cast<uint32_t>(gate_scales[linear]) |
-                                (static_cast<uint32_t>(gate_mins[linear])
-                                 << 16);
-                            up_scale_pair =
-                                static_cast<uint32_t>(up_scales[linear]) |
-                                (static_cast<uint32_t>(up_mins[linear]) << 16);
+                            // Branch once per matrix representation, then read
+                            // gate and up metadata in one straight-line block so
+                            // their global loads overlap (loadBlockMetadataAs());
+                            // a branch per read serialized two load latencies
+                            // before this barrier (PR #73 GB10 prefill regression).
+                            namespace nqs = ::llaminar2::native_quantised_scale;
+                            nqs::withMetadataRepresentation<CodebookId>(gate_meta, [&](auto gate_form) {
+                                nqs::withMetadataRepresentation<CodebookId>(up_meta, [&](auto up_form) {
+                                    const auto gate_words =
+                                        nqs::loadBlockMetadataAs<CodebookId, decltype(gate_form)::value>(
+                                            gate_meta, nqs::blockMajorAddress(gate_meta, block, column, N));
+                                    const auto up_words =
+                                        nqs::loadBlockMetadataAs<CodebookId, decltype(up_form)::value>(
+                                            up_meta, nqs::blockMajorAddress(up_meta, block, column, N));
+                                    gate_scale_pair = static_cast<uint32_t>(gate_words.primary) |
+                                                      (static_cast<uint32_t>(gate_words.secondary) << 16);
+                                    up_scale_pair = static_cast<uint32_t>(up_words.primary) |
+                                                    (static_cast<uint32_t>(up_words.secondary) << 16);
+                                });
+                            });
                         }
                         const int scale_index =
                             warp * kColumnsPerWarp + lane;
@@ -1684,10 +1762,8 @@ namespace
                                 gate_dot_lo[element],
                                 gate_dot_hi[element],
                                 gate_payload_base + linear * kPayloadBytes,
-                                gate_scales,
-                                gate_mins,
-                                gate_emins,
-                                linear,
+                                gate_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N),
                                 activation_scale, gate_descriptor.codebook_id));
                     }
                     int32_t up_dot_lo[4] = {0, 0, 0, 0};
@@ -1726,10 +1802,8 @@ namespace
                                 up_dot_lo[element],
                                 up_dot_hi[element],
                                 up_payload_base + linear * kPayloadBytes,
-                                up_scales,
-                                up_mins,
-                                up_emins,
-                                linear,
+                                up_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block, column, N),
                                 activation_scale, up_descriptor.codebook_id));
                     }
 #else
@@ -1787,10 +1861,8 @@ namespace
                                 gate_dot_lo[element],
                                 gate_dot_hi[element],
                                 gate_payload_base + linear * kPayloadBytes,
-                                gate_scales,
-                                gate_mins,
-                                gate_emins,
-                                linear,
+                                gate_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N),
                                 activation_scale, gate_descriptor.codebook_id));
                         up_partial[element] = __fadd_rn(
                             up_partial[element],
@@ -1799,10 +1871,8 @@ namespace
                                 up_dot_lo[element],
                                 up_dot_hi[element],
                                 up_payload_base + linear * kPayloadBytes,
-                                up_scales,
-                                up_mins,
-                                up_emins,
-                                linear,
+                                up_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block, column, N),
                                 activation_scale, up_descriptor.codebook_id));
                     }
 #endif
@@ -2128,7 +2198,6 @@ namespace
         LAUNCH_CODEBOOK(16);
         LAUNCH_CODEBOOK(17);
         LAUNCH_CODEBOOK(19);
-        LAUNCH_CODEBOOK(llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
 
 #undef LAUNCH_CODEBOOK
         return launched;
@@ -2192,8 +2261,6 @@ namespace
         LAUNCH_GATE_UP_CODEBOOK(16);
         LAUNCH_GATE_UP_CODEBOOK(17);
         LAUNCH_GATE_UP_CODEBOOK(19);
-        LAUNCH_GATE_UP_CODEBOOK(
-            llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
 
 #undef LAUNCH_GATE_UP_CODEBOOK
         return launched;
@@ -2257,8 +2324,6 @@ namespace
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(16);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(17);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(19);
-        LAUNCH_PAIRED_GATE_UP_CODEBOOK(
-            llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
 
 #undef LAUNCH_PAIRED_GATE_UP_CODEBOOK
         return launched;
@@ -2623,7 +2688,6 @@ namespace
             QUERY_CODEBOOK(16);
             QUERY_CODEBOOK(17);
             QUERY_CODEBOOK(19);
-            QUERY_CODEBOOK(llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
         default:
             return false;
         }
@@ -2675,8 +2739,6 @@ namespace
             QUERY_GATE_UP_CODEBOOK(16);
             QUERY_GATE_UP_CODEBOOK(17);
             QUERY_GATE_UP_CODEBOOK(19);
-            QUERY_GATE_UP_CODEBOOK(
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
         default:
             return false;
         }

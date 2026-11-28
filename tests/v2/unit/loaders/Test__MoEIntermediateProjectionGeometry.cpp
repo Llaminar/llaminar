@@ -7,11 +7,13 @@
  * tiny CPU-storage fixtures grant no TensorSharded execution/admission support.
  * Static projections require source-bound registry publication; legacy aliases
  * cannot admit a partition merely because a caller supplies its geometry.
- * No test constructs a backend, loads a model, or submits a kernel.
+ * The GPU pool sizing sweep uses mock host backing; no native backend,
+ * model, or kernel submission is needed.
  */
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
-#include "loaders/gpu_pipeline/WeightVRAMPool.h"
+#include "loaders/BoundedGPUExpertSource.h"
+#include "mocks/MockBackend.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "loaders/MoEExpertSourceView.h"
 #include "loaders/ExpertGemmRegistry.h"
@@ -403,62 +405,67 @@ TEST(MoEIntermediateProjectionGeometry, RegistryRejectsStaticProjectionWithoutOr
 namespace llaminar2::test
 {
 /**
- * @brief Compare canonical admission with the real unallocated pool planner.
+ * @brief Compare admission against the persistent bytes materialized by the weight pool.
  *
- * Each case prices one source projection, including allocator rounding. No
- * backend or allocation is created. Source canonicalization (not the source's
- * unnormalized asymmetry flag) determines whether a physical minima plane exists.
+ * Use the same typed metadata declaration as the loader on each backend,
+ * including a source column slice that starts inside a superblock. The mock
+ * allocation has no staging, so every counted byte belongs to the live slot.
  */
 TEST(MoEIntermediateProjectionGeometry, PreparedPoolLayoutsMatchActualPoolPlans)
 {
     using Layout = GPUPreparedWeightPoolLayout;
-    for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
     {
-        const auto &source = *entry.metadata;
-        const auto format = ExpertWeightFormat::nativeQuantised(
-            {source.codebook_id, source.is_superblock, true});
-        for (const int n : {1, 128, 256, 640})
-        for (const int k : {256, 512, 2560})
+        SCOPED_TRACE(device.toString());
+        MockBackend backend(device.type);
+        for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+        {
+            const auto &source = *entry.metadata;
+            const auto format = ExpertWeightFormat::nativeQuantised(
+                {source.codebook_id, source.is_superblock, true});
+            for (const int n : {1, 128, 256, 640})
+            for (const int k : {256, 512, 2560})
+            for (const auto layout : {Layout::SourceNative, Layout::MigrationReusable})
+            for (const uint8_t phase : {0, 7})
+            {
+                const auto coded = gpuPreparedWeightCodedDeclaration(source, layout, device, phase);
+                if (phase && !coded)
+                    continue;
+                SCOPED_TRACE(std::string(entry.quant_type));
+                SCOPED_TRACE(n);
+                SCOPED_TRACE(k);
+                SCOPED_TRACE(static_cast<int>(layout));
+                SCOPED_TRACE(static_cast<int>(phase));
+                const auto physical = gpuPreparedWeightPoolAllocation(source, layout);
+                WeightVRAMPool pool;
+                pool.planWeight("original", n, k, physical.payload_bytes_per_block,
+                    physical.has_mins, physical.has_emins,
+                    nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(source)), 0, {}, coded);
+                ASSERT_TRUE(pool.allocate(&backend, device.ordinal));
+                const auto geometry = resolveExpertPreparedProjectionMemoryGeometry(n, k, format, layout, phase);
+                EXPECT_EQ(geometry.gpu_live_bytes, backend.getTotalAllocatedBytes());
+                EXPECT_EQ(pool.totalPlannedBytes(), backend.getTotalAllocatedBytes());
+                EXPECT_EQ(geometry.cpu_bytes,
+                    resolveExpertPreparedProjectionMemoryGeometry(n, k, format).cpu_bytes);
+                if (layout == Layout::MigrationReusable && phase == 0)
+                    EXPECT_EQ(geometry.gpu_live_bytes,
+                        resolveExpertPreparedProjectionMemoryGeometry(n, k, format).gpu_live_bytes);
+            }
+        }
+        for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
         for (const auto layout : {Layout::SourceNative, Layout::MigrationReusable})
         {
-            SCOPED_TRACE(std::string(entry.quant_type));
-            SCOPED_TRACE(n);
-            SCOPED_TRACE(k);
-            SCOPED_TRACE(static_cast<int>(layout));
-            const auto physical = layout == Layout::MigrationReusable
-                ? reusableDeviceVnniAllocationFormat(source)
-                : NativeQuantisedReusableDeviceAllocationFormat{
-                      static_cast<uint8_t>(source.payload_bytes),
-                      canonicalDeviceVnniFormat(source).is_asymmetric,
-                      source.has_emins};
+            const auto format = ExpertWeightFormat::floating(type);
             WeightVRAMPool pool;
-            pool.planWeight("original", n, k, physical.payload_bytes_per_block,
-                physical.has_mins, physical.has_emins,
-                // Live slots carry the physical codebook's own primary plane
-                // (one E8M0 byte per block for native MXFP4).
-                nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(source)), 0);
-            const auto geometry = resolveExpertPreparedProjectionMemoryGeometry(
-                n, k, format, layout);
-            EXPECT_EQ(geometry.gpu_live_bytes,
-                alignGPUWeightLoadAllocation(pool.totalPlannedBytes()));
-            EXPECT_EQ(geometry.cpu_bytes,
-                resolveExpertPreparedProjectionMemoryGeometry(n, k, format).cpu_bytes);
-            if (layout == Layout::MigrationReusable)
-                EXPECT_EQ(geometry.gpu_live_bytes,
-                    resolveExpertPreparedProjectionMemoryGeometry(n, k, format).gpu_live_bytes);
+            constexpr int n = 3, k = 33; // Odd raw extent requires end-of-allocation padding.
+            pool.planRawWeight("original", n, k, size_t{n} * k * format.floatingElementBytes());
+            ASSERT_TRUE(pool.allocate(&backend, device.ordinal));
+            EXPECT_EQ(resolveExpertPreparedProjectionMemoryGeometry(n, k, format, layout).gpu_live_bytes,
+                backend.getTotalAllocatedBytes());
+            EXPECT_EQ(pool.totalPlannedBytes(), backend.getTotalAllocatedBytes());
+            EXPECT_THROW((void)resolveExpertPreparedProjectionMemoryGeometry(n, k, format,
+                static_cast<Layout>(99)), std::invalid_argument);
         }
-    }
-    for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
-    for (const auto layout : {Layout::SourceNative, Layout::MigrationReusable})
-    {
-        const auto format = ExpertWeightFormat::floating(type);
-        WeightVRAMPool pool;
-        pool.planRawWeight("original", 128, 256,
-            size_t{128} * 256 * format.floatingElementBytes());
-        EXPECT_EQ(resolveExpertPreparedProjectionMemoryGeometry(128, 256, format, layout).gpu_live_bytes,
-            alignGPUWeightLoadAllocation(pool.totalPlannedBytes()));
-        EXPECT_THROW((void)resolveExpertPreparedProjectionMemoryGeometry(128, 256, format,
-            static_cast<Layout>(99)), std::invalid_argument);
     }
     EXPECT_THROW((void)resolveExpertPreparedProjectionMemoryGeometry(128, 256,
         ExpertWeightFormat::nativeQuantised({native_quantised_formats::Q5_0.codebook_id, false, true}),

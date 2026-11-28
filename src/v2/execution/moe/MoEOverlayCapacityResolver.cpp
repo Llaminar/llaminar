@@ -189,6 +189,7 @@ namespace llaminar2
                     .N = projection.N,
                     .K = projection.K,
                     .format = projection.format,
+                    .gpu_superblock_phase = projection.gpuSuperblockPhase(),
                 };
             }
             return key;
@@ -650,7 +651,9 @@ namespace llaminar2
                     resolveExpertPreparedProjectionMemoryGeometry(
                         projection.N,
                         projection.K,
-                        projection.format);
+                        projection.format,
+                        GPUPreparedWeightPoolLayout::MigrationReusable,
+                        projection.gpuSuperblockPhase());
                 footprint.cpu_live_bytes = checkedAdd(
                     footprint.cpu_live_bytes,
                     geometry.cpu_bytes,

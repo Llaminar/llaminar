@@ -55,7 +55,6 @@ constexpr int shardIndexForCodebook(uint8_t codebook_id)
         return 6;
     case 17:
     case 19:
-    case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
         return 7;
     default:
         return -1;
@@ -120,15 +119,14 @@ extern "C"
  * @details The full buffer/epilogue contract is declared in CUDACanonicalKpartFold.h.
  */
 bool cudaNativeQuantisedGemvTuned_fusedKpar_fp32(
-    const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
-    const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+    const int8_t *activations, const uint8_t *payload, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes metadata, float *output,
     const float *activation_scales, int n, float alpha, float beta,
     const float *existing, const float *bias, uint8_t codebook_id, int device,
     void *raw_stream, const llaminar2::CUDACanonicalKpartFoldPlan &plan)
 {
     const auto stream = static_cast<cudaStream_t>(raw_stream);
     if (!stream || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
-        !activations || !payload || !scales || !output || !activation_scales ||
+        !activations || !payload || !metadata.primary || !output || !activation_scales ||
         n <= 0 || device < 0 || (beta != 0.0f && !existing) ||
         reinterpret_cast<uintptr_t>(activations) % alignof(int4) != 0)
         return false;
@@ -144,7 +142,7 @@ bool cudaNativeQuantisedGemvTuned_fusedKpar_fp32(
         return false;
     LLAMINAR_ROUTE_CUDA_NATIVE_QUANTISED_SHARD(
         cudaNativeQuantisedGemvTuned_fusedKpar_fp32, false,
-        activations, payload, scales, secondary, extended_minima, output,
+        activations, payload, metadata, output,
         activation_scales, n, alpha, beta, existing, bias, codebook_id,
         device, stream, plan);
 }
@@ -192,9 +190,8 @@ bool cudaNativeQuantisedGemvTuned_queryGeneratedDispatch(
 /**
  * @brief Resolve a complete source arithmetic policy on its owning shard.
  *
- * Physical codebook 19/23 shards call this only when CPU residency changed the
- * execution representation.  Routing policy lookup back to the source shard
- * avoids multiplying generated selector instantiations across decoder shards.
+ * Routing arithmetic lookup to the source shard avoids multiplying generated
+ * selector instantiations for the explicit physical-19 representation.
  */
 bool cudaNativeQuantisedGemvTuned_resolveArithmeticPolicy(
     uint8_t codebook_id,
@@ -298,9 +295,7 @@ double cudaNativeQuantisedGemvTuned_measureGeneratedDispatchNs(
 bool cudaNativeQuantisedGemvTuned_fp32(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const uint16_t *d_scales,
-    const uint16_t *d_mins,
-    const uint32_t *d_emins,
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
     float *d_C_fp32,
     const float *d_scales_A_block,
     int N,
@@ -320,9 +315,7 @@ bool cudaNativeQuantisedGemvTuned_fp32(
         false,
         d_A_int8,
         d_payload,
-        d_scales,
-        d_mins,
-        d_emins,
+        d_meta,
         d_C_fp32,
         d_scales_A_block,
         N,
@@ -341,16 +334,13 @@ bool cudaNativeQuantisedGemvTuned_fp32(
 /**
  * @brief Route a physical CUDA decoder with an independent arithmetic policy.
  *
- * ExpertOverlay CPU residency may normalize compact source bytes into codebook
- * 19 or 23.  The physical codebook selects the decoder shard; the policy
- * codebook selects the source model's generated launch and reduction tree.
+ * The physical codebook selects the decoder shard; the policy codebook selects
+ * the original source format’s generated launch and reduction tree.
  */
 bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const uint16_t *d_scales,
-    const uint16_t *d_mins,
-    const uint32_t *d_emins,
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
     float *d_C_fp32,
     const float *d_scales_A_block,
     int N,
@@ -371,9 +361,7 @@ bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
         false,
         d_A_int8,
         d_payload,
-        d_scales,
-        d_mins,
-        d_emins,
+        d_meta,
         d_C_fp32,
         d_scales_A_block,
         N,
@@ -393,9 +381,7 @@ bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
 bool cudaNativeQuantisedGemvTuned_small_m_fp32(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const uint16_t *d_scales,
-    const uint16_t *d_mins,
-    const uint32_t *d_emins,
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
     float *d_C_fp32,
     const float *d_scales_A_block,
     int M,
@@ -416,9 +402,7 @@ bool cudaNativeQuantisedGemvTuned_small_m_fp32(
         false,
         d_A_int8,
         d_payload,
-        d_scales,
-        d_mins,
-        d_emins,
+        d_meta,
         d_C_fp32,
         d_scales_A_block,
         M,
@@ -445,9 +429,7 @@ bool cudaNativeQuantisedGemvTuned_small_m_fp32(
 bool cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const uint16_t *d_scales,
-    const uint16_t *d_mins,
-    const uint32_t *d_emins,
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
     float *d_C_fp32,
     const float *d_scales_A_block,
     int M,
@@ -470,9 +452,7 @@ bool cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
         false,
         d_A_int8,
         d_payload,
-        d_scales,
-        d_mins,
-        d_emins,
+        d_meta,
         d_C_fp32,
         d_scales_A_block,
         M,
@@ -572,34 +552,9 @@ void cudaGemvContext_bindWorkspace(
         kpar_partials_bytes);
 }
 
-CUDARowMajorWeights *cudaRowMajorWeights_create(
-    const uint8_t *d_payload_col,
-    const uint16_t *d_scales_col,
-    const uint16_t *d_mins_col,
-    const uint32_t *d_emins_col,
-    int N,
-    int K,
-    int payload_bytes,
-    int cuda_device_id,
-    void *stream)
-{
-    return cudaRowMajorWeights_create_shard_0(
-        d_payload_col,
-        d_scales_col,
-        d_mins_col,
-        d_emins_col,
-        N,
-        K,
-        payload_bytes,
-        cuda_device_id,
-        stream);
-}
-
 CUDARowMajorWeights *cudaRowMajorWeights_createForCodebook(
     const uint8_t *d_payload_col,
-    const uint16_t *d_scales_col,
-    const uint16_t *d_mins_col,
-    const uint32_t *d_emins_col,
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta_col,
     int N,
     int K,
     uint8_t codebook_id,
@@ -610,9 +565,7 @@ CUDARowMajorWeights *cudaRowMajorWeights_createForCodebook(
         cudaRowMajorWeights_createForCodebook,
         nullptr,
         d_payload_col,
-        d_scales_col,
-        d_mins_col,
-        d_emins_col,
+        meta_col,
         N,
         K,
         codebook_id,

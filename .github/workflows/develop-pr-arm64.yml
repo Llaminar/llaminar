@@ -53,6 +53,7 @@ jobs:
             echo "ccache-prefix=llaminar-ccache-v1-neon-$toolchain_digest-"
             echo "source-tree=$source_tree"
             echo 'args<<BUILD_ARGS'
+            echo "LLAMINAR_TOOLCHAIN_CONTEXT=$TOOLCHAIN_CONTEXT"
             echo "VCS_REF=$(git rev-parse HEAD)"
             echo "LLAMINAR_SOURCE_TREE=$source_tree"
             echo 'LLAMINAR_CPU_ISA=NEON'
@@ -78,31 +79,56 @@ jobs:
         continue-on-error: true
         shell: bash
         run: bash scripts/ci/transfer_arm64_ccache.sh restore
-      - name: Build the sealed ARM64 test-runner
-        uses: docker/build-push-action@v7
+      - uses: crazy-max/ghaction-github-runtime@v3
+      - name: Export original canonical Integration attempt evidence
+        id: integration-evidence
+        shell: bash
         env:
-          DOCKER_BUILD_RECORD_UPLOAD: "false"
-        with:
-          context: .
-          platforms: linux/arm64
-          target: test-runner
-          build-args: ${{ steps.build.outputs.args }}
-          build-contexts: ${{ steps.toolchain.outputs.neon-context }}
-          tags: llaminar-arm64-test-runner:pr
-          load: true
-          cache-from: |
-            type=gha,scope=llaminar-build-neon-pr,version=2
-            type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}
-          cache-to: type=gha,scope=llaminar-build-neon-pr,mode=max,version=2,ignore-error=true
+          BUILD_ARGS: ${{ steps.build.outputs.args }}
+          TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
+          args=()
+          while IFS= read -r arg; do [[ -z "$arg" ]] || args+=(--build-arg "$arg"); done <<< "$BUILD_ARGS"
+          set -o pipefail
+          { docker buildx build "${args[@]}" --build-context "$TOOLCHAIN_CONTEXT" \
+            --platform linux/arm64 --progress rawjson --target arm64-build-evidence \
+            --output "type=local,dest=$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration" . \
+            2>&1 1>&3 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-export.rawjson" >&2; } 3>&1
+          nonce=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nonce"])' "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json")
+          echo "nonce=$nonce" >> "$GITHUB_OUTPUT"
+          python3 scripts/ci/native_build_cache_receipt.py "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-export.rawjson" "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json" > "$RUNNER_TEMP/llaminar-arm64-evidence/export-cache.json"
+      - name: Build the sealed ARM64 test-runner
+        shell: bash
+        env:
+          BUILD_ARGS: ${{ steps.build.outputs.args }}
+          TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
+          EXPECTED_NONCE: ${{ steps.integration-evidence.outputs.nonce }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
+          args=()
+          while IFS= read -r arg; do [[ -z "$arg" ]] || args+=(--build-arg "$arg"); done <<< "$BUILD_ARGS"
+          set -o pipefail
+          { docker buildx build "${args[@]}" --build-arg "LLAMINAR_EXPECTED_BUILD_NONCE=$EXPECTED_NONCE" \
+            --build-context "$TOOLCHAIN_CONTEXT" --platform linux/arm64 --progress rawjson \
+            --load --target test-runner --tag llaminar-arm64-test-runner:pr \
+            --cache-from type=gha,scope=llaminar-build-neon-pr,version=2 \
+            --cache-from type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }} \
+            --cache-to type=gha,scope=llaminar-build-neon-pr,mode=max,version=2,ignore-error=true . \
+            2>&1 1>&3 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" >&2; } 3>&1 || build_status=$?
+          python3 scripts/ci/native_build_cache_receipt.py "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json" > "$RUNNER_TEMP/llaminar-arm64-evidence/main-cache.json" || provenance_status=$?
+          if [[ "${build_status:-0}" != 0 ]]; then exit "$build_status"; fi
+          exit "${provenance_status:-0}"
       - name: Export the sibling Release runtime from the same builder
         shell: bash
         env:
           BUILD_ARGS: ${{ steps.build.outputs.args }}
           TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
         run: |
+          mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
           args=()
           while IFS= read -r arg; do
-            args+=(--build-arg "$arg")
+            [[ -z "$arg" ]] || args+=(--build-arg "$arg")
           done <<< "$BUILD_ARGS"
           docker buildx build "${args[@]}" --build-context "${TOOLCHAIN_CONTEXT:?}" \
             --platform linux/arm64 --progress plain --load --target runtime \
@@ -127,16 +153,52 @@ jobs:
               --output /evidence/tests
       - name: Export the BuildKit compiler cache mount
         id: export-ccache
-        if: steps.ccache.outputs.cache-hit != 'true'
+        # Also after a failed build or test step: the compiled objects are still
+        # valid, and skipping the save leaves every later run on this cache prefix cold.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.ccache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         shell: bash
         run: bash scripts/ci/transfer_arm64_ccache.sh save
       - name: Save ARM64 compiler objects
-        if: steps.export-ccache.outcome == 'success'
+        if: ${{ !cancelled() && steps.export-ccache.outcome == 'success' }}
         uses: actions/cache/save@v5
         with:
           path: ${{ runner.temp }}/llaminar-neon-ccache
           key: ${{ steps.build.outputs.ccache-prefix }}${{ steps.build.outputs.source-tree }}
+      - name: Compile and verify required ARM optional ISA envelopes
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        env:
+          TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes"
+          cat > "$RUNNER_TEMP/arm-envelope.Dockerfile" <<'EOF'
+          FROM toolchain
+          COPY . /envelope-source
+          WORKDIR /envelope-source
+          ENTRYPOINT ["python3", "scripts/ci/arm_envelope_checks.py", "/envelope-source", "/evidence"]
+          EOF
+          # This immutable git archive is already the complete admitted context.
+          # Override root .dockerignore so COPY cannot silently omit manifest files.
+          : > "$RUNNER_TEMP/arm-envelope.Dockerfile.dockerignore"
+          context=$(mktemp -d)
+          git archive HEAD | tar -x -C "$context"
+          git rev-parse HEAD HEAD^{tree} > "$context/arm-envelope-source.txt"
+          python3 - "$context" <<'PYTHON'
+          import hashlib, json, os, pathlib, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          manifest = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), tree=subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(), files={str(p.relative_to(root)): ({'symlink': os.readlink(p)} if p.is_symlink() else {'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}) for p in root.rglob('*') if p.is_file() or p.is_symlink()})
+          (root / 'arm-envelope-manifest.json').write_text(json.dumps(manifest, sort_keys=True))
+          PYTHON
+          manifest_sha=$(sha256sum "$context/arm-envelope-manifest.json" | cut -d' ' -f1)
+          cp "$context/arm-envelope-manifest.json" "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes/"
+          cp "$RUNNER_TEMP/arm-envelope.Dockerfile" "$context/arm-envelope.Dockerfile"
+          docker buildx build --platform linux/arm64 --load \
+            --build-context "$TOOLCHAIN_CONTEXT" -f "$RUNNER_TEMP/arm-envelope.Dockerfile" \
+            -t llaminar-arm-envelopes:pr "$context" 2>&1 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes-image.log"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes/source.txt"
+          printf '%s\n' "$TOOLCHAIN_CONTEXT" > "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes/toolchain.txt"
+          docker run --rm --env "ARM_ENVELOPE_MANIFEST_SHA256=$manifest_sha" --mount "type=bind,source=$RUNNER_TEMP/llaminar-arm64-evidence/envelopes,target=/evidence" llaminar-arm-envelopes:pr
       - name: Retain ARM64 build and test evidence
         if: always()
         uses: actions/upload-artifact@v4

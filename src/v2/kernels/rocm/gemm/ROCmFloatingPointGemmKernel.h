@@ -27,6 +27,7 @@
  */
 
 #pragma once
+#include "kernels/common/FixedHalfProjectionGroup.h"
 
 #include "kernels/common/FloatingOutputPartitionScope.h"
 #include "kernels/FloatingActivationOperandPrecision.h"
@@ -382,19 +383,17 @@ namespace llaminar2
                 int m, int n, int k, DeviceWorkspaceManager *workspace);
 
             /**
-             * @brief Consume the preceding same-stream half publication via GemmEx.
-             * @param half_input Complete admitted half-A matrix [m,k].
-             * @param output Stable FP32 destination [m,n].
-             * @param m Positive row count.
-             * @param n Output width matching this engine.
-             * @param k Reduction width matching this engine.
-             * @param alpha FP32 product multiplier.
-             * @param beta FP32 existing-output multiplier.
-             * @param workspace Canonical stage scratch retained through every consumer.
-             * @return Whether library enqueue succeeded; records actual operand types.
+             * @brief Submit one ordinary explicit-operand group through the fixed-K contract.
+             * @tparam Operand uint16_t (published half bank) or float (strict FP32 source).
+             * @param group Input, persistent weights and FP32 outputs of up to eight projections.
+             * @param m Physical rows. @param k Prepared reduction width.
+             * @param workspace Admitted scratch holding the bounded partition-chain bank.
+             * @return Submission success; emits the schedule as PerfStats evidence.
+             * @throws std::invalid_argument For a missing stream, workspace or bank.
              */
-            bool runFP16OperandProjection(const void *half_input, float *output,
-                int m, int n, int k, float alpha, float beta, DeviceWorkspaceManager *workspace);
+            template<class Operand>
+            bool runFixedKGroup(const FixedRaggedProjectionGroup<Operand> &group, int m, int k,
+                DeviceWorkspaceManager *workspace);
 
             bool run_fixed_order_swiglu_down(
                 const TensorBase *gate,

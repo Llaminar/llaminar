@@ -57,7 +57,7 @@ struct PhaseProjectionValidation {
         NUMERIC_CASE(NATIVE_QUANTISED_IQ3_S) NUMERIC_CASE(NATIVE_QUANTISED_IQ3_XXS)
         NUMERIC_CASE(NATIVE_QUANTISED_IQ2_S) NUMERIC_CASE(NATIVE_QUANTISED_IQ2_XS) NUMERIC_CASE(NATIVE_QUANTISED_IQ2_XXS)
         NUMERIC_CASE(NATIVE_QUANTISED_IQ1_S) NUMERIC_CASE(NATIVE_QUANTISED_IQ1_M)
-        NUMERIC_CASE(NATIVE_QUANTISED_Q8_0) NUMERIC_CASE(NATIVE_QUANTISED_EXPANDED_INT8_MIN)
+        NUMERIC_CASE(NATIVE_QUANTISED_Q8_0)
         default:return State::Invalid;
         }
 #undef NUMERIC_CASE
@@ -84,11 +84,19 @@ struct PhaseProjection {
     uint8_t codebook; ///< Original physical decoder, independent of source-policy identity.
     bool ready; ///< Original selected and payload-ready state.
     PhaseProjectionValidation::State numeric_validity; ///< Separate original invariant-zero decision, not a readiness replacement.
+    /// Packed metadata layout of the planes (nativeQuantisedMetadataLayout): zero
+    /// for per-block planes; superblock-coded roles hold codes in `scales` and
+    /// per-superblock d/dmin words in `mins` (no emins). Occupies former padding.
+    uint8_t metadata_layout;
+    /** @return The role's typed metadata planes. */
+    __device__ __forceinline__ ::llaminar2::rocm_native_metadata::MetadataPlanes meta() const
+    { return ::llaminar2::rocm_native_metadata::planesFromLayout(scales,mins,emins,metadata_layout); }
 };
 static_assert(std::is_standard_layout_v<PhaseProjection> &&
     std::is_trivially_copyable_v<PhaseProjection> && sizeof(PhaseProjection)==48&&offsetof(PhaseProjection,codebook)==40&&
-    offsetof(PhaseProjection,ready)==41&&offsetof(PhaseProjection,numeric_validity)==42,
-    "Numeric-worker metadata retains only original planes, partitions and publication validity in48bytes");
+    offsetof(PhaseProjection,ready)==41&&offsetof(PhaseProjection,numeric_validity)==42&&
+    offsetof(PhaseProjection,metadata_layout)==43,
+    "Numeric-worker metadata retains only original planes, layout, partitions and publication validity in48bytes");
 
 /**
  * @brief Recover immutable phase metadata from the first active lane of its physical wave.
@@ -109,6 +117,28 @@ __device__ __forceinline__ T waveMetadataValue(T value)
         return reinterpret_cast<T>(waveUniformAddress(reinterpret_cast<uintptr_t>(value)));
     }
     else return static_cast<T>(__builtin_amdgcn_readfirstlane(static_cast<unsigned>(value)));
+}
+/**
+ * @brief Recover one role's metadata planes and representation, wave-uniformly.
+ * @tparam FMT Physical decoder selected by the caller.
+ * @tparam Binding PhaseProjection reference (LDS or generic provenance).
+ * @param binding Role record shared by the whole wave.
+ * @return Planes for blockMetadata(): per-block planes keep exactly the planes
+ *         this decoder consumes; a codable decoder also borrows the secondary
+ *         slot, which holds the superblock plane of a coded role.
+ */
+template<NativeQuantisedFormat FMT,class Binding>
+__device__ __forceinline__ ::llaminar2::rocm_native_metadata::MetadataPlanes phaseRoleMetadata(const Binding& binding)
+{
+    using Traits=NATIVE_QUANTISEDTraits<FMT>;
+    constexpr bool codable=::llaminar2::nativeQuantisedSuperblockCodable(static_cast<uint8_t>(FMT));
+    const uint16_t* mins=nullptr;
+    const uint32_t* emins=nullptr;
+    uint8_t layout=0;
+    if constexpr(codable)layout=waveMetadataValue(binding.metadata_layout);
+    if constexpr(Traits::requires_secondary_metadata||codable)mins=waveMetadataValue(binding.mins);
+    if constexpr(Traits::needs_emin_array)emins=waveMetadataValue(binding.emins);
+    return ::llaminar2::rocm_native_metadata::planesFromLayout(waveMetadataValue(binding.scales),mins,emins,layout);
 }
 /** @brief Native32-bit LDS pointee; the host pass only parses this device helper. */
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -157,7 +187,6 @@ template<NativeQuantisedFormat FMT> struct BlockOperand : BlockExtendedBits<NATI
 };
 static_assert(sizeof(BlockOperand<NATIVE_QUANTISED_Q5_1>)==24 &&
     sizeof(BlockOperand<NATIVE_QUANTISED_Q8_0>)==36 &&
-    sizeof(BlockOperand<NATIVE_QUANTISED_EXPANDED_INT8_MIN>)==36 &&
     sizeof(BlockOperand<NATIVE_QUANTISED_Q2_K>)==16,
     "Complete operands contain only aligned original payload and required metadata words");
 /**
@@ -201,15 +230,34 @@ __device__ __forceinline__ void preloadBlockPayload(BlockOperand<FMT>& operand,
  * @brief Load only this original format's required metadata into its existing operand.
  * @tparam FMT Original physical decoder; no scale conversion occurs.
  * @param operand Existing current-K operand, retaining its original payload bytes.
- * @param scales Original primary plane, one element per block of its codebook's width.
- * @param mins Original optional secondary plane.
- * @param emins Original optional extended-minimum plane. @param linear Original index.
+ * @param meta Role metadata planes and representation (per-block or superblock-coded).
+ * @param address Block-major address (linear index plus superblock index).
  */
-template<NativeQuantisedFormat FMT,class Reader=NativeLayoutWeightReader>
+template<NativeQuantisedFormat FMT,class Reader=NativeLayoutWeightReader,int Representation=-1>
 __device__ __forceinline__ void preloadBlockMetadata(BlockOperand<FMT>& operand,
-    const uint16_t* scales,const uint16_t* mins,const uint32_t* emins,size_t linear)
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes& meta,::llaminar2::rocm_native_metadata::BlockAddress address)
 {
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
+    // Representation: 0 per-block only, 1 coded only (both selected once per
+    // role by withRoleRepresentation), -1 uniform runtime branch.
+    if constexpr(::llaminar2::nativeQuantisedSuperblockCodable(static_cast<uint8_t>(FMT)) && Representation!=0)
+    {
+        // Superblock-coded roles reconstruct the identical staged words; the
+        // branch is uniform for a whole role and never diverges within a wave.
+        if(Representation==1||meta.coded())
+        {
+            const auto words=::llaminar2::rocm_native_metadata::blockMetadataAt<static_cast<uint8_t>(FMT)>(meta,address);
+            uint32_t secondary=0;
+            if constexpr(Traits::requires_secondary_metadata)secondary=words.secondary;
+            operand.scale_pair=uint32_t(words.primary)|(secondary<<16);
+            if constexpr(Traits::needs_emin_array)operand.extended=words.emin;
+            return;
+        }
+    }
+    const auto* scales=meta.primary;
+    const auto* mins=static_cast<const uint16_t*>(meta.secondary);
+    const auto* emins=meta.emins;
+    const size_t linear=address.linear;
     // Normalize to the staged primary word: a one-byte E8M0 plane is indexed
     // by bytes and widened to its BF16 word, a halfword plane is loaded as is.
     uint32_t primary;
@@ -227,20 +275,37 @@ __device__ __forceinline__ void preloadBlockMetadata(BlockOperand<FMT>& operand,
  * @brief Preload one complete canonical block without converting its metadata.
  * @tparam FMT Original independently selected physical decoder.
  * @param payload Original payload plane; odd strides retain bounded byte loads.
- * @param scales Original primary plane. @param mins Original optional secondary plane.
- * @param emins Original optional extended-minimum plane. @param linear Original K32-major index.
+ * @param meta Role metadata planes and representation (per-block or superblock-coded).
+ * @param address Block-major address (linear index plus superblock index).
  * @return Current payload and exactly the format's required metadata bits.
  * @details Ordinary callers keep their original payload-then-metadata ordering;
  * both stages reuse the same helpers as EB4, without a second decoder/load policy.
  */
-template<NativeQuantisedFormat FMT,class Reader=NativeLayoutWeightReader>
+template<NativeQuantisedFormat FMT,class Reader=NativeLayoutWeightReader,int Representation=-1>
 __device__ __forceinline__ BlockOperand<FMT> preloadBlock(const uint8_t* payload,
-    const uint16_t* scales,const uint16_t* mins,const uint32_t* emins,size_t linear)
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes& meta,::llaminar2::rocm_native_metadata::BlockAddress address)
 {
     BlockOperand<FMT> operand;
-    preloadBlockPayload<FMT,Reader>(operand,payload,linear);
-    preloadBlockMetadata<FMT,Reader>(operand,scales,mins,emins,linear);
+    preloadBlockPayload<FMT,Reader>(operand,payload,address.linear);
+    preloadBlockMetadata<FMT,Reader,Representation>(operand,meta,address);
     return operand;
+}
+
+/**
+ * @brief Run @p body with the role's metadata representation fixed at compile time.
+ * @tparam FMT Physical decoder; non-codable decoders only instantiate the per-block body.
+ * @param meta Role planes (wave-uniform representation).
+ * @param body Generic lambda taking `template<int Representation>`.
+ * @details One uniform branch per role/partition keeps each K loop carrying
+ * only its own representation's registers, so per-block roles retain the
+ * original loop code and register budget.
+ */
+template<NativeQuantisedFormat FMT,class Body>
+__device__ __forceinline__ decltype(auto) withRoleRepresentation(const ::llaminar2::rocm_native_metadata::MetadataPlanes& meta,Body&& body)
+{
+    if constexpr(::llaminar2::nativeQuantisedSuperblockCodable(static_cast<uint8_t>(FMT)))
+        if(meta.coded())return body.template operator()<1>();
+    return body.template operator()<0>();
 }
 /**
  * @brief Keep a defined current-iteration payload and metadata in registers until consumption.
@@ -541,7 +606,7 @@ __device__ __forceinline__ void consumePackedBlock(const BlockOperand<FMT>& oper
  * @param grid Lookup bytes retained until this complete canonical consumer retires.
  */
 template<NativeQuantisedFormat FMT,ActivationIssue Issue=ActivationIssue::DownWordsPreload,
-    class Reader=NativeLayoutWeightReader,class Binding,class Grid=NativeQuantisedGridLookup>
+    class Reader=NativeLayoutWeightReader,bool SplitRepresentation=false,class Binding,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ float phaseRolePartial(const Binding& binding,unsigned n,
     const int8_t* code,const float* scale,const int32_t* sums,unsigned N,unsigned K,unsigned part,Grid grid={})
 {
@@ -550,25 +615,34 @@ __device__ __forceinline__ float phaseRolePartial(const Binding& binding,unsigne
         // Select the address space once for the whole K partition. Both paths
         // consume the same encoded weights with the same ordered integer dots.
         if (grid.template useDeviceTable<FMT>())
-            return phaseRolePartial<FMT,Issue,Reader>(binding,n,code,scale,sums,N,K,part,NativeQuantisedGridLookup{});
+            return phaseRolePartial<FMT,Issue,Reader,SplitRepresentation>(binding,n,code,scale,sums,N,K,part,
+                NativeQuantisedGridLookup{});
     }
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
     if(waveMetadataValue(binding.numeric_validity)!=PhaseProjectionValidation::State::Valid)return 0.f;
     const unsigned first=part*waveMetadataValue(binding.partition_blocks),last=min(K/32,first+waveMetadataValue(binding.partition_blocks));
-    const auto* payload=waveMetadataValue(binding.payload);const auto* weight_scales=waveMetadataValue(binding.scales);
-    const uint16_t* mins=nullptr;
-    const uint32_t* emins=nullptr;
-    if constexpr(Traits::requires_secondary_metadata)mins=waveMetadataValue(binding.mins);
-    if constexpr(Traits::needs_emin_array)emins=waveMetadataValue(binding.emins);
-    float accumulator=0.f;
-    #pragma unroll 1
-    for(unsigned block=first;block<last;++block)
-    {
-        const size_t linear=size_t(block)*N+n;const auto operand=preloadBlock<FMT,Reader>(payload,weight_scales,mins,emins,linear);
-        consumePackedBlock<FMT,Issue>(operand,
-            code+size_t(block)*32,scale,sums,block,accumulator,grid);
-    }
-    return accumulator;
+    const auto* payload=waveMetadataValue(binding.payload);
+    const auto meta=phaseRoleMetadata<FMT>(binding);
+    // SplitRepresentation selects the representation once per partition and
+    // instantiates two loops (each carrying only its own registers); otherwise
+    // one loop takes a uniform per-role branch. Each kernel family uses the
+    // form that keeps it within its measured register budget.
+    const auto partition=[&]<int Representation>() {
+        float accumulator=0.f;
+        #pragma unroll 1
+        for(unsigned block=first;block<last;++block)
+        {
+            const auto operand=preloadBlock<FMT,Reader,Representation>(payload,meta,
+                ::llaminar2::rocm_native_metadata::blockAddress(meta,block,n,N));
+            consumePackedBlock<FMT,Issue>(operand,
+                code+size_t(block)*32,scale,sums,block,accumulator,grid);
+        }
+        return accumulator;
+    };
+    if constexpr(SplitRepresentation)
+        return withRoleRepresentation<FMT>(meta,partition);
+    else
+        return partition.template operator()<-1>();
 }
 /**
  * @brief Reuse one immutable activation block across compatible independent role partials.
@@ -608,23 +682,19 @@ __device__ __forceinline__ bool pairedIndependentRolePartial(const Binding& gate
         waveMetadataValue(gate.codebook)!=FMT||waveMetadataValue(up.codebook)!=FMT)return false;
     const unsigned parts=waveMetadataValue(gate.parts),width=waveMetadataValue(gate.partition_blocks);
     if(part>=parts||parts!=waveMetadataValue(up.parts)||width!=waveMetadataValue(up.partition_blocks))return false;
-    const auto* gp=waveMetadataValue(gate.payload);const auto* gs=waveMetadataValue(gate.scales);
-    const auto* upayload=waveMetadataValue(up.payload);const auto* us=waveMetadataValue(up.scales);
-    const uint16_t *gm=nullptr,*um=nullptr;const uint32_t *ge=nullptr,*ue=nullptr;
-    if constexpr(NATIVE_QUANTISEDTraits<FMT>::requires_secondary_metadata) {
-        gm=waveMetadataValue(gate.mins);um=waveMetadataValue(up.mins);
-    }
-    if constexpr(NATIVE_QUANTISEDTraits<FMT>::needs_emin_array) {
-        ge=waveMetadataValue(gate.emins);ue=waveMetadataValue(up.emins);
-    }
+    const auto* gp=waveMetadataValue(gate.payload);
+    const auto* upayload=waveMetadataValue(up.payload);
+    const auto gate_meta=phaseRoleMetadata<FMT>(gate),up_meta=phaseRoleMetadata<FMT>(up);
     const unsigned first=part*width,last=min(K/32,first+width);
     gate_acc=0.f;up_acc=0.f;
+    withRoleRepresentation<FMT>(gate_meta,[&]<int GateRepresentation>() {
+    withRoleRepresentation<FMT>(up_meta,[&]<int UpRepresentation>() {
 #pragma unroll 1
     for(unsigned block=first;block<last;++block) {
-        const std::size_t linear=std::size_t(block)*N+n;
         ActivationBlockOperand activation;
         {
-            const auto operand=preloadBlock<FMT,Reader>(gp,gs,gm,ge,linear);
+            const auto operand=preloadBlock<FMT,Reader,GateRepresentation>(gp,gate_meta,
+                ::llaminar2::rocm_native_metadata::blockAddress(gate_meta,block,n,N));
             activation=preloadActivationBlock<FMT>(code+std::size_t(block)*32,scale,sums,block);
             const auto* original=reinterpret_cast<const int8_t*>(activation.words);
             int32_t low,high;
@@ -632,13 +702,16 @@ __device__ __forceinline__ bool pairedIndependentRolePartial(const Binding& gate
             commitPackedIntegerDots<FMT>(operand,original,low,high,activation.scale,activation.sum,gate_acc);
         }
         {
-            const auto operand=preloadBlock<FMT,Reader>(upayload,us,um,ue,linear);
+            const auto operand=preloadBlock<FMT,Reader,UpRepresentation>(upayload,up_meta,
+                ::llaminar2::rocm_native_metadata::blockAddress(up_meta,block,n,N));
             const auto* original=reinterpret_cast<const int8_t*>(activation.words);
             int32_t low,high;
             consumePackedIntegerDots<FMT>(operand,original,low,high);
             commitPackedIntegerDots<FMT>(operand,original,low,high,activation.scale,activation.sum,up_acc);
         }
     }
+    });
+    });
     return true;
 }
 /**
@@ -664,32 +737,22 @@ __device__ __forceinline__ void pairedRolePartial(const Binding& gate,const Bind
 {
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
     const auto* gate_payload=waveMetadataValue(gate.payload);
-    const auto* gate_scales=waveMetadataValue(gate.scales);
     const auto* up_payload=waveMetadataValue(up.payload);
-    const auto* up_scales=waveMetadataValue(up.scales);
-    const uint16_t *gate_mins=nullptr,*up_mins=nullptr;
-    const uint32_t *gate_emins=nullptr,*up_emins=nullptr;
-    if constexpr(Traits::requires_secondary_metadata)
-    {
-        gate_mins=waveMetadataValue(gate.mins);
-        up_mins=waveMetadataValue(up.mins);
-    }
-    if constexpr(Traits::is_dual_scale_asym)
-    {
-        gate_emins=waveMetadataValue(gate.emins);
-        up_emins=waveMetadataValue(up.emins);
-    }
+    const auto gate_meta=phaseRoleMetadata<FMT>(gate),up_meta=phaseRoleMetadata<FMT>(up);
     gate_acc=0.f;up_acc=0.f;
     // Publication computed this exact original ceil(K32/P) once, including
     // P1 and empty tails. Equal-P pairing changes neither role's interval.
     const unsigned blocks=K/32,width=waveMetadataValue(gate.partition_blocks);
     const unsigned first=part*width,last=min(blocks,first+width);
+    withRoleRepresentation<FMT>(gate_meta,[&]<int GateRepresentation>() {
+    withRoleRepresentation<FMT>(up_meta,[&]<int UpRepresentation>() {
     #pragma unroll 1
     for(unsigned block=first;block<last;++block)
     {
-        const size_t linear=size_t(block)*N+n;
-        const auto g=preloadBlock<FMT>(gate_payload,gate_scales,gate_mins,gate_emins,linear),
-            u=preloadBlock<FMT>(up_payload,up_scales,up_mins,up_emins,linear);
+        const auto g=preloadBlock<FMT,NativeLayoutWeightReader,GateRepresentation>(gate_payload,gate_meta,
+                ::llaminar2::rocm_native_metadata::blockAddress(gate_meta,block,n,N)),
+            u=preloadBlock<FMT,NativeLayoutWeightReader,UpRepresentation>(up_payload,up_meta,
+                ::llaminar2::rocm_native_metadata::blockAddress(up_meta,block,n,N));
         const auto activation=preloadActivationBlock<FMT>(code+size_t(block)*32,scale,sums,block);
         int32_t g_lo,u_lo;
         consumePairedQ4IntegerDots<FMT>(g,u,activation.words,g_lo,u_lo);
@@ -699,6 +762,8 @@ __device__ __forceinline__ void pairedRolePartial(const Binding& gate,const Bind
         commitPackedIntegerDots<FMT>(g,original_bytes,g_lo,0,activation.scale,activation.sum,gate_acc);
         commitPackedIntegerDots<FMT>(u,original_bytes,u_lo,0,activation.scale,activation.sum,up_acc);
     }
+    });
+    });
 }
 /**
  * @brief Return canonical EB4 partials in scalar registers instead of an LDS plane.
@@ -768,12 +833,8 @@ __device__ __forceinline__ float4 expertBatchPartial(const PhaseProjection* bind
             if(owns[expert])
             {
                 const auto& binding=current_bindings[expert];
-                const uint16_t* mins=nullptr;
-                const uint32_t* emins=nullptr;
-                if constexpr(NATIVE_QUANTISEDTraits<FMT>::requires_secondary_metadata)mins=waveMetadataValue(binding.mins);
-                if constexpr(NATIVE_QUANTISEDTraits<FMT>::needs_emin_array)emins=waveMetadataValue(binding.emins);
-                preloadBlockMetadata<FMT>(operand[expert],waveMetadataValue(binding.scales),
-                    mins,emins,size_t(block)*N+n);
+                const auto meta=phaseRoleMetadata<FMT>(binding);
+                preloadBlockMetadata<FMT>(operand[expert],meta,::llaminar2::rocm_native_metadata::blockAddress(meta,block,n,N));
             }
         }
         // Require all four complete current-K operands before consuming any expert. The

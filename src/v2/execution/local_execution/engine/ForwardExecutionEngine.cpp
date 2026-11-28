@@ -27,6 +27,7 @@
 #include "../../compute_stages/ComputeStageFactory.h"
 #include "../../compute_stages/stages/DecodePositionSnapshotStage.h"
 #include "../../moe/MoEOverlayRetainedParentComposer.h"
+#include "execution/moe/ICUDANativeArrivalCaptureStage.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/OpenMPUtils.h"
@@ -102,6 +103,20 @@ namespace llaminar2
             config.max_cached_entries = host.retainedExactPrefillCacheEntries().value_or(
                 static_cast<size_t>(env.execution.prefill_graph_max_cached_buckets));
             return config;
+        }
+
+        /** @return Native sites named by the actual stages, before any CUDA work is submitted. */
+        std::size_t countCUDAPrefillArrivalSites(const ComputeGraph &graph)
+        {
+            std::size_t sites = 0;
+            for (const auto &name : graph.getExecutionOrder())
+            {
+                const auto *node = graph.getNode(name);
+                if (node && node->stage)
+                    if (const auto *arrival = dynamic_cast<const ICUDANativeArrivalCaptureStage *>(node->stage.get()))
+                        sites += arrival->cudaLiveArrivalSites();
+            }
+            return sites;
         }
 
         /** @brief Select the common capture-cache stream from the actual graph execution policy.
@@ -2637,6 +2652,23 @@ namespace llaminar2
                 forward_signature.decode ? "decode" : "prefill",
                 forward_signature.device.toString(),
                 std::move(lookup_tags));
+            if (forward_signature.device.is_cuda() && forward_signature.rehydrate_prefix_runtime_on_device)
+            {
+                // The normal forward and its prefix-only alternative are
+                // separate owners. An alternative may change placement, rows,
+                // and bindings across restores without growing the native pool.
+                for (auto previous = cache_.begin(); previous != cache_.end();)
+                {
+                    if (sharesCUDARehydratingForwardOwner(forward_signature, previous->first) &&
+                        !(forward_signature == previous->first))
+                    {
+                        previous->second.retireCUDARehydratingOwner(forward_signature.device);
+                        previous = cache_.erase(previous);
+                    }
+                    else
+                        ++previous;
+                }
+            }
             auto [it, _inserted] = cache_.try_emplace(forward_signature);
             build_cache = &it->second;
             bindGraphSnapshotArenaReusePolicy(
@@ -5337,12 +5369,15 @@ namespace llaminar2
         }
 
         /*
-         * Setup owns a direct Cold -> Initialized transition. It has already
-         * built the exact graph topology and permanent storage family, so an
-         * eager synthetic request would add payload side effects without
-         * establishing any additional capture invariant.
+         * Setup and capture-required CUDA arrivals own a direct Cold ->
+         * Initialized transition. The original stages and storage are already
+         * declared. CUDA arrival nodes cannot run in an eager warmup.
          */
-        if (materialize_without_launch && phase == PrefillGraphPhase::Cold)
+        const auto native_arrival_sites = phase != PrefillGraphPhase::Ready && input.device.is_cuda()
+            ? countCUDAPrefillArrivalSites(*forward_cache.graph) : 0u;
+        const bool capture_without_warmup = materialize_without_launch || native_arrival_sites != 0u;
+        const bool native_arrival_first_use = native_arrival_sites != 0u && phase == PrefillGraphPhase::Cold;
+        if (capture_without_warmup && phase == PrefillGraphPhase::Cold)
         {
             cache.markInitializedForSetupMaterialization(key);
             phase = PrefillGraphPhase::Initialized;
@@ -5477,7 +5512,7 @@ namespace llaminar2
                 input,
                 snapshots_active,
                 moe_rebalancing_active,
-                materialize_without_launch
+                capture_without_warmup
                     ? PrefillGraphPreflightMode::Default
                     : PrefillGraphPreflightMode::CaptureReady,
                 prefill_collectives_graph_capturable,
@@ -5535,7 +5570,7 @@ namespace llaminar2
                     "capture"))
                 return false;
 
-            if (materialize_without_launch)
+            if (capture_without_warmup)
             {
                 capture_ready_reason = preflightPrefillGraph(
                     cache,
@@ -5682,7 +5717,7 @@ namespace llaminar2
                             &forward_cache.collective_nodes,
                             &forward_cache.snapshot_manifest);
                     },
-                    dependency_ledger.get()))
+                    dependency_ledger.get(), native_arrival_sites))
             {
                 LOG_ERROR(
                     "[ForwardExecutionEngine] Mandatory prefill graph capture transaction failed for seq_len="
@@ -5736,8 +5771,9 @@ namespace llaminar2
             // Kernels recorded during HIP/CUDA stream capture are not executed
             // until the executable graph is launched. Launch once immediately so
             // the capture request produces logits and advances device state.
-            const std::string recapture_reason =
-                phase == PrefillGraphPhase::Initialized
+            const std::string recapture_reason = native_arrival_first_use
+                ? "cuda_arrival_requires_first_use_capture"
+                : phase == PrefillGraphPhase::Initialized
                     ? "lazy_initialized_after_request_reset"
                     : "armed_warmup";
             if (!launchPrefillGraph(gpu_ctx, stream, "capture", PrefillGraphPhase::Ready, "launch_after_capture",
@@ -6144,6 +6180,13 @@ namespace llaminar2
             return false;
         }
 
+        const bool native_arrival_prefill = effective_input.device.is_cuda() && !is_decode &&
+            countCUDAPrefillArrivalSites(graph) != 0u;
+        if (native_arrival_prefill && (!should_cache || !build_cache))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] CUDA prefill arrivals require a retained executable; eager warmup is illegal");
+            return false;
+        }
         const bool bucketed_prefill_miss =
             should_cache && build_cache && signature.is_bucketed_prefill && !is_decode;
         bool bucketed_prefill_capture_candidate = false;
@@ -6340,7 +6383,7 @@ namespace llaminar2
             effective_input.graph_submission_intent ==
                 ForwardGraphSubmissionIntent::
                     MaterializeExecutableWithoutLaunch ||
-            bucketed_prefill_heterogeneous_segmented_candidate;
+            bucketed_prefill_heterogeneous_segmented_candidate || native_arrival_prefill;
         if (should_cache && build_cache && atomic_gpu_graph_first_use &&
             effective_input.device.is_gpu())
         {

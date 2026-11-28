@@ -15,8 +15,8 @@ ExpertTierWeightCPUStorageLayout directCPUFormat(const NativeQuantisedFormatInfo
     return {.cpu_codebook_id = format.codebook_id,
         .cpu_is_asymmetric = uint8_t(format.is_asymmetric),
         .cpu_is_superblock = uint8_t(format.is_superblock), .cpu_encoding = encoding,
-        .cpu_data_stride = uint32_t(cpu::native_quantised::preparedDataStride(encoding)),
-        .cpu_block_stride = uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding, format.is_asymmetric)),
+        .cpu_data_stride = uint32_t(cpu::native_quantised::preparedDataStride(encoding, format.codebook_id)),
+        .cpu_block_stride = uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding, format.is_asymmetric, format.codebook_id)),
         .wire_columns_per_unit = quantum};
 }
 
@@ -26,15 +26,17 @@ TEST(ExpertTierWeightStream, DirectCPUOriginalRootsAllFormatsPreserveIndependent
     using R = MoEProjectionResidence;
     const P from{R::ParticipantOutputSlice, 256, 256, 13, 128, 32, 96};
     const P to{R::ParticipantInputSlice, 256, 256, 72, 160, 64, 128};
-    const auto overlap = ExpertTierWeightProjectionIntersection::between(from, to);
     for (const auto &format : native_quantised_formats::kAllSourceFormats)
         for (const unsigned quantum : {1u, 3u, 17u, 64u})
         {
             SCOPED_TRACE(format.quant_type);
             SCOPED_TRACE(quantum);
             const auto traits = directCPUFormat(*format.metadata, quantum);
-            const auto source = cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536);
-            const auto destination = cpuExpertTierStorageLayoutForIntersection(traits, to, overlap, 65536);
+            const P original_source = traits.coded() ? P{R::ParticipantOutputSlice, 256, 768, 13, 128, 0, 512} : from;
+            const P original_destination = traits.coded() ? P{R::ParticipantInputSlice, 256, 768, 72, 160, 256, 512} : to;
+            const auto overlap = ExpertTierWeightProjectionIntersection::between(original_source, original_destination);
+            const auto source = cpuExpertTierStorageLayoutForIntersection(traits, original_source, overlap, 65536);
+            const auto destination = cpuExpertTierStorageLayoutForIntersection(traits, original_destination, overlap, 65536);
             std::vector<uint8_t> bytes(source.cpuStorageBytes());
             for (size_t index = 0; index < bytes.size(); ++index) bytes[index] = uint8_t(index * 37 + 11);
             std::vector<uint8_t> result(destination.cpuStorageBytes(), 0xa5);
@@ -48,12 +50,14 @@ TEST(ExpertTierWeightStream, DirectCPUOriginalRootsAllFormatsPreserveIndependent
                 live_bytes += source.chunkBytes(count, first);
                 first += count;
             }
-            EXPECT_EQ(live_bytes, size_t(69 * 2) * (traits.cpu_block_stride / 64));
+            EXPECT_EQ(live_bytes, source.chunkBytes(source.unit_count));
+            if (!traits.coded())
+                EXPECT_EQ(live_bytes, size_t(69 * 2) * (traits.cpu_block_stride / 64));
             for (size_t row = 0; row < 192; ++row)
-                for (size_t block = 0; block < 4; ++block)
-                    if (row < 69 && block < 2)
+                for (int block = 0; block < destination.cpu_K / 32; ++block)
+                    if (row < 69 && block < overlap.columns() / 32)
                         EXPECT_EQ(encodedTierColumn(result, destination, row, block),
-                            encodedTierColumn(bytes, source, 59 + row, 1 + block));
+                            encodedTierColumn(bytes, source, 59 + row, overlap.sourceColumnOrigin() / 32 + block));
                     else EXPECT_EQ(encodedTierColumn(result, destination, row, block),
                             encodedTierColumn(untouched, destination, row, block));
             const auto before = result;
@@ -67,7 +71,7 @@ TEST(ExpertTierWeightStream, DirectCPUOriginalRootsAllFormatsPreserveIndependent
         }
 }
 
-TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveSharedQ6WordsAcrossReset)
+TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveDirtyNeighborsAcrossReset)
 {
     using P = MoEExpertProjectionOwnership::Projection;
     using R = MoEProjectionResidence;

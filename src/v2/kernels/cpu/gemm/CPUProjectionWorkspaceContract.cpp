@@ -10,9 +10,13 @@
 #include "CPUProjectionWorkspaceContract.h"
 #include "CPUNativeQuantisedTileConfig.h"
 #include "CPUNativeQuantisedEncoding.h"
+#include "CPUNativeNEONPanelWorkspace.h"
+#include "CPUNativeX86PanelWorkspace.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
+#include <algorithm>
 #include <climits>
 #include <stdexcept>
+#include <string>
 
 namespace llaminar2
 {
@@ -33,7 +37,7 @@ namespace llaminar2
         requireGeometry(geometry);
         if (format == "F32" || format == "F16" || format == "BF16") return {};
         const auto *native = native_quantised_formats::forQuantType(format);
-        if (!native) throw std::invalid_argument("CPU projection workspace has an unsupported source format");
+        if (!native) throw std::invalid_argument("CPU projection workspace has an unsupported source format: " + std::string(format));
         return prepared(cpu::native_quantised::preparedFootprintForFormat(*native), native->codebook_id, geometry);
     }
 
@@ -53,18 +57,43 @@ namespace llaminar2
             if (!MoEProjectionNumericalContract::ownsOrderedKPartitionTree(codebook) ||
                 (geometry.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert && geometry.k % 32 != 0))
                 throw std::invalid_argument("Native ARM projection workspace requires a supported source and complete expert K blocks");
-            // The same registered implementation owns both ordinary full-K and
-            // canonical expert trees in registers. No x86 shared-K slab or
-            // anonymous capacity reserve is charged to the native participant.
-            return cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
+            auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
+            // Single-row decode retains its register-only contract. The prefill
+            // panel is a worker-indexed borrow of the existing named projection
+            // slab, admitted from the pooled expert-prefill domain (two rows)
+            // because this declaration does not know the invocation's purpose.
+            namespace panel_policy = cpu::native_quantised::neon_panel;
+            const auto panel = cpuProjectionPartialWorkspaceRequirements(panel_policy::workspaceFloats(
+                footprint.encoding, codebook, footprint.is_asymmetric, geometry.rows, geometry.k,
+                panel_policy::projectionWorkers(footprint.encoding, geometry.workers), geometry.numerical_policy));
+            requirements.buffers.insert(requirements.buffers.end(), panel.buffers.begin(), panel.buffers.end());
+            return requirements;
         }
-        const auto config = cpu::native_quantised::serialTileConfigForPreparedProjection(footprint,
-            codebook, geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,
-            geometry.k, geometry.workers, geometry.execution.cache);
+        const auto configAt = [&](int workers) {
+            return cpu::native_quantised::serialTileConfigForPreparedProjection(footprint, codebook,
+                geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,
+                geometry.k, workers, geometry.execution.cache);
+        };
+        const auto config = configAt(geometry.workers);
         auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
-        const auto partials = cpuProjectionPartialWorkspaceRequirements(cpuProjectionPartialEnvelopeFloats(
-            geometry.rows, geometry.n, config.k_tiles, geometry.workers,
-            static_cast<int>(geometry.execution.maximum_native_row_tile)));
+        // Use the participant's x86 ABI, not the planning host's build. An ARM
+        // participant returned above. Use physical N for strip ownership, not
+        // serial_n, and cover every team width up to the admitted workers.
+        // The declaration does not know the invocation's purpose: a stage
+        // whose rows reach x86_panel::min_pooled_rows may carry pooled
+        // ordinary-prefill members of the batched expert route, so it admits
+        // their slot slab as well as the dense panel (from min_rows rows).
+        namespace panel = cpu::native_quantised::x86_panel;
+        const auto format = panel::formatFor(footprint.encoding, codebook);
+        const int lanes = geometry.execution.active_isa == ISALevel::AVX512 ? 16 : 8;
+        const auto partitionsAt = [&](int workers) { return configAt(workers).k_tiles; };
+        const auto packed_panel = panel::workspaceFloats(format, lanes, geometry.rows, geometry.n,
+            (geometry.k + 31) / 32, geometry.workers, partitionsAt);
+        const auto pooled_panel = panel::pooledWorkspaceFloats(format, lanes, geometry.rows, (geometry.k + 31) / 32,
+            geometry.workers, partitionsAt);
+        const auto ordinary = cpuProjectionPartialEnvelopeFloats(geometry.rows, geometry.n, config.k_tiles,
+            geometry.workers, static_cast<int>(geometry.execution.maximum_native_row_tile));
+        const auto partials = cpuProjectionPartialWorkspaceRequirements(std::max({ordinary, packed_panel, pooled_panel}));
         // These are distinct canonical projection names (Q8 versus partials),
         // not grouped-MoE root-layout merges. Keep this pure BOM independent of
         // the unrelated storage-layout materialization/composition machinery.

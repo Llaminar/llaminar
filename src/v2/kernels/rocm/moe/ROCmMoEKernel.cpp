@@ -30,6 +30,7 @@
 #include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "../gemm/ROCmResidentMoEFFN.h"
 #include "../gemm/ROCmNativeLayoutRouterFFN.h"
@@ -165,6 +166,9 @@ namespace
             static_cast<std::uint64_t>(descriptor.source_codebook_id) |
             (static_cast<std::uint64_t>(descriptor.source_is_superblock) << 8U) |
             (static_cast<std::uint64_t>(descriptor.source_identity_present) << 16U));
+        // Metadata representation, phase and code bit shift are part of the
+        // captured descriptor identity (per-block vs superblock-coded readers).
+        words.push_back(static_cast<std::uint64_t>(descriptor.metadata_layout));
     }
 
     /**
@@ -339,7 +343,6 @@ namespace
         case 16: // IQ1_S
         case 17: // IQ1_M
         case 19: // Q8_0
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -362,7 +365,6 @@ namespace
         case 14: // IQ2_XS high half scale
         case 16: // IQ1_S min correction
         case 17: // IQ1_M high half scale
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: // Expanded asymmetric min correction
             return true;
         default:
             return false;
@@ -403,21 +405,16 @@ namespace
     }
 
     /**
-     * @brief Validate source provenance and its normalized execution format.
-     *
-     * Expanded INT8+minimum bytes are intentionally shared by several compact
-     * asymmetric sources, so codebook 23 is meaningless for exact arithmetic
-     * without provenance. Other descriptors retain compatibility with legacy
-     * immutable test fixtures, but authoritative provenance is validated when
-     * present rather than trusted as an unchecked policy-table index.
+     * @brief Authenticate the physical decoder against original GGUF provenance.
+     * IQ4_XS cannot infer its source policy from the physical decoder alone;
+     * other immutable descriptors may carry a self-describing decoder.
      */
     bool validateGroupedSourceIdentity(
         const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
-                   desc.codebook_id != llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook;
         }
         const auto *source =
             llaminar2::native_quantised_formats::forSourceIdentity(
@@ -450,8 +447,9 @@ namespace
                desc.blocks_per_row == static_cast<uint32_t>(intermediate / 32) &&
                validateGroupedSourceIdentity(desc) &&
                groupedDecodeSupportsCodebook(desc.codebook_id) &&
-               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins) &&
-               (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
+               // Per-block planes or a superblock-coded code + superblock plane.
+               ::llaminar2::rocm_native_metadata::descriptorMetadataComplete(desc, groupedDecodeRequiresMins(desc.codebook_id),
+                                              groupedDecodeRequiresEmins(desc.codebook_id));
     }
 
     bool validateGroupedGateUpDesc(
@@ -463,8 +461,9 @@ namespace
                desc.blocks_per_row == static_cast<uint32_t>(d_model / 32) &&
                validateGroupedSourceIdentity(desc) &&
                groupedDecodeSupportsCodebook(desc.codebook_id) &&
-               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins) &&
-               (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
+               // Per-block planes or a superblock-coded code + superblock plane.
+               ::llaminar2::rocm_native_metadata::descriptorMetadataComplete(desc, groupedDecodeRequiresMins(desc.codebook_id),
+                                              groupedDecodeRequiresEmins(desc.codebook_id));
     }
 
     bool isBlankGroupedDesc(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
@@ -954,7 +953,7 @@ extern "C"
         uint32_t local_transfer_slot_count,
         const void *config,
         void *status,
-        void *controller_state,
+        void *arrival_scratch,
         uint32_t command_buffer_count,
         int device_idx,
         void *stream);
@@ -6571,7 +6570,7 @@ namespace llaminar2
         uint32_t local_transfer_slot_count,
         const DeviceMoERebalanceConfig &config,
         DeviceMoERebalanceApplyStatus *status,
-        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceArrivalScratch *arrival_scratch,
         uint32_t command_buffer_count)
     {
         if (!validateDeviceMoERebalanceConfig(config))
@@ -6580,7 +6579,7 @@ namespace llaminar2
             return false;
         }
         if (!plan_entries || (!plan_count && !command_header) ||
-            !gathered_payload || !local_transfer_slots || !status ||
+            !gathered_payload || !local_transfer_slots || !status || !arrival_scratch ||
             plan_capacity == 0 || local_payload_slot_count == 0 ||
             payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
         {
@@ -6608,7 +6607,7 @@ namespace llaminar2
             local_transfer_slot_count,
             &config,
             status,
-            controller_state,
+            arrival_scratch,
             command_buffer_count,
             device_ordinal_,
             stream);
@@ -10318,8 +10317,9 @@ namespace llaminar2
                 down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
                 !areNativeQuantisedGateUpCodebooksCompatible(
                     down_descs[i].codebook_id, codebook_id) ||
-                (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins) ||
-                (groupedDecodeRequiresEmins(down_descs[i].codebook_id) && !down_descs[i].emins))
+                !::llaminar2::rocm_native_metadata::descriptorMetadataComplete(down_descs[i],
+                    groupedDecodeRequiresMins(down_descs[i].codebook_id),
+                    groupedDecodeRequiresEmins(down_descs[i].codebook_id)))
             {
                 return false;
             }
@@ -13559,6 +13559,7 @@ public:
             mix(matrix.n);mix(matrix.k);mix(matrix.blocks_per_row);mix(matrix.codebook_id);
             mix(matrix.source_identity_present);mix(matrix.source_codebook_id);mix(matrix.source_is_superblock);
             mix(matrix.allocation_payload_bytes_per_block);mix(matrix.allocation_has_mins);mix(matrix.allocation_has_emins);
+            mix(matrix.metadata_layout);mix(matrix.reserved_tail);
         }
         const auto rows=args_.rows.captureIdentity();
         mix(reinterpret_cast<std::uintptr_t>(rows.count));mix(rows.count_capacity);mix(rows.first_physical_row);
@@ -13703,7 +13704,7 @@ public:
                 a.allocation_payload_bytes_per_block==b.allocation_payload_bytes_per_block &&
                 a.allocation_has_mins==b.allocation_has_mins && a.allocation_has_emins==b.allocation_has_emins &&
                 a.source_codebook_id==b.source_codebook_id && a.source_is_superblock==b.source_is_superblock &&
-                a.source_identity_present==b.source_identity_present && a.reserved==b.reserved && a.reserved_tail==b.reserved_tail;
+                a.source_identity_present==b.source_identity_present && a.metadata_layout==b.metadata_layout && a.reserved_tail==b.reserved_tail;
         };
         if(!shared_gate.valid||!shared_down.valid||shared_gate.num_experts!=1||shared_down.num_experts!=1||
             shared_gate.weight_format!=DeviceMoEWeightFormat::NativeQuantised||shared_down.weight_format!=DeviceMoEWeightFormat::NativeQuantised||

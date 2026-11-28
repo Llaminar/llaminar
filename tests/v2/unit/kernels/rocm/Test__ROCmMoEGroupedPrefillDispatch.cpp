@@ -603,32 +603,39 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionNormalizesOnlyQ8SourceAlia
             EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,source),17),MoEGroupedDotProducer::Wmma);
         // An absent provenance flag uses the actual canonical physical codebook.
         EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,255,96,256,false),17),MoEGroupedDotProducer::Wmma);
-        EXPECT_EQ(admission.select(dotAdmissionDescriptor(20,20),17),MoEGroupedDotProducer::OrderedDot4);
-        EXPECT_EQ(admission.select(dotAdmissionDescriptor(21,21),17),MoEGroupedDotProducer::OrderedDot4);
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(20,20),17),MoEGroupedDotProducer::Invalid);
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(21,21),17),MoEGroupedDotProducer::Invalid);
         EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,7),17),MoEGroupedDotProducer::OrderedDot4);
     }
     const auto mixed = MoEGroupedDotAdmission::nativeCandidate(
         MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::EveryExpert,
-        dotAdmissionBit(19)|dotAdmissionBit(23),dotAdmissionBit(20)|dotAdmissionBit(21)|dotAdmissionBit(7));
+        dotAdmissionBit(19)|dotAdmissionBit(24),dotAdmissionBit(20)|dotAdmissionBit(21)|dotAdmissionBit(4));
     EXPECT_EQ(mixed.select(dotAdmissionDescriptor(19,21),31),MoEGroupedDotProducer::Wmma);
-    EXPECT_EQ(mixed.select(dotAdmissionDescriptor(23,7),31),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(mixed.select(dotAdmissionDescriptor(24,4),31),MoEGroupedDotProducer::Wmma);
 }
 
-/** @test CPU-promoted physical23 eligibility requires both decoder and compact source provenance. */
-TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionKeepsPromotedPhysicalAndSourceMasksSeparate)
+/** @test A coded IQ4_XS arrival binds its canonical decoder and original IQ4 source policy independently. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionKeepsCodedPhysicalAndSourceMasksSeparate)
 {
+    using namespace llaminar2;
     using namespace llaminar2::rocm;
+    constexpr auto &source = native_quantised_formats::IQ4_XS;
+    constexpr auto physical = canonicalDeviceVnniCodebookId(source);
+    constexpr auto original = source.codebook_id;
+    static_assert(physical != original);
     const auto admission = MoEGroupedDotAdmission::nativeCandidate(
         MoEPrefillProjectionRole::Down,2048,512,512,MoEGroupedWmmaRowFloor::Eight,
-        dotAdmissionBit(23),dotAdmissionBit(7));
-    const auto promoted = dotAdmissionDescriptor(23,7,512,512);
-    EXPECT_EQ(admission.select(promoted,7),MoEGroupedDotProducer::OrderedDot4);
-    EXPECT_EQ(admission.select(promoted,8),MoEGroupedDotProducer::Wmma);
-    EXPECT_EQ(admission.select(promoted,31),MoEGroupedDotProducer::Wmma);
-    EXPECT_EQ(admission.select(dotAdmissionDescriptor(7,7,512,512),31),MoEGroupedDotProducer::OrderedDot4);
-    EXPECT_EQ(admission.select(dotAdmissionDescriptor(23,5,512,512),31),MoEGroupedDotProducer::OrderedDot4);
-    EXPECT_EQ(admission.select(dotAdmissionDescriptor(23,7,512,512,false),31),MoEGroupedDotProducer::OrderedDot4);
-    EXPECT_EQ(admission.select(dotAdmissionDescriptor(23,23,512,512),31),MoEGroupedDotProducer::OrderedDot4);
+        dotAdmissionBit(physical),dotAdmissionBit(original));
+    auto coded = dotAdmissionDescriptor(physical,original,512,512);
+    coded.source_is_superblock = 1;
+    coded.metadata_layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 0);
+    EXPECT_EQ(admission.select(coded,7),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(coded,8),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(admission.select(coded,31),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(original,original,512,512),31),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(physical,5,512,512),31),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(physical,original,512,512,false),31),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(physical,physical,512,512),31),MoEGroupedDotProducer::OrderedDot4);
 }
 
 /** @test IQ4_NL and source-scaled IQ4_XS keep distinct physical writers despite shared source4. */
@@ -696,6 +703,8 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionRejectsMalformedCaptureGeo
         for (const int k : {0,-32,1,31,33,255})
             EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,96,k,Floor::Four),std::invalid_argument);
         EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,96,256,Floor::Four,0),std::invalid_argument);
+        EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,96,256,Floor::Four,
+            dotAdmissionBit(19) | dotAdmissionBit(23)),std::invalid_argument);
         EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,96,256,Floor::Four,UINT32_MAX,0),std::invalid_argument);
         for (const uint8_t floor : {uint8_t{1},uint8_t{3},uint8_t{5},uint8_t{17},uint8_t{255}})
         {
@@ -726,6 +735,7 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionRejectsInvalidLiveMetadata
         EXPECT_EQ(admission.select(dotAdmissionDescriptor(invalid,19),1),MoEGroupedDotProducer::Invalid);
         EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,invalid),1),MoEGroupedDotProducer::Invalid);
     }
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(23, 5),16),MoEGroupedDotProducer::Invalid);
     EXPECT_EQ(admission.select(valid,1),MoEGroupedDotProducer::OrderedDot4);
     EXPECT_EQ(admission.select(valid,16),MoEGroupedDotProducer::Wmma);
 }
@@ -752,12 +762,12 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, WideRowPlanCoversThresholdsAndAliasesE
                 const int expected_step = native || role == Role::Down ? 16 : 12;
                 ASSERT_EQ(plan.rows(rows),expected_step);
                 ASSERT_LE(plan.minimumRows(),expected_step);
-                // Gate/up may use different prepared codebooks but must share
-                // one count-only directory. Include Q8 aliases and promotion.
-                for (uint8_t codebook : {uint8_t{0},uint8_t{4},uint8_t{7},uint8_t{19},uint8_t{20},uint8_t{21},uint8_t{24}})
-                    for (uint8_t physical : {codebook,uint8_t{23}})
-                        ASSERT_EQ(admission.select(dotAdmissionDescriptor(physical,codebook),rows),
-                            native ? MoEGroupedDotProducer::Wmma : MoEGroupedDotProducer::OrderedDot4);
+                // Gate/up share one count-only directory across physical
+                // decoders, including native Q5, coded IQ4_XS and Q8 aliases.
+                for (const auto [physical, source] : {std::pair{0, 0}, {4, 4}, {7, 7},
+                         {19, 19}, {19, 20}, {19, 21}, {24, 4}})
+                    ASSERT_EQ(admission.select(dotAdmissionDescriptor(physical, source), rows),
+                        native ? MoEGroupedDotProducer::Wmma : MoEGroupedDotProducer::OrderedDot4);
                 std::vector<int> writers(rows);
                 for (int first = 0; first < rows; first += plan.rows(rows))
                 {

@@ -25,6 +25,7 @@
 namespace llaminar2
 {
     // Forward declarations
+    class ActivationRotation;
     class ITensorAttention;
     class TurboQuantContext;
 

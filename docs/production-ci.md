@@ -49,6 +49,14 @@ sparse attention, and Linux OpenMP/MPI placement and loader behavior. The
 shared PR driver verifies the installed receipt, runs both subsets without
 GPU devices or models, and retains JUnit logs. The check also starts the
 sibling Release application with `--help`.
+The ARM PR exports compact diagnostics from the original Integration build
+attempt before enforcing its status at the shared builder boundary. Failed
+attempts cannot produce runtime or test-runner images. Other inventories retain
+ordinary build-failure cache semantics. BuildKit progress records distinguish
+cached attempts by their retained nonce. The workflow exposes GitHub's runtime
+cache credentials to subsequent build steps through
+`crazy-max/ghaction-github-runtime`; these credentials are not build arguments
+or evidence artifacts.
 See [GitHub's standard ARM64 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
 The ARM host scope generates deterministic QFN fixture weights for bounded

@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include "execution/moe/DeviceMoEArrivalForwardDeclaration.h"
+
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -49,6 +51,8 @@ namespace llaminar2
             const GraphConfig &config,
             std::shared_ptr<IMPIContext> mpi_ctx)>;
 
+        using ArrivalDeclarationFn = decltype(&DeviceMoEArrivalForwardDeclaration::declare);
+
         /**
          * @brief Register a factory for an architecture
          *
@@ -56,9 +60,14 @@ namespace llaminar2
          * Thread-safe (guarded by mutex for static init ordering).
          *
          * @param architecture Lowercase architecture name (e.g., "qwen2")
-         * @param factory Factory function that creates IGraphBuilder instances
+         * @param factory Factory function that creates IGraphBuilder instances.
+         * @param arrival_declaration Same immutable arrival topology declaration used by graph lowering, if applicable.
          */
-        static void registerFactory(const std::string &architecture, FactoryFn factory);
+        static void registerFactory(const std::string &architecture, FactoryFn factory,
+                                    ArrivalDeclarationFn arrival_declaration = nullptr);
+
+        /** @brief Require the original model's device arrival declaration before GPU MoE admission. */
+        [[nodiscard]] static ArrivalDeclarationFn requireArrivalDeclaration(const std::string &architecture);
 
         /**
          * @brief Create an IGraphBuilder for the given architecture
@@ -85,7 +94,12 @@ namespace llaminar2
         static std::vector<std::string> supportedArchitectures();
 
     private:
-        static std::unordered_map<std::string, FactoryFn> &registry();
+        struct Registration
+        {
+            FactoryFn factory;
+            ArrivalDeclarationFn arrival_declaration;
+        };
+        static std::unordered_map<std::string, Registration> &registry();
         static std::mutex &mutex();
         static std::string normalize(const std::string &architecture);
 

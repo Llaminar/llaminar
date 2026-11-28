@@ -20,6 +20,7 @@
 #include "execution/moe/ExpertTierMigrationOperations.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "transfer/TransferEngine.h"
 #include "utils/DebugEnv.h"
@@ -33,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <sstream>
@@ -124,15 +126,16 @@ namespace llaminar2
                   k_(shape.K),
                   blocks_per_row_(shape.blocks_per_row),
                   payload_bytes_per_block_(shape.payload_bytes_per_block),
+                  metadata_layout_(shape.metadata_layout),
                   payload_bytes_(shape.payload.size()),
-                  scales_bytes_(shape.scales.size() * sizeof(std::uint16_t)),
-                  mins_bytes_(shape.mins.size() * sizeof(std::uint16_t))
+                  scales_bytes_(shape.codes.size() - native_quantised_superblock::kSuperblockCodePlanePadBytes),
+                  mins_bytes_(shape.superblocks.size())
             {
                 const int ordinal = device_.gpu_ordinal();
                 payload_ = static_cast<std::uint8_t *>(
                     backend_.allocate(payload_bytes_, ordinal));
                 scales_ = static_cast<std::uint16_t *>(
-                    backend_.allocate(scales_bytes_, ordinal));
+                    backend_.allocate(scales_bytes_ + native_quantised_superblock::kSuperblockCodePlanePadBytes, ordinal));
                 mins_ = static_cast<std::uint16_t *>(
                     backend_.allocate(mins_bytes_, ordinal));
                 if (!payload_ || !scales_ || !mins_)
@@ -162,9 +165,8 @@ namespace llaminar2
                 void *stream) noexcept
             {
                 if (!stream || source.payload.size() != payload_bytes_ ||
-                    source.scales.size() * sizeof(std::uint16_t) !=
-                        scales_bytes_ ||
-                    source.mins.size() * sizeof(std::uint16_t) != mins_bytes_)
+                    source.codes.size() != scales_bytes_ + native_quantised_superblock::kSuperblockCodePlanePadBytes ||
+                    source.superblocks.size() != mins_bytes_)
                 {
                     return false;
                 }
@@ -177,13 +179,13 @@ namespace llaminar2
                            stream) &&
                        backend_.hostToDeviceOnStream(
                            scales_,
-                           source.scales.data(),
-                           scales_bytes_,
+                           source.codes.data(),
+                           source.codes.size(),
                            ordinal,
                            stream) &&
                        backend_.hostToDeviceOnStream(
                            mins_,
-                           source.mins.data(),
+                           source.superblocks.data(),
                            mins_bytes_,
                            ordinal,
                            stream);
@@ -202,6 +204,7 @@ namespace llaminar2
                     .scales_bytes = scales_bytes_,
                     .mins_bytes = mins_bytes_,
                     .emins_bytes = 0,
+                    .metadata_layout = metadata_layout_,
                 };
             }
 
@@ -218,6 +221,7 @@ namespace llaminar2
                     .scales_bytes = scales_bytes_,
                     .mins_bytes = mins_bytes_,
                     .emins_bytes = 0,
+                    .metadata_layout = metadata_layout_,
                 };
             }
 
@@ -237,6 +241,7 @@ namespace llaminar2
                     .payload_bytes_per_block = payload_bytes_per_block_,
                     .is_asymmetric = true,
                     .has_emins = false,
+                    .metadata_layout = metadata_layout_,
                     .vnni_bytes = payload_bytes_,
                     .scales_bytes = scales_bytes_,
                     .mins_bytes = mins_bytes_,
@@ -257,15 +262,13 @@ namespace llaminar2
                 std::string *error) noexcept
             {
                 std::vector<std::uint8_t> payload(payload_bytes_);
-                std::vector<std::uint16_t> scales(
-                    scales_bytes_ / sizeof(std::uint16_t));
-                std::vector<std::uint16_t> mins(
-                    mins_bytes_ / sizeof(std::uint16_t));
+                std::vector<std::uint8_t> scales(scales_bytes_);
+                std::vector<std::uint8_t> mins(mins_bytes_);
                 const int ordinal = device_.gpu_ordinal();
                 if (!backend_.deviceToHost(
                         payload.data(), payload_, payload_bytes_, ordinal, stream) ||
                     !backend_.deviceToHost(
-                        scales.data(), scales_, scales_bytes_, ordinal, stream) ||
+                        scales.data(), scales_, scales.size(), ordinal, stream) ||
                     !backend_.deviceToHost(
                         mins.data(), mins_, mins_bytes_, ordinal, stream))
                 {
@@ -279,13 +282,13 @@ namespace llaminar2
                         *error = "Packed payload bytes differ";
                     return false;
                 }
-                if (scales != expected.scales)
+                if (!std::equal(scales.begin(), scales.end(), expected.codes.begin()))
                 {
                     if (error)
                         *error = "Packed scale bytes differ";
                     return false;
                 }
-                if (mins != expected.mins)
+                if (mins != expected.superblocks)
                 {
                     if (error)
                         *error = "Packed minimum bytes differ";
@@ -301,6 +304,7 @@ namespace llaminar2
             int k_ = 0;
             std::uint32_t blocks_per_row_ = 0;
             std::uint8_t payload_bytes_per_block_ = 0;
+            std::uint8_t metadata_layout_ = 0;
             std::size_t payload_bytes_ = 0;
             std::size_t scales_bytes_ = 0;
             std::size_t mins_bytes_ = 0;
@@ -377,20 +381,20 @@ namespace llaminar2
                 static_cast<std::size_t>(spec.n) *
                 projection.blocks_per_row;
             projection.payload.resize(blocks * 16);
-            projection.scales.resize(blocks);
-            projection.mins.resize(blocks);
-            for (std::size_t block = 0; block < blocks; ++block)
+            projection.metadata_layout = nativeQuantisedMetadataLayout(
+                NativeQuantisedMetadataRepresentation::SuperblockCoded, 0, 0);
+            const auto planes = native_quantised_superblock::planeBytes(
+                projection.codebook_id, spec.n, projection.blocks_per_row, 0);
+            projection.codes.resize(planes.code, 0);
+            projection.superblocks.resize(planes.superblock);
+            for (std::size_t byte = 0; byte < projection.payload.size(); ++byte)
+                projection.payload[byte] = static_cast<std::uint8_t>((seed + byte * 19u) & 0xffu);
+            for (std::size_t byte = 0; byte < planes.code - native_quantised_superblock::kSuperblockCodePlanePadBytes; ++byte)
+                projection.codes[byte] = static_cast<std::uint8_t>((seed + byte * 37u) & 0xffu);
+            for (std::size_t byte = 0; byte < planes.superblock; byte += sizeof(std::uint16_t))
             {
-                for (std::size_t byte = 0; byte < 16; ++byte)
-                {
-                    projection.payload[block * 16 + byte] =
-                        static_cast<std::uint8_t>(
-                            (seed + block * 37u + byte * 19u) & 0xffu);
-                }
-                projection.scales[block] = static_cast<std::uint16_t>(
-                    0x2800u + ((seed + block * 11u) & 0x03ffu));
-                projection.mins[block] = static_cast<std::uint16_t>(
-                    0xa800u + ((seed + block * 7u) & 0x03ffu));
+                const auto coefficient = static_cast<std::uint16_t>(0x2800u + ((seed + byte * 11u) & 0x03ffu));
+                std::memcpy(projection.superblocks.data() + byte, &coefficient, sizeof(coefficient));
             }
             return projection;
         }
@@ -612,7 +616,25 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Could not create all explicit three-tier streams");
                     }
-                    constexpr std::size_t blob_staging_bytes = 1024u;
+                    const auto *source_format =
+                        native_quantised_formats::forSourceIdentity(5, true);
+                    if (!source_format)
+                        throw std::runtime_error(
+                            "Q4_K source format is absent from NativeQuantised catalog");
+                    // Use the same retained staging BOM input as production
+                    // planning, not a private raw-payload-sized relay budget.
+                    // The protocol still communicates only live chunk bytes.
+                    constexpr std::size_t blob_staging_bytes =
+                        MoEOverlayCapacityAdmissionPolicy::kProductionStagingBytes;
+                    for (const auto &spec : kProjections)
+                    {
+                        const auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
+                            *source_format, spec.n, spec.k, 2, 0, 0,
+                            spec.projection, 1).deviceLayout();
+                        if (blob_staging_bytes < layout.cpuStorage().maximumWireUnitBytes())
+                            throw std::runtime_error(
+                                "Production staging cannot hold a complete coded projection unit");
+                    }
                     constexpr std::size_t blob_slots_per_device =
                         kProjectionCount * 2u;
                     cuda_progress_epoch_ =
@@ -649,12 +671,6 @@ namespace llaminar2
                             .perf_device =
                                 "cuda-priority0/rocm-priority1/cpu-priority2",
                         });
-
-                    const auto *source_format =
-                        native_quantised_formats::forSourceIdentity(5, true);
-                    if (!source_format)
-                        throw std::runtime_error(
-                            "Q4_K source format is absent from NativeQuantised catalog");
 
                     for (int expert = 0; expert < 3; ++expert)
                     {
@@ -782,7 +798,7 @@ namespace llaminar2
                                         .device = DeviceId::rocm(0),
                                         .staging = TransferEngine::instance()
                                                        .allocatePersistentTransferStagingSlices(
-                                                           flow->gpu_to_cpu_layout.chunkBytes(1),
+                                                           flow->gpu_to_cpu_layout.cpuStorage().maximumWireUnitBytes(),
                                                            1u,
                                                            DeviceId::rocm(0))
                                                        .front(),
@@ -813,7 +829,7 @@ namespace llaminar2
                                         .device = DeviceId::cuda(0),
                                         .staging = TransferEngine::instance()
                                                        .allocatePersistentTransferStagingSlices(
-                                                           flow->cpu_to_gpu_layout.chunkBytes(1),
+                                                           flow->cpu_to_gpu_layout.cpuStorage().maximumWireUnitBytes(),
                                                            1u,
                                                            DeviceId::cuda(0))
                                                        .front(),
@@ -1428,7 +1444,7 @@ namespace llaminar2
                                     .device = DeviceId::cuda(0),
                                     .staging = TransferEngine::instance()
                                                    .allocatePersistentTransferStagingSlices(
-                                                       layout.chunkBytes(1),
+                                                       layout.cpuStorage().maximumWireUnitBytes(),
                                                        1u,
                                                        DeviceId::cuda(0))
                                                    .front(),

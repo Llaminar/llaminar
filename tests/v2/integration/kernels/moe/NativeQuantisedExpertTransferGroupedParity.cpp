@@ -6,6 +6,7 @@
  * format/M sweep out of registration headers makes a lifecycle fix compile
  * once instead of recompiling both monolithic backend test translation units.
  */
+#include "../../../utils/CUDAMoEArrivalCapture.h"
 #include "NativeQuantisedExpertTransferParityTest.h"
 #include "../../../utils/DeviceEpochArenaTestMemory.h"
 
@@ -72,15 +73,10 @@ namespace llaminar2::test
                 projectionSpecsForFormat(format, kDModel, kIntermediate));
         }
 
-        auto transfer_directory = DeviceMoETransferSlotDirectory::createForTest(
-            backend,
-            device,
-            device.ordinal,
-            kDestinationParticipant,
-            /*slot_count=*/kTransferSlotCount,
-            DeviceMoETransferSlotDirectory::profileForLayerFormats(format_specs));
-        ASSERT_NE(transfer_directory, nullptr);
-        ASSERT_EQ(transfer_directory->slotCount(), kTransferSlotCount);
+        size_t wire_payload_bytes = 0u;
+        for (const auto &specs : format_specs)
+            wire_payload_bytes = std::max(wire_payload_bytes,
+                DeviceMoETransferSlotDirectory::profileForLayerFormats({specs}).max_wire_payload_bytes);
 
         auto kernel_owner =
             llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
@@ -117,7 +113,7 @@ namespace llaminar2::test
 
         const uint64_t payload_slot_bytes =
             (sizeof(DeviceMoEExpertDirectoryEntry) +
-             transfer_directory->wirePayloadBytes() + 255u) /
+             wire_payload_bytes + 255u) /
             256u * 256u;
         const size_t local_payload_bytes =
             kPlanCapacity * static_cast<size_t>(payload_slot_bytes);
@@ -154,6 +150,8 @@ namespace llaminar2::test
             backend,
             device.ordinal,
             sizeof(DeviceMoERebalanceApplyStatus));
+        DeviceAllocation d_arrival_scratch(backend, device.ordinal,
+            deviceMoETransferSlotClaimIndexBytes(kTransferSlotCount));
         DeviceAllocation d_apply_status(
             backend,
             device.ordinal,
@@ -174,6 +172,16 @@ namespace llaminar2::test
             const auto &format = formats[format_index];
             SCOPED_TRACE(
                 std::string(backend_label) + " format=" + format.label);
+
+            auto transfer_directory = DeviceMoETransferSlotDirectory::createForTest(
+                backend,
+                device,
+                device.ordinal,
+                kDestinationParticipant,
+                /*slot_count=*/kTransferSlotCount,
+                DeviceMoETransferSlotDirectory::profileForLayerFormats({format_specs[format_index], format_specs[format_index]}));
+            ASSERT_NE(transfer_directory, nullptr);
+            ASSERT_EQ(transfer_directory->slotCount(), kTransferSlotCount);
 
             std::vector<std::unique_ptr<TensorBase>> weights;
             std::vector<GpuPreparedGemm> prepared;
@@ -429,6 +437,8 @@ namespace llaminar2::test
             source_config.participant_id = 0u;
             auto destination_config = base_config;
             destination_config.participant_id = kDestinationParticipant;
+            destination_config.transfer_slot_layer_ranges = transfer_directory->deviceLayerRanges();
+            destination_config.histogram_layout = moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy;
             const auto apply_config = prefillLLEPTransferConfig(
                 destination_config,
                 PrefillLLEPTransferPurpose::CurrentBatchMovement);
@@ -511,21 +521,23 @@ namespace llaminar2::test
                 sizeof(retained_destination_header),
                 device.ordinal,
                 stream));
-            ASSERT_TRUE(kernel.unpackDeviceRebalanceCollectivePayloads(
-                launch,
-                d_plan.as<DeviceMoERebalancePlanEntry>(),
-                d_plan_count.as<uint32_t>(),
-                kPlanCapacity,
-                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
-                d_gathered_payload.as<uint8_t>(),
-                /*local_payload_slot_count=*/kPlanCapacity,
-                payload_slot_bytes,
-                transfer_directory->deviceEntries(),
-                transfer_directory->slotCount(),
-                destination_config,
-                d_copy_status.as<DeviceMoERebalanceApplyStatus>(),
-                /*controller_state=*/nullptr,
-                kCommandBufferCount));
+            ASSERT_TRUE(recordNativeMoEArrival(device, stream, [&] {
+                return kernel.unpackDeviceRebalanceCollectivePayloads(
+                    launch,
+                    d_plan.as<DeviceMoERebalancePlanEntry>(),
+                    d_plan_count.as<uint32_t>(),
+                    kPlanCapacity,
+                    d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                    d_gathered_payload.as<uint8_t>(),
+                    /*local_payload_slot_count=*/kPlanCapacity,
+                    payload_slot_bytes,
+                    transfer_directory->deviceEntries(),
+                    transfer_directory->slotCount(),
+                    destination_config,
+                    d_copy_status.as<DeviceMoERebalanceApplyStatus>(),
+                    d_arrival_scratch.as<DeviceMoERebalanceArrivalScratch>(),
+                    kCommandBufferCount);
+            }));
             ASSERT_TRUE(kernel.applyDeviceRebalanceArrivals(
                 launch,
                 destination_runtime->deviceLayerState(0),
@@ -600,21 +612,23 @@ namespace llaminar2::test
                 device.ordinal,
                 stream));
 
-            ASSERT_TRUE(kernel.unpackDeviceRebalanceCollectivePayloads(
-                launch,
-                d_plan.as<DeviceMoERebalancePlanEntry>(),
-                d_plan_count.as<uint32_t>(),
-                kPlanCapacity,
-                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
-                d_gathered_payload.as<uint8_t>(),
-                /*local_payload_slot_count=*/kPlanCapacity,
-                payload_slot_bytes,
-                transfer_directory->deviceEntries(),
-                transfer_directory->slotCount(),
-                destination_config,
-                d_copy_status.as<DeviceMoERebalanceApplyStatus>(),
-                /*controller_state=*/nullptr,
-                kCommandBufferCount));
+            ASSERT_TRUE(recordNativeMoEArrival(device, stream, [&] {
+                return kernel.unpackDeviceRebalanceCollectivePayloads(
+                    launch,
+                    d_plan.as<DeviceMoERebalancePlanEntry>(),
+                    d_plan_count.as<uint32_t>(),
+                    kPlanCapacity,
+                    d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                    d_gathered_payload.as<uint8_t>(),
+                    /*local_payload_slot_count=*/kPlanCapacity,
+                    payload_slot_bytes,
+                    transfer_directory->deviceEntries(),
+                    transfer_directory->slotCount(),
+                    destination_config,
+                    d_copy_status.as<DeviceMoERebalanceApplyStatus>(),
+                    d_arrival_scratch.as<DeviceMoERebalanceArrivalScratch>(),
+                    kCommandBufferCount);
+            }));
 
             ASSERT_TRUE(kernel.applyDeviceRebalanceArrivals(
                 launch,

@@ -113,6 +113,14 @@ def _run_pr_scope(images: dict, directory: Path, scope: PRTestScope) -> dict:
     a second, undocumented input surface.
     """
     image = images[ImageRole.TEST_RUNNER.value]["id"]
+    image_revision = (images[ImageRole.TEST_RUNNER.value].get("labels") or {}).get(
+        "org.opencontainers.image.revision", "")
+    if not (len(image_revision) == 40 and
+            all(c in "0123456789abcdef" for c in image_revision)):
+        # Reviewer-93 item 3: source binding needs the exact 40-lower-hex label;
+        # an unlabelled runner image cannot bind, so the revision is omitted
+        # and the diagnostic records the run as UNBOUND.
+        image_revision = ""
     prefix = "pr-tests" if scope is PRTestScope.HOST else "pr-tests/gpu"
     name = "llaminar-develop-" + prefix.replace("/", "-") + "-" + uuid.uuid4().hex
     command = ["python3", "scripts/ci/run_develop_pr_tests.py",
@@ -129,6 +137,8 @@ def _run_pr_scope(images: dict, directory: Path, scope: PRTestScope) -> dict:
               *docker_paths.device_args(image, scope.backends, user=f"{os.getuid()}:{os.getgid()}"),
               *(part for group in os.getgroups() for part in ("--group-add", str(group))),
               *docker_paths.mounts([(directory, "/ci-results", False)]),
+              *(["-e", f"LLAMINAR_IMAGE_REVISION={image_revision}"]
+                if image_revision else []),
               "-w", "/src", image,
               *logged_container_command(command, f"/ci-results/{prefix}.process.log")]
     try:

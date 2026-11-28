@@ -8476,17 +8476,18 @@ TEST(Test__ROCmQuantisedGemmSmallM, GDNPhysicalHalfOperandsAccumulateIntoFP32Cap
         EXPECT_NO_THROW({ auto partition = engines[0]->beginOutputPartitionEquivalenceScope(widths[0], widths[0]); });
         stage.unbindWorkspace();
     }
-    const auto records = PerfStatsCollector::snapshot({"gemm.rocm_fp16_operand_compute32_calls"});
+    // Ordinary half prefill runs the fixed-K contract (#74), never hipBLAS.
+    const auto records = PerfStatsCollector::snapshot({"gemm.rocm_fixed_k_projection_calls"});
     EXPECT_FALSE(records.empty());
     double consumers = 0.0;
     for (const auto &record : records)
     {
-        consumers += record.value;
+        consumers += record.value * std::stoi(record.tags.at("projections"));
         EXPECT_EQ(record.tags.at("activation"), "fp16_rne");
         EXPECT_EQ(record.tags.at("weight"), "fp16");
         EXPECT_EQ(record.tags.at("accumulation"), "fp32");
         EXPECT_EQ(record.tags.at("output"), "fp32");
-        EXPECT_EQ(record.tags.at("route"), "hipblas_gemm_ex");
+        EXPECT_TRUE(record.tags.at("route") == "fixed_k_wmma" || record.tags.at("route") == "fixed_k_scalar_fma");
     }
     const auto fixed = PerfStatsCollector::snapshot({"kernel.rocm_fp16_short_projection_group_calls"});
     EXPECT_FALSE(fixed.empty());
@@ -8512,11 +8513,13 @@ TEST(Test__ROCmQuantisedGemmSmallM, GDNPhysicalHalfOperandsAccumulateIntoFP32Cap
 }
 
 /**
- * @test A real captured half-operand GEMM exposes registered cast and module
- * library kernels through the same strict public resource inventory.
- * @details The first GEMM is captured cold at the real QKV M512 geometry that
- * reproduced invalid-device-symbol inspection. All resource and occupancy
- * values are checked against the representation's native typed query APIs.
+ * @test A real captured graph exposes registered and module-origin library
+ * kernels through the same strict public resource inventory.
+ * @details The half-operand GEMM is captured cold at the real QKV M512 geometry
+ * that reproduced invalid-device-symbol inspection; it contributes registered
+ * cast and fixed-K projection kernels (#74 retired its hipBLAS route). A native
+ * FP32 GEMM in the same capture contributes the module-origin hipBLAS SGEMM.
+ * All resource and occupancy values are checked against the representation's native typed query APIs.
  * Changed-input retained launches prove inspection does not alter graph work.
  * This is observability/correctness evidence, not a performance certificate.
  */
@@ -8538,9 +8541,13 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphInventoryAcceptsCapturedHostAndModuleKe
         auto weights=std::make_shared<FP16Tensor>(std::vector<size_t>{N,K},
             std::vector<uint16_t>(size_t(N)*K,canonicalPreparedHalfBits(1.0f/128.0f)));
         std::fill_n(input->mutable_data(),size_t(M)*K,1.0f);
-        std::vector<float> source(size_t(M)*K), actual(size_t(M)*N);
-        std::unique_ptr<ROCmFloatingPointGemmKernel> engine;
-        std::unique_ptr<DeviceWorkspaceManager> workspace;
+        // Native FP32 weights still execute through hipBLAS: the module-origin witness.
+        std::shared_ptr<FP32Tensor> blas_weights=TestTensorFactory::createFP32Zeros({N,K});
+        auto blas_output=TestTensorFactory::createFP32Zeros({M,N});
+        std::fill_n(blas_weights->mutable_data(),size_t(N)*K,1.0f/128.0f);
+        std::vector<float> source(size_t(M)*K), actual(size_t(M)*N), blas_actual(size_t(M)*N);
+        std::unique_ptr<ROCmFloatingPointGemmKernel> engine, blas_engine;
+        std::unique_ptr<DeviceWorkspaceManager> workspace, blas_workspace;
         std::unique_ptr<IGPUGraphCapture> graph;
         struct PendingJoin
         {
@@ -8549,7 +8556,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphInventoryAcceptsCapturedHostAndModuleKe
             ~PendingJoin(){(void)hipStreamSynchronize(stream);}
         } join{hip_stream};
         for(auto *tensor:{static_cast<TensorBase*>(input.get()),static_cast<TensorBase*>(output.get()),
-                static_cast<TensorBase*>(weights.get())})
+                static_cast<TensorBase*>(weights.get()),static_cast<TensorBase*>(blas_weights.get()),
+                static_cast<TensorBase*>(blas_output.get())})
             TransferEngine::prepareDeviceInput(tensor,device,stream);
         ASSERT_EQ(hipStreamSynchronize(hip_stream),hipSuccess);
         engine=std::make_unique<ROCmFloatingPointGemmKernel>(weights->gpu_data_ptr(),N,K,device.ordinal,
@@ -8558,11 +8566,18 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphInventoryAcceptsCapturedHostAndModuleKe
         const auto requirements=engine->getWorkspaceRequirements(M,N,K);
         workspace=std::make_unique<DeviceWorkspaceManager>(device,requirements.total_bytes_with_alignment());
         ASSERT_TRUE(workspace->allocate(requirements));engine->bindWorkspace(workspace.get());
+        blas_engine=std::make_unique<ROCmFloatingPointGemmKernel>(blas_weights->gpu_data_ptr(),N,K,device.ordinal,
+            ROCmFloatingPointGemmKernel::Precision::FP32,blas_weights,FloatingActivationOperandPrecision::Native);
+        blas_engine->setGPUStream(stream);
+        const auto blas_requirements=blas_engine->getWorkspaceRequirements(M,N,K);
+        blas_workspace=std::make_unique<DeviceWorkspaceManager>(device,blas_requirements.total_bytes_with_alignment());
+        ASSERT_TRUE(blas_workspace->allocate(blas_requirements));blas_engine->bindWorkspace(blas_workspace.get());
         graph=context.createGraphCapture(stream);ASSERT_NE(graph,nullptr);
         {
             ScopedBackendGraphCapture capture(context,*graph,"HIP host/module kernel inventory");
             ASSERT_TRUE(capture.begin());
-            const bool recorded=engine->multiply_tensor(input.get(),output.get(),M,N,K);
+            const bool recorded=engine->multiply_tensor(input.get(),output.get(),M,N,K) &&
+                blas_engine->multiply_tensor(input.get(),blas_output.get(),M,N,K);
             capture.finish();ASSERT_TRUE(recorded);
         }
         ASSERT_TRUE(graph->instantiate());
@@ -8629,20 +8644,23 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphInventoryAcceptsCapturedHostAndModuleKe
             }
         };
         verify(native->graph(),"root");
-        ASSERT_GT(host_count,0u)<<"Actual registered FP32-to-half producer missing";
-        ASSERT_GT(module_count,0u)<<"Actual captured module-origin library GEMM missing";
+        ASSERT_GT(host_count,0u)<<"Actual registered FP32-to-half producer and fixed-K projection missing";
+        ASSERT_GT(module_count,0u)<<"Actual captured module-origin hipBLAS SGEMM missing";
         EXPECT_EQ(kernel_count,observed.size());
         for(int replay=0;replay<3;++replay)
         {
             std::fill(source.begin(),source.end(),float(replay+1));
             ASSERT_EQ(hipMemcpyAsync(input->gpu_data_ptr(),source.data(),source.size()*sizeof(float),hipMemcpyHostToDevice,hip_stream),hipSuccess);
             ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(),0xff,actual.size()*sizeof(float),hip_stream),hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(blas_output->gpu_data_ptr(),0xff,blas_actual.size()*sizeof(float),hip_stream),hipSuccess);
             void *half=workspace->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16);ASSERT_NE(half,nullptr);
             ASSERT_EQ(hipMemsetAsync(half,replay%2?0x5a:0xa5,size_t(M)*K*sizeof(uint16_t),hip_stream),hipSuccess);
             ASSERT_TRUE(graph->launch());
             ASSERT_EQ(hipMemcpyAsync(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),hipMemcpyDeviceToHost,hip_stream),hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(blas_actual.data(),blas_output->gpu_data_ptr(),blas_actual.size()*sizeof(float),hipMemcpyDeviceToHost,hip_stream),hipSuccess);
             ASSERT_EQ(hipStreamSynchronize(hip_stream),hipSuccess);
             for(float value:actual)ASSERT_EQ(value,16.0f*float(replay+1));
+            for(float value:blas_actual)ASSERT_EQ(value,16.0f*float(replay+1));
         }
     });
 #endif

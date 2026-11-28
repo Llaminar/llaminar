@@ -11,6 +11,7 @@
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "kernels/FloatingActivationOperandPrecision.h"
+#include "kernels/common/FixedKProjectionContract.h"
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -38,7 +39,7 @@ namespace llaminar2::rocm::floating_gemm_workspace
         return result;
     }
     /**
-     * @brief Declare the optional physical half-A bank through the existing BOM.
+     * @brief Declare explicit-operand scratch: the fixed-K chain bank and, for half, the half-A bank.
      * @param m Maximum ordinary rows for the retained graph.
      * @param k Positive input width; weight/output banks retain their own owners.
      * @param operand_precision Immutable prepared-engine activation policy.
@@ -53,9 +54,19 @@ namespace llaminar2::rocm::floating_gemm_workspace
         FloatingActivationOperandPrecision operand_precision)
     {
         auto result = projectionRequirements();
+        if (operand_precision == FloatingActivationOperandPrecision::Native)
+            return result;
+        if (operand_precision == FloatingActivationOperandPrecision::FP16RNE && (m <= 0 || k <= 0))
+            throw std::invalid_argument("Half-operand projection scratch has invalid geometry");
+        if (m <= 0)
+            return result;  // a rowless strict-FP32 envelope launches nothing
+        // Ordinary explicit-operand prefill may partition narrow groups; one
+        // bounded chain bank covers every group at this row envelope.
+        result.buffers.push_back({GemmWorkspaceBuffers::FIXED_K_PARTIALS,
+            static_cast<std::size_t>(fixed_k_projection::partialBound(m)), 256, true});
         if (operand_precision != FloatingActivationOperandPrecision::FP16RNE)
             return result;
-        if (m <= 0 || k <= 0 || static_cast<std::size_t>(m) >
+        if (static_cast<std::size_t>(m) >
             std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t) /
                 static_cast<std::size_t>(k))
             throw std::invalid_argument("Half-operand projection scratch has invalid geometry");

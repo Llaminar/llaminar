@@ -3993,14 +3993,6 @@ namespace llaminar2
         LOG_DEBUG("[InferenceRunner] SingleDevice WeightPlan built with "
                   << weight_plan.size() << " requirements");
 
-        // =====================================================================
-        // Weight rotation (activation_rotation) is intentionally NOT registered
-        // as a weight preprocessor. GEMM invariance (R(X) @ R(W)^T = X @ W^T)
-        // means weight rotation produces identical outputs in exact arithmetic,
-        // but the extra quantization step (Q4_0 → FP32 → rotate → INT8) adds
-        // noise that compounds with Q16_1 KV cache quantization, degrading
-        // parity. KV rotation operates independently on K/V/Q activations.
-        // =====================================================================
         const auto &env = debugEnv();
 
         FrozenModelWeightSet frozen_weights = [&]()

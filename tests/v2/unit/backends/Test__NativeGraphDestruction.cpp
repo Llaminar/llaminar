@@ -1,5 +1,13 @@
 /** @file Test__NativeGraphDestruction.cpp
  * @brief Actual native reset bodies with SDK-return-code injection and no GPU runtime.
+ *
+ * The generator extracts the exact production CUDAGraphCapture::reset() and
+ * HIPGraphCapture::reset() bodies and compiles them against these mocks. A
+ * mock therefore declares every member a production body touches. The CUDA
+ * mock starts with live-launch bookkeeping (deferred child-path sites,
+ * owner-local update bindings and an in-place lowered definition) so the tests
+ * prove that a fatal native teardown failure leaves that bookkeeping with its
+ * still-owned handles, while a successful reset releases it.
  */
 #include <gtest/gtest.h>
 #include <cstddef>
@@ -44,20 +52,46 @@ struct CUDAGraphCapture:Common {
  enum class FragmentState{Unrecorded};FragmentState fragment_state_=FragmentState::Unrecorded;
  std::shared_ptr<OrderedTimelineRecording> timeline_recording_;
  std::vector<int>fragment_nodes_;void*fragment_entry_=nullptr,*fragment_exit_=nullptr;
+ // Same shape as the production DeferredLaunchSite: a native scope, the exact
+ // child path inside it and the control-argument count of the launch.
+ struct DeferredLaunchSite{void*scope;std::vector<void*>path;std::size_t control_argument_count;};
+ std::vector<DeferredLaunchSite>deferred_launches_{
+  DeferredLaunchSite{reinterpret_cast<void*>(0x400),{reinterpret_cast<void*>(0x500)},2u}};
+ std::size_t lowered_live_launch_sites_=1u;bool definition_consumed_=true;
  void reset();
 };
 struct HIPGraphCapture:Common {void reset();};
 #include "NativeGraphDestructionBodies.inc"
+/** @brief True for captures whose production reset owns live-launch bookkeeping (CUDA). */
+template<class Capture>constexpr bool kOwnsLiveLaunches=requires(const Capture&c){
+ c.deferred_launches_;c.lowered_live_launch_sites_;c.definition_consumed_;};
+/** @return Whether the initial live-launch bookkeeping is still intact (vacuous without it). */
+template<class Capture>bool liveLaunchesRetained(const Capture&capture){
+ if constexpr(kOwnsLiveLaunches<Capture>)
+  return capture.deferred_launches_.size()==1u&&capture.deferred_launches_[0].path.size()==1u&&
+         capture.lowered_live_launch_sites_==1u&&capture.definition_consumed_;
+ else return true;
+}
+/** @return Whether reset released every live-launch binding of the old executable. */
+template<class Capture>bool liveLaunchesReleased(const Capture&capture){
+ if constexpr(kOwnsLiveLaunches<Capture>)
+  return capture.deferred_launches_.empty()&&capture.lowered_live_launch_sites_==0u&&!capture.definition_consumed_;
+ else return true;
+}
+static_assert(kOwnsLiveLaunches<CUDAGraphCapture>&&!kOwnsLiveLaunches<HIPGraphCapture>);
 template<class Capture> void failure(int phase){
  SDK::reset(phase);Capture capture;
  std::set_terminate([]{std::_Exit(78);});
  // The termination observer checks actual still-owned handle state and every
- // successful-prefix SDK call before accepting fatal cleanup behavior.
+ // successful-prefix SDK call before accepting fatal cleanup behavior. No
+ // post-teardown bookkeeping (timing events, live-launch bindings) may be
+ // released once a native teardown has failed.
  static Capture* original=nullptr;original=&capture;
  std::set_terminate([]{
   const bool handles=SDK::fail==3?!original->exec_&&original->graph_:original->exec_&&original->graph_;
   const bool calls=SDK::activate==1&&SDK::exec==(SDK::fail==1?0:1)&&SDK::graph==(SDK::fail==3?1:0);
-  std::_Exit(handles&&calls&&!original->definition_scope_&&original->cleanup==0?77:79);
+  const bool bookkeeping=original->cleanup==0&&liveLaunchesRetained(*original);
+  std::_Exit(handles&&calls&&!original->definition_scope_&&bookkeeping?77:79);
  });
  capture.reset();std::_Exit(0);
 }
@@ -70,9 +104,12 @@ TEST(NativeGraphDestruction, ROCmActualFailureReturnsPreserveOriginalHandles){
 template<class Capture>void success(){
  for(bool executable:{false,true})for(bool graph:{false,true}){
   SDK::reset(0);Capture capture;if(!executable)capture.exec_=nullptr;if(!graph)capture.graph_=nullptr;
+  ASSERT_TRUE(liveLaunchesRetained(capture));
   capture.reset();EXPECT_EQ(capture.exec_,nullptr);EXPECT_EQ(capture.graph_,nullptr);
   EXPECT_EQ(SDK::exec,executable?1:0);EXPECT_EQ(SDK::graph,graph?1:0);EXPECT_EQ(capture.cleanup,1);
+  EXPECT_TRUE(liveLaunchesReleased(capture));
   capture.reset();EXPECT_EQ(SDK::exec,executable?1:0);EXPECT_EQ(SDK::graph,graph?1:0);
+  EXPECT_TRUE(liveLaunchesReleased(capture));
  }
 }
 /** @brief Retained original definitions must not preserve an invalidated parent frontier. */
@@ -87,6 +124,7 @@ template<class Capture>void metadataReset(){
  ASSERT_EQ(capture.fragment_frontiers_.require(&capture,definition,original_graph,original_nodes).size(),1u);
  capture.reset();
  EXPECT_EQ(capture.definition_scope_,nullptr);
+ EXPECT_TRUE(liveLaunchesReleased(capture));
  // Keep the original definition alive independently: expiration alone must
  // not conceal a reset that forgot to clear imported native frontier state.
  EXPECT_TRUE(capture.fragment_frontiers_.require(&capture,definition,original_graph,original_nodes).empty());

@@ -9,6 +9,8 @@
  * never migrate, replace, or discard already filled execution storage.
  * Registry-only consumers drop references on departure without releasing shared
  * weights or mutating the canonical registry and prepared-store ownership.
+ * Initial GPU pool plans retain the source operand's coded metadata declaration
+ * so physical allocation and expert admission describe the same native planes.
  */
 
 #include "MoEExpertWeightService.h"
@@ -24,6 +26,8 @@
 #include "../../kernels/cpu/gemm/CPUPackedWeights.h"
 #include "../../kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "../../loaders/MmapRegion.h"
+#include "../../loaders/BoundedGPUExpertSource.h"
+#include "MoEExpertGPUWeightPlan.h"
 #include "../../loaders/ExpertGemmRegistry.h"
 #include "../../loaders/GPUVramPreflight.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
@@ -545,7 +549,10 @@ namespace llaminar2
                     slot.d_native_quantised_emins,
                     codebook_id, blocks_per_row,
                     lifetime_owner,
-                    source_identity);
+                    source_identity,
+                    NativeQuantisedReusableDeviceAllocationFormat{},
+                    // The pool slot's producer chose its metadata representation.
+                    slot.metadata_layout);
             }
 #endif
             return nullptr;
@@ -2159,7 +2166,10 @@ namespace llaminar2
                         slot->d_native_quantised_emins,
                         canonicalDeviceVnniCodebookId(format), blocks_per_row,
                         orchestrator,
-                        sourceIdentityFor(format));
+                        sourceIdentityFor(format),
+                        NativeQuantisedReusableDeviceAllocationFormat{},
+                        // The pool slot's producer chose its metadata representation.
+                        slot->metadata_layout);
                 }
 #endif
 
@@ -2381,8 +2391,6 @@ namespace llaminar2
                 }
 #endif
 
-                const int N = static_cast<int>(view->rows());
-                const int K = static_cast<int>(view->cols());
                 const size_t raw_bytes = quantizedViewRawBytes(*view);
                 if (raw_bytes == 0)
                 {
@@ -2394,11 +2402,8 @@ namespace llaminar2
                 // Unique name per expert per group
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
-                orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
-                                         vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
-                                         vnni->has_emins,
-                                         nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
-                                         raw_bytes);
+                planMoEExpertGPUWeight(*orchestrator, ctx.device_id, slot_name, *view,
+                                       raw_bytes, GPUPreparedWeightPoolLayout::SourceNative);
                 max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
                 ++total_planned;
             }
@@ -2522,7 +2527,10 @@ namespace llaminar2
                         slot->d_native_quantised_emins,
                         canonicalDeviceVnniCodebookId(*vnni), blocks_per_row,
                         orchestrator,
-                        sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
+                        sourceIdentityFor(*vnni), // lifetime: keeps VRAM pool alive
+                        NativeQuantisedReusableDeviceAllocationFormat{},
+                        // The pool slot's producer chose its metadata representation.
+                        slot->metadata_layout);
                 }
 #endif
 
@@ -4535,7 +4543,10 @@ namespace llaminar2
                     slot.d_native_quantised_emins,
                     canonicalDeviceVnniCodebookId(vnni), blocks_per_row,
                     lifetime_owner,
-                    sourceIdentityFor(vnni));
+                    sourceIdentityFor(vnni),
+                    NativeQuantisedReusableDeviceAllocationFormat{},
+                    // The pool slot's producer chose its metadata representation.
+                    slot.metadata_layout);
             }
 #endif
             return nullptr;

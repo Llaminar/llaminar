@@ -43,6 +43,11 @@ endif()
 # The build type flags are picked up by the compiler setup during project()
 project(llaminar2 LANGUAGES C CXX)
 
+# Repository checkout root: the single authority for repository-relative paths
+# (external/ dependencies and test sources) in this directory and tests/v2, in
+# every backend configuration.
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+
 # Compile the same small semantic source identity into capture and offline replay.
 include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/MTPDepthReplayIdentity.cmake")
 
@@ -397,6 +402,8 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard6.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
+        kernels/cuda/gemm/CUDAFixedKHalfProjection.cu  # fixed-K chunk-invariant half-RNE prefill projections
+        kernels/cuda/gemm/CUDAFixedKScalarProjection.cu  # fixed-K chunk-invariant strict-FP32 prefill projections
         # NativeQuantised prefill is physically sharded by codebook pair, like
         # decode: eight complete, deterministic modules behind one host-only
         # dispatcher that owns the public ABI and the launch-policy state.
@@ -712,6 +719,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmNativeQuantisedVerifierWmma.hip # Native grouped verifier
         kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip # Independent native gfx1100 WMMA compilation
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
+        kernels/rocm/gemm/ROCmFixedKProjection.hip # fixed-K chunk-invariant explicit-operand prefill (gfx1100 WMMA, scalar FMA)
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/moe/ROCmMoEGroupedIntermediateExchange.hip # lossless SwiGLU/scales exchange boundary
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
@@ -915,7 +923,6 @@ if(HAVE_ROCM)
     # Discovery must know the local dependency location even when it is
     # already built and nested dependency compilation is disabled. Runtime
     # loading now honors this CMake selection exactly.
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
     set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
 
@@ -1253,8 +1260,6 @@ if(USE_ONEDNN)
     find_package(Git REQUIRED)
 
     # First, ensure OneDNN exists in external/ and is on the expected revision
-    # Note: Repository root is two levels up from src/v2
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
     set(ONEDNN_SOURCE_REF_FILE "${ONEDNN_EXTERNAL_DIR}/.llaminar-onednn-source-ref")
     set(ONEDNN_GIT_URL "https://github.com/uxlfoundation/oneDNN.git")
@@ -1390,6 +1395,13 @@ function(llaminar_configure_pre_tokenizer)
     set(PCRE2_SUPPORT_JIT OFF)
     set(PCRE2_BUILD_PCRE2GREP OFF)
     set(PCRE2_BUILD_TESTS OFF)
+    # pcre2 10.49 probes the compiler's __CET__ default (INTEL_CET_ENABLED) and
+    # then appends -mshstk to its C flags. -mshstk only enables shadow-stack
+    # intrinsics, which only its sljit JIT uses, and the JIT is disabled above.
+    # Pre-answering the probe keeps pcre2 inside the canonical CPU envelope
+    # (V2_Integration_CPUHostCompileContract). The compiler's own CET
+    # instrumentation (-fcf-protection, __CET__) is unchanged.
+    set(INTEL_CET_ENABLED OFF)
     FetchContent_MakeAvailable(pcre2)
     set(UTF8PROC_ENABLE_TESTING OFF CACHE BOOL "Disable utf8proc upstream test downloads" FORCE)
     set(UTF8PROC_INSTALL OFF CACHE BOOL "Keep utf8proc private to the tokenizer" FORCE)
@@ -1458,6 +1470,11 @@ set(LLAMINAR2_CORE_LIBRARY_TYPE STATIC)
 if(LLAMINAR_SHARED_CORE)
     set(LLAMINAR2_CORE_LIBRARY_TYPE SHARED)
 endif()
+# The ordered-partition plan reporters are one object shared by the core and
+# every core-free consumer of their header. Created here, beside the core, it
+# inherits the core's complete compile flags; the core links it below.
+set(LLAMINAR_NATIVE_PARTITION_PLAN_FLAGS_TARGET llaminar2_core)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/NativePartitionPlan.cmake")
 add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Interfaces
     interfaces/IMPIContext.cpp
@@ -1468,6 +1485,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/CPUExecutionGeometry.cpp
     backends/NativeGraphDependencyReduction.cpp
     kernels/cpu/gemm/CPUProjectionWorkspaceContract.cpp
+    kernels/cpu/gemm/CPUNativeX86PackedPrefill.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
     backends/BackendManager.cpp
@@ -2278,7 +2296,8 @@ endif()
 
 # Required dependencies
 target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
-target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer PkgConfig::LLAMINAR_CPU_PLACEMENT_HWLOC)
+target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer PkgConfig::LLAMINAR_CPU_PLACEMENT_HWLOC
+    llaminar2_native_partition_plan)
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX

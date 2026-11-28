@@ -2607,6 +2607,9 @@ against the compact source representation.
 
 ##### Grouped execution-format lifecycle re-audit (2026-08-21, post-proof)
 
+This section records the historical expanded-layout defect. Current file-density
+movement retains native Q5_K rather than the retired expanded decoder 23 layout.
+
 That focused chain localized the zero to a capture-identity split, not another
 movement phase.  Bootstrap Q5_K descriptors used compact execution codebook 7,
 so setup captured only codebook-7 grouped kernels.  CPU promotion correctly

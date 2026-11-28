@@ -1214,6 +1214,17 @@ namespace llaminar2
             // turn these fixed-BOM inputs into a second live allocation ledger.
             result.device_inputs = std::move(prepared.device_inputs);
 
+            // Auxiliary owners charge the exact same allocator observation as
+            // the fixed graph BOM, including GB10's shared host pool and the
+            // original observation adopted during native context preparation.
+            const auto resourceFor = [&](DeviceId device) -> PhysicalMemoryResource
+            {
+                if (const auto *fixed = result.fixed_memory_plan.physicalPlan().find({rank_plan.rank, device}))
+                    return fixed->resource();
+                const auto [total, available] = inventoryMemory(inventory, device);
+                return withObservedBacking({rank_plan.rank, device, total,
+                    usableMemory(available, device, input)}, inventory);
+            };
             PhysicalMemoryPlanBuilder physical_plan_builder;
             for (const auto &device_plan : result.fixed_memory_plan.devices)
             {
@@ -1269,9 +1280,7 @@ namespace llaminar2
                 for(const auto device:devices) {
                     if(!resource_devices.contains(device))
                         throw std::invalid_argument("GPU expert native context BOM omitted an original local resource");
-                    const auto [total,available]=inventoryMemory(inventory,device);
-                    physical_plan_builder.add({.world_rank=rank_plan.rank,.device=device,
-                        .total_bytes=total,.admission_available_bytes=usableMemory(available,device,input)},
+                    physical_plan_builder.add(resourceFor(device),
                         PhysicalMemoryOwner::LocalCollective,collective.perDeviceBytes());
                 }
             }
@@ -1282,12 +1291,10 @@ namespace llaminar2
             if (!input.native_context_budgets.empty()) {
                 if (rank_plan.runtime.native_context_preparation)
                     throw std::logic_error("Native birth budget cannot duplicate its live source declaration");
-                const auto [host_total,host_available]=inventoryMemory(inventory,DeviceId::cpu());
-                const PhysicalMemoryResource host{rank_plan.rank,DeviceId::cpu(),host_total,usableMemory(host_available,DeviceId::cpu(),input)};
+                const auto host = resourceFor(DeviceId::cpu());
                 std::vector<PhysicalMemoryResource> devices;
                 for(const auto device:resource_devices)if(device.is_gpu() && quoted_native_contexts.emplace(rank_plan.rank,device).second){
-                    const auto [total,available]=inventoryMemory(inventory,device);
-                    devices.push_back({rank_plan.rank,device,total,usableMemory(available,device,input)});
+                    devices.push_back(resourceFor(device));
                 }
                 const auto native_bom = planningNativeContextBOM(input.native_context_budgets, host, devices);
                 for (const auto& row : native_bom.resources()) physical_plan_builder.add(row);
@@ -1300,13 +1307,9 @@ namespace llaminar2
                 MoEOverlayMigrationStorageKind::PhysicalResidencyFabric) {
                 const auto counts=MoEOverlayCapacityAdmission::executionStreamCounts(overlay_plan,rank_plan.rank,
                     std::max<std::size_t>(1,rank_plan.runtime.moe_rebalance.resolvedMigrationExecutionStreams()));
-                const auto [host_total,host_available]=inventoryMemory(inventory,DeviceId::cpu());
-                const PhysicalMemoryResource host{rank_plan.rank,DeviceId::cpu(),host_total,
-                    usableMemory(host_available,DeviceId::cpu(),input)};
+                const auto host = resourceFor(DeviceId::cpu());
                 for(const auto& [device,count]:counts){
-                    const auto [total,available]=inventoryMemory(inventory,device);
-                    const auto quote=TransferEngine::persistentTransferExecutionLanesBOM(count,host,
-                        {rank_plan.rank,device,total,usableMemory(available,device,input)});
+                    const auto quote=TransferEngine::persistentTransferExecutionLanesBOM(count,host,resourceFor(device));
                     for(const auto& resource:quote.resources())physical_plan_builder.add(resource);
                 }
                 if(!counts.empty()) {
@@ -1328,11 +1331,9 @@ namespace llaminar2
                         return originalMoEOverlayDirectedPeerAccess(inventory,accessor,allocation);});
                     result.physical_gpu_lane_demand=demand;
                     for(const auto& [device,count]:originalMoEOverlayPeerEventCounts(*demand)) {
-                        const auto [total,available]=inventoryMemory(inventory,device);
                         // Both canonical production fabric creators enable economy timing.
                         // Quote actual operation owners; shared stream count is independent.
-                        const auto one=ExpertTierGpuPeerTransferLane::nativeEventsBOM(host,
-                            {rank_plan.rank,device,total,usableMemory(available,device,input)},true);
+                        const auto one=ExpertTierGpuPeerTransferLane::nativeEventsBOM(host,resourceFor(device),true);
                         for(const auto& resource:one.resources()) {
                             PhysicalMemoryBOMBuilder scaled(resource.resource());
                             for(size_t index=0;index<PhysicalMemoryBOM::ownerCount();++index){
@@ -1368,13 +1369,8 @@ namespace llaminar2
                 throw std::invalid_argument("Mapped Batch continuation requires its original retained source inventory");
             for (const auto& [device, channels] : batch_channels)
             {
-                const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
-                const PhysicalMemoryResource host{.world_rank = rank_plan.rank, .device = DeviceId::cpu(),
-                    .total_bytes = host_total,
-                    .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)};
-                const auto [total, available] = inventoryMemory(inventory, device);
-                const PhysicalMemoryResource gpu{.world_rank = rank_plan.rank, .device = device,
-                    .total_bytes = total, .admission_available_bytes = usableMemory(available, device, input)};
+                const auto host = resourceFor(DeviceId::cpu());
+                const auto gpu = resourceFor(device);
                 const auto add = [&](const PhysicalMemoryPlan& contribution) {
                     for (const auto& resource : contribution.resources()) physical_plan_builder.add(resource);
                 };
@@ -1406,13 +1402,8 @@ namespace llaminar2
             for (const auto device : local_grant_gpus)
             {
                 if (cold_publication_priced.contains(device)) continue;
-                const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
-                const PhysicalMemoryResource host{.world_rank = rank_plan.rank, .device = DeviceId::cpu(),
-                    .total_bytes = host_total,
-                    .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)};
-                const auto [total, available] = inventoryMemory(inventory, device);
-                const PhysicalMemoryResource gpu{.world_rank = rank_plan.rank, .device = device,
-                    .total_bytes = total, .admission_available_bytes = usableMemory(available, device, input)};
+                const auto host = resourceFor(DeviceId::cpu());
+                const auto gpu = resourceFor(device);
                 const auto cold_publication = MoEOverlayActivationBatchResources::coldPublicationBOM(host, gpu);
                 for (const auto& resource : cold_publication.resources())
                     physical_plan_builder.add(resource);
@@ -1439,11 +1430,7 @@ namespace llaminar2
                     const auto declaration = MoEOverlayNodeLocalRouteExchange::declareStorage(
                         {.devices=devices,.root_device=root,.identity="continuation:"+continuation->name},
                         rows, profile.expert_used_count, profile.d_model);
-                    const auto [ht,ha] = inventoryMemory(inventory,DeviceId::cpu());
-                    const auto [gt,ga] = inventoryMemory(inventory,root);
-                    const auto bom = declaration.bom(
-                        {rank_plan.rank,DeviceId::cpu(),ht,usableMemory(ha,DeviceId::cpu(),input)},
-                        {rank_plan.rank,root,gt,usableMemory(ga,root,input)});
+                    const auto bom = declaration.bom(resourceFor(DeviceId::cpu()), resourceFor(root));
                     for (const auto& resource:bom.resources()) physical_plan_builder.add(resource);
                 }
             }
@@ -1456,11 +1443,7 @@ namespace llaminar2
                     throw std::invalid_argument("Follower terminal BOM changed its original retained slot geometry");
                 const auto cache_count = MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(
                     input.activation_channel_row_capacity, family, input.activation_prefill_graph_rows);
-                const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
-                const PhysicalMemoryResource host{
-                    .world_rank = rank_plan.rank, .device = DeviceId::cpu(),
-                    .total_bytes = host_total,
-                    .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)};
+                const auto host = resourceFor(DeviceId::cpu());
                 bool terminal_holder_priced=false;
                 for (const auto& channel : result.activation_channel_plan.channels)
                 {
@@ -1469,11 +1452,7 @@ namespace llaminar2
                     {
                         if (!endpoint.device.is_gpu())
                             throw std::invalid_argument("Native follower terminals require original GPU endpoints");
-                        const auto [total, available] = inventoryMemory(inventory, endpoint.device);
-                        const PhysicalMemoryResource gpu = withObservedBacking({
-                            .world_rank = rank_plan.rank, .device = endpoint.device,
-                            .total_bytes = total,
-                            .admission_available_bytes = usableMemory(available, endpoint.device, input)}, inventory);
+                        const auto gpu = resourceFor(endpoint.device);
                         for (std::size_t cache = 0; cache < cache_count; ++cache)
                         {
                             if(!terminal_holder_priced){
@@ -1584,15 +1563,7 @@ namespace llaminar2
                 : std::optional<MoEOverlayDynamicPolicyWorkspaceDeclaration>{};
             for (const DeviceId device : resource_devices)
             {
-                const auto [total_bytes, available_bytes] =
-                    inventoryMemory(inventory, device);
-                const PhysicalMemoryResource resource = withObservedBacking({
-                    .world_rank = rank_plan.rank,
-                    .device = device,
-                    .total_bytes = total_bytes,
-                    .admission_available_bytes = usableMemory(
-                        available_bytes, device, input),
-                }, inventory);
+                const auto resource = resourceFor(device);
                 const std::size_t activation_staging_bytes =
                     result.activation_channel_plan.stagingBytesFor(
                         rank_plan.rank, device);
@@ -1600,6 +1571,8 @@ namespace llaminar2
                 const auto continuation = std::find_if(result.device_inputs.begin(), result.device_inputs.end(),
                     [&](const auto &config) { return config.device == device &&
                         config.execution_role == DeviceExecutionMemoryRole::ContinuationGraph; });
+                if (!device.is_cuda() || continuation == result.device_inputs.end())
+                    captured_inventory.cuda_arrival_owners = {};
                 if (device.is_gpu() && continuation != result.device_inputs.end())
                 {
                     const auto query_programs = profile.sparseQueryProgramCount();
@@ -1617,6 +1590,13 @@ namespace llaminar2
                     if (ordinary > std::numeric_limits<std::size_t>::max() - captured_inventory.auxiliary_executable_count)
                         throw std::overflow_error("ExpertOverlay ordinary native owner inventory overflows");
                     captured_inventory.auxiliary_executable_count += ordinary;
+                    // The copy source is itself executable, and the standalone
+                    // cadence imports it without retiring either owner. Native
+                    // generation/follower parents already pay their base slots.
+                    const auto maintenance = captured_inventory.cuda_arrival_owners.standaloneMaintenanceExecutableCount();
+                    if (maintenance > std::numeric_limits<std::size_t>::max() - captured_inventory.auxiliary_executable_count)
+                        throw std::overflow_error("ExpertOverlay CUDA maintenance owner inventory overflows");
+                    captured_inventory.auxiliary_executable_count += maintenance;
                 }
                 if(device.is_gpu() && endpoint_devices.contains(device) &&
                    rank_plan.runtime.moe_rebalance.mode==MoERebalanceRuntimeMode::Dynamic &&
@@ -1723,7 +1703,6 @@ namespace llaminar2
                     probe != gpu_service_device_bytes.end())
                 {
                     prepared_service_bytes = probe->second;
-                    const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
                     // The planning root may lack this rank's backend: price its
                     // adapter from the owner's declaration. A live native source
                     // means this process owns the device and compiles its backend.
@@ -1737,9 +1716,7 @@ namespace llaminar2
                     else
                         graph_objects = input.native_graph_objects;
                     const auto service_graph_bom = RetainedParticipantGraphExecutable::calibrationBOM(
-                        {.world_rank = rank_plan.rank, .device = DeviceId::cpu(),
-                         .total_bytes = host_total, .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)},
-                        resource, graph_objects);
+                        resourceFor(DeviceId::cpu()), resource, graph_objects);
                     for (const auto& contribution : service_graph_bom.resources())
                         physical_plan_builder.add(contribution);
                 }

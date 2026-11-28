@@ -27,8 +27,7 @@ namespace llaminar2::test
 inline size_t cpuPreparedStoreTestBytes(const TensorBase &tensor, std::optional<size_t> output_rows = std::nullopt)
 {
     // The ordinary CPU factory unwraps a physically presliced tensor before
-    // constructing the packer. Use that same source for shape and rotation;
-    // the wrapper's own rotation state need not equal its inner tensor's state.
+    // constructing the packer. Use that same source to obtain its exact shape.
     const TensorBase *packed_source = &tensor;
     if (const auto *slice = dynamic_cast<const TensorSlice *>(&tensor);
         slice && slice->metadata().inner_is_presliced)
@@ -39,7 +38,6 @@ inline size_t cpuPreparedStoreTestBytes(const TensorBase &tensor, std::optional<
     if (!format) return 0;
     if (packed_source->shape().size() != 2)
         throw std::invalid_argument("CPU prepared fixture requires a matrix with native packing metadata");
-    const auto footprint = cpu::native_quantised::preparedFootprintForFormat(*format, packed_source->activationRotation() != nullptr);
     const size_t rows = output_rows.value_or(packed_source->shape()[0]);
     if (rows == 0 || rows > packed_source->shape()[0])
         throw std::invalid_argument("CPU prepared fixture slice exceeds its actual source rows");
@@ -50,14 +48,16 @@ inline size_t cpuPreparedStoreTestBytes(const TensorBase &tensor, std::optional<
             throw std::overflow_error("CPU prepared fixture byte count overflows");
         return a * b;
     };
-    return CPUWeightStoragePlacement::local().requiredAllocationBytes<uint8_t>(
-        checked_product(checked_product(chunks, blocks), footprint.weight_bytes_per_n_chunk_k_block));
+    using namespace cpu::native_quantised;
+    const auto geometry = preparedBlockGeometry(preparedEncodingForSource(*format),
+        format->is_asymmetric, format->codebook_id, blocks);
+    return CPUWeightStoragePlacement::local().requiredAllocationBytes<uint8_t>(checked_product(chunks, geometry.rowBytes()));
 }
 /**
  * @brief Quote the actual serialized immediate preparation workspace from its production owner.
  * @param tensor Same native source used by the final allocation quote.
  * @param output_rows Exact useful physical slice rows, absent for the complete matrix.
- * @return Existing WeightLoadStaging peak; floating aliases and the separate rotated arm add none here.
+ * @return Existing WeightLoadStaging peak; floating aliases add none here.
  * @note Native fixture K tails use their complete source-group envelope solely
  * for scratch geometry. The producer groups those same blocks; final bytes and
  * useful source extents continue to use cpuPreparedStoreTestBytes unchanged.
@@ -68,7 +68,7 @@ inline size_t cpuPreparedStoreTestStagingBytes(const TensorBase& tensor,std::opt
     if(const auto* slice=dynamic_cast<const TensorSlice*>(&tensor);slice && slice->metadata().inner_is_presliced)
         source=slice->inner();
     const auto* native=IINT8Unpackable::fromTensor(source);
-    if(!native || !native->vnniFormatInfo() || source->activationRotation())return 0;
+    if(!native || !native->vnniFormatInfo())return 0;
     if(source->shape().size()!=2)throw std::invalid_argument("CPU fixture scratch requires an actual native matrix");
     const size_t rows=output_rows.value_or(source->shape()[0]);
     if(!rows || rows>source->shape()[0])throw std::invalid_argument("CPU fixture scratch has invalid physical slice rows");

@@ -35,7 +35,7 @@ namespace llaminar2
         std::uint64_t scales = 0u;
         std::uint64_t mins = 0u;
         std::uint64_t emins = 0u;
-        std::uint64_t device_staging = 0u;
+        std::uint64_t device_staging = 0u; ///< Zero selects the command-owned mapped wire for coded relays.
     };
 
     static_assert(offsetof(MappedTransferPackedWork, kind) == 0u);

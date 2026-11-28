@@ -48,6 +48,20 @@ namespace llaminar2
             size_t mins_bytes = 0;
             size_t emins_bytes = 0;
             size_t staging_bytes = 0;
+            /** Packed metadata layout (nativeQuantisedMetadataLayout); 0 = per-block planes. */
+            uint8_t metadata_layout = 0;
+        };
+
+        /**
+         * @brief Declares superblock-coded metadata for a planned matrix.
+         *
+         * The `scales` region then holds per-block source scale codes and the
+         * `mins` region per-superblock d/dmin words; there is no emins region.
+         */
+        struct SuperblockCodedMetadata
+        {
+            uint8_t physical_codebook = 0; ///< Codable execution codebook.
+            uint32_t superblock_phase = 0; ///< Phase of the first prepared K block (0..7).
         };
 
         WeightVRAMPool();
@@ -76,7 +90,8 @@ namespace llaminar2
         void planWeight(const std::string &name, int N, int K,
                         int payload_bytes_per_block, bool is_asymmetric, bool has_emins,
                         NativeQuantisedScalePlaneWidth scale_plane,
-                        size_t raw_gguf_bytes, ContiguousAlias alias = {0});
+                        size_t raw_gguf_bytes, ContiguousAlias alias = {0},
+                        std::optional<SuperblockCodedMetadata> coded = std::nullopt);
 
         /// Phase 1 (raw): Plan a floating-point weight that needs no repack.
         /// Allocates a contiguous region for raw bytes (H2D copy only, no repack).
@@ -159,6 +174,7 @@ namespace llaminar2
             size_t emins_bytes = 0;
             size_t staging_bytes = 0;
             int N = 0, K = 0;
+            uint8_t metadata_layout = 0;
         };
 
         static size_t alignUp(size_t offset, size_t alignment);

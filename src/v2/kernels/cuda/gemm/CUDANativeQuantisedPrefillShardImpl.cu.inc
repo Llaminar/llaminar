@@ -1109,9 +1109,7 @@ namespace
     bool launchNativeQuantisedTC_BK64(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         const int32_t *d_sums_A_block,
@@ -1147,7 +1145,7 @@ namespace
                             /*STAGES_=*/2,
                             /*CANONICAL_KPART=*/false, block_size, min_blocks,
                             Staging><<<grid, block, 0, cuda_stream>>>(
-              d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,
+              d_A_int8, d_payload, d_meta, d_C_fp32,
               d_scales_A_block, d_sums_A_block, d_C_existing, d_bias, M, N, K,
               alpha, beta,
               CanonicalM1PartitionGeometry{
@@ -1177,9 +1175,7 @@ namespace
     bool launchNativeQuantisedTC_BK64CanonicalKpart(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         const int32_t *d_sums_A_block,
@@ -1228,7 +1224,7 @@ namespace
                             /*STAGES_=*/2,
                             /*CANONICAL_KPART=*/true, block_size, min_blocks,
                             Staging><<<grid, block, 0, static_cast<cudaStream_t>(producer_stream)>>>(
-              d_A_int8, d_payload, d_scales, d_mins, d_emins, written.data(),
+              d_A_int8, d_payload, d_meta, written.data(),
               d_scales_A_block, d_sums_A_block, d_C_existing, d_bias, M, N, K,
               alpha, beta,
               CanonicalM1PartitionGeometry{
@@ -1671,9 +1667,7 @@ namespace
     bool launchGenericPrefillBK64(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         const int32_t *d_sums_A_block,
@@ -1736,7 +1730,7 @@ namespace
                     recordLastLaunchSelection(
                         -3, sk, true, false, use_exact_overlay);
                     return launchNativeQuantisedTC_BK256<128, 64, 4, 2>(
-                        d_A_int8, d_payload, d_scales, d_C_fp32,
+                        d_A_int8, d_payload, d_meta.primary, d_C_fp32,
                         d_scales_A_block, M, N, K, alpha, beta,
                         d_C_existing, d_bias, cuda_stream,
                         serial_m1_k_partitions,
@@ -1746,7 +1740,7 @@ namespace
                 recordLastLaunchSelection(
                     -2, sk, true, false, use_exact_overlay);
                 return launchNativeQuantisedTC_BK256<128, 128, 4, 4>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32,
+                    d_A_int8, d_payload, d_meta.primary, d_C_fp32,
                     d_scales_A_block, M, N, K, alpha, beta,
                     d_C_existing, d_bias, cuda_stream,
                     serial_m1_k_partitions,
@@ -1832,7 +1826,7 @@ namespace
                 use_exact_overlay, Staging);                                          \
             return launchNativeQuantisedTC_BK64CanonicalKpart<                             \
                 CB, BM_, BN_, WM_, WN_, Staging>(                                     \
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,                      \
+                d_A_int8, d_payload, d_meta,                      \
                 d_C_fp32, d_scales_A_block, d_sums_A_block,                           \
                 M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,              \
                 prefill_ctx, serial_m1_k_partitions);                                 \
@@ -1840,7 +1834,7 @@ namespace
         recordLastLaunchSelection(                                                    \
             static_cast<int>(tc.tile), 1, false, false, use_exact_overlay, Staging);  \
         return launchNativeQuantisedTC_BK64<CB, BM_, BN_, WM_, WN_, Staging>(              \
-            d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,                 \
+            d_A_int8, d_payload, d_meta, d_C_fp32,                 \
             d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta,                   \
             d_C_existing, d_bias, cuda_stream,                                        \
             serial_m1_k_partitions, serial_m1_uses_ordered_reducer);                  \
@@ -1876,6 +1870,31 @@ namespace
     template <uint8_t CB>
     inline constexpr bool kShardOwnsCodebook =
         prefillShardIndexForCodebook(CB) == LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD;
+
+    /**
+     * @brief Retain only the metadata planes the codebook's prefill consumes.
+     *
+     * Per-block codebooks keep the secondary plane only when their decoder
+     * requires it and the effective-minimum plane only for dual-scale
+     * asymmetric formats. Superblock-coded codebooks always keep their code and
+     * superblock planes and never carry an effective-minimum plane.
+     */
+    template <uint8_t CB>
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes prefillMetadataPlanes(
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes planes)
+    {
+        using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CB>;
+        if (planes.coded())
+            planes.emins = nullptr;
+        else
+        {
+            if constexpr (!Traits::requires_secondary_metadata)
+                planes.secondary = nullptr;
+            if constexpr (!Traits::is_dual_scale_asym)
+                planes.emins = nullptr;
+        }
+        return planes;
+    }
 
     /** @brief Launch an owned codebook; other codebooks are never instantiated here. */
     template <uint8_t CB, class... Args>
@@ -1932,9 +1951,7 @@ extern "C"
     bool LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_SYMBOL(cudaNativeQuantisedPrefill_launch)(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         const int32_t *d_sums_A_block,
@@ -1957,58 +1974,58 @@ extern "C"
         // --- Single-scale formats (no min correction) ---
         case 0:
             ok = ownedLaunchGenericPrefillBK64<0>(
-                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<0>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 4:
             ok = ownedLaunchGenericPrefillBK64<4>(
-                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<4>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case llaminar2::kNativeQuantisedMXFP4Codebook:
             ok = ownedLaunchGenericPrefillBK64<llaminar2::kNativeQuantisedMXFP4Codebook>(
-                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<llaminar2::kNativeQuantisedMXFP4Codebook>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
-            if (!d_mins) return false;
+            if (!d_meta.secondary) return false;
             ok = ownedLaunchGenericPrefillBK64<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 6: // Q5_0
             ok = ownedLaunchGenericPrefillBK64<6>(
-                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<6>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 11: // IQ3_S
-            if (!d_mins) return false; // Mandatory original source nibble.
+            if (!d_meta.secondary) return false; // Mandatory original source nibble.
             ok = ownedLaunchGenericPrefillBK64<11>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<11>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 12: // IQ3_XXS
             ok = ownedLaunchGenericPrefillBK64<12>(
-                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<12>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 15: // IQ2_XXS
             ok = ownedLaunchGenericPrefillBK64<15>(
-                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<15>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
@@ -2016,28 +2033,28 @@ extern "C"
 
         // --- Asymmetric formats (need min correction, d_mins required) ---
         case 5: // Q4_1 / Q4_K
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<5>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<5>(d_meta), d_C_fp32, d_scales_A_block,
                 d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 7: // Q5_1 / Q5_K
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<7>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<7>(d_meta), d_C_fp32, d_scales_A_block,
                 d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 16: // IQ1_S
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<16>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<16>(d_meta), d_C_fp32, d_scales_A_block,
                 d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
@@ -2045,55 +2062,55 @@ extern "C"
 
         // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
         case 8: // Q6_K
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<8>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<8>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 9: // Q3_K
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<9>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<9>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 10: // Q2_K (dual-scale + asymmetric via emins)
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<10>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<10>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 13: // IQ2_S
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<13>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<13>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 14: // IQ2_XS
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<14>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<14>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
         case 17: // IQ1_M (dual-scale + delta correction)
-            if (!d_mins)
+            if (!d_meta.secondary)
                 return false;
             ok = ownedLaunchGenericPrefillBK64<17>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<17>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
@@ -2102,21 +2119,10 @@ extern "C"
         // --- 8-bit format (no decode overhead, single-scale) ---
         case 19: // Q8_0
             ok = ownedLaunchGenericPrefillBK64<19>(
-                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                d_A_int8, d_payload, prefillMetadataPlanes<19>(d_meta), d_C_fp32, d_scales_A_block,
                 nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
-            break;
-
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
-            if (!d_mins || !d_sums_A_block)
-                return false;
-            ok = ownedLaunchGenericPrefillBK64<
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(
-                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32,
-                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta,
-                d_C_existing, d_bias, serial_m1_k_partitions,
-                serial_m1_uses_ordered_reducer, cuda_stream, prefill_ctx);
             break;
 
         default:
@@ -2182,8 +2188,6 @@ extern "C"
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(16);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(17);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(19);
-            QUERY_LAST_DENSE_PREFILL_CODEBOOK(
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
         default:
             return false;
         }
@@ -2257,8 +2261,6 @@ extern "C"
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(16);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(17);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(19);
-            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
         default:
             return false;
         }

@@ -29,9 +29,8 @@ enum class NativeWmmaActivationScale { Blockwise, WholeRow };
  * @tparam ScaleMode Prepared activation scale ownership and exact application point.
  * @param a Row-major signed activations [M,K].
  * @param payload Block-major compact weights [K/32,N,payload_bytes].
- * @param scales Primary source scale words [K/32,N].
- * @param aux Secondary source factors/minima when the decoder requires them.
- * @param emins Packed half minima for the dual-scale asymmetric decoder.
+ * @param meta Block metadata [K/32,N]: per-block primary/secondary/Q2_K minima
+ *        planes, or superblock-coded codes plus per-superblock d/dmin words.
  * @param output Unique-writer FP32 output [M,N].
  * @param row_scales Whole-row scales, used only without block_scales.
  * @param block_scales Optional row-major activation scales [M,K/32].
@@ -43,8 +42,7 @@ enum class NativeWmmaActivationScale { Blockwise, WholeRow };
 template <NativeQuantisedGemmFormat FMT, int BM, int BN, NativeWmmaActivationScale ScaleMode>
 __global__ __launch_bounds__(256, 1) void native_quantised_wmma_gemm(
     const int8_t *__restrict__ a, const uint8_t *__restrict__ payload,
-    const uint16_t *__restrict__ scales, const uint16_t *__restrict__ aux,
-    const uint32_t *__restrict__ emins, float *__restrict__ output,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes meta, float *__restrict__ output,
     const float *__restrict__ row_scales, const float *__restrict__ block_scales,
     int M, int N, int K, int serial_partitions)
 {
@@ -106,9 +104,12 @@ __global__ __launch_bounds__(256, 1) void native_quantised_wmma_gemm(
                 // loads ahead of decode and LDS stores hides their latency
                 // without changing source scale conversion or arithmetic.
                 load_payload<Traits::payload_bytes>(payload + index * Traits::payload_bytes, raw);
-                primary = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scales, index);
-                if constexpr (Traits::needs_aux_compute) secondary = aux[index];
-                if constexpr (Traits::is_dual_scale_asym) minimum_pair = emins[index];
+                // One metadata authority for per-block and superblock-coded matrices.
+                const auto words = ::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(FMT)>(
+                    meta, static_cast<uint32_t>(kb), static_cast<uint32_t>(column), static_cast<uint32_t>(N));
+                primary = words.primary;
+                if constexpr (Traits::needs_aux_compute) secondary = words.secondary;
+                if constexpr (Traits::is_dual_scale_asym) minimum_pair = words.emin;
             }
             int decoded[8];
             decode_block<FMT>(raw, decoded);

@@ -153,8 +153,17 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing,int p
     const char* pci=std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_PCI");
     const std::array<std::string_view,1> requested{pci?pci:""};
     shape.grouped_matrix_case=item.name;
-    expectGroupedM4Program(shape);
     shape.grouped_schedule=schedule;
+    if(schedule==GroupedFFNFixtureSchedule::SourceMatrix)
+        expectGroupedM4Program(shape);
+    else {
+        // Both native architecture schedules require the closed all-format
+        // graph. Case-specific checks below refine the gate symbol, not whether
+        // the production finalizer is expected to replace the staged region.
+        shape.grouped_matrix_program=GroupedM4FixtureProgram::AllFormats;
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGate";
+        shape.grouped_matrix_symbol_present=true;
+    }
     if(fixedQ51Down) {
         require(item.fixed_down_pitch==128 || item.fixed_down_pitch==256,"independent supported Q5_1 Down fixture pitch");
         shape.expected_q51_down_pitch=item.fixed_down_pitch;
@@ -184,10 +193,6 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing,int p
         nativeGate="groupedFFNFormatProgramGateILj"+std::to_string(shape.expected_grouped_decoder_family)+
             "ELin1ELi0ELi1ELb0EE";
         shape.grouped_matrix_symbol=nativeGate;
-    }
-    if(schedule!=GroupedFFNFixtureSchedule::SourceMatrix) {
-        shape.grouped_matrix_program=GroupedM4FixtureProgram::AllFormats;
-        shape.grouped_matrix_symbol_present=true;
     }
     shape.grouped_matrix_timing=timing;
     shape.deferred_frontier_history=deferred;

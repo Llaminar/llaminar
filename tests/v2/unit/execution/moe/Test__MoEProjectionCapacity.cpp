@@ -9,6 +9,8 @@
  * allocating a backend or treating a diagnostic byte counter as an authority.
  */
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
+#include "config/OrchestrationConfig.h"
+#include "planning/MoEOverlayPlanningInputs.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -44,6 +46,15 @@ namespace llaminar2
                 format.native_quantised.codebook_id, format.native_quantised.is_superblock);
             const auto packing = reusableDeviceVnniAllocationFormat(*source);
             const auto blocks = std::size_t(n) * (k / 32);
+            if (cpu::native_quantised::migrationUsesSuperblockCodes(*source))
+            {
+                namespace sb = native_quantised_superblock;
+                const auto book = canonicalDeviceVnniCodebookId(*source);
+                const auto code_bits = blocks * sb::superblockCodePlaneBits(book);
+                const auto headers = std::size_t(n) * ((k / 32 + 7) / 8) * sb::superblockFieldBytes(book);
+                const auto code_bytes = code_bits ? (code_bits + 7) / 8 + sb::kSuperblockCodePlanePadBytes : 0u;
+                return aligned(blocks * source->payload_bytes) + aligned(code_bytes) + aligned(headers);
+            }
             // Live slots carry the physical codebook's own primary plane (1 B for native MXFP4).
             const auto primary = blocks * nativeQuantisedScalePlaneBytes(canonicalDeviceVnniCodebookId(*source));
             return aligned(blocks * packing.payload_bytes_per_block) + aligned(primary) +
@@ -142,7 +153,17 @@ namespace llaminar2
                 EXPECT_EQ(resource->shadowBytes(), 0u);
                 EXPECT_EQ(resource->usedBytes(), expected + 4096u);
                 if (experts % degree == 0)
-                    EXPECT_EQ(resource->usedBytes(), control.resource(std::to_string(index))->usedBytes());
+                {
+                    std::size_t expected_control = 4096u;
+                    for (const auto &layer : source)
+                    {
+                        const auto i = layer.projections.front().K;
+                        expected_control += owned * (2u * gpuBytes(i, 768, format) + gpuBytes(768, i, format));
+                    }
+                    // Coded down slices align their own planes; equal logical
+                    // ownership does not imply equal physical padding.
+                    EXPECT_EQ(control.resource(std::to_string(index))->usedBytes(), expected_control);
+                }
                 // This includes zero gate/up owners: the immutable down bank
                 // must still be admitted in full on each participant.
                 input.physical_budgets[index] = input.physical_budgets[index].withAvailableBytes(expected + 4096u);
@@ -175,7 +196,7 @@ namespace llaminar2
             const auto input = MoEOverlayCapacityAdmission::buildResolverInput(p, 24, source, budgets(p), policy);
             const auto profile = DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(source, DeviceMoEProjectionSet::GateUp);
             const auto whole = DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(source);
-            ASSERT_EQ(profile.allocation_specs.size(), 2u);
+            ASSERT_EQ(profile.families.front().projections.size(), 2u);
             EXPECT_LT(profile.max_wire_payload_bytes, whole.max_wire_payload_bytes);
             const auto directory = DeviceMoETransferSlotDirectory::allocationBOM(slots, profile);
             const auto workspace = DeviceMoERebalanceWorkspaceContract::allocationBytes({
@@ -194,6 +215,45 @@ namespace llaminar2
     }
 
     /** @brief Unsupported topologies and source geometry fail before any quota is certified. */
+    /** @brief The model-free native candidate admits the same family bytes on both accelerators. */
+    TEST(MoEProjectionCapacity, MixedSlotFamiliesUseOnePlanningQuote)
+    {
+        using Directory = DeviceMoETransferSlotDirectory;
+        const auto quantized = [](const NativeQuantisedFormatInfo &source) {
+            return ExpertWeightFormat::nativeQuantised({.codebook_id = source.codebook_id,
+                .is_superblock = source.is_superblock, .present = true});
+        };
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            auto placement = plan(backend, 2, RoutedExpertComputePolicy::Apportioned);
+            const OrchestrationConfig config;
+            const std::array mixed{quantized(native_quantised_formats::IQ3_XXS),
+                quantized(native_quantised_formats::Q4_K), quantized(native_quantised_formats::Q8_0),
+                ExpertWeightFormat::floating(TensorType::FP16)};
+            for (const bool homogeneous : {false, true})
+            {
+                std::vector<MoEOverlayLayerWeightManifest> model;
+                for (int layer = 0; layer < static_cast<int>(mixed.size()); ++layer)
+                {
+                    model.push_back(manifest(mixed[homogeneous ? 0 : layer], true).front());
+                    model.back().layer_idx = layer;
+                }
+                const auto policy = resolveMoEOverlayCapacityAdmissionPolicy(placement, config, 1, model.size(), 24);
+                ASSERT_TRUE(policy.usesDeviceTransferDirectory());
+                const auto profile = Directory::profileForLayerWeightManifest(model);
+                const auto quote = Directory::allocationBOM(policy.device_transfer_directory_capacity, profile);
+                ASSERT_EQ(quote.families.size(), homogeneous ? 1u : 4u);
+                const auto input = MoEOverlayCapacityAdmission::buildResolverInput(placement, 24, model,
+                    budgets(placement), policy);
+                for (const auto &budget : input.physical_budgets)
+                    EXPECT_EQ(budget.certificate().bom().bytes(PhysicalMemoryOwner::ExpertMigrationStaging), quote.total_bytes);
+                const auto &workspace = *policy.device_rebalance_workspace_capacity;
+                EXPECT_EQ(workspace.localHistogramWords(),
+                    workspace.histogramLayerCount() * (2u * workspace.num_experts + 1u));
+            }
+        }
+    }
+
     TEST(MoEProjectionCapacity, RejectsUnimplementedOrInconsistentProjectionTopologies)
     {
         const auto source = manifest(ExpertWeightFormat::floating(TensorType::FP32));

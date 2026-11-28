@@ -9,6 +9,8 @@
  */
 
 #include "execution/moe/CpuExpertSlotPool.h"
+#include "execution/moe/GpuExpertSlotPool.h"
+#include "execution/moe/DeviceMoETransferSlotDirectory.h"
 #include "backends/BackendManager.h"
 #include "execution/moe/MoEOverlayCPUHostMaintenance.h"
 #include "loaders/ModelContext.h"
@@ -293,28 +295,19 @@ namespace
             }
             if (const auto *packed = projection.engine->exportCPUNativeQuantisedPackedWeights())
             {
-                // Real prepared experts carry admitted source coefficients:
-                // clamp the seeded words into their encoding's domain, then
-                // admit the publication like a producer does.
-                const std::uint16_t permitted = packed->usesIQ3SExpandedSourceScale() ? 15
-                    : packed->usesNibbleLUTSourceScale() ? 63
-                    : packed->usesCompactMultiScale() && packed->codebook_id == 13 ? 255 : 0xffff;
-                if (permitted != 0xffff)
-                {
-                    const std::size_t units = std::size_t(packed->N_padded / 64) * std::size_t(packed->blocks_per_row);
-                    const std::size_t secondary = std::size_t(packed->data_stride) +
-                        (packed->usesInlineCompensation() ? 256u : 128u);
-                    for (std::size_t unit = 0; unit < units; ++unit)
-                        for (std::size_t column = 0; column < 64; ++column)
+                // Seed MXFP4's single-byte exponent plane inside its admitted
+                // range, including inactive columns that SIMD may read. Coded
+                // superblocks have no inline secondary words to normalize.
+                using namespace cpu::native_quantised;
+                if (packed->scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+                    for (int chunk = 0; chunk < packed->N_padded / 64; ++chunk)
+                        for (int block = 0; block < packed->blocks_per_row; ++block)
                         {
-                            auto *word = projection.destination_bytes.data() +
-                                unit * std::size_t(packed->interleaved_block_stride) + secondary + column * 2;
-                            std::uint16_t value = 0;
-                            std::memcpy(&value, word, sizeof(value));
-                            value &= permitted;
-                            std::memcpy(word, &value, sizeof(value));
+                            auto *exponents = projection.destination_bytes.data() +
+                                packed->geometry().blockOffset(chunk, block) + packed->data_stride;
+                            for (int column = 0; column < 64; ++column)
+                                exponents[column] = 112 + (exponents[column] % 32);
                         }
-                }
                 projection.engine->admitCPUNativeQuantisedPublication();
             }
             switch (projection.projection)
@@ -514,15 +507,23 @@ namespace
                 // Native roots are N-padded for SIMD; only [0,N) columns
                 // execute or move. Inspect every live plane independently of
                 // the production copier, including comp/min/grid fields.
-                if(packed->N<=0 || packed->K<=0 || packed->K%32 || packed->interleaved_block_stride%64)
+                if(packed->N<=0 || packed->K<=0 || packed->K%32 || packed->preparedBytes() != packed->native_interleaved.size())
                     throw std::runtime_error("Native oracle received invalid physical geometry");
                 ExpertTierWeightCPUStorageLayout layout;
                 layout.cpu_K=packed->K;layout.cpu_data_stride=packed->data_stride;
                 layout.cpu_block_stride=packed->interleaved_block_stride;layout.cpu_encoding=packed->encoding;
+                layout.cpu_codebook_id=packed->codebook_id;layout.cpu_is_superblock=packed->is_superblock;
+                layout.cpu_is_asymmetric=packed->is_asymmetric;
                 const std::span<const uint8_t> root(packed->native_interleaved.data(),packed->native_interleaved.size());
                 for(int n=0;n<packed->N;++n)for(int kb=0;kb<packed->K/32;++kb) {
-                    const auto column=test::encodedTierColumn(root,layout,size_t(n),size_t(kb));
-                    if(column.size()!=size_t(packed->interleaved_block_stride)/64)
+                    auto column=test::encodedTierColumn(root,layout,size_t(n),size_t(kb));
+                    if (layout.coded())
+                    {
+                        const auto field = native_quantised_superblock::superblockFieldBytes(layout.codedCodebook());
+                        if (!packed->geometry().closesSuperblock(kb))
+                            column.resize(column.size() - field); // Headers are live once per touched superblock.
+                    }
+                    else if (column.size() != size_t(packed->interleaved_block_stride) / 64)
                         throw std::runtime_error("Independent native oracle omitted a live encoded field");
                     result[projection].insert(result[projection].end(),column.begin(),column.end());
                 }
@@ -1663,6 +1664,76 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     }
 }
 
+/** @test Recycle installed GPU residents using the family's exact allocation identity.
+ * The descriptors borrow aligned backing here, without requiring a GPU context.
+ * The companion CPU fabric test runs actual resident preparation and slot recycling.
+ */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, InitialGpuSlotAdoptionUsesExactFamily)
+{
+    using Pool = GpuExpertSlotPool;
+    namespace sb = native_quantised_superblock;
+    constexpr int N = 64, K = 256;
+    alignas(8) std::array<uint8_t, N * K> payload{}, primary{}, secondary{}, effective{};
+    unsigned coded_formats = 0, per_block_formats = 0;
+    for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+    {
+        SCOPED_TRACE(entry.quant_type);
+        const auto &source = *entry.metadata;
+        const auto format = ExpertWeightFormat::nativeQuantised({source.codebook_id, source.is_superblock, true});
+        const auto exec = canonicalDeviceVnniFormat(source);
+        const bool coded = cpu::native_quantised::migrationUsesSuperblockCodes(source);
+        coded ? ++coded_formats : ++per_block_formats;
+        for (const auto phase : {uint8_t{0}, uint8_t{3}})
+        {
+            if (!coded && phase) continue;
+            auto family = Pool::migrationProjectionSpec("gate", N, K, format, phase);
+            const auto info = gpuPreparedWeightPoolAllocation(source, GPUPreparedWeightPoolLayout::MigrationReusable);
+            const bool in_payload = coded && sb::superblockCodeInPayload(exec.codebook_id);
+            const auto layout = coded ? nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, phase) : uint8_t{0};
+            const auto resident = makeGpuExpertPackedDescriptor({
+                .payload = payload.data(), .scales = in_payload ? payload.data() : primary.data(),
+                .mins = info.has_mins ? secondary.data() : nullptr, .emins = info.has_emins ? effective.data() : nullptr,
+                .n = N, .k = K, .blocks_per_row = K / 32, .codebook_id = exec.codebook_id,
+                .allocation_payload_bytes_per_block = info.payload_bytes_per_block,
+                .allocation_has_mins = uint8_t(info.has_mins), .allocation_has_emins = uint8_t(info.has_emins),
+                .metadata_layout = layout}, exec.payload_bytes_per_block, exec.is_asymmetric, exec.has_emins);
+            const auto adopted = Pool::adoptResidentProjection(family, resident);
+            EXPECT_EQ(adopted.spec, family);
+            EXPECT_EQ(adopted.slot.metadata_layout, layout);
+            EXPECT_EQ(adopted.slot.payload_bytes, resident.allocationPayloadBytes());
+            EXPECT_EQ(adopted.slot.mins_bytes, resident.allocationMinsBytes());
+            EXPECT_EQ(adopted.slot.d_native_quantised_payload, payload.data());
+            EXPECT_EQ(adopted.slot.d_native_quantised_scales, resident.ptrs.d_scales);
+            auto wrong = resident;
+            if (coded)
+            {
+                wrong.metadata_layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, (phase + 1) % 8);
+                EXPECT_THROW((void)Pool::adoptResidentProjection(family, wrong), std::invalid_argument);
+                wrong = resident;
+                wrong.allocation_has_mins = false; // A legacy symmetric slot cannot hold the coded header.
+            }
+            else
+                wrong.allocation_payload_bytes_per_block = 0; // Immutable, non-recyclable packed root.
+            EXPECT_THROW((void)Pool::adoptResidentProjection(family, wrong), std::invalid_argument);
+        }
+    }
+    EXPECT_EQ(coded_formats, 13u);
+    EXPECT_EQ(coded_formats + per_block_formats, native_quantised_formats::kAllSourceFormats.size());
+    for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+    {
+        constexpr int Width = 32;
+        const auto format = ExpertWeightFormat::floating(type);
+        auto family = Pool::migrationProjectionSpec("down", N, Width, format, 0);
+        const ContiguousFloatingPointWeightDescriptor resident{
+            payload.data(), type, N, Width, N * Width * format.floatingElementBytes()};
+        const auto adopted = Pool::adoptResidentProjection(family, resident);
+        EXPECT_EQ(adopted.spec, family);
+        EXPECT_EQ(adopted.slot.payload_bytes, resident.bytes);
+        EXPECT_EQ(adopted.slot.d_native_quantised_payload, payload.data());
+        EXPECT_EQ(adopted.slot.metadata_layout, 0u);
+    }
+}
+
 /**
  * @brief Every prepared format moves and seals at global stage coordinates.
  *
@@ -1991,6 +2062,51 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PreparedGPUServiceMissingResidentC
     }
 }
 
+/** @test A partial MXFP4 slot must seal after a live-only transfer, without repairing invalid live exponents. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, MXFP4PublicationNormalizesOnlyPaddingExponents)
+{
+    using namespace cpu::native_quantised;
+    const auto &source = native_quantised_formats::MXFP4;
+    const auto expert = makeSourceExpert(0, 0, 19, ExpertWeightFormat::nativeQuantised({
+        .codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true}));
+    const auto engine = expert.gate();
+    const auto *packed = engine->exportCPUNativeQuantisedPackedWeights();
+    ASSERT_NE(packed, nullptr);
+    ASSERT_EQ(packed->scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
+    ASSERT_EQ(packed->N, 32);
+    ASSERT_GT(packed->blocks_per_row, 1);
+    const auto expected = livePreparedBytes(expert);
+    auto retired = engine->beginRetiredCPUNativeQuantisedRewrite();
+    ASSERT_FALSE(retired.empty());
+    EXPECT_FALSE(packed->publicationSealed());
+    for (int b = 0; b < packed->blocks_per_row; ++b)
+    {
+        const auto offset = packed->geometry().blockOffset(0, b);
+        // A compact transfer never writes this slot's padding. Leave a
+        // payload canary there too, proving that the repair touches only the
+        // actual field scanned at admission, not the whole padded column.
+        retired[offset + packed->N * 4] = 0x5a;
+        auto *plane = retired.data() + offset + packed->data_stride;
+        std::fill(plane + packed->N, plane + 64, std::uint8_t{0xff});
+    }
+    auto &live = retired[packed->data_stride];
+    const auto saved = live;
+    live = 0xff;
+    EXPECT_THROW(engine->admitCPUNativeQuantisedPublication(), std::invalid_argument);
+    EXPECT_FALSE(packed->publicationSealed());
+    EXPECT_EQ(live, 0xff);
+    live = saved;
+    ASSERT_NO_THROW(engine->admitCPUNativeQuantisedPublication());
+    EXPECT_EQ(livePreparedBytes(expert), expected);
+    const auto view = packed->readView();
+    for (int b = 0; b < packed->blocks_per_row; ++b)
+    {
+        const auto *plane = view.admittedE8M0Scales(0, b);
+        EXPECT_TRUE(std::all_of(plane + packed->N, plane + 64, [](auto e) { return e == 0; }));
+        EXPECT_EQ(view.bytes()[view.geometry().blockOffset(0, b) + packed->N * 4], 0x5a);
+    }
+}
+
 /** @test The independent equality oracle ignores only inactive padding and detects every live field class. */
 TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirtyPaddingAndEveryEncodedField)
 {
@@ -2005,9 +2121,9 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         auto engine=changed.gate();
         const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_TRUE(packed);
         ASSERT_EQ(packed->N,32);ASSERT_GE(packed->N_padded,64);
-        // This source fixture has never been published. Its actual slot owner
-        // grants the retired-storage mutation API, not a const-cast/live write.
-        auto bytes=engine->exportRetiredCPUNativeQuantisedStorage();ASSERT_FALSE(bytes.empty());
+        // This source fixture has no readers. Its slot owner opens an unsealed
+        // rewrite generation; no const-cast or mutation of a published view.
+        auto bytes=engine->beginRetiredCPUNativeQuantisedRewrite();ASSERT_FALSE(bytes.empty());
         const size_t inactive_data_byte=size_t(packed->N)*4;
         const auto before=bytes[inactive_data_byte];bytes[inactive_data_byte]^=0x80;
         EXPECT_NE(bytes[inactive_data_byte],before);
@@ -2019,10 +2135,23 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         if(q6)for(size_t group=0;group<8;++group) {
             fields.push_back(1024+group*64);fields.push_back(1024+group*64+8);
         }
-        const bool compact=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
-        for(size_t plane=0;plane<(compact?2:(size_t(packed->interleaved_block_stride)-packed->data_stride)/128);++plane)
-            for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
-        if(compact)for(size_t byte=0;byte<4;++byte)fields.push_back(packed->data_stride+256+byte);
+        if (cpu::native_quantised::preparedSuperblockCoded(packed->encoding))
+        {
+            const auto book = canonicalDeviceVnniCodebookId(*format.metadata);
+            const auto planes = expertTierCodedPlanes(book);
+            if (planes.low_bits)
+                fields.push_back(packed->data_stride);
+            if (planes.high_bits)
+                fields.push_back(packed->data_stride + planes.bytes(64, planes.low_bits));
+            const auto header = packed->geometry().headerOffset(0, 0);
+            for (unsigned byte = 0; byte < native_quantised_superblock::superblockFieldBytes(book); ++byte)
+                fields.push_back(header + byte);
+        }
+        else if (packed->scaleEncoding() == cpu::native_quantised::CPUNativeQuantisedScaleEncoding::E8M0)
+            fields.push_back(packed->data_stride);
+        else
+            for(size_t plane=0;plane<(size_t(packed->interleaved_block_stride)-packed->data_stride)/128;++plane)
+                for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
         for(const size_t byte:fields) {
             SCOPED_TRACE(byte);const auto saved=bytes[byte];bytes[byte]^=1;
             EXPECT_NE(livePreparedBytes(changed),expected); // All data/comp/scale/min/grid classes must contribute.
@@ -2032,7 +2161,16 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         for(size_t role=0;role<3;++role) {
             const auto& engine=role==0?original.gate():role==1?original.up():original.down();
             const auto* layout=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_TRUE(layout);
-            EXPECT_EQ(expected[role].size(),size_t(layout->N)*(layout->K/32)*(layout->interleaved_block_stride/64));
+            if (cpu::native_quantised::preparedSuperblockCoded(layout->encoding))
+            {
+                const auto book = canonicalDeviceVnniCodebookId(*format.metadata);
+                const auto per_block = layout->payload_bytes + (native_quantised_superblock::superblockCodePlaneBits(book) + 7) / 8;
+                const auto field = native_quantised_superblock::superblockFieldBytes(book);
+                EXPECT_EQ(expected[role].size(), size_t(layout->N) *
+                    (layout->blocks_per_row * per_block + layout->geometry().superblocksPerRow() * field));
+            }
+            else
+                EXPECT_EQ(expected[role].size(),size_t(layout->N)*(layout->K/32)*(layout->interleaved_block_stride/64));
         }
     }
 }

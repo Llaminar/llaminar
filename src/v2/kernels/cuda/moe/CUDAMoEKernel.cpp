@@ -42,6 +42,7 @@
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
+#include "../../../tensors/NativeQuantisedScalePlane.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
@@ -962,7 +963,6 @@ namespace
         case 16:
         case 17:
         case 19:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -984,7 +984,6 @@ namespace
         case 14:
         case 16:
         case 17:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -1004,22 +1003,16 @@ namespace
     }
 
     /**
-     * @brief Validate source provenance against the physical execution format.
-     *
-     * Expanded INT8+minimum bytes are shared by several compact asymmetric
-     * codebooks. A descriptor using execution codebook 23 therefore cannot
-     * select an exact arithmetic contract unless the producer also publishes
-     * its source identity. Legacy immutable descriptors remain accepted for
-     * self-describing execution formats, while any supplied provenance is
-     * checked against the central NativeQuantised catalog.
+     * @brief Authenticate the physical decoder against original GGUF provenance.
+     * IQ4_XS cannot infer its source policy from the physical decoder alone;
+     * other immutable descriptors may carry a self-describing decoder.
      */
     bool validateCudaGroupedSourceIdentity(
         const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
-                   desc.codebook_id != llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook;
         }
         const auto *source =
             llaminar2::native_quantised_formats::forSourceIdentity(
@@ -1112,6 +1105,25 @@ namespace
         return true;
     }
 
+    /**
+     * @brief Whether a grouped descriptor carries every metadata plane its representation reads.
+     *
+     * A superblock-coded matrix keeps its superblock plane in `mins` and has no
+     * emins plane (Q2_K's effective minima are reconstructed from the code);
+     * per-block matrices need the codebook's secondary and emins planes. Same
+     * rule as the device-side grouped validators.
+     */
+    bool cudaGroupedDescMetadataPlanesPresent(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
+    {
+        if (llaminar2::nativeQuantisedLayoutRepresentation(desc.metadata_layout) ==
+            llaminar2::NativeQuantisedMetadataRepresentation::SuperblockCoded)
+            return llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+                   desc.mins != nullptr && desc.emins == nullptr;
+        return desc.metadata_layout == 0 &&
+               (!cudaGroupedPrefillRequiresMins(desc.codebook_id) || desc.mins != nullptr) &&
+               (!cudaGroupedPrefillRequiresEmins(desc.codebook_id) || desc.emins != nullptr);
+    }
+
     bool validateCudaGroupedDesc(
         const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int n,
@@ -1123,8 +1135,7 @@ namespace
                desc.k == k &&
                desc.blocks_per_row == static_cast<uint32_t>(k / 32) &&
                desc.codebook_id == codebook_id &&
-               (!cudaGroupedPrefillRequiresMins(codebook_id) || desc.mins != nullptr) &&
-               (!cudaGroupedPrefillRequiresEmins(codebook_id) || desc.emins != nullptr);
+               cudaGroupedDescMetadataPlanesPresent(desc);
     }
 
     bool validateCudaGroupedDescShape(
@@ -1138,8 +1149,7 @@ namespace
                desc.blocks_per_row == static_cast<uint32_t>(k / 32) &&
                validateCudaGroupedSourceIdentity(desc) &&
                cudaGroupedPrefillSupportsCodebook(desc.codebook_id) &&
-               (!cudaGroupedPrefillRequiresMins(desc.codebook_id) || desc.mins != nullptr) &&
-               (!cudaGroupedPrefillRequiresEmins(desc.codebook_id) || desc.emins != nullptr);
+               cudaGroupedDescMetadataPlanesPresent(desc);
     }
 
     bool isBlankGroupedDesc(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
@@ -6380,7 +6390,7 @@ namespace llaminar2
         uint32_t local_transfer_slot_count,
         const DeviceMoERebalanceConfig &config,
         DeviceMoERebalanceApplyStatus *status,
-        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceArrivalScratch *arrival_scratch,
         uint32_t command_buffer_count)
     {
         if (!validateDeviceMoERebalanceConfig(config))
@@ -6389,7 +6399,7 @@ namespace llaminar2
             return false;
         }
         if (!plan_entries || (!plan_count && !command_header) ||
-            !gathered_payload || !local_transfer_slots || !status ||
+            !gathered_payload || !local_transfer_slots || !status || !arrival_scratch ||
             plan_capacity == 0 || local_payload_slot_count == 0 ||
             payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
         {
@@ -6414,7 +6424,7 @@ namespace llaminar2
             local_transfer_slot_count,
             &config,
             status,
-            controller_state,
+            arrival_scratch,
             command_buffer_count,
             device_ordinal_,
             stream);

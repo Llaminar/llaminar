@@ -42,9 +42,9 @@ namespace llaminar2
         if (!native || k % (native->is_superblock ? 256u : 32u))
             throw std::invalid_argument("CPU preparation requires a supported, block-aligned source format");
         using namespace cpu::native_quantised;
-        const auto footprint = preparedFootprintForFormat(*native);
-        const size_t units = multiply((n + 63) / 64, k / 32);
-        const size_t interleaved = multiply(units, footprint.weight_bytes_per_n_chunk_k_block);
+        const auto geometry = preparedBlockGeometry(preparedEncodingForSource(*native),
+            native->is_asymmetric, native->codebook_id, k / 32);
+        const auto interleaved = multiply((n + 63) / 64, geometry.rowBytes());
         const auto retained=CPUStoragePlacement::local().physicalBytes<uint8_t>(interleaved);
         // The immediate path borrows the caller's original native tensor and
         // uses the same bounded append workspace for every source codebook.

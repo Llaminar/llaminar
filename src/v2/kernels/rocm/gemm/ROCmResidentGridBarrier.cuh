@@ -32,14 +32,19 @@ struct ResidentGridBarrierFor {
      * retire that prior invocation through its exact stream/event edge. Within
      * an invocation each admitted slot is used exactly once.
      */
-    __device__ __forceinline__ void sync()
+    __device__ __forceinline__ void sync(){sync(threadIdx.x==0);}
+    /**
+     * @brief Same join with the caller's precomputed CTA-leader predicate.
+     * @param leader Whether this lane is thread 0 of its workgroup.
+     */
+    __device__ __forceinline__ void sync(bool leader)
     {
         if(!words||phase>=Layout::phases)__builtin_trap();
         auto* arrival=words+Layout::words_per_phase*phase;
         auto* generation=arrival+1;
         __builtin_amdgcn_fence(__ATOMIC_RELEASE,"agent");
         __syncthreads();
-        if(threadIdx.x==0)
+        if(leader)
         {
             const auto before=__hip_atomic_load(generation,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT);
             const auto ticket=__hip_atomic_fetch_add(arrival,1u,__ATOMIC_RELEASE,__HIP_MEMORY_SCOPE_AGENT);

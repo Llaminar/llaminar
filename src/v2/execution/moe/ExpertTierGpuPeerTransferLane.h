@@ -240,7 +240,10 @@ namespace llaminar2
             const GPUExpertPointers &destination,
             ExpertTierGpuBlobChunkProtocol& protocol,
             const ExpertTierSourceReadiness &source_readiness,
-            std::string *error) noexcept;
+            std::string *error,
+            const GpuExpertPackedDescriptor *coded_source = nullptr,
+            const GpuExpertPackedDescriptor *coded_destination = nullptr,
+            const ExpertTierWeightProjectionIntersection *coded_rectangle = nullptr) noexcept;
 
         /** Release resources through the destination runtime without waiting. */
         void releaseQuiescentResources() noexcept;

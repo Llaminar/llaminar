@@ -4,6 +4,11 @@ This investigation qualifies explicit gfx1100 candidates. Automatic dispatch
 still selects the installed Dot4 implementation. A row threshold is an experiment,
 not an installed performance claim.
 
+All results below involving promoted physical decoder 23 are historical.
+Current expert-tier promotion preserves the canonical source layout and no
+longer admits decoder 23. The original counts, timings and receipts are retained
+as evidence for their original producer, not as current qualification.
+
 ## Ownership and arithmetic
 
 `MoEGroupedDotAdmission` binds projection role, original output width, physical

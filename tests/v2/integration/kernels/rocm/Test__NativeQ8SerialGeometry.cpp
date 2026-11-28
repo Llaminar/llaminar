@@ -17,6 +17,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedSerialGeometry.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -42,7 +43,8 @@
 
 /** @brief Existing source-aware production serial entrypoint; no test implementation. */
 extern "C" bool rocmGemv_native_quantised_fp32_with_policy(
-    const int8_t *, const uint8_t *, const void *, const void *, const void *,
+    const int8_t *, const uint8_t *,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float *, const float *, float *, int, int, uint8_t, uint8_t, int, void *, const float *);
 /** @brief Existing thread-local arithmetic-width lifecycle, separate from physical N. */
 extern "C" void rocmGemv_native_quantised_set_serial_partition_n(int);
@@ -321,8 +323,7 @@ void proveShape(DeviceId device, void *stream, int n, int k,
             require(hipMemsetAsync(partials->gpu_data_ptr(), 0xff, partial_live * sizeof(float),
                 static_cast<hipStream_t>(stream)) == hipSuccess, "native-Q8 captured partial poison");
         const bool enqueued = rocmGemv_native_quantised_fp32_with_policy(
-            static_cast<const int8_t *>(activations->gpu_data_ptr()), descriptor.payload,
-            descriptor.scales, descriptor.mins, descriptor.emins,
+            static_cast<const int8_t *>(activations->gpu_data_ptr()), descriptor.payload, ::llaminar2::native_quantised_scale::metadataPlanes(descriptor),
             static_cast<float *>(output->gpu_data_ptr()), nullptr,
             static_cast<float *>(partials->gpu_data_ptr()), n, k, descriptor.codebook_id,
             descriptor.arithmeticPolicyCodebookId(), device.ordinal, stream,
@@ -445,11 +446,11 @@ TEST(NativeQ8SerialGeometry, CapturedTailsAndEmptyPartitionsAreByteExact)
         {
             ScopedNativeQ8SerialGeometry scope(admissions[0]);
             EXPECT_THROW((void)rocmGemv_native_quantised_fp32_with_policy(
-                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(nullptr, nullptr, nullptr), nullptr, nullptr, nullptr,
                 1, 640, 5, 5, 0, stream, nullptr), std::logic_error);
             EXPECT_FALSE(lastNativeQ8SerialLaunch().has_value());
             EXPECT_THROW((void)rocmGemv_native_quantised_fp32_with_policy(
-                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(nullptr, nullptr, nullptr), nullptr, nullptr, nullptr,
                 1, 640, 19, 19, 1, stream, nullptr), std::logic_error);
             EXPECT_FALSE(lastNativeQ8SerialLaunch().has_value());
             EXPECT_THROW(validateNativeQ8SerialScopeBinding(1, stream), std::logic_error);
@@ -457,7 +458,7 @@ TEST(NativeQ8SerialGeometry, CapturedTailsAndEmptyPartitionsAreByteExact)
                      static_cast<void *>(hipStreamLegacy), static_cast<void *>(hipStreamPerThread)})
             {
                 EXPECT_THROW((void)rocmGemv_native_quantised_fp32_with_policy(
-                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(nullptr, nullptr, nullptr), nullptr, nullptr, nullptr,
                     1, 640, 19, 19, 0, bad_stream, nullptr), std::logic_error);
                 EXPECT_FALSE(lastNativeQ8SerialLaunch().has_value());
             }

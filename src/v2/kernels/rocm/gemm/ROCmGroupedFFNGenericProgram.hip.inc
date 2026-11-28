@@ -224,11 +224,12 @@ __device__ __forceinline__ float orderedQ51DownPackets(const DeviceNativeQuantis
     using Payload=std::array<std::uint32_t,Traits::payload_bytes/sizeof(std::uint32_t)>;
     static_assert(sizeof(Payload)==Traits::payload_bytes);
     const auto partial=[&](const Payload& raw,int block,std::size_t index) {
+        (void)index; // The payload was loaded by the caller; metadata addresses by block/column.
         const auto* bytes=reinterpret_cast<const std::uint8_t*>(raw.data());
         int32_t decoded[8];
         moe_prefill_decode_groups<NATIVE_QUANTISED_PF_Q5_1,false>(bytes,decoded,nullptr);
-        return moe_prefill_accumulate_decoded_block<NATIVE_QUANTISED_PF_Q5_1>(
-            role,index,bytes,decoded,reinterpret_cast<const int32_t*>(codes+block*32),scales[block],0.0f);
+        return moe_prefill_accumulate_decoded_block_at<NATIVE_QUANTISED_PF_Q5_1>(
+            role,block,column,hidden,bytes,decoded,reinterpret_cast<const int32_t*>(codes+block*32),scales[block],0.0f);
     };
     float total=0.0f;
 #pragma unroll 1
@@ -503,7 +504,6 @@ bool launchFormatProgram(const RoutePlan& plan,const DeviceRowRange& rows,
         case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_IQ1_S): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_IQ1_S>();return hipGetLastError()==hipSuccess;
         case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_IQ1_M): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_IQ1_M>();return hipGetLastError()==hipSuccess;
         case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_Q8_0): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_Q8_0>();return hipGetLastError()==hipSuccess;
-        case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN>();return hipGetLastError()==hipSuccess;
         default: break;
         }
     }

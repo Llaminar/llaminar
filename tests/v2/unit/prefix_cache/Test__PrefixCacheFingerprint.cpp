@@ -209,7 +209,7 @@ TEST(Test__PrefixCacheFingerprint, ScopedAttentionRecoveryArithmeticIsRepeatable
 {
     const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
         .topology = 4, .hybrid = 5, .moe = 6, .mtp = 7};
-    constexpr uint64_t recovery_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t recovery_key = 0xd4828567ff6b6178ULL;
     EXPECT_EQ(combinePrefixFingerprintParts(parts), recovery_key);
     EXPECT_EQ(combinePrefixFingerprintParts(parts), combinePrefixFingerprintParts(parts));
 }
@@ -226,7 +226,7 @@ TEST(Test__PrefixCacheFingerprint, ScopedAttentionRecoveryArithmeticIsRepeatable
 TEST(Test__PrefixCacheFingerprint, NativeEmbeddingRejectsV9AndRestartsStably)
 {
     constexpr uint64_t old_lossy_embedding_key = 0x1e2eb47a6b0c05b5ULL;
-    constexpr uint64_t native_source_embedding_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t native_source_embedding_key = 0xd4828567ff6b6178ULL;
     const PrefixFingerprintParts original_process{.model = 1, .tokenizer = 2, .runtime = 3,
         .topology = 4, .hybrid = 5, .moe = 6, .mtp = 7};
     const uint64_t persisted_current_key = combinePrefixFingerprintParts(original_process);
@@ -252,7 +252,7 @@ TEST(Test__PrefixCacheFingerprint, NativeEmbeddingRejectsV9AndRestartsStably)
 TEST(Test__PrefixCacheFingerprint, GDNAdditiveEpsilonRejectsV10AndRestartsStably)
 {
     constexpr uint64_t old_gdn_norm_clamp_key = 0xab525267a6098d45ULL;
-    constexpr uint64_t additive_epsilon_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t additive_epsilon_key = 0xd4828567ff6b6178ULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -273,7 +273,7 @@ TEST(Test__PrefixCacheFingerprint, GDNAdditiveEpsilonRejectsV10AndRestartsStably
 TEST(Test__PrefixCacheFingerprint, FiniteQ8ScaleRejectsV11AndRestartsStably)
 {
     constexpr uint64_t old_unbounded_q8_scale_key = 0xfc4266874f559540ULL;
-    constexpr uint64_t finite_q8_scale_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t finite_q8_scale_key = 0xd4828567ff6b6178ULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -295,7 +295,7 @@ TEST(Test__PrefixCacheFingerprint, FiniteQ8ScaleRejectsV11AndRestartsStably)
 TEST(Test__PrefixCacheFingerprint, ResidualArithmeticRejectsV12AndRestartsStably)
 {
     constexpr uint64_t old_residual_arithmetic_key = 0xda62a3544f706d9bULL;
-    constexpr uint64_t current_residual_arithmetic_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t current_residual_arithmetic_key = 0xd4828567ff6b6178ULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -586,7 +586,7 @@ TEST(Test__PrefixCacheFingerprint, MoERuntimePlacementChangesKeyButHistogramDoes
 TEST(Test__PrefixCacheFingerprint, OriginalQ6ScaleRejectsV13AndRestartsStably)
 {
     constexpr uint64_t old_rounded_q6_key = 0xe8f93d2b09cca08eULL;
-    constexpr uint64_t source_factor_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t source_factor_key = 0xd4828567ff6b6178ULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -600,7 +600,7 @@ TEST(Test__PrefixCacheFingerprint, OriginalQ6ScaleRejectsV13AndRestartsStably)
 TEST(Test__PrefixCacheFingerprint, OriginalIQ2SScaleRejectsV14AndRestartsStably)
 {
     constexpr uint64_t old_rounded_iq2s_key = 0x6d9a77d4f2a0d599ULL;
-    constexpr uint64_t source_factor_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t source_factor_key = 0xd4828567ff6b6178ULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -614,7 +614,7 @@ TEST(Test__PrefixCacheFingerprint, OriginalIQ2SScaleRejectsV14AndRestartsStably)
 TEST(Test__PrefixCacheFingerprint, OriginalIQ4XSScaleRejectsV15AndRestartsStably)
 {
     constexpr uint64_t old_derived_half_key = 0x7850c4d9fdfa2764ULL;
-    constexpr uint64_t source_tuple_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t source_tuple_key = 0xd4828567ff6b6178ULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
@@ -628,7 +628,7 @@ TEST(Test__PrefixCacheFingerprint, OriginalIQ4XSScaleRejectsV15AndRestartsStably
 TEST(Test__PrefixCacheFingerprint, OriginalIQ3SScaleRejectsV16AndRestartsStably)
 {
     constexpr uint64_t old_derived_half_key=0x8573b84bbc243a1fULL;
-    constexpr uint64_t source_tuple_key=0xb4799c09af74cd7dULL;
+    constexpr uint64_t source_tuple_key=0xd4828567ff6b6178ULL;
     for(int restart=0;restart<8;++restart) {
         const PrefixFingerprintParts parts{.model=1,.tokenizer=2,.runtime=3,
             .topology=4,.hybrid=5,.moe=6,.mtp=7};
@@ -873,17 +873,38 @@ TEST(Test__PrefixCacheFingerprint, AbsentRecurrenceSectionsPreserveExistingIdent
 TEST(Test__PrefixCacheFingerprint, CUDAGroupedPhysicalRowsRejectV17AndRestartStably)
 {
     constexpr uint64_t frozen_v17_key = 0x5cc5df15e248ed72ULL;
-    constexpr uint64_t corrected_v18_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t current_key = 0xd4828567ff6b6178ULL;
     for (int restart = 0; restart < 8; ++restart)
     {
         const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
             .topology = 4, .hybrid = 5, .moe = 6, .mtp = 7};
-        EXPECT_EQ(combinePrefixFingerprintParts(parts), corrected_v18_key);
+        EXPECT_EQ(combinePrefixFingerprintParts(parts), current_key);
         EXPECT_NE(combinePrefixFingerprintParts(parts), frozen_v17_key);
         PrefixFingerprintMaterial material;
         material.runtime = {{"b", "2"}, {"a", "1"}};
         const auto first = combinePrefixFingerprintParts(buildPrefixFingerprintParts(material));
         std::reverse(material.runtime.begin(), material.runtime.end());
         EXPECT_EQ(first, combinePrefixFingerprintParts(buildPrefixFingerprintParts(material)));
+    }
+}
+
+/**
+ * @brief Reject chunk-dependent half-operand prefill state and keep restarts stable.
+ *
+ * V18 evaluated ordinary GPU half-RNE prefill projections (default GDN
+ * alpha/beta) with vendor BLAS, whose reduction order followed the chunk's row
+ * count. V19 uses the fixed-K partition contract, so cached recurrent and KV
+ * state from V18 can differ under identical metadata and must not restore.
+ */
+TEST(Test__PrefixCacheFingerprint, FixedKHalfPrefillRejectsV18AndRestartsStably)
+{
+    constexpr uint64_t frozen_v18_key = 0xb4799c09af74cd7dULL;
+    constexpr uint64_t fixed_k_v19_key = 0xd4828567ff6b6178ULL;
+    for (int restart = 0; restart < 8; ++restart)
+    {
+        const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
+            .topology = 4, .hybrid = 5, .moe = 6, .mtp = 7};
+        EXPECT_EQ(combinePrefixFingerprintParts(parts), fixed_k_v19_key);
+        EXPECT_NE(combinePrefixFingerprintParts(parts), frozen_v18_key);
     }
 }

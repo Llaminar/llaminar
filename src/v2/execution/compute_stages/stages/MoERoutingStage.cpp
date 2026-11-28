@@ -1770,7 +1770,14 @@ namespace llaminar2
                 : MoEWorkspaceBuffers::cudaRouting(
                       workspace_rows,
                       params_.d_model,
-                      params_.num_experts);
+                      params_.num_experts,
+                      // Only an FP32 prepared gate binds the Q8 gate cache;
+                      // an unbound gate keeps the conservative declaration.
+                      !params_.gate_weights ||
+                              (params_.gate_weights->native_type() == TensorType::FP32 &&
+                               debugEnv().gemm.cuda_moe_router_q8)
+                          ? MoEWorkspaceBuffers::CUDARouterGateCache::Q8
+                          : MoEWorkspaceBuffers::CUDARouterGateCache::None);
 
         if (params_.device_rebalance_route_apply)
         {

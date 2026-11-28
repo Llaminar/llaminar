@@ -16,7 +16,6 @@
 #include <array>
 #include <cstring>
 #include <limits>
-#include <optional>
 #include <vector>
 
 namespace llaminar2::test {
@@ -40,15 +39,11 @@ bool bytePattern(const void *source,std::size_t bytes,unsigned char pattern) {
  * @param format Canonical source-format factory and source identity.
  * @param n Original output columns, including representative tails.
  * @param k Original logical K, including the real QFN indexer width.
- * @param rotated Whether the existing prepared rotation contract is enabled.
  */
-void proveQueryRows(const QuantizedVerifierFormatCase &format,int n,int k,bool rotated) {
+void proveQueryRows(const QuantizedVerifierFormatCase &format,int n,int k) {
     QueryWorkerPolicy restore;
-    std::optional<ActivationRotation> rotation;
-    if(rotated)rotation.emplace(k,128);
     auto source=format.create({std::size_t(n),std::size_t(k)},17501);
     ASSERT_NE(source,nullptr);
-    if(rotation)source->setActivationRotation(&*rotation);
     CPUNativeQuantisedGemmKernel kernel(source.get());
     ASSERT_TRUE(kernel.isValid());
     constexpr int requests=3;
@@ -56,7 +51,7 @@ void proveQueryRows(const QuantizedVerifierFormatCase &format,int n,int k,bool r
         omp_set_num_threads(workers);
         const int physical=requests*rowsPerRequest,blocks=kernel.packedWeights().blocks_per_row;
         SCOPED_TRACE(std::string(format.label)+" N="+std::to_string(n)+" K="+std::to_string(k)+
-            " M="+std::to_string(physical)+" workers="+std::to_string(workers)+" rotation="+std::to_string(rotated));
+            " M="+std::to_string(physical)+" workers="+std::to_string(workers));
         FP32Tensor input({std::size_t(physical),std::size_t(k)}),output({std::size_t(physical),std::size_t(n)}),
             single({1,std::size_t(k)}),serial({1,std::size_t(n)});
         CPUProjectionTestWorkspace workspace(physical,k,kernel.getWorkspaceRequirements(physical));
@@ -87,9 +82,6 @@ void proveQueryRows(const QuantizedVerifierFormatCase &format,int n,int k,bool r
             std::copy(original.begin(),original.end(),input.mutable_data());
             std::fill_n(output.mutable_data(),output.numel(),-12345.f);
             std::memset(q8,0xa5,std::size_t(physical)*blocks*sizeof(Q8_1Block));
-            auto *rotatedBytes=workspace.get()->getBuffer(kCPUProjectionRotation);
-            const auto rotatedCapacity=workspace.get()->getBufferSize(kCPUProjectionRotation);
-            if(rotatedBytes)std::memset(rotatedBytes,0xa5,rotatedCapacity);
             for(int row=0;row<physical;++row)
                 if(!work.resolveHost(work.requestForRow(row)).contains(row))
                     std::fill_n(input.mutable_data()+std::size_t(row)*k,k,std::numeric_limits<float>::quiet_NaN());
@@ -108,7 +100,6 @@ void proveQueryRows(const QuantizedVerifierFormatCase &format,int n,int k,bool r
                 } else {
                     EXPECT_TRUE(std::all_of(actual,actual+n,[](float value){return value==-12345.f;}))<<"row="<<row;
                     EXPECT_TRUE(bytePattern(actualQ8,blocks*sizeof(Q8_1Block),0xa5))<<"row="<<row;
-                    if(rotatedBytes)EXPECT_TRUE(bytePattern(static_cast<const float *>(rotatedBytes)+std::size_t(row)*k,k*sizeof(float),0xa5));
                 }
             }
         }
@@ -117,12 +108,7 @@ void proveQueryRows(const QuantizedVerifierFormatCase &format,int n,int k,bool r
 class CPUQueryRowWork : public ::testing::TestWithParam<QuantizedVerifierFormatCase> {};
 TEST_P(CPUQueryRowWork, EverySourceRetainsSerialBytesAndUnwrittenRowsAcrossDirtyRequests) {
     for(const auto shape:{std::pair{65,512},std::pair{512,2560},std::pair{128,8192}})
-        proveQueryRows(GetParam(),shape.first,shape.second,false);
-}
-TEST(CPUQueryRowWorkRotation, OriginalPreparedRotationSkipsUnusedRows) {
-    const auto &formats=quantizedVerifierFormats();
-    const auto format=std::find_if(formats.begin(),formats.end(),[](const auto &value){return value.tensor_type==TensorType::Q4_0;});
-    ASSERT_NE(format,formats.end());proveQueryRows(*format,65,512,true);
+        proveQueryRows(GetParam(),shape.first,shape.second);
 }
 TEST_P(CPUQueryRowWork, OrdinaryM1WorkNeverEnablesVerifierMathAndPreservesUnusedScratch) {
     QueryWorkerPolicy restore;omp_set_num_threads(3);

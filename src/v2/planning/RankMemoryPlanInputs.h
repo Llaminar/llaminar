@@ -133,6 +133,17 @@ namespace llaminar2
         /** Explicit physical limits, shared with ExpertOverlay and runtime admission. */
         std::optional<std::size_t> max_gpu_memory_bytes;
         std::optional<std::size_t> max_cpu_memory_bytes;
+        /**
+         * True only when the caller is the rank's runtime admission, after its
+         * local backend contexts and physical hardware metadata exist. GPU
+         * workspace admission then prices the exact codebook-aware kernel
+         * contract (the same requirement factory the workspace allocator
+         * materializes) instead of the device-free legacy envelope, which
+         * under-admits large-K/N NativeQuantised prefill (split-K partials)
+         * and makes the exact runtime serial family exceed its budget.
+         * Candidate/metadata-only planning keeps it false.
+         */
+        bool local_runtime_device_policy = false;
     };
 
     /**

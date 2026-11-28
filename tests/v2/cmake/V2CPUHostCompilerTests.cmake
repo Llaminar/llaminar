@@ -1,0 +1,71 @@
+# @file V2CPUHostCompilerTests.cmake
+# @brief Register host ISA forwarding controls and actual build command admission.
+#
+# The compile contract binds every compile-database row to the canonical CPU
+# envelope, except the exact object rows of declared secondary-envelope targets
+# (V2CPUSecondaryEnvelope.cmake), which are bound to their own envelope. Include
+# this module after every module that declares secondary envelopes; a later
+# declaration is a configure error.
+include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/V2CPUSecondaryEnvelope.cmake")
+v2_add_core_free_test(V2_Unit_CPUHostCompilerOptions
+    COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+        -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
+        -p test_cpu_host_compiler_options.py
+    LABELS V2 Unit DeviceFree CI)
+if(NOT LLAMINAR_CPU_COMPILE_DEFINITIONS)
+    message(FATAL_ERROR "CPU host contract requires canonical definitions")
+endif()
+set(V2_CPU_HOST_DEFINITION_ARGS)
+foreach(definition IN LISTS LLAMINAR_CPU_COMPILE_DEFINITIONS)
+    list(APPEND V2_CPU_HOST_DEFINITION_ARGS "--definition=${definition}")
+endforeach()
+v2_cpu_secondary_envelope_contract_arguments(V2_CPU_HOST_SECONDARY_ENVELOPE_ARGS)
+v2_add_core_free_test(V2_Integration_CPUHostCompileContract
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci/cpu_host_compile_contract.py"
+        --database "${CMAKE_BINARY_DIR}/compile_commands.json"
+        "--flags=${LLAMINAR_CPU_COMPILE_FLAGS}"
+        ${V2_CPU_HOST_DEFINITION_ARGS}
+        ${V2_CPU_HOST_SECONDARY_ENVELOPE_ARGS}
+        "--compiler-C=${CMAKE_C_COMPILER}"
+        "--compiler-CXX=${CMAKE_CXX_COMPILER}"
+        "--compiler-CUDA=${CMAKE_CUDA_COMPILER}"
+        "--compiler-HIP=${CMAKE_HIP_COMPILER}"
+    LABELS V2 Integration DeviceFree ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHostCompileContract)
+
+# Simulated compiler identities exercise real CMake generation, not native codegen.
+# Unit owns fast feedback; the separately named Integration entry explicitly
+# retains the original-code regression in the canonical production preflight.
+v2_add_core_free_test(V2_Unit_CPUHostGeneratedCommands
+    COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+        -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
+        -p test_cpu_host_generated_commands.py
+    LABELS V2 Unit DeviceFree CI)
+v2_add_core_free_test(V2_Integration_CPUHostGeneratedCommands
+    COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+        -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
+        -p test_cpu_host_generated_commands.py
+    LABELS V2 Integration DeviceFree ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHostGeneratedCommands)
+
+# A configure-owned header fixture standard, independent of incidental CXXFLAGS.
+add_library(v2_cpu_host_coherence_contract INTERFACE)
+set_property(TARGET v2_cpu_host_coherence_contract PROPERTY CXX_STANDARD 23)
+get_target_property(V2_CPU_HOST_COHERENCE_STANDARD v2_cpu_host_coherence_contract CXX_STANDARD)
+v2_add_core_free_test(V2_Unit_CPUHostCoherence
+    COMMAND "${CMAKE_COMMAND}" -E env "LLAMINAR_TEST_CXX=${CMAKE_CXX_COMPILER}"
+        "LLAMINAR_TEST_CXX_STANDARD=${V2_CPU_HOST_COHERENCE_STANDARD}" "LLAMINAR_TEST_CMAKE=${CMAKE_COMMAND}"
+        "${Python3_EXECUTABLE}" -m unittest discover
+        -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
+        -p test_cpu_host_coherence.py
+    LABELS V2 Unit DeviceFree CI)
+v2_add_core_free_test(V2_Integration_CPUHostCoherence
+    COMMAND "${CMAKE_COMMAND}" -E env "LLAMINAR_TEST_CXX=${CMAKE_CXX_COMPILER}"
+        "LLAMINAR_TEST_CXX_STANDARD=${V2_CPU_HOST_COHERENCE_STANDARD}" "LLAMINAR_TEST_CMAKE=${CMAKE_COMMAND}"
+        "${Python3_EXECUTABLE}" -m unittest discover
+        -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
+        -p test_cpu_host_coherence.py
+    LABELS V2 Integration DeviceFree ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHostCoherence)

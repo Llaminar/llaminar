@@ -78,6 +78,9 @@
 
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/GraphArenaTestHarness.h"
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#include "../../backends/CUDAMoEArrivalPoolProof.h"
+#endif
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -3018,6 +3021,46 @@ TEST_F(CachedGraphReplayExecutionTest, BoundedHelperRejectsOversizedNativeGraph)
         if (segment.capture)
             EXPECT_FALSE(segment.capture->hasExecutable());
 }
+
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+/** @test Final-owner CUDA arrival lowering fits the same opaque pool admission model. */
+TEST_F(CachedGraphReplayExecutionTest, CUDAMoEArrivalFinalOwnersFitNativePool)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+    using Owner = CUDAMoEArrivalPoolOwner;
+    const auto device = device_ctx_->deviceId();
+    const auto scope = graphObservationScope(device);
+    for (const bool mixed_families : {false, true})
+    {
+        SCOPED_TRACE(mixed_families);
+        using Role = CUDAArrivalOwnerRole;
+        for (const auto [owner, role] : {
+                std::pair{Owner::StandaloneCopy, Role::MaintenanceCopy},
+                std::pair{Owner::StandaloneCadence, Role::StandaloneCadence},
+                std::pair{Owner::OrdinaryDecode, Role::GenerationParent},
+                std::pair{Owner::NativeMTPFixed, Role::GenerationParent},
+                std::pair{Owner::NativeMTPDynamic, Role::GenerationParent},
+                std::pair{Owner::OrdinaryFollower, Role::PipelineFollower},
+                std::pair{Owner::SpeculativeFollower, Role::PipelineFollower},
+                std::pair{Owner::ForwardTimeline, Role::PrefixDecode},
+                std::pair{Owner::ForwardTimeline, Role::RestoredPrefixBridge},
+                std::pair{Owner::ForwardTimeline, Role::PrefixRehydration}})
+        {
+            SCOPED_TRACE(static_cast<int>(owner));
+            SCOPED_TRACE(static_cast<int>(role));
+            ASSERT_NO_FATAL_FAILURE(proveCUDAMoEArrivalPool(*gpu_ctx_, device, scope, owner, role, mixed_families, 1u));
+        }
+        for (const std::size_t sites : {64u, 1024u})
+        {
+            SCOPED_TRACE(sites);
+            ASSERT_NO_FATAL_FAILURE(proveCUDAMoEArrivalPool(*gpu_ctx_, device, scope,
+                Owner::ForwardTimeline, Role::Prefill, mixed_families, sites));
+        }
+    }
+}
+#endif
 
 /**
  * @test Production-scale checkpoint capture remains VRAM-local and publishes

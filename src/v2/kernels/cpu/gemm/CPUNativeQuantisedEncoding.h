@@ -4,8 +4,8 @@
  *
  * The packer, prepared read view, cache/workspace contracts and ISA leaves
  * consume this one mapping. Source codebooks and physical encodings are
- * distinct: IQ4_XS and IQ3_S retain original source factors, while explicit
- * activation rotation owns its existing expanded-INT8 representation.
+ * distinct: coded formats retain original source factors, while Q8 retains
+ * signed bytes with one FP16 scale per block.
  */
 #pragma once
 
@@ -13,6 +13,7 @@
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/BlockStructures.h"
 #include <cstdint>
+#include <stdexcept>
 
 namespace llaminar2::cpu::native_quantised
 {
@@ -35,81 +36,59 @@ namespace llaminar2::cpu::native_quantised
         }
     }
 
-    /**
-     * @brief Select the physical CPU execution encoding for a source codebook.
-     *
-     * @param codebook_id NativeQuantised execution codebook identifier.
-     * @param rotation_enabled Whether preparation applies activation rotation;
-     *        rotated values are requantized to the expanded INT8 encoding.
-     * @return Physical encoding consumed by CPU GEMV/GEMM kernels.
-     */
-    [[nodiscard]] inline CPUNativeQuantisedEncoding preparedEncodingForCodebook(
-        uint8_t codebook_id,
-        bool rotation_enabled = false) noexcept
-    {
-        if (rotation_enabled)
-            return CPUNativeQuantisedEncoding::ExpandedInt8;
-        if (codebook_id == 11)
-            return CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale;
-        if (is_nibble_lut_format(codebook_id))
-            return CPUNativeQuantisedEncoding::NibbleLUT;
-        if (codebook_id == 8)
-            return CPUNativeQuantisedEncoding::Q6KNativeDualScale;
-        if (hasCompactMultiScaleVnniPayload(codebook_id))
-            return CPUNativeQuantisedEncoding::CompactMultiScale;
-        return CPUNativeQuantisedEncoding::ExpandedInt8;
-    }
-
-    /** @brief Select CPU encoding using the original source tuple.
+    /** @brief Select the canonical CPU encoding using the original source tuple.
      * @param source Original GGUF descriptor, including superblock identity.
-     * @param rotation_enabled Explicit separately selected rotated INT8 policy.
-     * @return Lossless ordinary encoding or the unchanged explicit rotation encoding.
+     * @return Physical encoding consumed by CPU GEMV/GEMM.
+     * @throws std::invalid_argument For an uncataloged codebook.
      */
-    [[nodiscard]] inline CPUNativeQuantisedEncoding preparedEncodingForSource(
-        const NativeQuantisedFormatInfo &source, bool rotation_enabled = false) noexcept
+    [[nodiscard]] inline constexpr CPUNativeQuantisedEncoding preparedEncodingForSource(
+        const NativeQuantisedFormatInfo &source)
     {
-        if (!rotation_enabled && source.codebook_id == 4 && source.is_superblock)
+        const auto codebook = source.codebook_id;
+        if (codebook == 5 && source.is_superblock)
+            return CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
+        if (isQ5NativeSingleScaleSource(codebook, source.is_superblock))
+            return CPUNativeQuantisedEncoding::Q5NativeSingleScale;
+        if (codebook == 4 && source.is_superblock)
             return CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
-        return preparedEncodingForCodebook(source.codebook_id, rotation_enabled);
+        if (is_nibble_lut_format(codebook))
+            return CPUNativeQuantisedEncoding::NibbleLUT;
+        if (codebook == 8)
+            return CPUNativeQuantisedEncoding::Q6KNativeDualScale;
+        if (codebook == 7 || codebook == 11 || hasCompactMultiScaleVnniPayload(codebook))
+            return CPUNativeQuantisedEncoding::CompactMultiScale;
+        if (isSignedInt8SingleScaleSource(codebook))
+            return CPUNativeQuantisedEncoding::SignedInt8SingleScale;
+        throw std::invalid_argument("Native CPU preparation requires a cataloged source codebook");
     }
 
-    /**
-     * @brief Build an exact cache footprint without materializing a matrix.
-     *
-     * This helper is used by planning/corpus tools that know format metadata
-     * but intentionally do not allocate production-sized weights.
+    /** @return Whether migration must preserve this source's codes and superblock words, not staged products. */
+    [[nodiscard]] inline constexpr bool migrationUsesSuperblockCodes(const NativeQuantisedFormatInfo &source)
+    {
+        return preparedSuperblockCoded(preparedEncodingForSource(source));
+    }
+
+    /** @brief Compute a source-aware cache footprint without materializing weight data.
+     * @param source Exact original source descriptor.
+     * @return Authoritative per-unit weight and activation byte counts for cache tiling.
      */
     [[nodiscard]] inline NativeQuantisedPreparedFootprint preparedFootprintForFormat(
-        uint8_t codebook_id,
-        bool is_asymmetric,
-        bool rotation_enabled = false) noexcept
+        const NativeQuantisedFormatInfo &source)
     {
-        const CPUNativeQuantisedEncoding encoding =
-            preparedEncodingForCodebook(codebook_id, rotation_enabled);
-        const bool prepared_is_asymmetric =
-            rotation_enabled ? false : is_asymmetric;
-        return NativeQuantisedPreparedFootprint{
+        const auto encoding = preparedEncodingForSource(source);
+        auto result = NativeQuantisedPreparedFootprint{
             .encoding = encoding,
-            .is_asymmetric = prepared_is_asymmetric,
-            .weight_bytes_per_n_chunk_k_block =
-                static_cast<std::uint64_t>(preparedInterleavedBlockStride(
-                    encoding, prepared_is_asymmetric)),
+            .is_asymmetric = source.is_asymmetric,
+            .weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(encoding, source.is_asymmetric, source.codebook_id),
             .activation_bytes_per_row_k_block = sizeof(Q8_1Block),
             .output_bytes_per_row_n_chunk = 64u * sizeof(float),
         };
-    }
-
-    /** @brief Compute source-aware footprint without materializing weight data.
-     * @param source Exact original source descriptor.
-     * @param rotation_enabled Explicit CPU rotation policy.
-     * @return Authoritative physical per-unit weight and activation byte counts.
-     */
-    [[nodiscard]] inline NativeQuantisedPreparedFootprint preparedFootprintForFormat(
-        const NativeQuantisedFormatInfo &source, bool rotation_enabled = false) noexcept
-    {
-        auto result = preparedFootprintForFormat(source.codebook_id, source.is_asymmetric, rotation_enabled);
-        result.encoding = preparedEncodingForSource(source, rotation_enabled);
-        result.weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(result.encoding, result.is_asymmetric);
+        if (result.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded ||
+            result.encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+            result.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+            (result.encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
+             (source.codebook_id == 7 || source.codebook_id == 11)))
+            result.weight_bytes_per_n_chunk_k_block += preparedSuperblockHeaderBytes(result.encoding, source.codebook_id) / 8u;
         return result;
     }
 

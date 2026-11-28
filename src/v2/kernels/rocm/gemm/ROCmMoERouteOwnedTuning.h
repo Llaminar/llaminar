@@ -72,11 +72,7 @@ inline constexpr int kMoERouteOwnedGateUpPartitionColumns = 64;
  */
 [[nodiscard]] constexpr bool moeRouteOwnedGateUpPartitionCodebook(std::uint8_t codebook) noexcept
 {
-    for (const auto &source : native_quantised_formats::kAllSourceFormats)
-        if (canonicalDeviceVnniFormat(*source.metadata).codebook_id == codebook ||
-            migrationStableDeviceVnniFormat(*source.metadata).codebook_id == codebook)
-            return true;
-    return false;
+    return (kNativeQuantisedPhysicalCodebooks & nativeQuantisedCodebookMaskBit(codebook)) != 0;
 }
 
 /**
@@ -186,14 +182,10 @@ struct MoERouteOwnedKernelResources
 [[nodiscard]] constexpr bool moeRouteOwnedGateUpEnvelopeValid(
     const NativeQuantisedExecutionFormatEnvelope &envelope) noexcept
 {
-    std::uint32_t known_execution = 0, known_policy = 0;
+    std::uint32_t known_policy = 0;
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
-    {
-        known_execution |= nativeQuantisedCodebookMaskBit(canonicalDeviceVnniFormat(*source.metadata).codebook_id);
-        known_execution |= nativeQuantisedCodebookMaskBit(migrationStableDeviceVnniFormat(*source.metadata).codebook_id);
         known_policy |= nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(source.metadata->codebook_id));
-    }
-    return envelope.valid() && !(envelope.execution_codebook_mask & ~known_execution) &&
+    return envelope.valid() && !(envelope.execution_codebook_mask & ~kNativeQuantisedPhysicalCodebooks) &&
         !(envelope.policy_codebook_mask & ~known_policy);
 }
 

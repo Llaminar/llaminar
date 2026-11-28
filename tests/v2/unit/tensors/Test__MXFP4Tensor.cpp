@@ -194,11 +194,15 @@ namespace
         packed.payload_bytes = encoding == CPUNativeQuantisedEncoding::NibbleLUT ? 16 : 32;
         packed.codebook_id = codebook;
         packed.encoding = encoding;
-        packed.data_stride = static_cast<int>(preparedDataStride(packed.encoding));
+        packed.data_stride = static_cast<int>(preparedDataStride(packed.encoding, packed.codebook_id));
         packed.interleaved_block_stride =
-            static_cast<int>(preparedInterleavedBlockStride(packed.encoding, false));
+            static_cast<int>(preparedInterleavedBlockStride(packed.encoding, false, packed.codebook_id));
         packed.native_interleaved.resize(static_cast<size_t>(packed.interleaved_block_stride), uint8_t{0});
-        std::memcpy(const_cast<uint16_t *>(packed.chunkScales(0, 0)), words.data(), sizeof(words));
+        if (packed.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+            for (int col = 0; col < 64; ++col)
+                packed.native_interleaved.beginRewrite()[packed.data_stride + col] = static_cast<uint8_t>(words[col]);
+        else
+            std::memcpy(const_cast<uint16_t *>(packed.chunkScales(0, 0)), words.data(), sizeof(words));
         return packed;
     }
 
@@ -213,7 +217,7 @@ namespace
     }
 } // namespace
 
-TEST(MXFP4CPUScaleLoaders, PowerOfTwoBF16AndFP16WordsWidenExactlyOnEveryISA)
+TEST(MXFP4CPUScaleLoaders, NativeE8M0BytesAndFP16WordsWidenExactlyOnEveryISA)
 {
     using namespace cpu::native_quantised;
     // Every admitted native exponent plus the zero marker, 64 per unit.
@@ -223,33 +227,36 @@ TEST(MXFP4CPUScaleLoaders, PowerOfTwoBF16AndFP16WordsWidenExactlyOnEveryISA)
     auto vector_check = [](const uint16_t *primary, const std::array<uint32_t, 64> &expected,
                            const CPUNativeQuantisedPackedWeights &packed)
     {
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
         for (int group = 0; group < 4; ++group)
         {
             alignas(64) float out[16];
-            _mm512_store_ps(out, packed.loadScales512(primary + group * 16));
+            _mm512_store_ps(out, primary ? packed.loadScales512(primary + group * 16)
+                : loadNibbleFactors512(packed, 0, 0, group * 16).primary);
             for (int lane = 0; lane < 16; ++lane)
                 EXPECT_EQ(bits(out[lane]), expected[group * 16 + lane]) << "512 col " << group * 16 + lane;
         }
 #endif
 #if defined(__AVX2__)
+        // Native-plane reads use the production nibble domain for this codebook.
+        if (!primary)
+            ASSERT_EQ(nibbleDotAVX2(packed.codebook_id), NibbleDotAVX2::SmallLUT);
         for (int group = 0; group < 8; ++group)
         {
             alignas(32) float out[8];
-            _mm256_store_ps(out, packed.loadScales256(primary + group * 8));
+            _mm256_store_ps(out, primary ? packed.loadScales256(primary + group * 8)
+                : loadNibbleFactors256<NibbleDotAVX2::SmallLUT>(packed, 0, 0, group * 8).primary);
             for (int lane = 0; lane < 8; ++lane)
                 EXPECT_EQ(bits(out[lane]), expected[group * 8 + lane]) << "256 col " << group * 8 + lane;
         }
 #endif
 #if defined(__aarch64__) && defined(__ARM_NEON)
-        // The NEON projection tile selects bf16() or half() from the same
-        // prepared scale encoding; check that pairing on every column.
+        // Match the NEON projection tile's E8M0 or FP16 widening on every column.
         using Ops = multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>;
         for (int group = 0; group < 16; ++group)
         {
-            const uint16_t *words = primary + group * 4;
-            const auto out = std::bit_cast<std::array<uint32_t, 4>>(
-                packed.scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16 ? Ops::bf16(words) : Ops::half(words));
+            const auto out = std::bit_cast<std::array<uint32_t, 4>>(primary ? Ops::half(primary + group * 4)
+                : Ops::e8m0(packed.blockUnit(0, 0) + packed.data_stride + group * 4));
             for (int lane = 0; lane < 4; ++lane)
                 EXPECT_EQ(out[lane], expected[group * 4 + lane]) << "neon col " << group * 4 + lane;
         }
@@ -263,15 +270,17 @@ TEST(MXFP4CPUScaleLoaders, PowerOfTwoBF16AndFP16WordsWidenExactlyOnEveryISA)
         for (int column = 0; column < 64; ++column)
         {
             const uint8_t e = exponents[(first + column) % exponents.size()];
-            words[column] = mxfp4::powerOfTwoBF16Word(e);
+            words[column] = e;
             expected[column] = e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e);
         }
         const auto packed = cpuUnitWithScales(words, kNativeQuantisedMXFP4Codebook);
-        ASSERT_EQ(packed.scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
-        ASSERT_EQ(packed.primaryScaleLayout(), VnniPrimaryScaleLayout::PowerOfTwoBF16Words);
-        expectColumns(packed, expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, packed); });
+        ASSERT_EQ(packed.scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
+        ASSERT_EQ(packed.primaryScaleLayout(), VnniPrimaryScaleLayout::NativeE8M0Bytes);
+        for (int col = 0; col < 64; ++col)
+            EXPECT_EQ(bits(packed.blockScale(0, 0, col)), expected[col]);
+        vector_check(nullptr, expected, packed);
     }
-    // FP16 (every other format, and rotated/expanded source-25 weights) is unchanged.
+    // FP16 (every other format) is unchanged.
     std::array<uint16_t, 64> half_words{};
     std::array<uint32_t, 64> half_expected{};
     for (int column = 0; column < 64; ++column)
@@ -282,12 +291,7 @@ TEST(MXFP4CPUScaleLoaders, PowerOfTwoBF16AndFP16WordsWidenExactlyOnEveryISA)
     const auto fp16 = cpuUnitWithScales(half_words, 4);
     ASSERT_EQ(fp16.scaleEncoding(), CPUNativeQuantisedScaleEncoding::FP16);
     expectColumns(fp16, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, fp16); });
-    // Rotated MXFP4 keeps source codebook 25 but is expanded INT8 with FP16 scales.
-    // Every column goes through the scalar reader and each ISA's vector loader.
-    const auto rotated = cpuUnitWithScales(half_words, kNativeQuantisedMXFP4Codebook, CPUNativeQuantisedEncoding::ExpandedInt8);
-    ASSERT_EQ(rotated.scaleEncoding(), CPUNativeQuantisedScaleEncoding::FP16);
-    ASSERT_EQ(rotated.primaryScaleLayout(), VnniPrimaryScaleLayout::FP16Words);
-    expectColumns(rotated, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, rotated); });
+
 }
 
 TEST(MXFP4ScaleCarrier, StagedWordsDecodeExactlyAndFP16CallbacksAreUntouched)
@@ -377,7 +381,6 @@ TEST(MXFP4Format, CatalogAndRepackIdentity)
     EXPECT_EQ(canonicalDeviceVnniCodebookId(*format), kNativeQuantisedMXFP4Codebook);
     EXPECT_EQ(canonicalDeviceVnniCodebookId(kNativeQuantisedMXFP4Codebook), 4);
     EXPECT_EQ(nativeQuantisedPolicyCodebook(kNativeQuantisedMXFP4Codebook), 4);
-    EXPECT_EQ(migrationStableDeviceVnniFormat(*format).codebook_id, kNativeQuantisedMXFP4Codebook);
     EXPECT_FALSE(areNativeQuantisedGateUpCodebooksCompatible(4, kNativeQuantisedMXFP4Codebook));
     EXPECT_EQ(codebookIdToRepackFormat(kNativeQuantisedMXFP4Codebook, false), RepackFormat::MXFP4);
     EXPECT_EQ(repackPayloadBytesPerBlock(RepackFormat::MXFP4), 16);

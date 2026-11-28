@@ -1,0 +1,131 @@
+{
+ "elf": {
+  "functions": {
+   "first": [
+    [
+     "stp x29, x30, [sp, -16]!",
+     0
+    ],
+    [
+     "mov x29, sp",
+     0
+    ],
+    [
+     "add x0, x0, #1",
+     0
+    ],
+    [
+     "sub x1, x1, #2",
+     0
+    ],
+    [
+     "fadd v0.4s, v0.4s, v1.4s",
+     1
+    ],
+    [
+     "ldp x29, x30, [sp], 16",
+     0
+    ],
+    [
+     "nop",
+     0
+    ],
+    [
+     "ret",
+     0
+    ]
+   ],
+   "second": [
+    [
+     "ret",
+     0
+    ],
+    [
+     "dmb ish",
+     2
+    ],
+    [
+     "mov x0, x1",
+     0
+    ],
+    [
+     "isb",
+     3
+    ]
+   ]
+  },
+  "locations": {
+   "first": [
+    "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h:42",
+    "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h:42",
+    "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h:42",
+    "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h:42",
+    "arm_neon.h:1210",
+    "tests/v2/unit/fixture.h:9",
+    "?:5",
+    "?:5"
+   ],
+   "second": [
+    "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h:7",
+    "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h:7",
+    "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h:7",
+    "src/v2/kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h:7"
+   ]
+  },
+  "stray": []
+ },
+ "errors": {
+  "directive inside": "directive inside an inline-asm block: .word 0",
+  "label inside": "a function label inside an inline-asm block",
+  "nested": "nested inline-asm block in the probe assembly",
+  "unbalanced": "unbalanced inline-asm block end in the probe assembly",
+  "unterminated": "unterminated inline-asm block in the probe assembly"
+ },
+ "generated": {
+  "functions": 11,
+  "input_sha256": "768bc2bcf068410cab33e49b3c45783b77e7362539b20f02972860da1656a6fb",
+  "instructions": 378,
+  "sha256": "73e3548849e2516b0d6ac6296f6ce050fbeefcebd663bd1df421248658353949",
+  "stray": 47
+ },
+ "macho": {
+  "functions": {
+   "_first": [
+    [
+     "stp x29, x30, [sp, #-16]!",
+     0
+    ],
+    [
+     "mov x29, sp",
+     0
+    ],
+    [
+     "fadd v2.4s, v2.4s, v3.4s",
+     1
+    ],
+    [
+     "ret",
+     0
+    ]
+   ],
+   "_second": [
+    [
+     "ret",
+     0
+    ]
+   ]
+  },
+  "locations": {
+   "_first": [
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h:100",
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h:100",
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h:100",
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h:100"
+   ],
+   "_second": [
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h:100"
+   ]
+  },
+  "stray": []
+ }
+}

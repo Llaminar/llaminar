@@ -225,7 +225,6 @@ namespace llaminar2::cuda::prefill_host
         case 16:
         case 17:
         case 19:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -394,7 +393,6 @@ namespace llaminar2::cuda::prefill_host
             return 6;
         case 17:
         case 19:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return 7;
         default:
             return -1;

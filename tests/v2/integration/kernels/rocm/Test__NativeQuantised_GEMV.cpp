@@ -38,6 +38,7 @@
 #include <string>
 #include <vector>
 
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -70,9 +71,7 @@ extern "C" bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
 extern "C" bool rocmGemv_native_quantised_fp32(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const void *d_block_scales,
-    const void *d_block_mins,
-    const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float *d_C_fp32,
     const float *d_scale_A,
     float *d_partial_fp32,
@@ -83,9 +82,7 @@ extern "C" bool rocmGemv_native_quantised_fp32(
 extern "C" bool rocmGemv_native_quantised_small_m_fp32_with_sums(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const void *d_block_scales,
-    const void *d_block_mins,
-    const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float *d_C_fp32,
     const float *d_scale_A_blockwise,
     const int32_t *d_sum_A_blockwise,
@@ -1483,10 +1480,7 @@ namespace
                     << fmt.name << " capture begin M=" << M;
                 ASSERT_TRUE(rocmGemv_native_quantised_small_m_fp32_with_sums(
                     d_A_int8,
-                    static_cast<const uint8_t *>(desc.payload),
-                    desc.scales,
-                    desc.mins,
-                    desc.emins,
+                    static_cast<const uint8_t *>(desc.payload), ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     d_output_specialized,
                     d_scales_A,
                     d_sums_A,
@@ -1519,10 +1513,7 @@ namespace
                         d_output_serial + static_cast<size_t>(row) * static_cast<size_t>(N);
                     ASSERT_TRUE(rocmGemv_native_quantised_fp32(
                         row_A,
-                        static_cast<const uint8_t *>(desc.payload),
-                        desc.scales,
-                        desc.mins,
-                        desc.emins,
+                        static_cast<const uint8_t *>(desc.payload), ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                         row_output,
                         nullptr,
                         d_partial,

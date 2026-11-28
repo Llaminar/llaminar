@@ -60,6 +60,8 @@
  */
 
 #include "kernels/rocm/common/ROCmSignedDot4.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
+#include "kernels/rocm/gemm/ROCmNativeM1CaptureABI.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "kernels/common/NativeQuantisedPackedBits.h"
 #include "kernels/common/NativeTileCompletion.cuh"
@@ -227,10 +229,6 @@ struct NativeQuantisedDecodeGeneratedRuntimeConfig
 /**
  * @brief Select the historical policy for a self-describing execution format.
  *
- * Codebook 23 is a migration-only physical representation and therefore has
- * no independent tuning corpus. Legacy one-ID callers retain the prior
- * codebook-19 policy. Production callers carrying source provenance use the
- * explicit two-ID entrypoints below and never consult this default.
  */
 static constexpr uint8_t defaultNativeQuantisedArithmeticPolicyCodebook(
     uint8_t execution_codebook_id)
@@ -238,9 +236,6 @@ static constexpr uint8_t defaultNativeQuantisedArithmeticPolicyCodebook(
     return execution_codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
                    execution_codebook_id == llaminar2::kNativeQuantisedMXFP4Codebook
                ? static_cast<uint8_t>(4)
-               : execution_codebook_id ==
-                   llaminar2::kNativeQuantisedExpandedInt8MinCodebook
-               ? static_cast<uint8_t>(19)
                : execution_codebook_id;
 }
 
@@ -501,8 +496,6 @@ enum NativeQuantisedFormat : uint8_t {
     NATIVE_QUANTISED_IQ1_S  = 16,  // IQ1 grid (8 elem/lookup), 11-bit index, signed values {-1,0,+1}, delta correction
     NATIVE_QUANTISED_IQ1_M  = 17,  // IQ1 grid (8 elem/lookup), 11-bit index, signed values {-1,0,+1}, dual-scale + delta
     NATIVE_QUANTISED_Q8_0   = 19,  // 8-bit symmetric, direct INT8 payload (32 bytes)
-    NATIVE_QUANTISED_EXPANDED_INT8_MIN =
-        llaminar2::kNativeQuantisedExpandedInt8MinCodebook,
 };
 
 // Compile-time format properties
@@ -511,7 +504,7 @@ struct NATIVE_QUANTISEDTraits {
     // Asymmetric formats have a min correction term: f_acc += sum_a * block_m
     static constexpr bool is_asymmetric =
         FMT == NATIVE_QUANTISED_Q4_1 || FMT == NATIVE_QUANTISED_Q5_1 ||
-        FMT == NATIVE_QUANTISED_IQ1_S || FMT == NATIVE_QUANTISED_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_IQ1_S;
     // --- IQ grid format traits ---
     static constexpr bool is_iq3_grid = (FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ3_XXS);
     static constexpr bool is_iq2_grid = (FMT == NATIVE_QUANTISED_IQ2_S || FMT == NATIVE_QUANTISED_IQ2_XS || FMT == NATIVE_QUANTISED_IQ2_XXS);
@@ -540,7 +533,7 @@ struct NATIVE_QUANTISEDTraits {
     static constexpr bool is_3bit       = (FMT == NATIVE_QUANTISED_Q3_K);
     static constexpr bool is_2bit       = (FMT == NATIVE_QUANTISED_Q2_K);
     static constexpr bool is_8bit =
-        FMT == NATIVE_QUANTISED_Q8_0 || FMT == NATIVE_QUANTISED_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_Q8_0;
     static constexpr bool requires_secondary_metadata =
         is_asymmetric || is_dual_scale || FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE;
     static constexpr bool uses_lut      = (FMT == NATIVE_QUANTISED_IQ4_NL || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE || FMT == NATIVE_QUANTISED_MXFP4);
@@ -652,7 +645,7 @@ struct NATIVE_QUANTISEDGroupedMoESupported {
         FMT == NATIVE_QUANTISED_Q3_K || FMT == NATIVE_QUANTISED_Q2_K || FMT == NATIVE_QUANTISED_IQ3_S ||
         FMT == NATIVE_QUANTISED_IQ3_XXS || FMT == NATIVE_QUANTISED_IQ2_S || FMT == NATIVE_QUANTISED_IQ2_XS ||
         FMT == NATIVE_QUANTISED_IQ2_XXS || FMT == NATIVE_QUANTISED_IQ1_S || FMT == NATIVE_QUANTISED_IQ1_M ||
-        FMT == NATIVE_QUANTISED_Q8_0 || FMT == NATIVE_QUANTISED_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_Q8_0;
 };
 
 /**
@@ -1208,9 +1201,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
     const int32_t* __restrict__ a4,
     [[maybe_unused]] int32_t sum_a,
     const uint8_t*  __restrict__ d_payload,
-    const uint16_t* __restrict__ d_block_scales,
-    const uint16_t* __restrict__ d_block_mins,
-    int n_base, int N, size_t b_offset_N,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes& d_meta, // block metadata (per-block or superblock-coded)
+    int n_base, int N, size_t b_offset_N, int block,
     float* f_acc,
     [[maybe_unused]] const uint32_t* lds32 = nullptr,
     [[maybe_unused]] const uint64_t* lds64 = nullptr,
@@ -1230,7 +1222,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
             const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
 
             // Scale always from global array
-            uint16_t scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
+            const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(FMT)>(d_meta, static_cast<uint32_t>(block), static_cast<uint32_t>(n), static_cast<uint32_t>(N));
+            uint16_t scale_bits = block_meta.primary;
 
             int32_t packed_groups[8];
 
@@ -1260,7 +1253,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
                     const uint32_t w0 = pw[0];  // qs[0..3]
                     const uint32_t w1 = pw[1];  // qs[4..7]
-                    const uint32_t w2 = pw[2];  // signs[0..3]
+                    // Coded IQ3_XXS payloads keep their scale code in sign parity bits.
+                    const uint32_t w2 = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT)>(pw[2]);  // signs[0..3]
 
                     #pragma unroll
                     for (int g = 0; g < 8; ++g)
@@ -1287,7 +1281,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
                     const uint32_t w0 = pw[0];  // qs[0..3]
                     const uint32_t w1 = pw[1];  // qs[4..7]
-                    const uint32_t w2 = pw[2];  // {qh, signs[0], signs[1], signs[2]}
+                    const uint32_t w2 = pw[2];  // {qh, signs[0], signs[1], signs[2]} (IQ3_S: explicit signs)
                     const uint8_t signs3 = payload[12];  // signs[3]
 
                     #pragma unroll
@@ -1318,7 +1312,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     // payload_bytes=8 is 4-byte aligned → dword loads are safe.
                     const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
                     const uint32_t w_qs    = pw[0];  // qs[0..3]
-                    const uint32_t w_signs = pw[1];  // signs[0..3]
+                    // Coded IQ2_XXS payloads keep their scale code in sign parity bits.
+                    const uint32_t w_signs = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT)>(pw[1]);  // signs[0..3]
 
                     #pragma unroll
                     for (int l = 0; l < 4; ++l)
@@ -1345,8 +1340,9 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     // Payload layout: [qs0..qs3][qh][signs0..signs3] = 9 bytes
                     const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
                     const uint32_t w_qs       = pw[0];  // qs[0..3]
-                    const uint32_t w_qh_signs = pw[1];  // {qh, signs[0], signs[1], signs[2]}
-                    const uint8_t signs3 = payload[8];   // signs[3]
+                    // Coded IQ2_XS payloads keep their scale code in sign parity bits (qh lane untouched).
+                    const uint32_t w_qh_signs = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT), 0xFFFFFF00u>(pw[1]);  // {qh, signs[0], signs[1], signs[2]}
+                    const uint8_t signs3 = ::llaminar2::rocm_native_metadata::restoreSignParity<static_cast<uint8_t>(FMT)>(payload[8]);   // signs[3]
 
                     #pragma unroll
                     for (int l = 0; l < 4; ++l)
@@ -1420,7 +1416,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     acc_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_hi);
 
                 const auto weight_scales = rocm_native_quantised_load_dual_weight_scales<FMT>(
-                    scale_bits, d_block_mins[linear]);
+                    scale_bits, block_meta.secondary);
                 const float scale_lo = weight_scales.low;
                 const float scale_hi = weight_scales.high;
                 if constexpr (Traits::is_dual_scale_asym)
@@ -1513,10 +1509,10 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], block_acc);
 
                 const float block_d = rocm_native_quantised_load_single_weight_scale<FMT>(
-                    scale_bits, (FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE) ? d_block_mins[linear] : uint16_t{0});
+                    scale_bits, (FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE) ? block_meta.secondary : uint16_t{0});
                 if constexpr (Traits::is_asymmetric)
                 {
-                    const uint16_t min_bits = d_block_mins[linear];
+                    const uint16_t min_bits = block_meta.secondary;
                     const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
                     f_acc[c] =
                         rocm_native_quantised_commit_corrected_single_scale_block(
@@ -1566,9 +1562,7 @@ template <int TILE_N, int CPT, NativeQuantisedFormat FMT, bool HasWork = false>
 __device__ __forceinline__ void nativeM1ColumnsBody(
     const int8_t*    __restrict__ d_A_int8,       // [K] quantized activations (INT8)
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × payload_bytes] payload
-    const uint16_t*  __restrict__ d_block_scales,  // [blocks_per_row × N] FP16 scale (d)
-    const uint16_t*  __restrict__ d_block_mins,    // [blocks_per_row × N] FP16 min (m), NULL for symmetric
-    const uint32_t*  __restrict__ d_block_emins,   // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded metadata
     float*           __restrict__ d_C_fp32,        // [N] output (FP32), used when kblocks=1
     float*           __restrict__ d_partial_fp32,  // [KB × N] partials, used when kblocks>1
     const float*     __restrict__ d_scale_A,       // [1] per-row activation scale (CK fallback, used when d_scale_A_blockwise==nullptr)
@@ -1640,12 +1634,12 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                 const float scale_ab_0 = d_scale_A_blockwise ? d_scale_A_blockwise[b] : 1.0f;
                 const float scale_ab_1 = d_scale_A_blockwise ? d_scale_A_blockwise[b + 1] : 1.0f;
                 iq_decode_accumulate_block<CPT, FMT, false>(
-                    a4_0, sum_a_0, d_payload, d_block_scales, d_block_mins,
-                    n_base, N, static_cast<size_t>(b) * static_cast<size_t>(N), f_acc,
+                    a4_0, sum_a_0, d_payload, d_meta,
+                    n_base, N, static_cast<size_t>(b) * static_cast<size_t>(N), b, f_acc,
                     nullptr, nullptr, scale_ab_0);
                 iq_decode_accumulate_block<CPT, FMT, false>(
-                    a4_1, sum_a_1, d_payload, d_block_scales, d_block_mins,
-                    n_base, N, static_cast<size_t>(b + 1) * static_cast<size_t>(N), f_acc,
+                    a4_1, sum_a_1, d_payload, d_meta,
+                    n_base, N, static_cast<size_t>(b + 1) * static_cast<size_t>(N), b + 1, f_acc,
                     nullptr, nullptr, scale_ab_1);
             }
             // Handle odd remainder block
@@ -1661,8 +1655,8 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                         sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
                 }
                 iq_decode_accumulate_block<CPT, FMT, false>(
-                    a4, sum_a, d_payload, d_block_scales, d_block_mins,
-                    n_base, N, static_cast<size_t>(b) * static_cast<size_t>(N), f_acc,
+                    a4, sum_a, d_payload, d_meta,
+                    n_base, N, static_cast<size_t>(b) * static_cast<size_t>(N), b, f_acc,
                     nullptr, nullptr, d_scale_A_blockwise ? d_scale_A_blockwise[b] : 1.0f);
             }
         }
@@ -1697,7 +1691,8 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                 {
                     const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
                     const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
-                    const uint16_t scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
+                    const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(FMT)>(d_meta, static_cast<uint32_t>(b), static_cast<uint32_t>(n), static_cast<uint32_t>(N));
+                    const uint16_t scale_bits = block_meta.primary;
 
                     // Decode 32 quantized values to 8 packed INT32 words (4 INT8 each)
                     // Nibble layout: qs[j] = lo_nibble(elem_j) | hi_nibble(elem_{j+16})
@@ -1943,7 +1938,9 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                         {
                             // IQ3_XXS: wide dword loads (see O5 in iq_decode_accumulate_block)
                             const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
-                            const uint32_t w0 = pw[0], w1 = pw[1], w2 = pw[2];
+                            const uint32_t w0 = pw[0], w1 = pw[1];
+                            // Coded IQ3_XXS sign parity restore (identity for IQ3_S).
+                            const uint32_t w2 = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT)>(pw[2]);
                             #pragma unroll
                             for (int g = 0; g < 8; ++g)
                             {
@@ -1959,7 +1956,9 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                         {
                             // O6: IQ3_S wide dword loads (see iq_decode_accumulate_block)
                             const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
-                            const uint32_t w0 = pw[0], w1 = pw[1], w2 = pw[2];
+                            const uint32_t w0 = pw[0], w1 = pw[1];
+                            // Coded IQ3_XXS sign parity restore (identity for IQ3_S).
+                            const uint32_t w2 = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT)>(pw[2]);
                             const uint8_t signs3 = payload[12];
                             #pragma unroll
                             for (int g = 0; g < 8; ++g)
@@ -1979,7 +1978,8 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                         {
                             // IQ2_XXS: wide dword loads (see O5 in iq_decode_accumulate_block)
                             const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
-                            const uint32_t w_qs = pw[0], w_signs = pw[1];
+                            const uint32_t w_qs = pw[0];
+                            const uint32_t w_signs = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT)>(pw[1]);
                             #pragma unroll
                             for (int l = 0; l < 4; ++l)
                             {
@@ -1998,8 +1998,9 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                         {
                             // O6: IQ2_XS/IQ2_S wide dword loads (see iq_decode_accumulate_block)
                             const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
-                            const uint32_t w_qs = pw[0], w_qh_signs = pw[1];
-                            const uint8_t signs3 = payload[8];
+                            const uint32_t w_qs = pw[0];
+                            const uint32_t w_qh_signs = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT), 0xFFFFFF00u>(pw[1]);
+                            const uint8_t signs3 = ::llaminar2::rocm_native_metadata::restoreSignParity<static_cast<uint8_t>(FMT)>(payload[8]);
                             #pragma unroll
                             for (int l = 0; l < 4; ++l)
                             {
@@ -2130,7 +2131,7 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                             acc_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_hi);
 
                         const auto weight_scales = rocm_native_quantised_load_dual_weight_scales<FMT>(
-                            scale_bits, d_block_mins[linear]);
+                            scale_bits, block_meta.secondary);
                         const float scale_lo = weight_scales.low;
                         const float scale_hi = weight_scales.high;
                         // Q2_K/IQ1_M: dual-scale + emin/delta correction
@@ -2149,7 +2150,7 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
 
                             float min_lo, min_hi;
                             if constexpr (Traits::needs_emin_array) {
-                                const uint32_t emin_packed = d_block_emins[linear];
+                                const uint32_t emin_packed = block_meta.emin;
                                 const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
                                 const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
                                 min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
@@ -2233,12 +2234,12 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
 
                         const float block_d = rocm_native_quantised_load_single_weight_scale<FMT>(
                             scale_bits, (FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE) ?
-                                d_block_mins[linear] : uint16_t{0});
+                                block_meta.secondary : uint16_t{0});
                         // Asymmetric min correction: f_acc += sum_a * block_m
                         // Derives from: value = d*q + m  →  Σ a_i*value_i = d*Σ(a_i*q_i) + m*Σ(a_i)
                         if constexpr (Traits::is_asymmetric)
                         {
-                            const uint16_t min_bits = d_block_mins[linear];
+                            const uint16_t min_bits = block_meta.secondary;
                             const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
                             f_acc[c] =
                                 rocm_native_quantised_commit_corrected_single_scale_block(
@@ -2297,16 +2298,14 @@ template <int TILE_N, int CPT, NativeQuantisedFormat FMT, bool HasWork = false>
 __global__ void gemv_native_quantised_kernel_t(
     const int8_t*    __restrict__ d_A_int8,       // [K] quantized activations (INT8)
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × payload_bytes] payload
-    const uint16_t*  __restrict__ d_block_scales,  // [blocks_per_row × N] FP16 scale (d)
-    const uint16_t*  __restrict__ d_block_mins,    // [blocks_per_row × N] FP16 min (m), NULL for symmetric
-    const uint32_t*  __restrict__ d_block_emins,   // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded metadata
     float*           __restrict__ d_C_fp32,        // [N] output (FP32), used when kblocks=1
     float*           __restrict__ d_partial_fp32,  // [KB × N] partials, used when kblocks>1
     const float*     __restrict__ d_scale_A,       // [1] per-row activation scale (CK fallback, used when d_scale_A_blockwise==nullptr)
     const float*     __restrict__ d_scale_A_blockwise, // [blocks_per_row] per-block activation scales
     int N, int K, int kblocks, llaminar2::ProjectionRowWork work)
 {
-    nativeM1ColumnsBody<TILE_N,CPT,FMT,HasWork>(d_A_int8,d_payload,d_block_scales,d_block_mins,d_block_emins,
+    nativeM1ColumnsBody<TILE_N,CPT,FMT,HasWork>(d_A_int8,d_payload,d_meta,
         d_C_fp32,d_partial_fp32,d_scale_A,d_scale_A_blockwise,N,K,kblocks,work,blockIdx.x,blockIdx.y,threadIdx.x);
 }
 
@@ -2430,7 +2429,7 @@ static_assert(offsetof(DeviceNativeQuantisedMatrixDesc,payload)==0 &&
     offsetof(DeviceNativeQuantisedMatrixDesc,source_codebook_id)==48 &&
     offsetof(DeviceNativeQuantisedMatrixDesc,source_is_superblock)==49 &&
     offsetof(DeviceNativeQuantisedMatrixDesc,source_identity_present)==50 &&
-    offsetof(DeviceNativeQuantisedMatrixDesc,reserved)==51 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,metadata_layout)==51 &&
     offsetof(DeviceNativeQuantisedMatrixDesc,reserved_tail)==52,
     "Canonical NativeQuantised descriptor must retain every original ROCm ABI field");
 
@@ -2683,15 +2682,21 @@ __device__ __forceinline__ bool native_quantised_desc_shape_ok(
     int K)
 {
     using Traits = NATIVE_QUANTISEDTraits<FMT>;
+    // Per-block descriptors own their secondary/emin planes; a superblock-coded
+    // descriptor owns a code plane plus a superblock plane and reconstructs both.
+    const auto meta = ::llaminar2::native_quantised_scale::metadataPlanes(desc);
     return desc.payload &&
            desc.scales &&
+           ::llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
            desc.n == N &&
            desc.k == K &&
            desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
            (desc.codebook_id == static_cast<uint8_t>(FMT) ||
             (FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE && desc.codebook_id == NATIVE_QUANTISED_IQ4_NL)) &&
-           (!(Traits::requires_secondary_metadata && desc.codebook_id != NATIVE_QUANTISED_IQ4_NL) || desc.mins) &&
-           (!Traits::is_dual_scale_asym || desc.emins);
+           (meta.coded()
+                ? desc.mins != nullptr
+                : ((!(Traits::requires_secondary_metadata && desc.codebook_id != NATIVE_QUANTISED_IQ4_NL) || desc.mins) &&
+                   (!Traits::is_dual_scale_asym || desc.emins)));
 }
 
 __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
@@ -2905,6 +2910,8 @@ __device__ __forceinline__ int32_t moe_decode_native_quantised_group(
                 static_cast<uint8_t>(moe_native_group_byte<Ordered>(payload,12,previous_dot));
         }
         else sign_byte=static_cast<uint8_t>(signs>>((group/2)*8));
+        // Coded IQ3_XXS selectors keep their scale code in the parity bit.
+        sign_byte=::llaminar2::rocm_native_metadata::restoreSignParity<static_cast<uint8_t>(FMT)>(sign_byte);
         const uint8_t sign_nibble=group&1?sign_byte>>4:sign_byte&0xF;
         return static_cast<int32_t>(iq_apply_signs_4(table_view.template iq3<FMT>(idx),sign_nibble));
     }
@@ -2923,6 +2930,8 @@ __device__ __forceinline__ int32_t moe_decode_native_quantised_group(
                 static_cast<uint8_t>(moe_native_group_byte<Ordered>(payload,8,previous_dot));
         }
         else sign_byte=static_cast<uint8_t>(signs>>(lookup*8));
+        // Coded IQ2_XS/IQ2_XXS selectors keep their scale code in the parity bit.
+        sign_byte=::llaminar2::rocm_native_metadata::restoreSignParity<static_cast<uint8_t>(FMT)>(sign_byte);
         const uint64_t grid=table_view.template iq2<FMT>(idx);
         const uint32_t word=group&1?static_cast<uint32_t>(grid>>32):static_cast<uint32_t>(grid);
         const uint8_t sign_nibble=group&1?sign_byte>>4:sign_byte&0xF;
@@ -3107,12 +3116,14 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_bloc
     const int32_t* __restrict__ a4,
     const int32_t* __restrict__ packed_groups,
     const uint8_t* __restrict__ payload,
-    const uint16_t* __restrict__ scale_base,
-    const uint16_t* __restrict__ min_base,
-    const uint32_t* __restrict__ emin_base,
-    size_t linear,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes& meta,
+    ::llaminar2::rocm_native_metadata::BlockAddress address,
     float scale_ab,
     int32_t sum_a);
+
+template <NativeQuantisedFormat FMT>
+__device__ __forceinline__ ::llaminar2::rocm_native_metadata::StagedBlockMetadata native_quantised_block_words(
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes& meta, ::llaminar2::rocm_native_metadata::BlockAddress address);
 
 template <NativeQuantisedFormat FMT>
 __device__ __forceinline__ float moe_native_quantised_dot_desc_range(
@@ -3138,9 +3149,8 @@ __device__ __forceinline__ float moe_native_quantised_dot_desc_range(
 
     const int blocks_per_row = K / 32;
     const uint8_t* payload_base = desc.payload;
-    const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
-    const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
-    const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
+    // One metadata authority for per-block and superblock-coded descriptors.
+    const auto meta = ::llaminar2::native_quantised_scale::metadataPlanes(desc);
     float acc = 0.0f;
 
     if (b_start < 0) b_start = 0;
@@ -3150,8 +3160,9 @@ __device__ __forceinline__ float moe_native_quantised_dot_desc_range(
     {
         const int32_t* a4 = reinterpret_cast<const int32_t*>(A_int8 + b * 32);
         int32_t packed_groups[8];
-        const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-        const uint8_t* payload = payload_base + linear * NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
+        const auto address = ::llaminar2::rocm_native_metadata::blockAddress(meta, static_cast<uint32_t>(b), static_cast<uint32_t>(n),
+                                                  static_cast<uint32_t>(N));
+        const uint8_t* payload = payload_base + address.linear * NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
         moe_decode_native_quantised_groups<FMT>(payload, packed_groups);
 
         const float scale_ab = scales_A_blockwise[b];
@@ -3162,18 +3173,15 @@ __device__ __forceinline__ float moe_native_quantised_dot_desc_range(
         {
             if (desc.codebook_id == NATIVE_QUANTISED_IQ4_NL)
                 native_quantised_small_m_accumulate_decoded_block<NATIVE_QUANTISED_IQ4_NL>(
-                    acc, a4, packed_groups, payload, scale_base, min_base,
-                    emin_base, linear, scale_ab, sum_a);
+                    acc, a4, packed_groups, payload, meta, address, scale_ab, sum_a);
             else
                 native_quantised_small_m_accumulate_decoded_block<FMT>(
-                    acc, a4, packed_groups, payload, scale_base, min_base,
-                    emin_base, linear, scale_ab, sum_a);
+                    acc, a4, packed_groups, payload, meta, address, scale_ab, sum_a);
         }
         else
         {
             native_quantised_small_m_accumulate_decoded_block<FMT>(
-                acc, a4, packed_groups, payload, scale_base, min_base,
-                emin_base, linear, scale_ab, sum_a);
+                acc, a4, packed_groups, payload, meta, address, scale_ab, sum_a);
         }
     }
 
@@ -3737,9 +3745,7 @@ __global__ void moe_grouped_native_quantised_down_runtime_kpart_kernel_t(
  * @brief Return the canonical source policy carried by a device descriptor.
  *
  * Q8_1 and Q8_K keep distinct source identities but intentionally share the
- * Q8_0 accelerator arithmetic policy, and MXFP4 shares IQ4_NL's.  Expanded codebook 23 never supplies a
- * policy of its own: its authoritative source identity selects the reduction
- * tree that existed before migration.
+ * Q8_0 accelerator arithmetic policy, and MXFP4 shares IQ4_NL's.
  */
 __device__ __forceinline__ uint8_t
 moe_native_quantised_descriptor_policy_codebook(
@@ -3910,11 +3916,6 @@ __device__ __forceinline__ float moe_native_quantised_dot_desc_range_dynamic(
             return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q8_0>(
                 *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         break;
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_EXPANDED_INT8_MIN))!=0)
-            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_EXPANDED_INT8_MIN>(
-                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-        break;
     default:
         break;
     }
@@ -3949,7 +3950,6 @@ __device__ __forceinline__ float moe_native_quantised_dot_desc_range_dynamic(
     Apply(NATIVE_QUANTISED_IQ1_S,NATIVE_QUANTISED_IQ1_S) \
     Apply(NATIVE_QUANTISED_IQ1_M,NATIVE_QUANTISED_IQ1_M) \
     Apply(NATIVE_QUANTISED_Q8_0,NATIVE_QUANTISED_Q8_0) \
-    Apply(NATIVE_QUANTISED_EXPANDED_INT8_MIN,NATIVE_QUANTISED_EXPANDED_INT8_MIN) \
     Apply(NATIVE_QUANTISED_IQ4_NL,NATIVE_QUANTISED_IQ4_XS_SOURCE) \
     Apply(NATIVE_QUANTISED_IQ4_XS_SOURCE,NATIVE_QUANTISED_IQ4_NL)
 
@@ -3994,15 +3994,17 @@ static_assert(moePairedK32RegistryMatchesCanonical(),
  * address escapes this force-inlined call, and no new scratch allocation exists.
  */
 template<NativeQuantisedFormat FMT>
-__device__ __forceinline__ void moePairedK32Commit(const DeviceNativeQuantisedMatrixDesc& desc,size_t linear,
-    const int32_t* a4,float scale,int32_t sum,float& accumulator)
+__device__ __forceinline__ void moePairedK32Commit(const DeviceNativeQuantisedMatrixDesc& desc,int block,int column,
+    int N,const int32_t* a4,float scale,int32_t sum,float& accumulator)
 {
-    const auto* payload=desc.payload+linear*NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
+    // Each role addresses its own metadata representation and superblock phase.
+    const auto meta=::llaminar2::native_quantised_scale::metadataPlanes(desc);
+    const auto address=::llaminar2::rocm_native_metadata::blockAddress(meta,uint32_t(block),uint32_t(column),uint32_t(N));
+    const auto* payload=desc.payload+address.linear*NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
     int32_t groups[8];
     moe_decode_native_quantised_groups<FMT>(payload,groups);
     native_quantised_small_m_accumulate_decoded_block<FMT>(accumulator,a4,groups,payload,
-        static_cast<const uint16_t*>(desc.scales),static_cast<const uint16_t*>(desc.mins),
-        static_cast<const uint32_t*>(desc.emins),linear,scale,sum);
+        meta,address,scale,sum);
 }
 /**
  * @brief Commit the unchanged canonical block from immutable planes captured before the loop.
@@ -4018,14 +4020,14 @@ __device__ __forceinline__ void moePairedK32Commit(const DeviceNativeQuantisedMa
  */
 template<NativeQuantisedFormat FMT>
 __device__ __forceinline__ void moePairedK32CommitPlanes(const uint8_t* payload_base,
-    const uint16_t* scales,const uint16_t* mins,const uint32_t* emins,size_t linear,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes& meta,::llaminar2::rocm_native_metadata::BlockAddress address,
     const int32_t* a4,float scale,int32_t sum,float& accumulator)
 {
-    const auto* payload=payload_base+linear*NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
+    const auto* payload=payload_base+address.linear*NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
     int32_t groups[8];
     moe_decode_native_quantised_groups<FMT>(payload,groups);
     native_quantised_small_m_accumulate_decoded_block<FMT>(accumulator,a4,groups,payload,
-        scales,mins,emins,linear,scale,sum);
+        meta,address,scale,sum);
 }
 /**
  * @brief Walk only the union of two original partition ranges, sharing identical activations.
@@ -4060,13 +4062,9 @@ __device__ __forceinline__ void moePairedK32RangeTyped(const DeviceNativeQuantis
         // Read immutable plane addresses before the loop, rather than requesting
         // descriptor fields again after a canonical rounded-operation barrier.
         const uint8_t* gate_payload=gate.payload;
-        const uint16_t* gate_scales=static_cast<const uint16_t*>(gate.scales);
-        const uint16_t* gate_mins=static_cast<const uint16_t*>(gate.mins);
-        const uint32_t* gate_emins=static_cast<const uint32_t*>(gate.emins);
+        const auto gate_meta=::llaminar2::native_quantised_scale::metadataPlanes(gate);
         const uint8_t* up_payload=up.payload;
-        const uint16_t* up_scales=static_cast<const uint16_t*>(up.scales);
-        const uint16_t* up_mins=static_cast<const uint16_t*>(up.mins);
-        const uint32_t* up_emins=static_cast<const uint32_t*>(up.emins);
+        const auto up_meta=::llaminar2::native_quantised_scale::metadataPlanes(up);
         #pragma unroll 1
         for(int b=gate_begin;b<gate_end;++b)
         {
@@ -4082,11 +4080,10 @@ __device__ __forceinline__ void moePairedK32RangeTyped(const DeviceNativeQuantis
                 for(int word=0;word<8;++word)
                     sum=::llaminar2::rocm_integer_contract::signedDot4(activation[word],0x01010101,sum);
             }
-            const size_t linear=size_t(b)*size_t(N)+size_t(n);
-            moePairedK32CommitPlanes<Gate>(gate_payload,gate_scales,gate_mins,gate_emins,
-                linear,activation,scale,sum,gate_acc);
-            moePairedK32CommitPlanes<Up>(up_payload,up_scales,up_mins,up_emins,
-                linear,activation,scale,sum,up_acc);
+            moePairedK32CommitPlanes<Gate>(gate_payload,gate_meta,
+                ::llaminar2::rocm_native_metadata::blockAddress(gate_meta,uint32_t(b),uint32_t(n),uint32_t(N)),activation,scale,sum,gate_acc);
+            moePairedK32CommitPlanes<Up>(up_payload,up_meta,
+                ::llaminar2::rocm_native_metadata::blockAddress(up_meta,uint32_t(b),uint32_t(n),uint32_t(N)),activation,scale,sum,up_acc);
         }
         return;
     }
@@ -4113,9 +4110,8 @@ __device__ __forceinline__ void moePairedK32RangeTyped(const DeviceNativeQuantis
             for(int word=0;word<8;++word)
                 sum=::llaminar2::rocm_integer_contract::signedDot4(activation[word],0x01010101,sum);
         }
-        const size_t linear=size_t(b)*size_t(N)+size_t(n);
-        if(active_gate)moePairedK32Commit<Gate>(gate,linear,activation,scale,sum,gate_acc);
-        if(active_up)moePairedK32Commit<Up>(up,linear,activation,scale,sum,up_acc);
+        if(active_gate)moePairedK32Commit<Gate>(gate,b,n,N,activation,scale,sum,gate_acc);
+        if(active_up)moePairedK32Commit<Up>(up,b,n,N,activation,scale,sum,up_acc);
     }
 }
 /**
@@ -5395,7 +5391,7 @@ const void* residentMoEFFNKernelFunction(ResidentMoEFFNDecoderProgram program,Re
     if(currentResidentMoEFFNProgram()==ResidentMoEFFNProgram::PartitionLocal)
     {
         if(program.groups()!=1)
-            throw std::invalid_argument("Partition-local FFN diagnostic requires the complete affine/byte execution envelope {5,7,19,23}");
+            throw std::invalid_argument("Partition-local FFN diagnostic requires the complete affine/byte execution envelope {5,7,19}");
         if(width!=ResidentMoEFFNSchedulerWidth::UInt32&&width!=ResidentMoEFFNSchedulerWidth::UInt64)
             throw std::invalid_argument("Partition-local FFN diagnostic scheduler width is unknown");
         return width==ResidentMoEFFNSchedulerWidth::UInt32
@@ -5773,6 +5769,8 @@ template <int TN,int CPT,bool HasWork>
 void finishNativeM1Producer(float *partials,float *output,int n,int kb,int device,void *stream,
     llaminar2::rocm::NativeM1ReductionTicket *deferred,llaminar2::ProjectionRowWork work)
 {
+    static_assert(std::is_same_v<decltype(gemv_native_quantised_reduce_kernel_t<TN,CPT,HasWork>),
+        llaminar2::rocm::NativeM1ReducerSignature>);
     if(deferred)
     {
         if(hipPeekAtLastError()!=hipSuccess)throw std::runtime_error("M1 deferred producer submission failed");
@@ -6012,14 +6010,18 @@ llaminar2::rocm::NativeQ8SerialKernelResources inspectNativeQ8SerialSymbol(
  */
 template <int TN, int CPT, NativeQuantisedFormat FMT>
 void launchNativeQuantisedSerialGeometry(
-    const int8_t *A, const uint8_t *payload, const uint16_t *scales,
-    const uint16_t *mins, const uint32_t *emins, float *output, float *partials,
+    const int8_t *A, const uint8_t *payload, const ::llaminar2::rocm_native_metadata::MetadataPlanes meta,
+    float *output, float *partials,
     const float *scale_a, const float *block_scales, int N, int K, int kb,
     uint8_t arithmetic_policy, int device, void *stream,
     llaminar2::rocm::NativeQ8SerialGeometry geometry,
     llaminar2::rocm::NativeM1ReductionTicket *deferred=nullptr,
     const llaminar2::rocm::NativeQ8SerialGeometryAdmission *prepared=nullptr)
 {
+    static_assert(std::is_same_v<decltype(gemv_native_quantised_kernel_t<TN,CPT,FMT,false>),
+        llaminar2::rocm::NativeM1ProducerSignature>);
+    static_assert(std::is_same_v<decltype(gemv_native_quantised_kernel_t<TN,CPT,FMT,true>),
+        llaminar2::rocm::NativeM1ProducerSignature>);
     static_assert(CPT == 1 || CPT == 2);
     static_assert(TN % CPT == 0);
     using Loads=llaminar2::rocm::NativeQ8SerialProducerLoads;
@@ -6050,17 +6052,17 @@ void launchNativeQuantisedSerialGeometry(
                 if constexpr(TN==128)
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_q8_k32_contribution_tile_kernel_t<HasWork>),
                         dim3(grid_n,kb,1),dim3(producer_spec.block_threads),0,static_cast<hipStream_t>(stream),
-                        A,payload,scales,output,partials,scale_a,block_scales,N,K,kb,work);
+                        A,payload,meta.primary,output,partials,scale_a,block_scales,N,K,kb,work);
                 else throw std::invalid_argument("native-Q8 K32 contribution tile requires original128 CPT1 reducer geometry");
             }
             else if(loads==Loads::TwoK32Lookahead)
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_q8_two_k32_lookahead_kernel_t<TN,HasWork>),
                     dim3(grid_n,kb,1),block,0,static_cast<hipStream_t>(stream),
-                    A,payload,scales,output,partials,scale_a,block_scales,N,K,kb,work);
+                    A,payload,meta.primary,output,partials,scale_a,block_scales,N,K,kb,work);
             else if(loads==Loads::Original)
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_quantised_kernel_t<TN,CPT,FMT,HasWork>),
                     dim3(grid_n,kb,1),block,0,static_cast<hipStream_t>(stream),
-                    A,payload,scales,mins,emins,output,partials,scale_a,block_scales,N,K,kb,work);
+                    A,payload,meta,output,partials,scale_a,block_scales,N,K,kb,work);
             else throw std::invalid_argument("unknown native-Q8 producer load schedule");
         }
         else
@@ -6068,7 +6070,7 @@ void launchNativeQuantisedSerialGeometry(
             if(loads!=Loads::Original)throw std::invalid_argument("native-Q8 lookahead requires admitted64/128 CPT1 source");
             hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_quantised_kernel_t<TN,CPT,FMT,HasWork>),
                 dim3(grid_n,kb,1),block,0,static_cast<hipStream_t>(stream),
-                A,payload,scales,mins,emins,output,partials,scale_a,block_scales,N,K,kb,work);
+                A,payload,meta,output,partials,scale_a,block_scales,N,K,kb,work);
         }
     if (g_native_q8_serial_scope && hipPeekAtLastError() != hipSuccess)
     {
@@ -6329,9 +6331,7 @@ struct NativeQuantisedSmallMProjection
     unsigned n; ///< Validated positive physical output width.
     unsigned column_base; ///< This lane's nonnegative output column, including tail lanes.
     const uint8_t* payload; ///< Borrowed packed weight blocks.
-    const uint16_t* scales; ///< Primary scale plane.
-    const uint16_t* mins; ///< Optional secondary/minimum plane.
-    const uint32_t* emins; ///< Optional extended minima.
+    ::llaminar2::rocm_native_metadata::MetadataPlanes meta; ///< Block metadata planes and representation.
     const float* bias; ///< Optional output bias.
     float* output; ///< This physical row tile's output.
     float* partial; ///< This CTA's split-K plane, or null for direct output.
@@ -6365,8 +6365,9 @@ __device__ __forceinline__ NativeQuantisedSmallMProjection native_quantised_reso
         bias = args.bias[projection];
     }
     return {n, local_tile * TILE_N + threadIdx.x * CPT,
-            args.payload[projection], args.scales[projection],
-            args.mins[projection], args.emins[projection],
+            args.payload[projection],
+            ::llaminar2::rocm_native_metadata::planesFromLayout(args.scales[projection], args.mins[projection], args.emins[projection],
+                              args.metadata_layout[projection]),
             bias, output, partial};
 }
 
@@ -6421,23 +6422,6 @@ __device__ __forceinline__ void native_quantised_small_m_commit_single_dot_bits(
     }
 }
 
-/**
- * @brief Preserve the original pointer API while sharing one scalar-bit commit body.
- * @tparam FMT Original single-scale decoder.
- * @param f_acc Original running partition accumulator. @param block_acc Exact integer dot.
- * @param scale_base Original primary plane. @param min_base Original secondary plane.
- * @param linear Original metadata index. @param scale_ab Original activation scale.
- * @param sum_a Exact signed activation sum.
- */
-template<NativeQuantisedFormat FMT>
-__device__ __forceinline__ void native_quantised_small_m_commit_single_dot(float& f_acc,int32_t block_acc,
-    const uint16_t* scale_base,const uint16_t* min_base,size_t linear,float scale_ab,int32_t sum_a)
-{
-    using Traits=NATIVE_QUANTISEDTraits<FMT>;
-    const uint16_t primary=::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scale_base,linear);
-    const uint16_t secondary=Traits::requires_secondary_metadata?min_base[linear]:uint16_t{0};
-    native_quantised_small_m_commit_single_dot_bits<FMT>(f_acc,block_acc,primary,secondary,scale_ab,sum_a);
-}
 
 /**
  * @brief Construct the original IQ1_M signed one-eighth from its source sign bit.
@@ -6637,18 +6621,27 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_bloc
  * @param scale_ab Original activation scale. @param sum_a Exact original activation sum.
  */
 template<NativeQuantisedFormat FMT>
-__device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_block(
-    float& f_acc,const int32_t* __restrict__ a4,const int32_t* __restrict__ packed_groups,
-    const uint8_t* __restrict__ payload,const uint16_t* __restrict__ scale_base,
-    const uint16_t* __restrict__ min_base,const uint32_t* __restrict__ emin_base,
-    size_t linear,float scale_ab,int32_t sum_a)
+__device__ __forceinline__ ::llaminar2::rocm_native_metadata::StagedBlockMetadata native_quantised_block_words(
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes& meta, ::llaminar2::rocm_native_metadata::BlockAddress address)
 {
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
-    const uint16_t primary=::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scale_base,linear);
-    const uint16_t secondary=Traits::requires_secondary_metadata?min_base[linear]:uint16_t{0};
-    const uint32_t extended=Traits::needs_emin_array?emin_base[linear]:uint32_t{0};
+    // Keep each decoder's original metadata consumption: unused words are zero,
+    // exactly as the former conditional plane reads produced.
+    auto words=::llaminar2::rocm_native_metadata::blockMetadataAt<static_cast<uint8_t>(FMT)>(meta,address);
+    if constexpr(!Traits::requires_secondary_metadata) words.secondary=0;
+    if constexpr(!Traits::needs_emin_array) words.emin=0;
+    return words;
+}
+
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_block(
+    float& f_acc,const int32_t* __restrict__ a4,const int32_t* __restrict__ packed_groups,
+    const uint8_t* __restrict__ payload,const ::llaminar2::rocm_native_metadata::MetadataPlanes& meta,
+    ::llaminar2::rocm_native_metadata::BlockAddress address,float scale_ab,int32_t sum_a)
+{
+    const auto words=native_quantised_block_words<FMT>(meta,address);
     native_quantised_small_m_accumulate_decoded_block_bits<FMT>(f_acc,a4,packed_groups,payload,
-        primary,secondary,extended,scale_ab,sum_a);
+        words.primary,words.secondary,words.emin,scale_ab,sum_a);
 }
 
 /**
@@ -6671,10 +6664,7 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_row(
     unsigned b,
     const int32_t* __restrict__ packed_groups,
     const uint8_t* __restrict__ payload,
-    const uint16_t* __restrict__ scale_base,
-    const uint16_t* __restrict__ min_base,
-    const uint32_t* __restrict__ emin_base,
-    size_t linear)
+    const ::llaminar2::rocm_native_metadata::StagedBlockMetadata& words)
 {
     const int32_t* a4 = reinterpret_cast<const int32_t*>(
         d_A_int8 + static_cast<size_t>(row) * K + static_cast<size_t>(b) * 32);
@@ -6687,9 +6677,8 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_row(
             ? d_sum_A_blockwise[static_cast<size_t>(row) * blocks_per_row + b]
             : native_quantised_activation_sum_a<FMT>(a4);
     }
-    native_quantised_small_m_accumulate_decoded_block<FMT>(
-        acc, a4, packed_groups, payload, scale_base, min_base, emin_base,
-        linear, scale_ab, sum_a);
+    native_quantised_small_m_accumulate_decoded_block_bits<FMT>(acc, a4, packed_groups, payload,
+        words.primary, words.secondary, words.emin, scale_ab, sum_a);
 }
 
 
@@ -6749,9 +6738,7 @@ __device__ __forceinline__ void gemv_native_quantised_small_m_batched_shared_til
     const unsigned b_end = min(b_start + b_per, blocks_per_row);
 
     const uint8_t* payload_base = projection.payload;
-    const uint16_t* scale_base = projection.scales;
-    const uint16_t* min_base = projection.mins;
-    const uint32_t* emin_base = projection.emins;
+    const auto meta = projection.meta;
     float* out_base = projection.output;
     float* partial_base = projection.partial;
 
@@ -6775,10 +6762,11 @@ __device__ __forceinline__ void gemv_native_quantised_small_m_batched_shared_til
         for (unsigned b = b_start; b < b_end; ++b)
         {
             int32_t packed_groups[8];
-            const size_t linear =
-                static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
-            const uint8_t* payload = payload_base + linear * NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
+            const auto address = ::llaminar2::rocm_native_metadata::blockAddress(meta, b, n, N);
+            const uint8_t* payload = payload_base + address.linear * NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
             moe_decode_native_quantised_groups<FMT>(payload, packed_groups);
+            // One metadata fetch per weight block, shared by every verifier row.
+            const auto words = native_quantised_block_words<FMT>(meta, address);
 
             #pragma unroll
             for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
@@ -6788,8 +6776,7 @@ __device__ __forceinline__ void gemv_native_quantised_small_m_batched_shared_til
                     continue;
                 native_quantised_small_m_accumulate_row<FMT>(
                     acc[tile_row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
-                    row, K, blocks_per_row, b, packed_groups, payload, scale_base,
-                    min_base, emin_base, linear);
+                    row, K, blocks_per_row, b, packed_groups, payload, words);
             }
         }
     }
@@ -6981,10 +6968,6 @@ __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_quantised_small_m_ba
         gemv_native_quantised_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NATIVE_QUANTISED_Q8_0, Publication>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
         break;
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        gemv_native_quantised_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NATIVE_QUANTISED_EXPANDED_INT8_MIN, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
-        break;
     default:
         break;
     }
@@ -7056,9 +7039,7 @@ template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeQuantisedFormat FMT, boo
 __global__ void gemv_native_quantised_small_m_kernel_t(
     const int8_t*    __restrict__ d_A_int8,       // [M x K] quantized activations
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row x N x payload_bytes]
-    const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row x N]
-    const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row x N], nullable when unused
-    const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row x N], Q2_K only
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,             // per-block or superblock-coded metadata
     float*           __restrict__ d_C_fp32,       // [M x N] output
     float*           __restrict__ d_partial_fp32, // [KB x M x N] partials
     const float*     __restrict__ d_scale_A_blockwise, // [M x blocks_per_row]
@@ -7133,10 +7114,12 @@ __global__ void gemv_native_quantised_small_m_kernel_t(
             for (int b = b_start; b < b_end; ++b)
             {
                 int32_t packed_groups[8];
-                const size_t linear =
-                    static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
-                const uint8_t* payload = d_payload + linear * NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
+                const auto address = ::llaminar2::rocm_native_metadata::blockAddress(d_meta, static_cast<uint32_t>(b),
+                                                          static_cast<uint32_t>(n), static_cast<uint32_t>(N));
+                const uint8_t* payload = d_payload + address.linear * NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
                 moe_decode_native_quantised_groups<FMT>(payload, packed_groups);
+                // One metadata fetch per weight block, shared by every verifier row.
+                const auto words = native_quantised_block_words<FMT>(d_meta, address);
 
 #pragma unroll
                 for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
@@ -7148,8 +7131,7 @@ __global__ void gemv_native_quantised_small_m_kernel_t(
                         if(!(authored_rows&(std::uint32_t(1)<<row)))continue;
                     native_quantised_small_m_accumulate_row<FMT>(
                         acc[tile_row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, row, K,
-                        blocks_per_row, b, packed_groups, payload, d_block_scales, d_block_mins,
-                        d_block_emins, linear);
+                        blocks_per_row, b, packed_groups, payload, words);
                 }
             }
         }
@@ -7218,9 +7200,7 @@ template <int IQ_TN, NativeQuantisedFormat FMT, bool HasWork = false>
 __device__ __forceinline__ void nativeM1IQLDSBody(
     const int8_t*    __restrict__ d_A_int8,
     const uint8_t*   __restrict__ d_payload,
-    const uint16_t*  __restrict__ d_block_scales,
-    const uint16_t*  __restrict__ d_block_mins,
-    const uint32_t*  __restrict__ d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float*           __restrict__ d_C_fp32,
     float*           __restrict__ d_partial_fp32,
     const float*     __restrict__ d_scale_A,
@@ -7291,8 +7271,8 @@ __device__ __forceinline__ void nativeM1IQLDSBody(
             }
 
             iq_decode_accumulate_block<1, FMT, true>(
-                a4, sum_a, d_payload, d_block_scales, d_block_mins,
-                n, N, static_cast<size_t>(b) * static_cast<size_t>(N), &f_acc,
+                a4, sum_a, d_payload, d_meta,
+                n, N, static_cast<size_t>(b) * static_cast<size_t>(N), b, &f_acc,
                 lds32, lds64, scale_ab);
         }
 
@@ -7319,16 +7299,14 @@ template <int IQ_TN, NativeQuantisedFormat FMT, bool HasWork = false>
 __global__ void gemv_iq_lds_kernel_t(
     const int8_t*    __restrict__ d_A_int8,
     const uint8_t*   __restrict__ d_payload,
-    const uint16_t*  __restrict__ d_block_scales,
-    const uint16_t*  __restrict__ d_block_mins,
-    const uint32_t*  __restrict__ d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float*           __restrict__ d_C_fp32,
     float*           __restrict__ d_partial_fp32,
     const float*     __restrict__ d_scale_A,
     const float*     __restrict__ d_scale_A_blockwise,
     int N, int K, int kblocks, llaminar2::ProjectionRowWork work)
 {
-    nativeM1IQLDSBody<IQ_TN,FMT,HasWork>(d_A_int8,d_payload,d_block_scales,d_block_mins,d_block_emins,
+    nativeM1IQLDSBody<IQ_TN,FMT,HasWork>(d_A_int8,d_payload,d_meta,
         d_C_fp32,d_partial_fp32,d_scale_A,d_scale_A_blockwise,N,K,kblocks,work,blockIdx.x,blockIdx.y);
 }
 
@@ -7809,9 +7787,6 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode(
     case NATIVE_QUANTISED_IQ1_S:    LAUNCH_GROUPED_DOWN_DIRECT(NATIVE_QUANTISED_IQ1_S);    break;
     case NATIVE_QUANTISED_IQ1_M:    LAUNCH_GROUPED_DOWN_DIRECT(NATIVE_QUANTISED_IQ1_M);    break;
     case NATIVE_QUANTISED_Q8_0:     LAUNCH_GROUPED_DOWN_DIRECT(NATIVE_QUANTISED_Q8_0);     break;
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        LAUNCH_GROUPED_DOWN_DIRECT(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
-        break;
     default:
         fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_quantised_decode] unsupported codebook_id=%u\n",
                 static_cast<unsigned>(codebook_id));
@@ -8155,9 +8130,7 @@ template <NativeQuantisedFormat FMT>
 bool rocmLaunch_native_quantised_small_m_fp32(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
-    const uint16_t* d_block_scales,
-    const uint16_t* d_block_mins,
-    const uint32_t* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float* d_C_fp32,
     const float* d_scale_A_blockwise,
     const int32_t* d_sum_A_blockwise,
@@ -8264,8 +8237,9 @@ bool rocmLaunch_native_quantised_small_m_fp32(
         .work=llaminar2::projectionWorkForLaunch(M,row_range)};
     original_packet.num_projections=1; original_packet.total_grid_n=grid_n;
     original_packet.N[0]=N; original_packet.grid_offsets[1]=grid_n;
-    original_packet.payload[0]=d_payload; original_packet.scales[0]=d_block_scales;
-    original_packet.mins[0]=d_block_mins; original_packet.emins[0]=d_block_emins;
+    original_packet.payload[0]=d_payload; original_packet.scales[0]=d_meta.primary;
+    original_packet.mins[0]=static_cast<const uint16_t*>(d_meta.secondary); original_packet.emins[0]=d_meta.emins;
+    original_packet.metadata_layout[0]=::llaminar2::rocm_native_metadata::packedLayout(d_meta);
     original_packet.output[0]=d_C_fp32; original_packet.partial[0]=d_partial_fp32;
     original_packet.codebook[0]=static_cast<uint8_t>(FMT);
     // Only the complete materialized head may authorize a new singleton call;
@@ -8296,7 +8270,7 @@ bool rocmLaunch_native_quantised_small_m_fp32(
             generated_cfg.kb == kHCDownPartitions && kb == kHCDownPartitions &&
             arithmetic_policy_codebook_id == static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0) &&
             N == kHCDownColumns && K == kHCDownReduction && M >= 2 && M <= 8 &&
-            row_range && row_range->countOwner() && !d_block_mins && !d_block_emins &&
+            row_range && row_range->countOwner() && !d_meta.secondary && !d_meta.emins &&
             !llaminar2::currentProjectionRowWork(M) &&
             (publication || llaminar2::qfnGroupedHCDownLongKExperiment()))
         {
@@ -8372,7 +8346,7 @@ bool rocmLaunch_native_quantised_small_m_fp32(
             constexpr int threads = kHCDownTileColumns * kHCDownWindow;
             hipLaunchKernelGGL(qfn_hc_down_long_k_contributions, grid, dim3(threads), 0,
                 static_cast<hipStream_t>(stream),
-                (HCDownLongKArgs{tile_a, d_payload, d_block_scales, tile_scales, d_partial_fp32, tile_rows}));
+                (HCDownLongKArgs{tile_a, d_payload, d_meta.primary, tile_scales, d_partial_fp32, tile_rows}));
             llaminar2::PerfStatsCollector::addCounter("gemm", "qfn_grouped_hc_down_long_k_nodes", 1.0,
                 "gemm", "rocm:" + std::to_string(device_id));
         }
@@ -8382,8 +8356,9 @@ bool rocmLaunch_native_quantised_small_m_fp32(
                 .work=llaminar2::projectionWorkForLaunch(M,row_range).slice(row_base,tile_m)};
             bundle.num_projections=1; bundle.total_grid_n=grid_n;
             bundle.N[0]=N; bundle.grid_offsets[1]=grid_n;
-            bundle.payload[0]=d_payload; bundle.scales[0]=d_block_scales;
-            bundle.mins[0]=d_block_mins; bundle.emins[0]=d_block_emins;
+            bundle.payload[0]=d_payload; bundle.scales[0]=d_meta.primary;
+            bundle.mins[0]=static_cast<const uint16_t*>(d_meta.secondary); bundle.emins[0]=d_meta.emins;
+            bundle.metadata_layout[0]=::llaminar2::rocm_native_metadata::packedLayout(d_meta);
             bundle.output[0]=tile_c; bundle.partial[0]=d_partial_fp32;
             bundle.codebook[0]=static_cast<uint8_t>(FMT);
             llaminar2::rocm::submitNativeQuantisedVerifierWmma({
@@ -8401,7 +8376,7 @@ bool rocmLaunch_native_quantised_small_m_fp32(
                     TN, CPT, NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE, FMT, HasWork>),
                 dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
                 static_cast<hipStream_t>(stream),
-                tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                tile_a, d_payload, d_meta,
                 tile_c, d_partial_fp32, tile_scales, tile_sums,
                 tile_m, N, K, kb, tile_rows,llaminar2::projectionWorkForLaunch(M,row_range).slice(row_base,tile_m));
         });
@@ -8414,7 +8389,7 @@ bool rocmLaunch_native_quantised_small_m_fp32(
                     TN, CPT, NATIVE_QUANTISED_VERIFIER_WIDE_ROWS_PER_TILE, FMT, HasWork>),
                 dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
                 static_cast<hipStream_t>(stream),
-                tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                tile_a, d_payload, d_meta,
                 tile_c, d_partial_fp32, tile_scales, tile_sums,
                 tile_m, N, K, kb, tile_rows,llaminar2::projectionWorkForLaunch(M,row_range).slice(row_base,tile_m));
         });
@@ -8462,9 +8437,7 @@ template <NativeQuantisedFormat FMT>
 bool rocmLaunch_native_quantised_small_m_batched_fp32(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes* d_metas,
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
@@ -8502,9 +8475,10 @@ bool rocmLaunch_native_quantised_small_m_batched_fp32(
         args.grid_offsets[p] = args.total_grid_n;
         args.total_grid_n += grid_n;
         args.payload[p] = d_payloads[p];
-        args.scales[p] = d_block_scales[p];
-        args.mins[p] = d_block_mins ? d_block_mins[p] : nullptr;
-        args.emins[p] = d_block_emins ? d_block_emins[p] : nullptr;
+        args.scales[p] = d_metas[p].primary;
+        args.mins[p] = static_cast<const uint16_t*>(d_metas[p].secondary);
+        args.emins[p] = d_metas[p].emins;
+        args.metadata_layout[p] = ::llaminar2::rocm_native_metadata::packedLayout(d_metas[p]);
         args.bias[p] = d_biases ? d_biases[p] : nullptr;
         args.output[p] = d_outputs[p];
         args.partial[p] = d_partials ? d_partials[p] : nullptr;
@@ -8766,7 +8740,6 @@ static bool nativeQuantisedCodebookRequiresAux(uint8_t codebook_id)
     case NATIVE_QUANTISED_IQ2_XS:
     case NATIVE_QUANTISED_IQ1_S:
     case NATIVE_QUANTISED_IQ1_M:
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
         return true;
     default:
         return false;
@@ -8800,7 +8773,6 @@ static bool nativeQuantisedCodebookSupported(uint8_t codebook_id)
     case NATIVE_QUANTISED_IQ1_S:
     case NATIVE_QUANTISED_IQ1_M:
     case NATIVE_QUANTISED_Q8_0:
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
         return true;
     default:
         return false;
@@ -8810,9 +8782,7 @@ static bool nativeQuantisedCodebookSupported(uint8_t codebook_id)
 bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes* d_metas,
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
@@ -8851,9 +8821,10 @@ bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
         args.grid_offsets[p] = args.total_grid_n;
         args.total_grid_n += grid_n;
         args.payload[p] = d_payloads[p];
-        args.scales[p] = d_block_scales[p];
-        args.mins[p] = d_block_mins ? d_block_mins[p] : nullptr;
-        args.emins[p] = d_block_emins ? d_block_emins[p] : nullptr;
+        args.scales[p] = d_metas[p].primary;
+        args.mins[p] = static_cast<const uint16_t*>(d_metas[p].secondary);
+        args.emins[p] = d_metas[p].emins;
+        args.metadata_layout[p] = ::llaminar2::rocm_native_metadata::packedLayout(d_metas[p]);
         args.bias[p] = d_biases ? d_biases[p] : nullptr;
         args.output[p] = d_outputs[p];
         args.partial[p] = d_partials ? d_partials[p] : nullptr;
@@ -9115,7 +9086,9 @@ bool enqueueGroupedHCDownReducePublish(
         return false;
     HipDeviceGuard::setDevice(device);
     return rocmLaunch_native_quantised_small_m_fp32<NATIVE_QUANTISED_Q8_0>(
-        activation, weights, weight_scales, nullptr, nullptr, raw, activation_scales, activation_sums,
+        // Native Q8 has no superblock-coded representation: layout zero.
+        activation, weights, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(weight_scales, nullptr, nullptr), raw,
+        activation_scales, activation_sums,
         partials, kHCDownTileRows, kHCDownColumns, kHCDownReduction, device, stream,
         static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0), &publication.rows, &publication);
 }
@@ -9133,9 +9106,7 @@ extern "C" {
 bool rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
-    const void* d_block_scales,
-    const void* d_block_mins,
-    const void* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float* d_C_fp32,
     const float* d_scale_A_blockwise,
     const int32_t* d_sum_A_blockwise,
@@ -9165,39 +9136,24 @@ bool rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] K must be multiple of 32 (M=%d N=%d K=%d)\n", M, N, K);
         return false;
     }
-    if (!d_A_int8 || !d_payload || !d_block_scales || !d_C_fp32 || !d_scale_A_blockwise)
+    if (!d_A_int8 || !d_payload || !d_meta.primary || !d_C_fp32 || !d_scale_A_blockwise)
     {
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] missing required pointer (M=%d N=%d K=%d)\n", M, N, K);
         return false;
     }
 
-    const uint16_t* d_scales_u16 = static_cast<const uint16_t*>(d_block_scales);
-    const uint16_t* d_mins_u16 = static_cast<const uint16_t*>(d_block_mins);
-    const uint32_t* d_emins_u32 = static_cast<const uint32_t*>(d_block_emins);
-
     #define LAUNCH_SMALL_M(FMT_TAG)                                                              \
         do {                                                                                      \
             using Traits = NATIVE_QUANTISEDTraits<FMT_TAG>;                                                  \
-            if constexpr (Traits::requires_secondary_metadata)                         \
+            if (!::llaminar2::rocm_native_metadata::metadataPlanesComplete(codebook_id, d_meta,              \
+                    Traits::requires_secondary_metadata, Traits::needs_emin_array))              \
             {                                                                                     \
-                if (!d_mins_u16)                                                                  \
-                {                                                                                 \
-                    fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] codebook_id=%u requires mins/aux buffer (M=%d N=%d K=%d)\n", \
-                            static_cast<unsigned>(codebook_id), M, N, K);                         \
-                    return false;                                                                 \
-                }                                                                                 \
-            }                                                                                     \
-            if constexpr (Traits::needs_emin_array)                                               \
-            {                                                                                     \
-                if (!d_emins_u32)                                                                 \
-                {                                                                                 \
-                    fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] codebook_id=%u requires emins buffer (M=%d N=%d K=%d)\n", \
-                            static_cast<unsigned>(codebook_id), M, N, K);                         \
-                    return false;                                                                 \
-                }                                                                                 \
+                fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] codebook_id=%u requires complete admitted metadata planes (M=%d N=%d K=%d)\n", \
+                        static_cast<unsigned>(codebook_id), M, N, K);                             \
+                return false;                                                                     \
             }                                                                                     \
             return rocmLaunch_native_quantised_small_m_fp32<FMT_TAG>(                                 \
-                d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, d_C_fp32,            \
+                d_A_int8, d_payload, d_meta, d_C_fp32,                                            \
                 d_scale_A_blockwise, d_sum_A_blockwise, d_partial_fp32,                           \
                 M, N, K, device_id, stream, arithmetic_policy_codebook_id, row_range);                       \
         } while (0)
@@ -9222,8 +9178,6 @@ bool rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
     case NATIVE_QUANTISED_IQ1_S:    LAUNCH_SMALL_M(NATIVE_QUANTISED_IQ1_S);
     case NATIVE_QUANTISED_IQ1_M:    LAUNCH_SMALL_M(NATIVE_QUANTISED_IQ1_M);
     case NATIVE_QUANTISED_Q8_0:     LAUNCH_SMALL_M(NATIVE_QUANTISED_Q8_0);
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        LAUNCH_SMALL_M(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
     default:
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] unsupported codebook_id=%u (M=%d N=%d K=%d)\n",
                 static_cast<unsigned>(codebook_id), M, N, K);
@@ -9238,9 +9192,7 @@ bool rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
 bool rocmGemv_native_quantised_small_m_fp32_with_sums(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
-    const void* d_block_scales,
-    const void* d_block_mins,
-    const void* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float* d_C_fp32,
     const float* d_scale_A_blockwise,
     const int32_t* d_sum_A_blockwise,
@@ -9252,9 +9204,7 @@ bool rocmGemv_native_quantised_small_m_fp32_with_sums(
     return rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
         d_A_int8,
         d_payload,
-        d_block_scales,
-        d_block_mins,
-        d_block_emins,
+        d_meta,
         d_C_fp32,
         d_scale_A_blockwise,
         d_sum_A_blockwise,
@@ -9272,9 +9222,7 @@ bool rocmGemv_native_quantised_small_m_fp32_with_sums(
 bool rocmGemv_native_quantised_small_m_fp32_with_policy(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
-    const void* d_block_scales,
-    const void* d_block_mins,
-    const void* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float* d_C_fp32,
     const float* d_scale_A_blockwise,
     float* d_partial_fp32,
@@ -9286,9 +9234,7 @@ bool rocmGemv_native_quantised_small_m_fp32_with_policy(
     return rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
         d_A_int8,
         d_payload,
-        d_block_scales,
-        d_block_mins,
-        d_block_emins,
+        d_meta,
         d_C_fp32,
         d_scale_A_blockwise,
         nullptr,
@@ -9305,9 +9251,7 @@ bool rocmGemv_native_quantised_small_m_fp32_with_policy(
 bool rocmGemv_native_quantised_small_m_fp32(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
-    const void* d_block_scales,
-    const void* d_block_mins,
-    const void* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float* d_C_fp32,
     const float* d_scale_A_blockwise,
     float* d_partial_fp32,
@@ -9316,7 +9260,7 @@ bool rocmGemv_native_quantised_small_m_fp32(
     int device_id, void* stream)
 {
     return rocmGemv_native_quantised_small_m_fp32_with_sums(
-        d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+        d_A_int8, d_payload, d_meta,
         d_C_fp32, d_scale_A_blockwise, nullptr, d_partial_fp32,
         M, N, K, codebook_id, device_id, stream);
 }
@@ -9324,9 +9268,7 @@ bool rocmGemv_native_quantised_small_m_fp32(
 static bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes* d_metas,
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
@@ -9370,7 +9312,7 @@ static bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl
                 num_projections, NATIVE_QUANTISED_SMALL_M_MAX_BATCH);
         return false;
     }
-    if (!d_A_int8 || !d_payloads || !d_block_scales || !d_outputs ||
+    if (!d_A_int8 || !d_payloads || !d_metas || !d_outputs ||
         !d_scale_A_blockwise || !d_sum_A_blockwise || !d_partials || !Ns)
     {
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] missing required pointer (M=%d K=%d projections=%d)\n",
@@ -9379,11 +9321,11 @@ static bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl
     }
     for (int p = 0; p < num_projections; ++p)
     {
-        if (Ns[p] <= 0 || !d_payloads[p] || !d_block_scales[p] || !d_outputs[p] || !d_partials[p])
+        if (Ns[p] <= 0 || !d_payloads[p] || !d_metas[p].primary || !d_outputs[p] || !d_partials[p])
         {
             fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] invalid projection %d (N=%d payload=%p scales=%p output=%p partial=%p)\n",
                     p, Ns[p], static_cast<const void*>(d_payloads[p]),
-                    static_cast<const void*>(d_block_scales[p]),
+                    static_cast<const void*>(d_metas[p].primary),
                     static_cast<const void*>(d_outputs[p]),
                     static_cast<const void*>(d_partials[p]));
             return false;
@@ -9393,36 +9335,16 @@ static bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl
 #define DISPATCH_BATCHED_FMT(FMT_TAG)                                                                   \
     do {                                                                                                \
         using Traits = NATIVE_QUANTISEDTraits<FMT_TAG>;                                                            \
-        if constexpr (Traits::requires_secondary_metadata) {                                 \
-            if (!d_block_mins) {                                                                        \
-                fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] codebook_id=%u requires mins/aux array (M=%d K=%d projections=%d)\n", \
-                        codebook_id, M, K, num_projections);                                            \
-                return false;                                                                           \
-            }                                                                                           \
-            for (int p = 0; p < num_projections; ++p) {                                                  \
-                if (!d_block_mins[p]) {                                                                 \
-                    fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] projection %d codebook_id=%u requires mins/aux buffer (M=%d N=%d K=%d)\n", \
-                            p, codebook_id, M, Ns[p], K);                                               \
-                    return false;                                                                       \
-                }                                                                                       \
-            }                                                                                           \
-        }                                                                                               \
-        if constexpr (Traits::needs_emin_array) {                                                       \
-            if (!d_block_emins) {                                                                       \
-                fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] codebook_id=%u requires emins array (M=%d K=%d projections=%d)\n", \
-                        codebook_id, M, K, num_projections);                                            \
-                return false;                                                                           \
-            }                                                                                           \
-            for (int p = 0; p < num_projections; ++p) {                                                  \
-                if (!d_block_emins[p]) {                                                                \
-                    fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] projection %d codebook_id=%u requires emins buffer (M=%d N=%d K=%d)\n", \
-                            p, codebook_id, M, Ns[p], K);                                               \
-                    return false;                                                                       \
-                }                                                                                       \
-            }                                                                                           \
-        }                                                                                               \
+        for (int p = 0; p < num_projections; ++p) {                                                     \
+            if (!::llaminar2::rocm_native_metadata::metadataPlanesComplete(codebook_id, d_metas[p],                    \
+                    Traits::requires_secondary_metadata, Traits::needs_emin_array)) {                  \
+                fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] projection %d codebook_id=%u requires complete admitted metadata planes (M=%d N=%d K=%d)\n", \
+                        p, codebook_id, M, Ns[p], K);                                                  \
+                return false;                                                                          \
+            }                                                                                          \
+        }                                                                                              \
         return rocmLaunch_native_quantised_small_m_batched_fp32<FMT_TAG>(                                  \
-            d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins, d_biases, d_outputs,    \
+            d_A_int8, d_payloads, d_metas, d_biases, d_outputs,                                         \
             d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, num_projections, M, K,             \
             device_id, stream, policy_kb, policy_target_waves, row_range);                                        \
     } while (0)
@@ -9447,8 +9369,6 @@ static bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl
     case NATIVE_QUANTISED_IQ1_S:    DISPATCH_BATCHED_FMT(NATIVE_QUANTISED_IQ1_S);
     case NATIVE_QUANTISED_IQ1_M:    DISPATCH_BATCHED_FMT(NATIVE_QUANTISED_IQ1_M);
     case NATIVE_QUANTISED_Q8_0:     DISPATCH_BATCHED_FMT(NATIVE_QUANTISED_Q8_0);
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        DISPATCH_BATCHED_FMT(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
     default:
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] unsupported codebook_id=%u (M=%d K=%d projections=%d)\n",
                 codebook_id, M, K, num_projections);
@@ -9461,9 +9381,7 @@ static bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl
 bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes* d_metas,
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
@@ -9480,7 +9398,7 @@ bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
     const llaminar2::DeviceRowRange *row_range)
 {
     return rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl(
-        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
+        d_A_int8, d_payloads, d_metas,
         d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise,
         d_partials, Ns, num_projections, M, K, codebook_id, device_id,
         stream, policy_kb, policy_target_waves, row_range);
@@ -9489,9 +9407,7 @@ bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
 bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes* d_metas,
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
@@ -9505,7 +9421,7 @@ bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums(
     void* stream)
 {
     return rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl(
-        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
+        d_A_int8, d_payloads, d_metas,
         d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise,
         d_partials, Ns, num_projections, M, K, codebook_id, device_id,
         stream, -1, -1);
@@ -9515,9 +9431,7 @@ bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums(
 static bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy_impl(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes* d_metas,
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
@@ -9561,7 +9475,7 @@ static bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_polic
                 num_projections, NATIVE_QUANTISED_SMALL_M_MAX_BATCH);
         return false;
     }
-    if (!d_A_int8 || !d_payloads || !d_block_scales || !d_outputs ||
+    if (!d_A_int8 || !d_payloads || !d_metas || !d_outputs ||
         !d_scale_A_blockwise || !d_sum_A_blockwise || !d_partials || !Ns || !codebook_ids)
     {
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_mixed_fp32] missing required pointer (M=%d K=%d projections=%d)\n",
@@ -9577,34 +9491,27 @@ static bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_polic
                     p, static_cast<unsigned>(codebook), M, K, num_projections);
             return false;
         }
-        if (Ns[p] <= 0 || !d_payloads[p] || !d_block_scales[p] || !d_outputs[p] || !d_partials[p])
+        if (Ns[p] <= 0 || !d_payloads[p] || !d_metas[p].primary || !d_outputs[p] || !d_partials[p])
         {
             fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_mixed_fp32] invalid projection %d (N=%d payload=%p scales=%p output=%p partial=%p codebook=%u)\n",
                     p, Ns[p], static_cast<const void*>(d_payloads[p]),
-                    static_cast<const void*>(d_block_scales[p]),
+                    static_cast<const void*>(d_metas[p].primary),
                     static_cast<const void*>(d_outputs[p]),
                     static_cast<const void*>(d_partials[p]),
                     static_cast<unsigned>(codebook));
             return false;
         }
-        if (nativeQuantisedCodebookRequiresAux(codebook) &&
-            (!d_block_mins || !d_block_mins[p]))
+        if (!::llaminar2::rocm_native_metadata::metadataPlanesComplete(codebook, d_metas[p],
+                nativeQuantisedCodebookRequiresAux(codebook), nativeQuantisedCodebookRequiresEmins(codebook)))
         {
-            fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_mixed_fp32] projection %d codebook_id=%u requires mins/aux buffer (M=%d N=%d K=%d)\n",
-                    p, static_cast<unsigned>(codebook), M, Ns[p], K);
-            return false;
-        }
-        if (nativeQuantisedCodebookRequiresEmins(codebook) &&
-            (!d_block_emins || !d_block_emins[p]))
-        {
-            fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_mixed_fp32] projection %d codebook_id=%u requires emins buffer (M=%d N=%d K=%d)\n",
+            fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_mixed_fp32] projection %d codebook_id=%u requires complete admitted metadata planes (M=%d N=%d K=%d)\n",
                     p, static_cast<unsigned>(codebook), M, Ns[p], K);
             return false;
         }
     }
 
     return rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
-        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
+        d_A_int8, d_payloads, d_metas,
         d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise,
         d_partials, Ns, codebook_ids, num_projections, M, K, device_id,
         stream, policy_kb, policy_target_waves, row_range);
@@ -9613,9 +9520,7 @@ static bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_polic
 bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes* d_metas,
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
@@ -9632,7 +9537,7 @@ bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
     const llaminar2::DeviceRowRange *row_range)
 {
     return rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy_impl(
-        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
+        d_A_int8, d_payloads, d_metas,
         d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise,
         d_partials, Ns, codebook_ids, num_projections, M, K, device_id,
         stream, policy_kb, policy_target_waves, row_range);
@@ -9641,9 +9546,7 @@ bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
 bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes* d_metas,
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
@@ -9657,7 +9560,7 @@ bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums(
     void* stream)
 {
     return rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy_impl(
-        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
+        d_A_int8, d_payloads, d_metas,
         d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise,
         d_partials, Ns, codebook_ids, num_projections, M, K, device_id,
         stream, -1, -1);
@@ -9680,15 +9583,12 @@ static bool nativeM1UsesIQLDS(std::uint8_t execution,int n,int k)
  * @brief Execute serial NativeQuantised GEMV with an explicit arithmetic policy.
  *
  * The execution codebook owns physical decoding; the arithmetic policy
- * codebook owns generated occupancy and split-K reduction order. These IDs
- * differ after compact CPU weights are promoted into expanded codebook 23.
+ * codebook owns generated occupancy and split-K reduction order.
  */
 static bool nativeM1WithReduction(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
-    const void* d_block_scales,  // __half* (FP16 scale d)
-    const void* d_block_mins,    // __half* (FP16 min m), NULL for symmetric formats
-    const void* d_block_emins,   // uint32_t* packed {lo,hi} emins (Q2_K only, else nullptr)
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded block metadata
     float* d_C_fp32,
     const float* d_scale_A,
     float* d_partial_fp32,       // [KB_MAX × N] partial buffer (nullable when KB=1)
@@ -9700,8 +9600,9 @@ static bool nativeM1WithReduction(
     llaminar2::rocm::NativeM1ReductionTicket *deferred,
     const llaminar2::rocm::NativeQ8SerialGeometryAdmission *prepared=nullptr)
 {
-    if(reinterpret_cast<std::uintptr_t>(stream)<=2 || device_id<0 || N<=0 || K<=0 || !d_A_int8 || !d_payload || !d_block_scales || !d_C_fp32)
-        throw std::invalid_argument("Native M1 submission requires exact non-null operands, device and stream");
+    if(reinterpret_cast<std::uintptr_t>(stream)<=2 || device_id<0 || N<=0 || K<=0 || !d_A_int8 || !d_payload || !d_C_fp32 ||
+       !::llaminar2::rocm_native_metadata::metadataPlanesAdmitted(codebook_id, d_meta))
+        throw std::invalid_argument("Native M1 submission requires exact non-null operands, admitted metadata, device and stream");
     if(prepared&&(g_native_q8_serial_scope||codebook_id!=NATIVE_QUANTISED_Q8_0||
         arithmetic_policy_codebook_id!=19||!d_scale_A_blockwise||g_native_quantised_serial_partition_n!=0||
         prepared->deviceOrdinal()!=device_id||prepared->geometry()!=llaminar2::rocm::NativeQ8SerialGeometry::TN128CPT1||
@@ -9735,9 +9636,6 @@ static bool nativeM1WithReduction(
         llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions;
 
     const int blocks_per_row = K / 32;
-    const uint16_t* d_scales_u16 = static_cast<const uint16_t*>(d_block_scales);
-    const uint16_t* d_mins_u16   = static_cast<const uint16_t*>(d_block_mins);
-    const uint32_t* d_emins_u32  = static_cast<const uint32_t*>(d_block_emins);
 
     const auto& rocm_env = llaminar2::debugEnv().rocm;
     const int api_kb_override =
@@ -9921,7 +9819,7 @@ static bool nativeM1WithReduction(
             do { llaminar2::dispatchProjectionWorkMode(1,[&]<bool HasWork>() { \
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN,FMT_TAG,HasWork>), \
                     dim3(grid_n,kb),block,0,static_cast<hipStream_t>(stream), \
-                    d_A_int8,d_payload,d_scales_u16,d_mins_u16,d_emins_u32, \
+                    d_A_int8,d_payload,d_meta, \
                     d_C_fp32,d_partial_fp32,d_scale_A,d_scale_A_blockwise,N,K,kb,llaminar2::projectionWorkForLaunch(1)); \
                 finishNativeM1Producer<IQ_TN,1,HasWork>(d_partial_fp32,d_C_fp32,N,kb,device_id,stream,deferred,llaminar2::projectionWorkForLaunch(1)); \
             }); } while(false)
@@ -9960,14 +9858,8 @@ static bool nativeM1WithReduction(
 
         constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
 
-        // Both expanded INT8 representations have the same payload traffic
-        // and direct decode.  Codebook 23 adds only the already-vectorized
-        // asymmetric correction, so it intentionally inherits codebook 19's
-        // trained launch policy until its own certification corpus is added.
         constexpr int Q8_0_TARGET_WAVES_PER_CU = 4;
-        const bool uses_expanded_int8 =
-            codebook_id == static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0) ||
-            codebook_id == static_cast<uint8_t>(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
+        const bool uses_expanded_int8 = codebook_id == NATIVE_QUANTISED_Q8_0;
         const int default_waves = uses_expanded_int8
                                       ? Q8_0_TARGET_WAVES_PER_CU
                                       : DEFAULT_TARGET_WAVES_PER_CU;
@@ -10015,7 +9907,7 @@ static bool nativeM1WithReduction(
          */
         #define LAUNCH_NATIVE_QUANTISED(FMT_TAG) \
             launchNativeQuantisedSerialGeometry<TN, CPT, FMT_TAG>( \
-                d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, \
+                d_A_int8, d_payload, d_meta, \
                 d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb, \
                 arithmetic_policy_codebook_id, device_id, stream, serial_geometry,deferred,prepared)
 
@@ -10044,7 +9936,7 @@ static bool nativeM1WithReduction(
             using G = llaminar2::rocm::NativeQ8SerialGeometry;
 #define LAUNCH_NATIVE_Q8_GEOMETRY(TILE, COLUMNS) \
             launchNativeQuantisedSerialGeometry<TILE, COLUMNS, NATIVE_QUANTISED_Q8_0>( \
-                d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, \
+                d_A_int8, d_payload, d_meta, \
                 d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb, \
                 arithmetic_policy_codebook_id, device_id, stream, serial_geometry,deferred,prepared)
             switch (serial_geometry)
@@ -10059,9 +9951,6 @@ static bool nativeM1WithReduction(
 #undef LAUNCH_NATIVE_Q8_GEOMETRY
             break;
         }
-        case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-            LAUNCH_NATIVE_QUANTISED(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
-            break;
         default:
             fprintf(stderr, "[rocmGemv_native_quantised_fp32] Unknown codebook_id=%u (N=%d K=%d)\n",
                     static_cast<unsigned>(codebook_id), N, K);
@@ -10097,11 +9986,11 @@ static bool nativeM1WithReduction(
 
 /** @brief Preserve the public immediate-reduction ABI through the shared original dispatcher. */
 bool rocmGemv_native_quantised_fp32_with_policy(const int8_t *A,const uint8_t *payload,
-    const void *scales,const void *mins,const void *emins,float *output,const float *scale_a,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes meta,float *output,const float *scale_a,
     float *partials,int n,int k,uint8_t execution,uint8_t policy,int device,void *stream,
     const float *block_scales)
 {
-    return nativeM1WithReduction(A,payload,scales,mins,emins,output,scale_a,partials,
+    return nativeM1WithReduction(A,payload,meta,output,scale_a,partials,
         n,k,execution,policy,device,stream,block_scales,nullptr);
 }
 
@@ -10109,9 +9998,7 @@ bool rocmGemv_native_quantised_fp32_with_policy(const int8_t *A,const uint8_t *p
 bool rocmGemv_native_quantised_fp32(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
-    const void* d_block_scales,
-    const void* d_block_mins,
-    const void* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float* d_C_fp32,
     const float* d_scale_A,
     float* d_partial_fp32,
@@ -10123,9 +10010,7 @@ bool rocmGemv_native_quantised_fp32(
     return rocmGemv_native_quantised_fp32_with_policy(
         d_A_int8,
         d_payload,
-        d_block_scales,
-        d_block_mins,
-        d_block_emins,
+        d_meta,
         d_C_fp32,
         d_scale_A,
         d_partial_fp32,
@@ -10201,11 +10086,11 @@ extern "C" bool rocmNativeEmbeddingIQTableView(
 namespace llaminar2::rocm
 {
 bool enqueueNativeM1Producer(NativeM1ReductionTicket &ticket,const std::int8_t *A,
-    const std::uint8_t *payload,const void *scales,const void *mins,const void *emins,
+    const std::uint8_t *payload,const rocm_native_metadata::MetadataPlanes meta,
     float *output,const float *scale_a,float *partials,int n,int k,std::uint8_t execution,
     std::uint8_t policy,int device,void *stream,const float *block_scales)
 {
-    return nativeM1WithReduction(A,payload,scales,mins,emins,output,scale_a,partials,
+    return nativeM1WithReduction(A,payload,meta,output,scale_a,partials,
         n,k,execution,policy,device,stream,block_scales,&ticket);
 }
 
@@ -10225,7 +10110,9 @@ bool enqueueNativeM1HCDownProjection(const std::int8_t *A,const std::uint8_t *pa
     debugEnv().rocm.native_quantised_gemv_kb>0||debugEnv().rocm.native_quantised_gemv_target_waves>0)
     throw std::invalid_argument("HC down epilogue requires original native19 M1 reducer policy and sealed complete banks");
  NativeM1ReductionTicket ticket;
- if(!nativeM1WithReduction(A,payload,scales,mins,emins,output,scale_a,partials,
+ // Native Q8 (execution 19, enforced above) has no superblock-coded representation.
+ const auto meta=rocm_native_metadata::perBlockMetadataPlanes(scales,mins,emins);
+ if(!nativeM1WithReduction(A,payload,meta,output,scale_a,partials,
     n,k,execution,policy,device,stream,block_scales,&ticket,prepared))
     throw std::runtime_error("Original HC down producer enqueue failed");
  const auto& shape=ticket.producerShape();
@@ -10531,8 +10418,8 @@ void launchCTAOwnedHCRead(const CTAOwnedHCReadProgram& program,const PersistentH
     1,args.down_weights.k,program.device_.ordinal,stream,32))
   throw std::runtime_error("CTA-owned HC original SingleQ8 producer failed");
  NativeM1ReductionTicket ticket;
- if(!enqueueNativeM1Producer(ticket,args.input_codes,args.down_weights.payload,args.down_weights.scales,
-    args.down_weights.mins,args.down_weights.emins,args.raw_down,nullptr,args.down_partials,
+ if(!enqueueNativeM1Producer(ticket,args.input_codes,args.down_weights.payload,
+    native_quantised_scale::metadataPlanes(args.down_weights),args.raw_down,nullptr,args.down_partials,
     args.down_weights.n,args.down_weights.k,args.down_weights.codebook_id,
     canonicalDeviceVnniCodebookId(args.down_weights.source_codebook_id),program.device_.ordinal,stream,args.input_scales))
   throw std::runtime_error("CTA-owned HC original down producer failed");

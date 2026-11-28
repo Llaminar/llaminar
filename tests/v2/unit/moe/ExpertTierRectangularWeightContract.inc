@@ -44,6 +44,10 @@ TEST(ExpertTierWeightStream, RectangularEncodedColumnsAllFormatsPreserveNeighbou
         P{R::ParticipantInputSlice,256,256,72,160,64,128});
     for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         SCOPED_TRACE(format.quant_type);
+        // Coded CPU roots cannot start at the synthetic per-block origin below;
+        // CodedMidSuperblockChunksRetainExactPlanes exercises their intersections.
+        if (cpu::native_quantised::migrationUsesSuperblockCodes(*format.metadata))
+            continue;
         const auto full=makeGpuToCpuExpertTierWeightStreamManifest(*format.metadata,128,96,17,0,9,ExpertTierWeightProjection::Down,2);
         const auto manifest=full.forIntersection(intersection);
         const auto source_layout=manifest.deviceLayout();ASSERT_TRUE(source_layout.valid());
@@ -96,12 +100,13 @@ TEST(ExpertTierWeightStream, NativeCpuRectanglesUseOnlyLivePlanesAndIndependentR
             .cpu_is_asymmetric=uint8_t(format.metadata->is_asymmetric),
             .cpu_is_superblock=uint8_t(format.metadata->is_superblock),
             .cpu_encoding=encoding,
-            .cpu_data_stride=uint32_t(cpu::native_quantised::preparedDataStride(encoding)),
-            .cpu_block_stride=uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding,format.metadata->is_asymmetric))};
+            .cpu_data_stride=uint32_t(cpu::native_quantised::preparedDataStride(encoding,format.metadata->codebook_id)),
+            .cpu_block_stride=uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding,format.metadata->is_asymmetric,format.metadata->codebook_id))};
         source.cpu_N=128;source.cpu_K=96;source.cpu_first_row=59;source.cpu_first_column=32;
         source.wire_columns_per_unit=quantum;source.unit_count=((69+quantum-1)/quantum)*2;
         source.maximum_units_per_chunk=std::min(2u,source.unit_count);
-        auto target=source;target.cpu_N=160;target.cpu_K=128;target.cpu_first_row=7;target.cpu_first_column=64;
+        auto target=source;target.cpu_N=160;target.cpu_K=128;target.cpu_first_row=7;
+        target.cpu_first_column=source.coded() ? 32 : 64;
         ASSERT_TRUE(source.valid());ASSERT_TRUE(target.valid());
         std::vector<uint8_t> original(source.cpuStorageBytes()),destination(target.cpuStorageBytes(),0xa5);
         for(size_t byte=0;byte<original.size();++byte)original[byte]=uint8_t(byte*37+11);
@@ -109,9 +114,18 @@ TEST(ExpertTierWeightStream, NativeCpuRectanglesUseOnlyLivePlanesAndIndependentR
             auto identity=source;identity.N=128;identity.K=96;identity.blocks_per_row=3;
             identity.cpu_first_row=0;identity.cpu_first_column=0;
             identity.unit_count=6;identity.maximum_units_per_chunk=6;
-            std::vector<uint8_t> whole(original.size());
+            std::vector<uint8_t> whole(identity.chunkBytes(6));
             ASSERT_TRUE(gatherExpertTierCPUWeightChunk(identity,original,0,6,whole));
-            EXPECT_EQ(whole,original); // Whole aligned units preserve their exact bulk-copy representation.
+            if (identity.coded())
+            {
+                std::vector<uint8_t> restored(original.size());
+                ASSERT_TRUE(scatterExpertTierCPUWeightChunk(identity, whole, 0, 6, restored));
+                for (size_t row = 0; row < 128; ++row)
+                    for (size_t block = 0; block < 3; ++block)
+                        EXPECT_EQ(encodedTierColumn(restored, identity, row, block), encodedTierColumn(original, identity, row, block));
+            }
+            else
+                EXPECT_EQ(whole,original); // Whole aligned per-block units preserve their bulk representation.
         }
         const auto dirty=destination;size_t transferred=0;
         for(uint32_t first=0;first<source.unit_count;first+=source.maximum_units_per_chunk) {
@@ -126,12 +140,27 @@ TEST(ExpertTierWeightStream, NativeCpuRectanglesUseOnlyLivePlanesAndIndependentR
             EXPECT_FALSE(scatterExpertTierCPUWeightChunk(target,std::span(wire).first(bytes-1),first,count,destination));
             EXPECT_EQ(before,destination);
         }
-        EXPECT_EQ(transferred,size_t(69*2)*(source.cpu_block_stride/64));
+        const auto dest_first = target.cpu_first_column / 32;
+        if (!source.coded())
+            EXPECT_EQ(transferred,size_t(69*2)*(source.cpu_block_stride/64));
+        else
+            EXPECT_EQ(transferred, source.chunkBytes(source.unit_count));
         for(size_t n=0;n<192;++n)for(size_t kb=0;kb<4;++kb) {
             const auto observed=encodedTierColumn(destination,target,n,kb);
-            if(n>=7 && n<76 && kb>=2)
-                EXPECT_EQ(observed,encodedTierColumn(original,source,n-7+59,kb-2+1));
-            else EXPECT_EQ(observed,encodedTierColumn(dirty,target,n,kb));
+            if (n >= 7 && n < 76 && kb >= dest_first && kb < dest_first + 2)
+                EXPECT_EQ(observed, encodedTierColumn(original, source, n - 7 + 59, kb - dest_first + 1));
+            else if (source.coded() && n >= 7 && n < 76)
+            {
+                // Sharing the destination's superblock changes its header, not
+                // payload or code bytes of K blocks outside the intersection.
+                auto expected = encodedTierColumn(dirty, target, n, kb);
+                const auto header = native_quantised_superblock::superblockFieldBytes(target.codedCodebook());
+                const auto live = encodedTierColumn(original, source, n - 7 + 59, 1);
+                std::copy(live.end() - header, live.end(), expected.end() - header);
+                EXPECT_EQ(observed, expected);
+            }
+            else
+                EXPECT_EQ(observed,encodedTierColumn(dirty,target,n,kb));
         }
     }
 }

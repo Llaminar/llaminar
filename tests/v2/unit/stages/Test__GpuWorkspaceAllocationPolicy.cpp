@@ -922,6 +922,30 @@ TEST(
         << "Mixed-stride LocalTP geometry must not overlap a scalar owner with the packed bank";
 }
 
+/**
+ * @test Only an FP32-gate router owns the CUDA Q8 gate cache.
+ *
+ * BF16/FP16 gates never bind it, yet it was reserved for every
+ * MoE graph: 128 slots x 256 experts x 4096 = 144 MiB of dead device memory.
+ * Expert stages never own it either.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, RouterQ8GateCacheIsDeclaredOnlyForFP32Gates)
+{
+    using llaminar2::MoEWorkspaceBuffers::CUDARouterGateCache;
+    namespace moe = llaminar2::MoEWorkspaceBuffers;
+    const auto q8 = moe::cudaRouting(512, 4096, 256, CUDARouterGateCache::Q8);
+    const auto none = moe::cudaRouting(512, 4096, 256, CUDARouterGateCache::None);
+    ASSERT_NE(q8.find(moe::CUDA_ROUTER_Q8_GATE_WEIGHTS), nullptr);
+    ASSERT_NE(q8.find(moe::CUDA_ROUTER_Q8_GATE_SCALES), nullptr);
+    EXPECT_EQ(none.find(moe::CUDA_ROUTER_Q8_GATE_WEIGHTS), nullptr);
+    EXPECT_EQ(none.find(moe::CUDA_ROUTER_Q8_GATE_SCALES), nullptr);
+    EXPECT_GE(q8.total_bytes_with_alignment() - none.total_bytes_with_alignment(), 144ull << 20);
+    // The hidden-row Q8 scratch still exists for both: grouped decode uses it.
+    EXPECT_NE(none.find(moe::DECODE_HIDDEN_INT8), nullptr);
+    const auto expert = moe::cudaMoE(512, 4096, 2048, 256, 6, CUDARouterGateCache::None);
+    EXPECT_EQ(expert.find(moe::CUDA_ROUTER_Q8_GATE_WEIGHTS), nullptr);
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExperts)
 {
     const int max_seq_len = 9;
@@ -4350,8 +4374,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedFusedVerifierRowsPin
         EXPECT_EQ(body.find("prepareRowMajorWeightsOutsideCapture("), std::string::npos);
     }
     EXPECT_NE(m1_compact.find("cudaNativeQuantisedGemvTuned_fp32_withPolicy("
-                              "d_A_int8,impl_->d_weights_native_quantised,impl_->d_weights_native_scales,"
-                              "impl_->d_weights_native_mins,impl_->d_weights_native_emins,d_C,"
+                              "d_A_int8,impl_->d_weights_native_quantised,impl_->nativeMetadataPlanes(),d_C,"
                               "d_scales_A_blockwise,n,k,alpha,beta,nullptr,d_bias,"
                               "impl_->native_codebook_id,arithmetic_policy_codebook_id,"
                               "cuda_device_id_,stream_handle,impl_->gemv_ctx,rowmajor_slot)"),
@@ -17334,9 +17357,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         composer.find(
             "sampling_mode==DeviceGenerationSamplingMode::Stochastic?2u:0u"),
         std::string::npos);
+    // Native parents compose the complete participant-local cadence
+    // (publication, guarded maintenance, acknowledgement) directly; hosted
+    // ticket publishers retain one maintenance transaction per depth.
     EXPECT_NE(
-        composer.find("include_device_moe_maintenance?1u:0u"),
-        std::string::npos);
+        composer.find(
+            "include_device_moe_maintenance?(hosted_execution?1u:"
+            "DeviceMoERebalanceCadenceRecipe::fragment_count):0u"),
+        std::string::npos)
+        << "Fragment reservation must count every maintenance fragment the "
+           "parent actually composes.";
     EXPECT_NE(
         composer.find("source_fragments.capacity()<expected_fragment_count"),
         std::string::npos)
@@ -17378,6 +17408,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_LT(state_publication, terminal_hidden);
     EXPECT_LT(terminal_hidden, maintenance)
         << "Dynamic maintenance must consume exactly the transaction committed by the preceding parent fragments.";
+    const size_t native_cadence = composer.find(
+        "nativeMoERebalanceCadenceRecipe(&fragment_error)");
+    ASSERT_NE(native_cadence, std::string::npos)
+        << "Native parents must embed the shared cadence recipe, not a lent conditional graph.";
+    EXPECT_LT(terminal_hidden, native_cadence)
+        << "The native cadence must also consume the transaction committed by the preceding parent fragments.";
     EXPECT_NE(
         composer.find(
             "DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero"),

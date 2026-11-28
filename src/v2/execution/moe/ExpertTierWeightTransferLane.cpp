@@ -215,10 +215,12 @@ namespace llaminar2
         }
         const std::size_t total_bytes = layout.cpuStorageBytes();
         if (final_cpu_bytes.size() != total_bytes ||
-            layout.chunkBytes(layout.maximum_units_per_chunk) >
+            layout.cpuStorage().maximumChunkBytes() >
                 config_.staging.sizeBytes())
         {
-            assignError(error, "GPU-to-CPU tier transfer storage does not match its manifest");
+            assignError(error, "GPU-to-CPU tier transfer storage does not match its manifest: staging_bytes=" +
+                std::to_string(config_.staging.sizeBytes()) + ", required_chunk_bytes=" +
+                std::to_string(layout.cpuStorage().maximumChunkBytes()));
             return false;
         }
         /*
@@ -287,10 +289,12 @@ namespace llaminar2
         }
         const std::size_t total_bytes = layout.cpuStorageBytes();
         if (cpu_bytes.size() != total_bytes ||
-            layout.chunkBytes(layout.maximum_units_per_chunk) >
+            layout.cpuStorage().maximumChunkBytes() >
                 config_.staging.sizeBytes())
         {
-            assignError(error, "CPU-to-GPU tier transfer storage does not match its manifest");
+            assignError(error, "CPU-to-GPU tier transfer storage does not match its manifest: staging_bytes=" +
+                std::to_string(config_.staging.sizeBytes()) + ", required_chunk_bytes=" +
+                std::to_string(layout.cpuStorage().maximumChunkBytes()));
             return false;
         }
 

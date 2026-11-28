@@ -3,6 +3,7 @@
 # Defer exactly once until every registration, including late included modules,
 # exists. CTest labels and add_v2_test target metadata remain the only authorities;
 # late targets cannot silently escape CI builds or CPU scheduling budgets.
+# The explicit ProductionTestPreflight inventory must equal its label membership.
 include_guard(DIRECTORY)
 
 # @brief Derive the ARM64 PR build and CTest scope from the same registrations.
@@ -31,6 +32,54 @@ function(v2_register_arm64_pr_gate tests)
     endforeach()
     list(REMOVE_DUPLICATES targets)
     add_custom_target(v2_arm64_pr_gate DEPENDS ${targets})
+endfunction()
+
+# @brief Require ProductionTestPreflight label membership to equal the explicit list.
+# @param tests Final configure-time test inventory for this directory.
+# @param explicit_members Final V2_PRODUCTION_TEST_PREFLIGHT_TESTS, including
+#        members appended after the canonical labeling pass and in included modules.
+# A label without a list entry, or a list entry without a labeled registration,
+# is fatal: the explicit inventory cannot silently drift from the CTest label.
+function(v2_verify_production_preflight_inventory tests explicit_members)
+    # Backend-omitted members leave this build's preflight explicitly, exactly as
+    # in the canonical labeling pass; late appends receive the same removal.
+    get_property(omitted GLOBAL PROPERTY V2_BACKEND_OMITTED_TESTS)
+    if(omitted AND explicit_members)
+        list(REMOVE_ITEM explicit_members ${omitted})
+    endif()
+    list(REMOVE_DUPLICATES explicit_members)
+    set(labeled "")
+    foreach(test IN LISTS tests)
+        get_property(labels TEST ${test} PROPERTY LABELS)
+        if("ProductionTestPreflight" IN_LIST labels)
+            list(APPEND labeled ${test})
+        endif()
+    endforeach()
+    set(labeled_only ${labeled})
+    if(labeled_only AND explicit_members)
+        list(REMOVE_ITEM labeled_only ${explicit_members})
+    endif()
+    set(listed_only ${explicit_members})
+    if(listed_only AND labeled)
+        list(REMOVE_ITEM listed_only ${labeled})
+    endif()
+    if(labeled_only OR listed_only)
+        set(diagnostic "ProductionTestPreflight label membership differs from V2_PRODUCTION_TEST_PREFLIGHT_TESTS.")
+        foreach(difference IN ITEMS labeled_only listed_only)
+            if(NOT ${difference})
+                continue()
+            endif()
+            if(difference STREQUAL "labeled_only")
+                set(heading "Labeled but not listed")
+            else()
+                set(heading "Listed but not a labeled registered test")
+            endif()
+            list(LENGTH ${difference} count)
+            list(JOIN ${difference} "\n  " names)
+            string(APPEND diagnostic "\n${heading} (${count}):\n  ${names}")
+        endforeach()
+        message(FATAL_ERROR "${diagnostic}")
+    endif()
 endfunction()
 
 # Finalize this directory only after all of its test declarations have executed.
@@ -67,6 +116,8 @@ function(v2_finalize_test_gates)
     # target behind each registration; this avoids a hand-maintained mirror of the
     # 500+ executable inventory.
     if(NOT V2_PERF_TESTS_ONLY)
+        v2_verify_production_preflight_inventory(
+            "${V2_CONFIGURED_TESTS}" "${V2_PRODUCTION_TEST_PREFLIGHT_TESTS}")
         get_property(V2_UNIT_GATE_TARGETS GLOBAL PROPERTY V2_UNIT_GATE_TARGETS)
         list(REMOVE_DUPLICATES V2_UNIT_GATE_TARGETS)
         if(NOT V2_UNIT_GATE_TARGETS)

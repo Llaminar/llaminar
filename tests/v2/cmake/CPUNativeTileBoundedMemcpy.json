@@ -1,0 +1,31 @@
+{
+ "column_loop": "column<columns;column+=Lanes)",
+ "file": "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h",
+ "guard": "if(column+Lanes<=columns)",
+ "reviewer": "91 (M-1..M-4)",
+ "schema": 1,
+ "texts": [
+  "std::memcpy(&acc[row],output[row]+column,(columns-column)*sizeof(float));",
+  "std::memcpy(output[row]+column,&reduced[row],(columns-column)*sizeof(float));"
+ ],
+ "trees": {
+  "fd810ab34e3519811120af995eccbe5560150cdaa2c3b9a1429156d4f68000b8": {
+   "lines": [1111, 1355],
+   "tree": "a4392ddd9"
+  },
+  "44a46bf7b36830996a9b93ec0961bb08d3d862babd9194c6353a34eba62485ed": {
+   "lines": [
+    1110,
+    1354
+   ],
+   "tree": "cf29bdbc0"
+  },
+  "de93dc51f371a407931bca1d95e18ad1ce076b8c8f0cdaf5dd3de3aec64a6929": {
+   "lines": [
+    598,
+    708
+   ],
+   "tree": "63b053401"
+  }
+ }
+}

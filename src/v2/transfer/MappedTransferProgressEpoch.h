@@ -129,12 +129,13 @@ namespace llaminar2
 
         /**
          * @brief Publish one indivisible GPU reformat-and-download command.
+         * CUDA admits staged work; ROCm admits only direct coded mapped work.
          * @param source Published separated projection, retained through completion.
          * @param layout Canonical authenticated conversion geometry.
          * @param first_unit First complete CPU unit in the projection.
          * @param unit_count Complete units covered by this command.
-         * @param device_staging This lane's exclusive, already-owned scratch region.
-         * @param staging_capacity Exact capacity of that scratch region.
+         * @param device_staging Exclusive device scratch, or null to pack coded units directly in the mapped slot.
+         * @param staging_capacity Exact device scratch capacity, or zero when the mapped slot owns the wire.
          * @param dependency Exact source producer, or an already-published bank.
          * @return The generation whose receipt covers both conversion and copying.
          */
@@ -147,12 +148,13 @@ namespace llaminar2
 
         /**
          * @brief Publish one indivisible upload-and-GPU-reformat command.
+         * CUDA admits staged work; ROCm admits only direct coded mapped work.
          * @param destination Inactive separated projection retained through completion.
          * @param layout Canonical authenticated conversion geometry.
          * @param first_unit First complete CPU unit in the projection.
          * @param unit_count Complete received units covered by this command.
-         * @param device_staging This lane's exclusive, already-owned scratch region.
-         * @param staging_capacity Exact capacity of that scratch region.
+         * @param device_staging Exclusive device scratch, or null to pack coded units directly in the mapped slot.
+         * @param staging_capacity Exact device scratch capacity, or zero when the mapped slot owns the wire.
          * @return The generation whose receipt covers both copying and conversion.
          */
         std::uint64_t publishPackedMappedHostToDevice(
@@ -257,8 +259,8 @@ namespace llaminar2
          * @brief Return the exact graph branch required by this backend's service.
          *
          * CUDA requires graph-resident progress when future event observers can
-         * occupy independent native queues. ROCm uses its proven native SDMA
-         * service and has no auxiliary compute branch. This is a backend-owned
+         * occupy independent native queues. ROCm uses native background streams
+         * for SDMA and finite coded work, with no captured service branch. This is a backend-owned
          * mechanism distinction, not a runtime retry or alternate inference mode.
          * The factory retains this authority; every cache owns one private
          * mapped lifetime word and one bounded co-resident service CTA.

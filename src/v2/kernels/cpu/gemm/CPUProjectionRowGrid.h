@@ -54,6 +54,20 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] bool beginWorkshare() const
         { return llaminar::v2::beginWorkshare(hasAny()); }
 
+        /** @brief Count authored rows across every original request in this physical slice.
+         * @return Useful rows of this invocation; equals the physical capacity without explicit work.
+         * @details Route economy only. Storage, strides and admission stay sized by the
+         * physical capacity, and rows are never compacted. Every member of a retained
+         * team reads the same immutable publication words, so all members agree.
+         */
+        [[nodiscard]] int liveRows() const
+        {
+            if(!work_)return physical_;
+            int rows=0;
+            for(int request=0;request<work_->requests();++request)rows+=work_->resolveHost(request).size();
+            return rows;
+        }
+
         /** @brief Test an original physical row before any activation or partial read.
          * @param row Original matrix-relative row, never a compacted useful index.
          * @return Whether that exact row is authored.
@@ -98,6 +112,8 @@ namespace llaminar2::cpu::native_quantised
             const int selectedEnd=std::min(end,authored.end);
             return {std::min(selectedEnd,std::max(first,authored.first)),selectedEnd};
         }
+        /** @return Original publication whose bytes must remain disjoint from any writable workspace. */
+        [[nodiscard]] const ProjectionRowWork *publication() const noexcept { return work_; }
     private:
         int physical_; ///< Original tensor/partial capacity; never useful row count.
         const ProjectionRowWork *work_; ///< Invocation-owned immutable metadata, live through the workshare.

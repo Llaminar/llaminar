@@ -13,12 +13,14 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
+#include "../../../utils/ROCmNativeM1CaptureArguments.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/TensorSlice.h"
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstring>
+#include <iostream>
 #include <type_traits>
 extern "C" bool rocmGDN_gated_rmsnorm(const float*,const float*,const float*,float*,
     int,int,int,int,float,bool,llaminar2::GatedNormActivation,int,void*);
@@ -26,25 +28,35 @@ namespace gated_norm_single_q8_production
 {
 using namespace llaminar2;
 /** @brief Fatal diagnostic admission; never select another arithmetic program. */
-inline void require(bool value,const char* why) {if(!value)throw std::runtime_error(why);}
-/**
- * @brief Recover one source-owned captured argument without constructing a placeholder.
- * @tparam T Exact trivially-copyable native argument type, including checked descriptors.
- * @param node Retained kernel node whose immutable argument storage is still alive.
- * @param index Source-authenticated zero-based argument slot in that native ABI.
- * @return Value reconstructed from all sizeof(T) captured bytes, without a default constructor.
- * @throws std::runtime_error If the retained argument storage is absent.
- * @details Copying through bytes avoids pointer-object strict aliasing. bit_cast
- * also admits ProjectionRowWork, whose checked factories intentionally provide
- * no default constructor; no descriptor fields or replacement policy are guessed.
- */
-template<class T>T argument(const hipKernelNodeParams& node,int index)
+inline void require(bool value,const char* why) {
+    if(!value) {
+        std::cerr<<"GDN_NORM_SINGLE_Q8_REQUIRE,error="<<why<<std::endl;
+        throw std::runtime_error(why);
+    }
+}
+/** @brief Recover a signature-checked native argument while its graph is retained. */
+template<class Signature, std::size_t Index>
+auto argument(const hipKernelNodeParams& node)
 {
-    require(node.kernelParams&&node.kernelParams[index],"Missing captured argument");
-    static_assert(std::is_trivially_copyable_v<T>);
-    std::array<std::byte,sizeof(T)> bytes{};
-    std::memcpy(bytes.data(),node.kernelParams[index],bytes.size());
-    return std::bit_cast<T>(bytes);
+    return test::nativeM1CaptureArgument<Signature, Index>(node.kernelParams);
+}
+using Producer = rocm::NativeM1ProducerSignature;
+using Reducer = rocm::NativeM1ReducerSignature;
+using Normalizer = void(rocm::GatedNormSingleQ8Input);
+/** @brief Compare each semantic argument field, excluding aggregate padding. */
+template<class Signature, std::size_t... Indices>
+void sameArguments(const hipKernelNodeParams& a,const hipKernelNodeParams& b,std::index_sequence<Indices...>)
+{
+    const auto same=[&]<std::size_t Index>() {
+        const auto x=argument<Signature,Index>(a),y=argument<Signature,Index>(b);
+        using T=std::remove_cv_t<decltype(x)>;
+        if constexpr(std::is_same_v<T,rocm_native_metadata::MetadataPlanes>)
+            return x.primary==y.primary&&x.secondary==y.secondary&&x.emins==y.emins&&
+                x.superblock_phase==y.superblock_phase&&x.representation==y.representation&&x.code_bit_shift==y.code_bit_shift;
+        else if constexpr(std::is_same_v<T,ProjectionRowWork>)return x.captureIdentity()==y.captureIdentity();
+        else return x==y;
+    };
+    require((same.template operator()<Indices>()&&...),"Composite changed original projection argument");
 }
 /** @brief Preserve exact native producer/reducer argument and geometry identity. */
 inline void sameProjection(const hipKernelNodeParams& a,const hipKernelNodeParams& b,bool producer)
@@ -52,12 +64,8 @@ inline void sameProjection(const hipKernelNodeParams& a,const hipKernelNodeParam
     require(a.func==b.func&&a.gridDim.x==b.gridDim.x&&a.gridDim.y==b.gridDim.y&&a.gridDim.z==b.gridDim.z&&
         a.blockDim.x==b.blockDim.x&&a.blockDim.y==b.blockDim.y&&a.blockDim.z==b.blockDim.z&&a.sharedMemBytes==b.sharedMemBytes,
         "Composite changed original projection function/geometry");
-    const auto pointer=[&](const hipKernelNodeParams& p,int i){return argument<const void*>(p,i);};
-    for(int i=0;i<(producer?9:2);++i)require(pointer(a,i)==pointer(b,i),"Composite changed original projection pointer");
-    for(int i=producer?9:2;i<(producer?12:4);++i)
-        require(argument<int>(a,i)==argument<int>(b,i),"Composite changed original projection scalar");
-    require(argument<ProjectionRowWork>(a,producer?12:4).captureIdentity()==
-        argument<ProjectionRowWork>(b,producer?12:4).captureIdentity(),"Composite changed original projection row authority");
+    if(producer)sameArguments<Producer>(a,b,std::make_index_sequence<rocm::NativeM1CaptureABI<Producer>::arity>{});
+    else sameArguments<Reducer>(a,b,std::make_index_sequence<rocm::NativeM1CaptureABI<Reducer>::arity>{});
 }
 /** @brief One exact native stream retired after all graph/borrowed-storage owners. */
 struct Stream
@@ -106,6 +114,12 @@ public:
             if(record.domain=="gdn_output"&&record.name=="normalization_submission"&&record.tags.at("preparation")=="fused_single_q8")count+=record.count;
         return count;
     }
+    /** @brief Flush a test-local boundary before native code can terminate without a GoogleTest result. */
+    void phase(const char* name)const {
+        std::cerr<<"GDN_NORM_SINGLE_Q8_PHASE,format="<<tensorTypeName(weights->native_type())
+            <<",N="<<n<<",K="<<k<<",activation="<<static_cast<int>(policy.activation)
+            <<",phase="<<name<<std::endl;
+    }
     /** @brief Materialize actual original sources/scratch, bind once, then capture both programs. */
     Cell(const test::QuantizedVerifierFormatCase& format,int columns,int width,
         GatedNormActivation activation,bool subtract,float epsilon=1e-6f)
@@ -123,14 +137,21 @@ public:
             require(consumer,"Original prepared source has no workspace contract");
             workspace=std::make_unique<Workspace>(device,consumer->getWorkspaceRequirements(3,n,k));
             context=IDeviceContext::create(device,1);require(bool(context),"Missing exact native context");
+            phase("context_created");
             GEMMStage::Params params;
             params.device_id=device;params.A=&values;params.B=weights.get();params.C=&output;
             params.gated_norm=GEMMStage::GatedNormPublication{&gate,&gamma,BufferId::GDN_Z,policy};
             params.m=1;params.n=n;params.k=k;params.a_buffer_id=BufferId::ATTN_OUTPUT;params.c_buffer_id=BufferId::ATTN_PROJ;
             params.prepared_ref=prepared.ref;params.prepared_store=prepared.store.get();
+            phase("stage_construct_begin");
             stage=std::make_unique<GEMMStage>(params);stage->setGPUStream(stream.value);
-            stage->bindWorkspace(workspace->value.get());publish(0);join();
+            phase("workspace_bind_begin");
+            stage->bindWorkspace(workspace->value.get());
+            phase("initial_publish_begin");
+            publish(0);join();
+            phase("cold_prepare_begin");
             require(stage->prepareGraphLaunch(context.get(),stream.value),"Composite cold preparation failed");
+            phase("capture_identity_begin");
             signature=stage->graphCaptureVariantSignature();require(signature!=0,"Missing composite capture identity");
             for(const auto* name:{GemmWorkspaceBuffers::QUANT_A,GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
                 GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::SCALES_A})
@@ -141,10 +162,21 @@ public:
             const auto blocks=static_cast<size_t>(n)*descriptor.blocks_per_row;
             immutable={{const_cast<uint8_t*>(descriptor.payload),blocks*(descriptor.allocation_payload_bytes_per_block?
                 descriptor.allocation_payload_bytes_per_block:physical.payload_bytes_per_block)},
-                {const_cast<void*>(descriptor.scales),blocks*2}};
-            if(descriptor.mins)immutable.emplace_back(const_cast<void*>(descriptor.mins),blocks*2);
+            };
+            if(descriptor.metadata_layout) {
+                const auto planes=native_quantised_superblock::planeBytes(descriptor.codebook_id,n,descriptor.blocks_per_row,
+                    nativeQuantisedLayoutPhase(descriptor.metadata_layout));
+                if(planes.code)immutable.emplace_back(const_cast<void*>(descriptor.scales),planes.code);
+                immutable.emplace_back(const_cast<void*>(descriptor.mins),planes.superblock);
+            } else {
+                immutable.emplace_back(const_cast<void*>(descriptor.scales),
+                    nativeQuantisedScalePlaneStorageWords(descriptor.codebook_id,blocks)*sizeof(std::uint16_t));
+                if(descriptor.mins)immutable.emplace_back(const_cast<void*>(descriptor.mins),blocks*sizeof(std::uint16_t));
+            }
             if(descriptor.emins)immutable.emplace_back(const_cast<void*>(descriptor.emins),blocks*4);
+            phase("immutable_readback_begin");
             for(const auto& bank:immutable)original_immutable.push_back(download(bank.first,bank.second));
+            phase("immutable_readback_end");
             const std::vector<const TensorBase*> inputs{&values,&gate,&gamma};
             const std::vector<TensorBase*> outputs{&values,&output};
             // Recording declares dependencies but cannot import an external
@@ -155,8 +187,10 @@ public:
             const auto before_submissions=submissionCount();
             // Capture the actual selected program first: the control cannot
             // initialize a missing source/table/workspace on its behalf.
+            phase("candidate_capture_begin");
             require(candidate.capture(stream.value,device,inputs,outputs,[&]{return stage->execute(context.get());}),
                 "Actual composite stage capture failed");
+            phase("control_capture_begin");
             require(control.capture(stream.value,device,inputs,outputs,[&]{
                 if(!rocmGDN_gated_rmsnorm(static_cast<const float*>(values.gpu_data_ptr()),
                     static_cast<const float*>(gate.gpu_data_ptr()),static_cast<const float*>(gamma.gpu_data_ptr()),
@@ -167,13 +201,25 @@ public:
             }),"Original complete capture failed");
             recorded_submissions=submissionCount();
             require(recorded_submissions==before_submissions+1,"Actual composite capture submission counter missing");
+            phase("inspect_begin");
             inspect();
-        }catch(...){join();throw;}
+            phase("prepared");
+        }catch(const std::exception& error){
+            std::cerr<<"GDN_NORM_SINGLE_Q8_SETUP_EXCEPTION,error="<<error.what()<<std::endl;
+            join();throw;
+        }catch(...){phase("setup_nonstandard_exception");join();throw;}
     }
     /** @brief Retire native work/graphs before any borrowed allocation can unwind. */
     ~Cell(){join();control.reset();candidate.reset();if(stage)stage->unbindWorkspace();}
     /** @brief Test-only terminal observation boundary, never production ordering. */
-    void join()const {if(hipStreamSynchronize(stream.value)!=hipSuccess)std::terminate();}
+    void join()const {
+        const auto status=hipStreamSynchronize(stream.value);
+        if(status!=hipSuccess) {
+            std::cerr<<"GDN_NORM_SINGLE_Q8_JOIN_ERROR,status="<<static_cast<int>(status)
+                <<",error="<<hipGetErrorString(status)<<std::endl;
+            std::terminate();
+        }
+    }
     /** @brief Observe only an explicitly owned native bank, outside captured/timed work. */
     std::vector<uint8_t> download(const void* pointer,size_t bytes)const
     {
@@ -218,7 +264,7 @@ public:
             const std::string name(raw);
             if(name.find("gemv_native_quantised_kernel_t")!=std::string::npos||name.find("gemv_native_quantised_reduce_kernel_t")!=std::string::npos) {
                 original.push_back(node);
-                if(name.find("reduce_kernel_t")==std::string::npos)parts=argument<int>(node,11);
+                if(name.find("reduce_kernel_t")==std::string::npos)parts=argument<Producer,9>(node);
             }
             else require(name.find("rocm_gated_rmsnorm_kernel")!=std::string::npos||name.find("quantizeActivationsQ8")!=std::string::npos,
                 "Foreign original complete-boundary kernel");
@@ -228,7 +274,7 @@ public:
             const auto* raw=hipKernelNameRefByPtr(node.func,stream.value);require(raw,"Missing candidate raw symbol");
             const std::string name(raw);
             if(name.find("rocm_gdn_gated_norm_single_q8_kernel")!=std::string::npos) {
-                ++fused;const auto native=argument<rocm::GatedNormSingleQ8Input>(node,0);
+                ++fused;const auto native=argument<Normalizer,0>(node);
                 require(native.input==values.gpu_data_ptr()&&native.output==values.gpu_data_ptr()&&native.gate==gate.gpu_data_ptr()&&
                     native.gamma==gamma.gpu_data_ptr()&&native.columns==k&&native.parameters==policy&&
                     native.quant==banks[0].first&&native.scales==banks[1].first,"Captured composite producer ABI differs");
@@ -257,7 +303,9 @@ public:
     /** @brief Compare every produced/unused byte, guards and immutable native plane after a dirty replay. */
     std::vector<std::vector<uint8_t>> observe(bool fused,int dirty,unsigned char poison)
     {
+        phase(fused?"candidate_replay_begin":"control_replay_begin");
         publish(dirty,poison);require((fused?candidate:control).launch(stream.value),"Norm retained replay failed");join();
+        phase("replay_readback_begin");
         return currentObservation(dirty,poison);
     }
     /** @brief Observe the ACTUAL completed result without restoring, submitting or replaying anything. */
@@ -289,7 +337,7 @@ public:
         for(const auto& node:candidate.kernelNodes()) {
             const auto* raw=hipKernelNameRefByPtr(node.func,stream.value);
             if(raw&&std::string(raw).find("rocm_gdn_gated_norm_single_q8_kernel")!=std::string::npos) {
-                native=argument<rocm::GatedNormSingleQ8Input>(node,0);found=true;
+                native=argument<Normalizer,0>(node);found=true;
             }
         }
         require(found,"Missing exact captured producer tuple for selection rejection");

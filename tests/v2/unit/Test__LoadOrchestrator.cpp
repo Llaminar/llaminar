@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "loaders/GPUVramPreflight.h"
+#include "execution/moe/MoEExpertGPUWeightPlan.h"
+#include "execution/moe/ExpertPreparedMemoryGeometry.h"
+#include "../utils/QuantizedVerifierFormats.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "../mocks/MockBackend.h"
 
@@ -325,6 +328,97 @@ namespace llaminar2
         EXPECT_EQ(orch.totalPendingBytes(0), raw_bytes);
         ASSERT_NE(orch.getPool(0), nullptr);
         EXPECT_EQ(orch.getPool(0)->maxStagingSlotBytes(), 2 * bytes_per_row);
+    }
+
+    /**
+     * @test Initial expert planning preserves coded planes and exactly matches the BOM.
+     *
+     * Every native format enters the production service planner in both layouts.
+     * Noncoded source-native plans must also remain identical to the old call.
+     * Host-backed
+     * mock allocations measure persistent pool bytes, with no staging region.
+     * The literal former call (omitting the coded declaration) must overallocate
+     * at least one matrix, so a pool self-consistency check cannot mask the bug.
+     */
+    TEST(Test__LoadOrchestrator, InitialMoEExpertCodedPoolPlanMatchesPhysicalPreparedBytes)
+    {
+        using Layout = GPUPreparedWeightPoolLayout;
+        size_t original_mismatches = 0;
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const auto &entry : test::quantizedVerifierFormats())
+        {
+            const auto *metadata = native_quantised_formats::forQuantType(entry.label);
+            ASSERT_NE(metadata, nullptr);
+            for (const auto layout : {Layout::SourceNative, Layout::MigrationReusable})
+            for (const int n : {1, 17, 128})
+            for (const int k : {256, 512})
+            {
+                SCOPED_TRACE(device.toString());
+                SCOPED_TRACE(entry.label);
+                SCOPED_TRACE(static_cast<int>(layout));
+                SCOPED_TRACE(n);
+                SCOPED_TRACE(k);
+                auto source = entry.create({static_cast<size_t>(n), static_cast<size_t>(k)}, 73);
+                ASSERT_NE(source, nullptr);
+                const auto *format = gpuWeightSourceFormat(*source);
+                ASSERT_NE(format, nullptr);
+                const auto declaration = gpuPreparedWeightCodedDeclaration(*source, layout, device);
+                const auto bom = resolveExpertPreparedProjectionMemoryGeometry(n, k,
+                    ExpertWeightFormat::nativeQuantised(
+                        {format->codebook_id, format->is_superblock, true}), layout);
+                test::MockBackend backend(device.type);
+                LoadOrchestrator orchestrator(&backend, kTestOnlyUnadmittedGPUAllocation);
+                orchestrator.addDevice(device.ordinal);
+                planMoEExpertGPUWeight(orchestrator, device, "gate_e0", *source,
+                    source->size_bytes(), layout);
+                auto *pool = orchestrator.getPool(device.ordinal);
+                ASSERT_NE(pool, nullptr);
+                // Planning exposes the last region's unrounded end; physical
+                // allocation rounds that end once, independently of staging.
+                const auto planned_cursor = pool->totalPlannedBytes();
+                EXPECT_EQ(alignGPUWeightLoadAllocation(planned_cursor), bom.gpu_live_bytes);
+
+                // A following operand aligns its first region, not every
+                // logical byte. Verify the interior boundary as well as the
+                // final allocation so tail padding is neither lost nor doubled.
+                test::MockBackend pair_backend(device.type);
+                LoadOrchestrator pair(&pair_backend, kTestOnlyUnadmittedGPUAllocation);
+                pair.addDevice(device.ordinal);
+                planMoEExpertGPUWeight(pair, device, "gate_e0", *source,
+                    source->size_bytes(), layout);
+                planMoEExpertGPUWeight(pair, device, "up_e0", *source,
+                    source->size_bytes(), layout);
+                auto *pair_pool = pair.getPool(device.ordinal);
+                ASSERT_NE(pair_pool, nullptr);
+                EXPECT_EQ(pair_pool->totalPlannedBytes(), bom.gpu_live_bytes + planned_cursor);
+                ASSERT_TRUE(pair_pool->allocate(&pair_backend, device.ordinal));
+                EXPECT_EQ(pair_pool->totalPlannedBytes(), 2 * bom.gpu_live_bytes);
+                EXPECT_EQ(pair_backend.getTotalAllocatedBytes(), 2 * bom.gpu_live_bytes);
+
+                ASSERT_TRUE(pool->allocate(&backend, device.ordinal));
+                EXPECT_EQ(backend.getTotalAllocatedBytes(), bom.gpu_live_bytes);
+                EXPECT_EQ(pool->totalPlannedBytes(), backend.getTotalAllocatedBytes());
+
+                WeightVRAMPool original;
+                original.planWeight("gate_e0", n, k, format->payload_bytes,
+                    canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins,
+                    nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)),
+                    source->size_bytes(), {0});
+                if (layout == Layout::SourceNative)
+                {
+                    const auto original_physical_bytes =
+                        alignGPUWeightLoadAllocation(original.totalPlannedBytes());
+                    if (declaration && original_physical_bytes > bom.gpu_live_bytes)
+                        ++original_mismatches;
+                    if (!declaration)
+                    {
+                        EXPECT_EQ(original.totalPlannedBytes(), planned_cursor);
+                        EXPECT_EQ(original_physical_bytes, pool->totalPlannedBytes());
+                    }
+                }
+            }
+        }
+        EXPECT_GT(original_mismatches, 0u);
     }
 
     /** @test Conversion writes the existing ring, uploads live rows and retires its sole source owner. */

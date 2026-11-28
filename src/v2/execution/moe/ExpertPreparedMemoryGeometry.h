@@ -37,6 +37,7 @@ namespace llaminar2
         int N = 0;
         int K = 0;
         ExpertWeightFormat format;
+        std::uint8_t gpu_superblock_phase = 0; ///< Original K phase in a coded GPU allocation.
 
         /** @return Whether shape and exact arithmetic provenance are equal. */
         bool operator==(const ExpertPreparedProjectionIdentity &) const = default;
@@ -51,14 +52,16 @@ namespace llaminar2
                        format.kind,
                        format.native_quantised.codebook_id,
                        format.native_quantised.is_superblock,
-                       format.native_quantised.present) <
+                       format.native_quantised.present,
+                       gpu_superblock_phase) <
                    std::tie(
                        other.N,
                        other.K,
                        other.format.kind,
                        other.format.native_quantised.codebook_id,
                        other.format.native_quantised.is_superblock,
-                       other.format.native_quantised.present);
+                       other.format.native_quantised.present,
+                       other.gpu_superblock_phase);
         }
     };
 
@@ -178,18 +181,10 @@ namespace llaminar2
             }
             const auto encoding =
                 cpu::native_quantised::preparedEncodingForSource(*source);
-            const std::size_t stride =
-                cpu::native_quantised::preparedInterleavedBlockStride(
-                    encoding, source->is_asymmetric);
-            const std::size_t padded_n =
-                checkedAdd(static_cast<std::size_t>(N), 63u, "CPU padded N") &
-                ~std::size_t{63u};
-            const std::size_t units = checkedMultiply(
-                padded_n / 64u,
-                static_cast<std::size_t>(K / 32),
-                "CPU NativeQuantised units");
-            const std::size_t logical_bytes = checkedMultiply(
-                units, stride, "CPU NativeQuantised projection");
+            const auto geometry = cpu::native_quantised::preparedBlockGeometry(
+                encoding, source->is_asymmetric, source->codebook_id, K / 32);
+            const auto chunks = checkedAdd(static_cast<std::size_t>(N), 63u, "CPU padded N") / 64u;
+            const auto logical_bytes = checkedMultiply(chunks, geometry.rowBytes(), "CPU NativeQuantised projection");
             return AlignedVector<std::uint8_t>::requiredAllocationBytes(
                 logical_bytes, page_alignment);
         }
@@ -254,6 +249,7 @@ namespace llaminar2
      * @param K Reduction dimension for the prepared GEMM weight.
      * @param format Exact quantized codebook or floating precision provenance.
      * @param layout Actual GPU pool representation; movable slots remain the default.
+     * @param gpu_superblock_phase Original K phase of a coded GPU allocation (CPU remains phase zero).
      * @return Byte-exact geometry. GPU shadow retains the migration staging contract.
      * @throws std::invalid_argument If the layout or source geometry is invalid.
      */
@@ -263,7 +259,8 @@ namespace llaminar2
         int K,
         const ExpertWeightFormat &format,
         GPUPreparedWeightPoolLayout layout =
-            GPUPreparedWeightPoolLayout::MigrationReusable)
+            GPUPreparedWeightPoolLayout::MigrationReusable,
+        std::uint8_t gpu_superblock_phase = 0)
     {
         switch (layout)
         {
@@ -274,6 +271,8 @@ namespace llaminar2
             throw std::invalid_argument("Unknown GPU prepared weight pool layout");
         }
         using namespace expert_prepared_memory_detail;
+        if (gpu_superblock_phase >= native_quantised_superblock::kBlocksPerSuperblock)
+            throw std::invalid_argument("Invalid coded GPU expert root phase");
         ExpertPreparedProjectionMemoryGeometry result;
         result.cpu_bytes = cpuProjectionBytes(N, K, format);
 
@@ -300,6 +299,18 @@ namespace llaminar2
         {
             throw std::invalid_argument(
                 "GPU expert projection source codebook is not catalogued");
+        }
+        if (cpu::native_quantised::migrationUsesSuperblockCodes(*source))
+        {
+            const auto planes = NativeQuantisedMetadataPlaneBytes::coded(canonicalDeviceVnniCodebookId(*source), N, K / 32, gpu_superblock_phase);
+            const auto payload = checkedMultiply(checkedMultiply(N, K / 32, "GPU coded expert blocks"),
+                source->payload_bytes, "GPU coded expert payload");
+            auto bytes = checkedAdd(alignGPUWeightLoadAllocation(payload),
+                alignGPUWeightLoadAllocation(planes.scales), "GPU coded expert codes");
+            bytes = checkedAdd(bytes, alignGPUWeightLoadAllocation(planes.secondary), "GPU coded expert superblocks");
+            result.gpu_live_bytes = bytes;
+            result.gpu_shadow_bytes = bytes;
+            return result;
         }
         const auto live = gpuPreparedWeightPoolAllocation(*source, layout);
         result.gpu_live_bytes = gpuSeparatedProjectionBytes(

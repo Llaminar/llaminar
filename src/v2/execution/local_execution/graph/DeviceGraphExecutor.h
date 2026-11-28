@@ -2209,11 +2209,13 @@ namespace llaminar2
             /**
              * @brief Retire native graph resources and invalidate their evidence ID.
              * @param stream_policy Whether to destroy or retain the owned stream.
+             * @param wait_policy How to observe the terminal event before destroying resources.
              *
              * This is a cache-lifetime boundary, not a request data reset. Exact
              * terminal events protect resource retirement before ownership clears.
              */
-            void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
+            void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy,
+                       HostFenceWaitPolicy wait_policy = HostFenceWaitPolicy::Blocking)
             {
                 if (original_slot_terminals)
                 {
@@ -2221,7 +2223,7 @@ namespace llaminar2
                         waitForPublishedCaptureStreamTerminal(
                             CaptureStreamTerminalTicket{receipt->generation(),terminal_receipt_identity,gpu_ctx_ref,
                                 original_slot_terminals->eventForObservation(*receipt,gpu_ctx_ref,capture_stream),
-                                capture_stream,*receipt});
+                                capture_stream,*receipt}, wait_policy);
                 }
                 if (terminal_fence_published_generation >
                     terminal_fence_observed_generation)
@@ -2229,11 +2231,11 @@ namespace llaminar2
                     waitForPublishedCaptureStreamTerminal(
                         CaptureStreamTerminalTicket{
                             terminal_fence_published_generation,terminal_receipt_identity,
-                            gpu_ctx_ref,terminal_event,capture_stream});
+                            gpu_ctx_ref,terminal_event,capture_stream}, wait_policy);
                 }
                 else
                 {
-                    waitForCaptureStreamFence();
+                    waitForCaptureStreamFence(wait_policy);
                 }
                 // The parent owns clones of every child graph. Destroy it first
                 // so no backend child-node lifetime can outlive its source cache.

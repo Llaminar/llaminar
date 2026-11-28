@@ -18,6 +18,7 @@ import unittest
 
 BUILD: Path
 SWEEP_THREADS: int
+PATTERN_GROUPS: int
 LOGICAL_PER_CORE: int
 POOL_VARIABLES = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                   "NUMEXPR_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
@@ -33,9 +34,11 @@ def fixture_properties(document, name):
 
 def validate_reservations(document):
     """Reject under-reserved explicit sweeps and unbounded numerical worker pools."""
-    sweep = fixture_properties(document, "V2_Unit_CPUQuantizedGemmParity")
-    if sweep.get("PROCESSORS", 1) < SWEEP_THREADS * LOGICAL_PER_CORE:
-        raise ValueError("kernel sweep exceeds its physical CPU reservation")
+    sweep_name = "V2_Unit_CPUQuantizedGemmParity"
+    for name in [sweep_name, *(f"{sweep_name}_PatternedInputs_Group{i}" for i in range(PATTERN_GROUPS))]:
+        sweep = fixture_properties(document, name)
+        if sweep.get("PROCESSORS", 1) < SWEEP_THREADS * LOGICAL_PER_CORE:
+            raise ValueError(f"kernel sweep exceeds its physical CPU reservation: {name}")
     reference = fixture_properties(document, "V2_Unit_Python_Reference_All")
     if reference.get("PROCESSORS", 1) != LOGICAL_PER_CORE:
         raise ValueError("reference fixture must reserve one physical core")
@@ -62,10 +65,11 @@ class UnitCpuBudgetTests(unittest.TestCase):
 
     def test_missing_and_under_reserved_owners_are_rejected(self):
         """An absent fixture or the previous four-core reservation cannot certify the sweep."""
-        for mutation in ("missing", "processors"):
-            with self.subTest(mutation=mutation):
+        for mutation, name in (("missing", "V2_Unit_CPUQuantizedGemmParity"),
+                               ("processors", "V2_Unit_CPUQuantizedGemmParity_PatternedInputs_Group0")):
+            with self.subTest(mutation=mutation, fixture=name):
                 document = copy.deepcopy(self.document)
-                test = next(row for row in document["tests"] if row["name"] == "V2_Unit_CPUQuantizedGemmParity")
+                test = next(row for row in document["tests"] if row["name"] == name)
                 if mutation == "missing":
                     document["tests"].remove(test)
                 else:
@@ -111,8 +115,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--sweep-threads", type=int, required=True)
+    parser.add_argument("--pattern-groups", type=int, required=True)
     parser.add_argument("--logical-per-core", type=int, required=True)
     args, remaining = parser.parse_known_args()
     BUILD = args.build_dir.resolve(strict=True)
-    SWEEP_THREADS, LOGICAL_PER_CORE = args.sweep_threads, args.logical_per_core
+    SWEEP_THREADS, PATTERN_GROUPS, LOGICAL_PER_CORE = args.sweep_threads, args.pattern_groups, args.logical_per_core
     unittest.main(argv=[sys.argv[0], *remaining])

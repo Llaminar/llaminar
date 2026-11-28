@@ -39,6 +39,49 @@ TEST(CPUExplicitRoundingContract, NativeHalfScaleEveryEncodingIsByteExact)
     }
 }
 
+/**
+ * @test The finite/non-finite seam of the native half conversion, at runtime.
+ *
+ * Regression for the x86 F16C branch that fell off the end of the function
+ * for exponent-31 words: the undefined behaviour let GCC 14 publish the
+ * max-finite scale 65504 as +inf and quiet signalling NaNs. The words are read
+ * through a volatile table so no conversion is constant-folded, and every
+ * expected value is spelled out instead of derived from fp16_to_fp32().
+ */
+TEST(CPUExplicitRoundingContract, NativeHalfScaleFiniteSeamSaturatesAndKeepsPayloads)
+{
+    struct Case
+    {
+        std::uint16_t half;
+        std::uint32_t fp32;
+    };
+    static constexpr Case cases[] = {
+        {0x7bffu, 0x477fe000u}, // +65504, the largest finite half: never +inf.
+        {0xfbffu, 0xc77fe000u}, // -65504.
+        {0x7bfeu, 0x477fc000u}, // +65472.
+        {0x7800u, 0x47000000u}, // +32768.
+        {0x7c00u, 0x7f800000u}, // +inf.
+        {0xfc00u, 0xff800000u}, // -inf.
+        {0x7c01u, 0x7f802000u}, // Signalling NaN payload stays signalling.
+        {0xfc01u, 0xff802000u},
+        {0x7dffu, 0x7fbfe000u}, // Largest signalling payload.
+        {0x7e00u, 0x7fc00000u}, // Quiet NaN.
+        {0x7fffu, 0x7fffe000u},
+        {0xffffu, 0xffffe000u},
+        {0x0001u, 0x33800000u}, // Smallest subnormal.
+        {0x0000u, 0x00000000u},
+        {0x8000u, 0x80000000u},
+    };
+    for (const Case &c : cases)
+    {
+        volatile std::uint16_t opaque = c.half;
+        const std::uint16_t half = opaque;
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(cpu::native_quantised::nativeQuantisedFP16ScaleToFP32(half)), c.fp32)
+            << "binary16 word=0x" << std::hex << c.half;
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(fp16_to_fp32(half)), c.fp32) << "binary16 word=0x" << std::hex << c.half;
+    }
+}
+
 /** @test Every persisted positive binary16 scale keeps the identical reciprocal. */
 TEST(CPUExplicitRoundingContract, EveryHalfScalePreservesReciprocalBits)
 {

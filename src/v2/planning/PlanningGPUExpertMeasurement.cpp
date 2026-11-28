@@ -14,6 +14,7 @@
  * original fixed-down lease supplies policy metadata without down arithmetic.
  */
 #include "PlanningGPUExpertMeasurement.h"
+#include "loaders/BoundedGPUExpertSource.h"
 #include "PlanningExecutionMeasurement.h"
 #include "WorkspaceMemoryEstimator.h"
 #include "backends/BackendManager.h"
@@ -106,7 +107,9 @@ namespace llaminar2
                     pool.planWeightForOwner(device.gpu_ordinal(), inputs[i]->tensor_name,
                         matrix.n, matrix.k, format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric,
                         format->has_emins, nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)),
-                        matrix.source_bytes, kWeightOwner);
+                        matrix.source_bytes, kWeightOwner, {0},
+                        // Whole-K sample bound as an immutable source-native matrix.
+                        gpuPreparedWeightCodedDeclaration(*format, GPUPreparedWeightPoolLayout::SourceNative, device));
                 else if (description.formats[i] == "F32" || description.formats[i] == "F16" ||
                          description.formats[i] == "BF16")
                     pool.planRawWeightForOwner(device.gpu_ordinal(), inputs[i]->tensor_name,

@@ -52,24 +52,23 @@ TEST(ROCmGroupedFFNFormatSelection, AllSourceAndMigrationFormatsRetainIndependen
         const auto& source=*entry.metadata;
         const auto routed=reachable(source);
         const auto policy=nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(source.codebook_id));
-        for(auto physical:{canonicalDeviceVnniCodebookId(source),migrationStableDeviceVnniFormat(source).codebook_id}) {
-            for(unsigned role=0;role<3;++role) {
-                std::array weights{matrix(formats::Q8_0,19,false),matrix(formats::Q8_0,19,false),
-                                   matrix(formats::Q8_0,19,true)};
-                weights[role]=matrix(source,physical,role==2);
-                const auto program=ffn::declareSourceFormats(160,shared,routed,q8,sources(source,source,formats::Q8_0),weights);
-                EXPECT_EQ(program.routedColumns(),160);
-                EXPECT_EQ(program.sharedColumns(),shared);
-                EXPECT_EQ(program.formats().routedGateUp.policy_codebook_mask,policy);
-                EXPECT_EQ(program.formats().routedDown.execution_codebook_mask,q8.execution_codebook_mask);
-                for(unsigned index=0;index<3;++index) {
-                    EXPECT_EQ(program.formats().shared[index].execution_codebook_mask,
-                        index==role?nativeQuantisedCodebookMaskBit(physical):q8.execution_codebook_mask);
-                    EXPECT_EQ(program.formats().shared[index].policy_codebook_mask,index==role?policy:q8.policy_codebook_mask);
-                }
-                EXPECT_EQ(program.family(),rocm::ResidentMoEFFNDecoderProgram::fromExecutionMask(
-                    routed.execution_codebook_mask|q8.execution_codebook_mask|nativeQuantisedCodebookMaskBit(physical)).groups());
+        const auto physical=canonicalDeviceVnniCodebookId(source);
+        for(unsigned role=0;role<3;++role) {
+            std::array weights{matrix(formats::Q8_0,19,false),matrix(formats::Q8_0,19,false),
+                               matrix(formats::Q8_0,19,true)};
+            weights[role]=matrix(source,physical,role==2);
+            const auto program=ffn::declareSourceFormats(160,shared,routed,q8,sources(source,source,formats::Q8_0),weights);
+            EXPECT_EQ(program.routedColumns(),160);
+            EXPECT_EQ(program.sharedColumns(),shared);
+            EXPECT_EQ(program.formats().routedGateUp.policy_codebook_mask,policy);
+            EXPECT_EQ(program.formats().routedDown.execution_codebook_mask,q8.execution_codebook_mask);
+            for(unsigned index=0;index<3;++index) {
+                EXPECT_EQ(program.formats().shared[index].execution_codebook_mask,
+                    index==role?nativeQuantisedCodebookMaskBit(physical):q8.execution_codebook_mask);
+                EXPECT_EQ(program.formats().shared[index].policy_codebook_mask,index==role?policy:q8.policy_codebook_mask);
             }
+            EXPECT_EQ(program.family(),rocm::ResidentMoEFFNDecoderProgram::fromExecutionMask(
+                routed.execution_codebook_mask|q8.execution_codebook_mask|nativeQuantisedCodebookMaskBit(physical)).groups());
         }
     }
 }
@@ -77,10 +76,11 @@ TEST(ROCmGroupedFFNFormatSelection, AllSourceAndMigrationFormatsRetainIndependen
 /** @test An indexed gate schedule depends on its gate/up readers, including every encoding reachable by movement. */
 TEST(ROCmGroupedFFNFormatSelection, IndexedGateReadersAreIndependentOfDownAndRejectMixedEncodings)
 {
-    const auto& gate=formats::IQ3_XXS;
     const auto& sharedGate=formats::IQ2_S;
+    for(const auto* gate_format:{&formats::IQ3_XXS,&formats::Q5_K})
     for(const auto* down:{&formats::Q5_1,&formats::Q6_K}) {
-        SCOPED_TRACE(down->codebook_id);
+        const auto& gate=*gate_format;
+        SCOPED_TRACE(::testing::Message()<<int(gate.codebook_id)<<' '<<int(down->codebook_id));
         const std::array weights{matrix(sharedGate,sharedGate.codebook_id,false),
             matrix(sharedGate,sharedGate.codebook_id,false),matrix(*down,down->codebook_id,true)};
         const auto declare=[&](bool movable) {
@@ -89,7 +89,7 @@ TEST(ROCmGroupedFFNFormatSelection, IndexedGateReadersAreIndependentOfDownAndRej
         };
         const auto compact=declare(false);
         EXPECT_TRUE(compact.hasOriginalGateReaders(gate,sharedGate,weights));
-        EXPECT_FALSE(declare(true).hasOriginalGateReaders(gate,sharedGate,weights));
+        EXPECT_TRUE(declare(true).hasOriginalGateReaders(gate,sharedGate,weights));
         EXPECT_FALSE(compact.hasOriginalGateReaders(formats::IQ3_S,sharedGate,weights));
         for(unsigned role=0;role<2;++role) {
             auto changed=weights;
@@ -190,7 +190,11 @@ TEST(ROCmGroupedFFNFormatSelection, FixedQ5PitchRequiresMeasuredWidthsAndExactGa
         EXPECT_FALSE(classify(160,width,q5,q5k,sharedWeights(width,formats::Q8_0)));
     EXPECT_FALSE(classify(160,160,q5,sources(formats::Q5_K,formats::Q5_1,formats::Q8_0),exact));
     EXPECT_FALSE(classify(160,160,q5,q5k,sharedWeights(160,formats::Q8_K)));
-    EXPECT_FALSE(classify(160,160,reachable(formats::Q5_K),q5k,exact));
+    const auto movable_q5 = reachable(formats::Q5_K);
+    EXPECT_EQ(movable_q5.execution_codebook_mask,q5.execution_codebook_mask);
+    EXPECT_EQ(movable_q5.policy_codebook_mask,q5.policy_codebook_mask);
+    for(int width:{128,160,256})
+        EXPECT_EQ(classify(width,160,movable_q5,q5k,exact),static_cast<ffn::FixedQ5GatePitch>(width));
 }
 
 /** @test A fixed down reader must remain correct for every descriptor reachable after a move. */
@@ -218,7 +222,13 @@ TEST(ROCmGroupedFFNFormatSelection, PairedDownRequiresOriginalSourcePitchAndSing
                         q4,reachable(formats::Q5_K,false),formats::Q8_0));
     EXPECT_EQ(select(256,160,original,reachable(formats::Q4_K,true),q51,formats::Q8_0),
               ffn::FixedQ51DownPitch::F256);
-    EXPECT_FALSE(select(256,160,original,q4,reachable(formats::Q5_1,true),formats::Q8_0));
+    // CPU migration preserves the plain Q5_1 physical reader and K32 policy.
+    const auto movable_q51 = reachable(formats::Q5_1,true);
+    EXPECT_EQ(movable_q51.execution_codebook_mask,q51.execution_codebook_mask);
+    EXPECT_EQ(movable_q51.policy_codebook_mask,q51.policy_codebook_mask);
+    for(int width:{128,256})
+        EXPECT_EQ(select(width,160,original,q4,movable_q51,formats::Q8_0),
+                  static_cast<ffn::FixedQ51DownPitch>(width));
 }
 
 #endif

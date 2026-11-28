@@ -26,6 +26,31 @@ sys.path.insert(0, str(ROOT / "scripts/ci"))
 import toolchain_cache as cache
 
 
+def cache_to_types(run: str) -> list[str]:
+    """Return the ``type`` of every BuildKit ``--cache-to`` export in a shell step.
+
+    The run text is tokenised like the shell would (line continuations joined,
+    quotes removed), so quoted, unquoted and ``--cache-to=`` forms are all seen.
+    """
+    import shlex
+    tokens = shlex.split(run.replace("\\\n", " "), comments=False, posix=True)
+    values = []
+    for index, token in enumerate(tokens):
+        if token == "--cache-to":
+            if index + 1 == len(tokens):
+                raise AssertionError("--cache-to without a value")
+            values.append(tokens[index + 1])
+        elif token.startswith("--cache-to="):
+            values.append(token.split("=", 1)[1])
+    types = []
+    for value in values:
+        fields = dict(field.split("=", 1) for field in value.split(",") if "=" in field)
+        if "type" not in fields:
+            raise AssertionError("--cache-to without an explicit type: " + value)
+        types.append(fields["type"])
+    return types
+
+
 def oci(layout: Path, admitted: dict, *, architecture: str = "amd64") -> tuple[dict, Path]:
     """Write an actual descriptor graph with small, authenticated layer bytes."""
     (layout / "blobs/sha256").mkdir(parents=True)
@@ -189,6 +214,8 @@ class ToolchainCacheTests(unittest.TestCase):
         self.assertEqual(checkpoint["with"]["target"], "gpu-sdk")
         self.assertIn("scope=llaminar-gpu-sdk-neon", checkpoint["with"]["cache-to"])
         self.assertEqual(toolchain["with"]["target"], "toolchain")
+        # A cold toolchain must reuse the checkpointed SDK, not rebuild it.
+        self.assertIn("type=gha,scope=llaminar-gpu-sdk-neon,", toolchain["with"]["cache-from"])
         for step in (checkpoint, toolchain):
             self.assertEqual(step["with"]["platforms"], "linux/arm64")
             self.assertIn("LLAMINAR_CUDA_ARCHS=121", step["with"]["build-args"])
@@ -203,11 +230,33 @@ class ToolchainCacheTests(unittest.TestCase):
             cache_step = next(step for step in steps if step.get("id") == "toolchain")
             self.assertEqual(cache_step["uses"], "./.github/actions/cache-develop-toolchain")
             self.assertEqual(cache_step["with"]["cpu-isa"], "NEON")
-        build = next(step["with"] for step in pr_steps if step.get("with", {}).get("target") == "test-runner")
-        self.assertEqual(build["build-contexts"], "${{ steps.toolchain.outputs.neon-context }}")
-        self.assertIn("type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}", build["cache-from"])
-        self.assertTrue(build["cache-to"].startswith("type=gha,scope=llaminar-build-neon-pr,"))
-        self.assertIn("scope=llaminar-build-neon-pr", build["cache-from"])
+        # The PR builds through shell `docker buildx build` commands.  Every one
+        # must consume the admitted NEON toolchain context, and none may write
+        # the trusted registry cache.
+        pr_builds = [step for step in pr_steps if "docker buildx build" in step.get("run", "")]
+        self.assertTrue(pr_builds)
+        for step in pr_builds:
+            with self.subTest(step=step.get("name")):
+                self.assertEqual(step["env"]["TOOLCHAIN_CONTEXT"], "${{ steps.toolchain.outputs.neon-context }}")
+                self.assertRegex(step["run"], r'--build-context "\$(TOOLCHAIN_CONTEXT|\{TOOLCHAIN_CONTEXT:\?\})"')
+        # No PR step, of any kind, may export to the trusted registry cache, in
+        # any spelling (quoted, unquoted or --cache-to=).
+        # Allowlist: the only cache a PR may export is the job-scoped gha cache.
+        # Action steps' `with: cache-to` values are checked as well as shell runs.
+        for step in pr_steps:
+            exports = cache_to_types(step.get("run", ""))
+            action_cache = step.get("with", {}).get("cache-to", "")
+            if action_cache:
+                exports += [line.split("type=", 1)[1].split(",", 1)[0]
+                            if "type=" in line else "<untyped>"
+                            for line in action_cache.splitlines() if line.strip()]
+            with self.subTest(step=step.get("name")):
+                self.assertTrue(all(kind == "gha" for kind in exports), exports)
+        build = next(step for step in pr_builds if "--target test-runner" in step["run"])["run"]
+        self.assertIn("--cache-from type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}", build)
+        self.assertIn("--cache-from type=gha,scope=llaminar-build-neon-pr,", build)
+        self.assertIn("--cache-to type=gha,scope=llaminar-build-neon-pr,", build)
+        self.assertEqual(build.count("--cache-to "), 1)
         publish_build = next(step for step in publication_steps if "--cache-to" in step.get("run", ""))
         login = next(step for step in publication_steps if step.get("uses") == "docker/login-action@v4")
         self.assertLess(publication_steps.index(login), publication_steps.index(publish_build))
@@ -216,6 +265,22 @@ class ToolchainCacheTests(unittest.TestCase):
         self.assertIn("--build-context", publish_build["run"])
         self.assertIn("--cache-from", publish_build["run"])
         self.assertIn('--cache-to "type=registry,ref=$REGISTRY_CACHE', publish_build["run"])
+
+    def test_cache_to_parser_sees_every_registry_export_spelling(self):
+        """The PR registry-write guard must not be bypassed by quoting or ``=``."""
+        for run in ('docker buildx build --cache-to type=registry,ref=x .',
+                    'docker buildx build --cache-to "type=registry,ref=$REGISTRY_CACHE,mode=max" .',
+                    "docker buildx build \\\n  --cache-to='type=registry,ref=x' .",
+                    'docker buildx build --cache-to=type=registry,ref=x .'):
+            with self.subTest(run=run):
+                self.assertIn("registry", cache_to_types(run))
+        self.assertEqual(cache_to_types(
+            'docker buildx build --cache-to type=gha,scope=s,mode=max .'), ["gha"])
+        self.assertEqual(cache_to_types("echo no cache export"), [])
+        # A parameterised type is not provably gha; the allowlist rejects it.
+        self.assertEqual(cache_to_types('docker buildx build --cache-to "type=${KIND},ref=x" .'), ["${KIND}"])
+        with self.assertRaises(AssertionError):
+            cache_to_types("docker buildx build --cache-to ref=x .")
 
     def test_artifact_survives_source_failure_and_binds_a_new_source_tree_by_digest(self):
         expected = cache.identity(self.tree, "AVX512")

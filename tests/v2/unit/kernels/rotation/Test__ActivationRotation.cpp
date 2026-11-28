@@ -1,12 +1,10 @@
 /**
  * @file Test__ActivationRotation.cpp
- * @brief Unit tests for ActivationRotation and ModelWeightRotation
+ * @brief Unit tests for ActivationRotation
  *
  * Tests:
  * - Block-diagonal rotation preserves vector norms (orthogonality)
  * - Rotation + inverse rotation = identity
- * - Weight rotation sets activation_rotation metadata on tensors
- * - ModelWeightRotation correctly rotates all GEMM weights
  * - Rotation with 4B-model dimensions (hidden=2560, ffn=9216, block_dim=128)
  * - Rotated GEMM output matches unrotated GEMM (mathematical invariance)
  * - FWHT correctness: H·H = n·I property verified at all supported sizes
@@ -19,7 +17,6 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../utils/CPUProjectionTestWorkspace.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -29,12 +26,8 @@
 #include <vector>
 
 #include "kernels/cpu/rotation/ActivationRotation.h"
-#include "kernels/cpu/rotation/ModelWeightRotation.h"
-#include "models/GraphTypes.h"
-#include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
-using namespace llaminar2::test;
 
 namespace
 {
@@ -447,150 +440,6 @@ TEST(Test__ActivationRotation, CalibrationSelectedHadamardSeedImprovesQ8RoundTri
         << "Selected seed should improve held-out cosine similarity";
     EXPECT_LT(current_heldout.mse, raw_heldout_mse)
         << "The existing Hadamard rotation should improve over unrotated Q8_1 round-trip";
-}
-
-// ============================================================================
-// ModelWeightRotation Tests
-// ============================================================================
-
-TEST(Test__ActivationRotation, ModelWeightRotation_Create)
-{
-    auto rotator = ModelWeightRotation::create(2560, 9216, 128);
-    ASSERT_NE(rotator, nullptr);
-    EXPECT_NE(rotator->hiddenRotation(), nullptr);
-    EXPECT_NE(rotator->ffnRotation(), nullptr);
-    EXPECT_EQ(rotator->hiddenRotation()->total_dim(), 2560);
-    EXPECT_EQ(rotator->ffnRotation()->total_dim(), 9216);
-}
-
-TEST(Test__ActivationRotation, ModelWeightRotation_RotateWeight_SetsMetadata)
-{
-    auto rotator = ModelWeightRotation::create(256, 512, 128);
-
-    // Create a small FP32 weight tensor [8×256]
-    auto weight = TestTensorFactory::createFP32Random({8, 256});
-    weight->setDebugName("test_wq");
-
-    TensorBase *ptr = weight.get();
-    bool ok = rotator->rotateWeight(&ptr, ModelWeightRotation::HIDDEN);
-    ASSERT_TRUE(ok) << "rotateWeight should succeed";
-
-    // Pointer should be the same (tag-only, no data copy)
-    EXPECT_EQ(ptr, weight.get()) << "rotateWeight should tag in-place, not create a new tensor";
-
-    // The tensor should have rotation metadata
-    EXPECT_NE(ptr->activationRotation(), nullptr)
-        << "Tagged tensor should have activationRotation set";
-    EXPECT_EQ(ptr->activationRotation()->total_dim(), 256);
-}
-
-TEST(Test__ActivationRotation, ModelWeightRotation_SkipsDimensionMismatch)
-{
-    auto rotator = ModelWeightRotation::create(256, 512, 128);
-
-    // Create weight with K-dim = 384 (doesn't match hidden=256 or ffn=512)
-    auto weight = TestTensorFactory::createFP32Random({8, 384});
-    weight->setDebugName("test_mismatch");
-
-    TensorBase *ptr = weight.get();
-    bool ok = rotator->rotateWeight(&ptr, ModelWeightRotation::HIDDEN);
-    EXPECT_FALSE(ok) << "rotateWeight should fail for dimension mismatch";
-    EXPECT_EQ(ptr, weight.get()) << "Pointer should be unchanged on failure";
-}
-
-TEST(Test__ActivationRotation, ModelWeightRotation_RotateLayerWeights)
-{
-    auto rotator = ModelWeightRotation::create(64, 128, 64);
-
-    // Create mock layer weights
-    auto wq = TestTensorFactory::createFP32Random({16, 64});
-    auto wk = TestTensorFactory::createFP32Random({8, 64});
-    auto wv = TestTensorFactory::createFP32Random({8, 64});
-    auto gate = TestTensorFactory::createFP32Random({128, 64});
-    auto up = TestTensorFactory::createFP32Random({128, 64});
-    auto down = TestTensorFactory::createFP32Random({64, 128});
-
-    wq->setDebugName("wq");
-    wk->setDebugName("wk");
-    wv->setDebugName("wv");
-    gate->setDebugName("gate");
-    up->setDebugName("up");
-    down->setDebugName("down");
-
-    LayerWeights layer{};
-    layer.wq = wq.get();
-    layer.wk = wk.get();
-    layer.wv = wv.get();
-    layer.gate_proj = gate.get();
-    layer.up_proj = up.get();
-    layer.down_proj = down.get();
-
-    TensorBase *orig_wq = layer.wq;
-    TensorBase *orig_down = layer.down_proj;
-
-    rotator->rotateLayerWeights(layer);
-
-    // FA weights with K=64 should be tagged (hidden rotation)
-    EXPECT_EQ(layer.wq, orig_wq)
-        << "wq pointer should be unchanged (tag-only)";
-    EXPECT_NE(layer.wq->activationRotation(), nullptr)
-        << "Tagged wq should have rotation metadata";
-
-    // FFN down with K=128 should be tagged (ffn rotation)
-    EXPECT_EQ(layer.down_proj, orig_down)
-        << "down_proj pointer should be unchanged (tag-only)";
-    EXPECT_NE(layer.down_proj->activationRotation(), nullptr)
-        << "Tagged down_proj should have rotation metadata";
-}
-
-TEST(Test__ActivationRotation, ModelWeightRotation_RotateAllWeights)
-{
-    auto rotator = ModelWeightRotation::create(64, 128, 64);
-
-    // Create a minimal ModelWeights with 2 layers
-    auto wq0 = TestTensorFactory::createFP32Random({16, 64});
-    auto gate0 = TestTensorFactory::createFP32Random({128, 64});
-    auto down0 = TestTensorFactory::createFP32Random({64, 128});
-    auto wq1 = TestTensorFactory::createFP32Random({16, 64});
-    auto gate1 = TestTensorFactory::createFP32Random({128, 64});
-    auto down1 = TestTensorFactory::createFP32Random({64, 128});
-    auto lm_head = TestTensorFactory::createFP32Random({100, 64});
-
-    wq0->setDebugName("wq0");
-    gate0->setDebugName("gate0");
-    down0->setDebugName("down0");
-    wq1->setDebugName("wq1");
-    gate1->setDebugName("gate1");
-    down1->setDebugName("down1");
-    lm_head->setDebugName("lm_head");
-
-    std::vector<LayerWeights> layers(2);
-    layers[0].wq = wq0.get();
-    layers[0].gate_proj = gate0.get();
-    layers[0].down_proj = down0.get();
-    layers[1].wq = wq1.get();
-    layers[1].gate_proj = gate1.get();
-    layers[1].down_proj = down1.get();
-
-    ModelWeights weights;
-    weights.lm_head = lm_head.get();
-    weights.get_layer_weights = [&](int idx) -> LayerWeights
-    { return layers[idx]; };
-
-    rotator->rotateAllWeights(weights, 2, rotator);
-
-    // LM head should be tagged (K=64 = hidden_dim)
-    EXPECT_EQ(weights.lm_head, lm_head.get())
-        << "LM head pointer should be unchanged (tag-only)";
-    EXPECT_NE(weights.lm_head->activationRotation(), nullptr)
-        << "LM head should have rotation metadata";
-
-    // Layer accessor should return tagged weights
-    auto l0 = weights.get_layer_weights(0);
-    EXPECT_NE(l0.wq->activationRotation(), nullptr)
-        << "Layer 0 wq should have rotation metadata";
-    EXPECT_NE(l0.down_proj->activationRotation(), nullptr)
-        << "Layer 0 down_proj should have rotation metadata";
 }
 
 // ============================================================================
@@ -1541,7 +1390,6 @@ TEST(Test__ActivationRotation, LargeDimension_NormPreserved)
 
 // ============================================================================
 // Edge Cases
-// ============================================================================
 
 TEST(Test__ActivationRotation, ZeroVector_RoundTrip)
 {
@@ -1621,161 +1469,4 @@ TEST(Test__ActivationRotation, RotationChangesVector)
         }
     }
     EXPECT_TRUE(any_different) << "Rotation should actually modify the vector";
-}
-
-// ============================================================================
-// Rotation-Fused VNNI Weight Packing Tests
-//
-// Verify that packing with rotation fused in produces correct GEMM results:
-//   X @ W^T == (X@R) @ Pack(R^T @ dequant(W))
-// ============================================================================
-
-#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
-
-TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
-{
-    // Test that activating rotation on a Q4_0 weight produces the same
-    // GEMM result as the manual approach: dequant → rotate → GEMM.
-    const int M = 2;   // batch
-    const int K = 128;  // hidden dim (must be multiple of block_dim)
-    const int N = 32;   // output dim
-
-    // Create rotation
-    ActivationRotation rot(K, 128);
-
-    // Create Q4_0 weight [N×K]
-    auto weight = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N),
-                                                        static_cast<size_t>(K)});
-
-    // Reference: dequantize weight to FP32
-    std::vector<float> W_fp32(N * K);
-    for (int n = 0; n < N; ++n)
-        weight->to_fp32_row(n, W_fp32.data() + n * K);
-
-    // Create random FP32 input [M×K]
-    std::mt19937 gen(42);
-    std::normal_distribution<float> dist(0.0f, 1.0f);
-    std::vector<float> X(M * K);
-    for (auto &v : X) v = dist(gen);
-
-    // Reference result: Y_ref = X @ W^T (unrotated, in FP32)
-    std::vector<float> Y_ref(M * N, 0.0f);
-    for (int m = 0; m < M; ++m)
-        for (int n = 0; n < N; ++n)
-            for (int k = 0; k < K; ++k)
-                Y_ref[m * N + n] += X[m * K + k] * W_fp32[n * K + k];
-
-    // Tag weight with rotation
-    weight->setActivationRotation(&rot);
-
-    // Create GEMM kernel (will pack with rotation fused in)
-    auto kernel = std::make_unique<llaminar2::cpu::native_quantised::CPUNativeQuantisedGemmKernel>(
-        weight.get());
-    ASSERT_TRUE(kernel->isValid()) << "GEMM kernel should be valid after packing";
-
-    // Create input tensor [M×K]
-    auto input_tensor = TestTensorFactory::createFP32(
-        {static_cast<size_t>(M), static_cast<size_t>(K)});
-    std::memcpy(input_tensor->mutable_data(), X.data(), M * K * sizeof(float));
-
-    // Create output tensor [M×N]
-    auto output_tensor = TestTensorFactory::createFP32(
-        {static_cast<size_t>(M), static_cast<size_t>(N)});
-
-    // Execute GEMM: kernel rotates activations, uses rotation-fused packed weights
-    llaminar2::test::CPUProjectionTestWorkspace workspace(M, K, kernel->getWorkspaceRequirements(M));
-    bool ok = kernel->multiply_tensor(
-        input_tensor.get(), output_tensor.get(), M, N, K,
-        true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
-    ASSERT_TRUE(ok) << "GEMM should succeed";
-
-    const float *Y_fused = output_tensor->data();
-
-    // Compare. The rotation-fused path introduces INT8 quantization noise,
-    // so we allow some tolerance (Q4_0 + rotation INT8 requant).
-    float max_rel_err = 0.0f;
-    for (int i = 0; i < M * N; ++i)
-    {
-        float ref = Y_ref[i];
-        float got = Y_fused[i];
-        float abs_err = std::fabs(ref - got);
-        float rel_err = (std::fabs(ref) > 1e-6f) ? abs_err / std::fabs(ref) : abs_err;
-        max_rel_err = std::max(max_rel_err, rel_err);
-
-        // Q4_0 already has ~1-2% quantization noise from the original format,
-        // plus the rotation requant adds another layer. Allow generous tolerance.
-        EXPECT_NEAR(got, ref, std::fabs(ref) * 0.15f + 0.5f)
-            << "GEMM invariance failed at index " << i
-            << " (ref=" << ref << ", got=" << got
-            << ", rel_err=" << rel_err << ")";
-    }
-
-    LOG_INFO("[FusedPacking_Q4_0] max_rel_err=" << max_rel_err);
-}
-
-TEST(Test__ActivationRotation, FusedPacking_PreservesFormatForNonRotated)
-{
-    // Verify that packing WITHOUT rotation produces the same result as before.
-    const int K = 128;
-    const int N = 16;
-
-    auto weight = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N),
-                                                        static_cast<size_t>(K)});
-    // No rotation set — should use the nibble-LUT path as usual
-    EXPECT_EQ(weight->activationRotation(), nullptr);
-
-    auto kernel = std::make_unique<llaminar2::cpu::native_quantised::CPUNativeQuantisedGemmKernel>(
-        weight.get());
-    ASSERT_TRUE(kernel->isValid());
-
-    // Simple smoke test: multiply identity-like input
-    auto input = TestTensorFactory::createFP32({1, static_cast<size_t>(K)});
-    auto output = TestTensorFactory::createFP32({1, static_cast<size_t>(N)});
-
-    // Set all inputs to 1.0 — output should be row sums of weight
-    float *inp_data = input->mutable_data();
-    for (int i = 0; i < K; ++i) inp_data[i] = 1.0f;
-
-    llaminar2::test::CPUProjectionTestWorkspace workspace(1, K);
-    bool ok = kernel->multiply_tensor(input.get(), output.get(), 1, N, K,
-        true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
-    ASSERT_TRUE(ok);
-
-    // Just verify output is not NaN/Inf
-    const float *out_data = output->data();
-    for (int n = 0; n < N; ++n)
-    {
-        EXPECT_FALSE(std::isnan(out_data[n])) << "Output NaN at " << n;
-        EXPECT_FALSE(std::isinf(out_data[n])) << "Output Inf at " << n;
-    }
-}
-
-TEST(Test__ActivationRotation, FusedPacking_RotationTagOnlyNoDataChange)
-{
-    // Verify that tagging with rotation doesn't modify the tensor's data
-    const int K = 128;
-    const int N = 8;
-
-    auto weight = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N),
-                                                        static_cast<size_t>(K)});
-
-    // Save a copy of the FP32 dequantized data before tagging
-    std::vector<float> before(N * K);
-    for (int n = 0; n < N; ++n)
-        weight->to_fp32_row(n, before.data() + n * K);
-
-    // Tag with rotation
-    ActivationRotation rot(K, 128);
-    weight->setActivationRotation(&rot);
-
-    // Verify data is unchanged
-    std::vector<float> after(N * K);
-    for (int n = 0; n < N; ++n)
-        weight->to_fp32_row(n, after.data() + n * K);
-
-    for (int i = 0; i < N * K; ++i)
-    {
-        EXPECT_EQ(before[i], after[i])
-            << "Tensor data should not change after setActivationRotation at index " << i;
-    }
 }

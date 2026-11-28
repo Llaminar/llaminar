@@ -6,11 +6,29 @@
  * independently stalled slots, throttling, and counter boundaries without sleep.
  */
 #include "transfer/TransferCommandProgressWatch.h"
+#include "transfer/MappedTransferProgressABI.h"
 #include <gtest/gtest.h>
 #include <limits>
 
 namespace llaminar2::test
 {
+    /** @brief The existing terminal receipt names the rejecting packed-work predicate. */
+    TEST(TransferCommandProgressWatch, PackedWorkTerminalReasonsNameRejectingPredicate)
+    {
+        EXPECT_STREQ(mappedTransferProgressErrorName(MappedTransferProgressError::InvalidPackedPointers),
+            "invalid packed transfer staging or metadata pointers");
+        EXPECT_STREQ(mappedTransferProgressErrorName(MappedTransferProgressError::InvalidPackedGeometry),
+            "invalid packed transfer dimensions, units or direction");
+        EXPECT_STREQ(mappedTransferProgressErrorName(MappedTransferProgressError::InvalidPackedExtent),
+            "invalid packed transfer encoded byte boundary");
+        EXPECT_STREQ(mappedTransferProgressErrorName(MappedTransferProgressError::InvalidPackedPopulation),
+            "invalid packed transfer chunk population");
+        EXPECT_STREQ(mappedTransferProgressErrorName(MappedTransferProgressError::InvalidPackedDispatch),
+            "invalid packed transfer format dispatch");
+        EXPECT_STREQ(mappedTransferProgressErrorName(static_cast<MappedTransferProgressError>(99u)),
+            "unknown transfer error");
+    }
+
     /** @brief Many fast commands never inherit a busy queue's accumulated age. */
     TEST(TransferCommandProgressWatch, BusyQueueDoesNotAgeNewCommands)
     {

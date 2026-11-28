@@ -32,7 +32,7 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Declare a source-native, unrotated projection without loading weights.
+         * @brief Declare a source-native projection without loading weights.
          * @param format Canonical source format, including F32/F16/BF16.
          * @param geometry Participant and physical matrix geometry.
          * @return Exact named Q8/partial envelope; floating projections require neither.
@@ -51,7 +51,7 @@ namespace llaminar2
             const CPUProjectionWorkspaceGeometry &geometry);
         /**
          * @brief Declare the same bank from an actually prepared encoding.
-         * @param footprint Live prepared encoding, including optional rotated encoding.
+         * @param footprint Live prepared encoding.
          * @param codebook Arithmetic source identity retained by the prepared engine.
          * @param geometry Exact dimensions and participant policy observation.
          * @return Checked named Q8 and ordered-partial envelope.

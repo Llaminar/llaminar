@@ -4,15 +4,16 @@
  *
  * The CPU factory, prepared owners, workspace names and request coordinates are
  * unchanged. Synchronous NEON batches consume the published interleaved bank;
- * all arithmetic stays in native shared-row tiles. Ordinary rows own full-K
- * chains, experts own their canonical register-resident ordered tree. Neither
- * requires a shared K-partial allocation. No x86 intrinsic, weight repack, row
- * inference replay, allocation or coherence publication belongs in this layer.
+ * ordinary rows own full-K chains and experts own their canonical ordered
+ * tree. Deep prefill can reuse transient weight panels from the participant's
+ * admitted worker slab. No expanded weights survive the call; no x86 intrinsic,
+ * row inference replay, allocation or coherence publication belongs here.
  */
 #pragma once
 #include "CPUNativeQuantisedExecutionContract.h"
 #include "CPUNativeQuantisedPackedWeights.h"
 #include "CPUNativeNEONProjectionBatch.h"
+#include "CPUNativeNEONPackedPrefill.h"
 #include "CPUNativeNEONExactOverlay.h"
 #include "CPUNativeQuantisedScalarReference.h"
 #include "CPUProjectionQ8Publication.h"
@@ -23,6 +24,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -165,6 +167,70 @@ namespace llaminar2::cpu::native_quantised
             batch.execute<multi_scale::NEONByteDot::ASIMD>();
         }
 
+        /** @return Existing team width, including a serialized team, or the new team's budget. */
+        inline int packedPrefillWorkers() noexcept
+        { return llaminar::v2::inLexicalWorkshare() ? omp_get_num_threads() : omp_get_max_threads(); }
+
+        /**
+         * @brief Shared source/team rule of both packed-panel prefill routes.
+         * @param w Actual prepared source and arithmetic identity.
+         * @param rows Physical rows of this projection.
+         * @param workers Width of the team that will execute the projection.
+         * @param minimum_rows The route's measured row domain.
+         * @return Whether the projection streams transient packed panels.
+         */
+        inline bool panelEligible(const CPUNativeQuantisedPackedWeights &w, int rows, int workers, int minimum_rows) noexcept
+        {
+            if (rows < minimum_rows) return false;
+            const auto encoding = w.preparedFootprint().encoding;
+            if (!neon_panel::supports(encoding, w.codebook_id, w.is_asymmetric)) return false;
+            // Parallel Q5_0 loses at deep prefill even with smaller column jobs.
+            // Its cheaper on-demand decoder keeps the ordinary row-grid work
+            // sharing for parallel teams. Its one panel slot can still serve a
+            // serialized retained team without rebinding the stage.
+            return workers == neon_panel::projectionWorkers(encoding, workers);
+        }
+
+        /**
+         * @brief Decide the dense ordinary-prefill panel route for one source, row extent and team.
+         * @param w Actual prepared source and arithmetic identity.
+         * @param rows Physical rows of the projection.
+         * @param workers Width of the team that will execute the projection.
+         * @return Whether the projection streams transient packed panels.
+         */
+        inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows, int workers) noexcept
+        { return panelEligible(w, rows, workers, neon_panel::min_rows); }
+
+        /**
+         * @brief Decide the panel route of one ordinary-prefill member of a pooled launch.
+         * @param w Actual prepared source and arithmetic identity.
+         * @param rows The member's own physical rows (one routed expert's rows).
+         * @param workers Width of the team that executes the whole launch.
+         * @return Whether the member streams transient packed panels.
+         * @details Members share one workshare, so the pooled domain starts at
+         * neon_panel::min_pooled_rows rather than the dense domain's min_rows.
+         */
+        inline bool usesPooledPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows, int workers) noexcept
+        { return panelEligible(w, rows, workers, neon_panel::min_pooled_rows); }
+
+        /** @return Whether this source, row extent and the current/new team use transient packed panels. */
+        inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows) noexcept
+        { return usesPackedPrefill(w, rows, packedPrefillWorkers()); }
+
+        /** @brief Launch an admitted panel binding with the invocation's native dot family. */
+        inline void executePacked(const CPUNativeNEONPackedPrefill &binding, multi_scale::NEONByteDot dot)
+        {
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+            if (dot == multi_scale::NEONByteDot::I8MM) return binding.execute<multi_scale::NEONByteDot::I8MM>();
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+            if (dot == multi_scale::NEONByteDot::DotProd) return binding.execute<multi_scale::NEONByteDot::DotProd>();
+#endif
+            if (dot != multi_scale::NEONByteDot::ASIMD)
+                throw std::invalid_argument("Native ARM packed prefill requires its admitted dot family");
+            binding.execute<multi_scale::NEONByteDot::ASIMD>();
+        }
+
         /** @brief Publish original FP32 rows and project them within one retained/new team.
          * @param packed Retained canonical prepared owner.
          * @param input Original host-owned FP32 rows.
@@ -173,9 +239,11 @@ namespace llaminar2::cpu::native_quantised
          * @param stride Original output row stride.
          * @param activation Caller-owned admitted persistent Q8 workspace.
          * @param work Optional original-coordinate row publication.
+         * @param partial Caller-owned per-worker slab for eligible prefill invocations.
          */
         inline void full(const CPUNativeQuantisedPackedWeights &packed, const float *input, float *output,
-            int rows, int stride, std::span<Q8_1Block> activation, const ProjectionRowWork *work = nullptr)
+            int rows, int stride, std::span<Q8_1Block> activation, const ProjectionRowWork *work = nullptr,
+            std::span<float> partial = {})
         {
             geometry(packed, rows, stride);
             const CPUProjectionRowGrid grid(rows, work);
@@ -193,9 +261,17 @@ namespace llaminar2::cpu::native_quantised
             const auto schedule = automatic(packed, rows);
             const auto batch = bind(packed, activation.data(), output, rows, stride,
                 schedule.tile, schedule.n_block_chunks, work);
+            std::optional<CPUNativeNEONPackedPrefill> panel;
+            if (usesPackedPrefill(packed, rows))
+            {
+                storage_proof::requireDisjoint({partial.data(), partial.size_bytes()},
+                    {input, std::size_t(rows) * packed.K * sizeof(float)});
+                panel.emplace(CPUNativeNEONPackedPrefill::bind(batch, partial, packedPrefillWorkers()));
+            }
             auto run = [&] {
                 quantize_activations_to_q8_1(input, activation.data(), rows, packed.K, packed.blocks_per_row,
                     packed.numerical_policy, work);
+                if (panel) return executePacked(*panel, dot);
                 execute(batch, dot);
             };
             OMP_WORKSHARE_REGION(run);
@@ -216,17 +292,32 @@ namespace llaminar2::cpu::native_quantised
         }
     }
 
-    /** @brief ARM's full-K/register-tree implementation requires no shared partial bank.
+    /** @brief Resolve the slab one dense projection invocation borrows.
      * @param packed Actual source/arithmetic geometry.
      * @param rows Physical invocation row capacity.
-     * @return Zero; canonical expert partials live only in bounded native registers.
+     * @return Zero outside the dense packed prefill domain; otherwise exact FP32 slab units.
      */
     inline std::size_t nativeQuantisedProjectionPartialFloats(const CPUNativeQuantisedPackedWeights &packed, int rows)
-    { neon_execution::geometry(packed, rows, packed.N); return 0; }
+    {
+        neon_execution::geometry(packed, rows, packed.N);
+        const auto encoding = packed.preparedFootprint().encoding;
+        return neon_panel::invocationFloats(encoding, packed.codebook_id, packed.is_asymmetric, rows, packed.K,
+            neon_panel::projectionWorkers(encoding, neon_execution::packedPrefillWorkers()), packed.numerical_policy);
+    }
 
-    /** @copydoc nativeQuantisedProjectionPartialFloats */
+    /** @brief This prepared member's contribution to an admitted serial/fused slab.
+     * @param packed Actual source/arithmetic geometry.
+     * @param rows Physical row capacity of the member (or of the declaring stage).
+     * @return Zero outside every panel domain; covers pooled ordinary-prefill members
+     *         from neon_panel::min_pooled_rows rows, matching the stage declaration.
+     */
     inline std::size_t nativeQuantisedProjectionPartialEnvelopeFloats(const CPUNativeQuantisedPackedWeights &packed, int rows)
-    { return nativeQuantisedProjectionPartialFloats(packed, rows); }
+    {
+        neon_execution::geometry(packed, rows, packed.N);
+        const auto encoding = packed.preparedFootprint().encoding;
+        return neon_panel::workspaceFloats(encoding, packed.codebook_id, packed.is_asymmetric, rows, packed.K,
+            neon_panel::projectionWorkers(encoding, neon_execution::packedPrefillWorkers()), packed.numerical_policy);
+    }
 
     /** @brief Execute the canonical native M1 prequantized entrypoint.
      * @param packed Retained prepared source.
@@ -292,7 +383,7 @@ namespace llaminar2::cpu::native_quantised
      * @param packed Retained prepared source.
      * @param input Original physical-M Q8 bank.
      * @param output Exclusive physical output.
-     * @param partial_storage Existing ABI bank, unused by native full-K ownership.
+     * @param partial_storage Persistent worker scratch for admitted packed prefill.
      * @param rows Positive physical M.
      * @param stride Original output row stride.
      * @param isa_path Explicit native or automatic ISA.
@@ -321,6 +412,18 @@ namespace llaminar2::cpu::native_quantised
         }
         else if (schedule != PrefillSchedulePolicy::Auto)
             throw std::invalid_argument("ARM prefill requires native shared-row grid ownership");
+        if (schedule == PrefillSchedulePolicy::Auto && policy == VerifierRowsPolicy::Auto && chunks == 0 &&
+            neon_execution::usesPackedPrefill(packed, rows))
+        {
+            requireNativeQuantisedISAPath(isa_path);
+            neon_execution::geometry(packed, rows, stride);
+            (void)cpuNativeQuantisedSerialEquivalentPolicyN(packed.N);
+            if (!CPUProjectionRowGrid(rows, work).beginWorkshare()) return;
+            const auto dot = neon_execution::instruction(isa_path);
+            const auto batch = neon_execution::bind(packed, input, output, rows, stride, NEONProjectionRowTile::Pair, 1, work);
+            const auto panel = CPUNativeNEONPackedPrefill::bind(batch, partial_storage, neon_execution::packedPrefillWorkers());
+            return neon_execution::executePacked(panel, dot);
+        }
         gemm_native_quantised_preq_decode_equivalent_rows(packed, input, output, partial_storage,
             rows, stride, isa_path, policy, false, chunks, work);
     }
@@ -340,14 +443,14 @@ namespace llaminar2::cpu::native_quantised
      * @param packed Actual prepared source.
      * @param input Original FP32 row-major matrix.
      * @param output Exclusive strided destination.
-     * @param partial_storage Existing ABI bank, unused on ARM.
+     * @param partial_storage Persistent worker scratch for admitted packed prefill.
      * @param rows Positive physical M.
      * @param stride Original output stride.
      * @param activation_storage Participant-owned admitted complete Q8 bank.
      */
     inline void gemm_native_quantised(const CPUNativeQuantisedPackedWeights &packed, const float *input,
         float *output, std::span<float> partial_storage, int rows, int stride, std::span<Q8_1Block> activation_storage)
-    { (void)partial_storage; neon_execution::full(packed, input, output, rows, stride, activation_storage); }
+    { neon_execution::full(packed, input, output, rows, stride, activation_storage, nullptr, partial_storage); }
 
     /** @brief Add immutable bias after every native row's complete K result.
      * @param output Exclusive original physical destination.
@@ -389,7 +492,7 @@ namespace llaminar2::cpu::native_quantised
      * @param beta Prior-output scale.
      * @param activation Admitted persistent Q8 input bank.
      * @param product Admitted distinct product bank when beta is nonzero.
-     * @param partial Existing ABI bank; ARM uses register-resident K trees.
+     * @param partial Persistent worker scratch for admitted packed prefill.
      * @param work Optional original row publication.
      */
     inline void multiply_native_quantised_with_epilogue(const CPUNativeQuantisedPackedWeights &packed,
@@ -397,7 +500,6 @@ namespace llaminar2::cpu::native_quantised
         std::span<Q8_1Block> activation, std::span<float> product, std::span<float> partial,
         const ProjectionRowWork *work = nullptr)
     {
-        (void)partial;
         neon_execution::geometry(packed, rows, columns);
         if (columns != packed.N) throw std::invalid_argument("Native ARM BLAS epilogue requires the exact prepared output width");
         const CPUProjectionRowGrid grid(rows, work);
@@ -415,7 +517,9 @@ namespace llaminar2::cpu::native_quantised
                 throw std::invalid_argument("Native ARM beta epilogue requires distinct admitted retained banks");
         }
         float *destination = beta == 0.0f ? output : product.data();
-        neon_execution::full(packed, input, destination, rows, columns, activation, work);
+        if (beta != 0.0f && neon_execution::usesPackedPrefill(packed, rows))
+            storage_proof::requireDisjoint({partial.data(), partial.size_bytes()}, {output, elements * sizeof(float)});
+        neon_execution::full(packed, input, destination, rows, columns, activation, work, partial);
         if (beta == 0.0f && alpha == 1.0f) return;
         auto epilogue = [&] {
 #pragma omp for schedule(static)
@@ -447,7 +551,18 @@ namespace llaminar2::cpu::native_quantised
         OMP_WORKSHARE_REGION(epilogue);
     }
 
-    /** @brief Bounded native fused planning, with no payload reads or shared partial bank. */
+    /**
+     * @brief Bounded native fused planning, with no payload reads.
+     *
+     * Register-tile members need no shared memory. Ordinary-prefill members
+     * (typed Prefill purpose, automatic schedules) whose source admits the
+     * dense prefill route's packed panels take that program here from two
+     * rows up (neon_panel::min_pooled_rows): each decodes a weight panel once
+     * per four-column strip into a worker slot of the invocation's admitted
+     * projection slab and reuses it for all of the member's rows. Every panel
+     * member of one launch uses one uniform slot stride, so concurrently
+     * running members never share a slot.
+     */
     struct NativeQuantisedFusedRowsPlan
     {
         static constexpr int capacity = 2 * (moe_runtime_abi::kMaxExperts + 1);
@@ -455,8 +570,12 @@ namespace llaminar2::cpu::native_quantised
         std::array<int, capacity> rows{}; ///< Original per-projection physical row capacity.
         std::array<int, capacity> chunks{}; ///< Exact physical N ownership per task.
         std::array<NEONProjectionRowTile, capacity> tiles{}; ///< Native shared-row reuse.
-        /** @return Zero: full-K/native ordered trees do not consume shared partial memory. */
-        constexpr std::size_t sharedPartialFloats() const noexcept { return 0; }
+        std::array<bool, capacity> panels{}; ///< Members executed as packed-panel chunk tasks.
+        std::size_t panel_slot_floats = 0; ///< Uniform worker slot stride over every panel member; zero without panels.
+        int panel_workers = 0; ///< Admitted panel slots (the planned team width); zero without panels.
+        /** @return Worker-slot slab demand of the panel members in FP32 units; zero for register-only bundles. */
+        constexpr std::size_t sharedPartialFloats() const noexcept
+        { return std::size_t(panel_workers) * panel_slot_floats; }
     };
 
     /**
@@ -507,11 +626,33 @@ namespace llaminar2::cpu::native_quantised
                 throw std::invalid_argument("Native ARM fused members require the same physical K width");
             blocks = d.packed->blocks_per_row;
             if (d.policy_n == 0) (void)cpuNativeQuantisedSerialEquivalentPolicyN(d.N);
+            // An ordinary-prefill member takes the dense prefill entry's
+            // packed-panel program whenever its source, rows and team admit it
+            // (pooled domain: two rows up, see neon_panel::min_pooled_rows).
+            // Decode/MTP purposes and explicit candidates keep tiles.
+            plan.panels[p] = d.purpose == ProjectionRowsPurpose::Prefill &&
+                d.verifier_schedule == VerifierRowsPolicy::Auto && d.decode_schedule == DecodeSchedulePolicy::Auto &&
+                neon_execution::usesPooledPackedPrefill(*d.packed, plan.rows[p], workers);
+            if (plan.panels[p])
+            {
+                // The panel consumes row pairs over whole 64-column chunks.
+                plan.tiles[p] = NEONProjectionRowTile::Pair;
+                plan.chunks[p] = 1;
+                plan.panel_slot_floats = std::max(plan.panel_slot_floats,
+                    neon_panel::workerFloats(plan.rows[p], d.packed->K, d.packed->numerical_policy));
+                continue;
+            }
             const auto schedule = neon_execution::automatic(*d.packed, plan.rows[p], d.policy_n, workers);
             plan.tiles[p] = d.verifier_schedule == VerifierRowsPolicy::Auto
                 ? schedule.tile : neon_execution::rowTile(d.verifier_schedule);
             plan.chunks[p] = d.decode_schedule == DecodeSchedulePolicy::Auto
                 ? schedule.n_block_chunks : neon_execution::nChunks(d.decode_schedule);
+        }
+        if (plan.panel_slot_floats)
+        {
+            if (plan.panel_slot_floats > std::numeric_limits<std::size_t>::max() / sizeof(float) / std::size_t(workers))
+                throw std::overflow_error("Native ARM fused panel workspace exceeds addressable storage");
+            plan.panel_workers = workers;
         }
         return plan;
     }
@@ -539,19 +680,21 @@ namespace llaminar2::cpu::native_quantised
     /** @brief Execute native fused members within one retained/new OpenMP team.
      * @param input Shared persistent Q8 bank, overridden by a member's explicit input.
      * @param descriptors Independent retained prepared/input/output descriptions.
-     * @param partial_storage Existing ABI bank; native partial demand is zero.
+     * @param partial_storage Invocation's admitted projection slab; only packed-panel
+     *        (ordinary-prefill) members borrow worker slots of it, register tiles use none.
      * @param count Number of complete descriptors.
      * @param rows Default positive physical M.
      * @param blocks Exact complete Q8 blocks per row shared by all members.
      * @param isa_path Explicit native or automatic ISA.
      * @return True after successful native completion; invalid bundles throw, never select another implementation.
+     * @throws std::invalid_argument Before any write for incomplete geometry, aliases, or a
+     *         panel plan whose slab is short, misaligned, aliased, or narrower than the team.
      */
     inline bool gemm_native_quantised_fused_verifier_rows_preq(const Q8_1Block *input,
         const FusedVerifierRowsDesc *descriptors, std::span<float> partial_storage, int count,
         int rows, int blocks, ISAPath isa_path = ISAPath::AUTO,
         FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Auto)
     {
-        (void)partial_storage;
         requireNativeNEONFusedOutputJobOwnership(job_ownership);
         if (!descriptors || count <= 0 || count > NativeQuantisedFusedRowsPlan::capacity || blocks <= 0)
             throw std::invalid_argument("Native ARM fused execution requires complete descriptor geometry");
@@ -559,6 +702,9 @@ namespace llaminar2::cpu::native_quantised
             nativeQuantisedInvocationWorkerCount(), isa_path);
         const auto dot = neon_execution::instruction(isa_path);
         std::array<std::optional<CPUNativeNEONProjectionBatch>, NativeQuantisedFusedRowsPlan::capacity> batches;
+        // Packed-panel members: decode once per weight strip, reuse across the
+        // member's rows. Bound below only after every member is admitted.
+        std::array<std::optional<CPUNativeNEONPackedPrefill>, NativeQuantisedFusedRowsPlan::capacity> panels;
         for (int p = 0; p < count; ++p)
         {
             const auto &d = descriptors[p];
@@ -586,6 +732,39 @@ namespace llaminar2::cpu::native_quantised
                     throw std::invalid_argument("Native ARM fused destination aliases a sibling publication");
             }
         }
+        if (plan.sharedPartialFloats())
+        {
+            // Worker w owns slab floats [w*stride, (w+1)*stride) for every panel
+            // member. The slot index is the executing worker's team id, so the
+            // team may not be wider than the admitted slot count.
+            const std::span<float> slab = partial_storage.size() < plan.sharedPartialFloats()
+                ? partial_storage : partial_storage.first(plan.sharedPartialFloats());
+            // Tile members run concurrently with panel tasks, so the slab may
+            // not alias any member's publication, not only the panel members'.
+            const auto slab_bytes = slab.size_bytes();
+            if (neon_execution::overlaps(slab.data(), slab_bytes, descriptors, std::size_t(count) * sizeof(FusedVerifierRowsDesc)))
+                throw std::invalid_argument("Native ARM fused panel slab aliases its descriptors");
+            for (int other = 0; other < count; ++other)
+            {
+                const auto &s = descriptors[other];
+                const auto view = s.packed->readView();
+                if (neon_execution::overlaps(slab.data(), slab_bytes, s.packed, sizeof(*s.packed)) ||
+                    neon_execution::overlaps(slab.data(), slab_bytes, s.input ? s.input : input,
+                        std::size_t(plan.rows[other]) * blocks * sizeof(Q8_1Block)) ||
+                    neon_execution::overlaps(slab.data(), slab_bytes, view.bytes().data(), view.bytes().size()) ||
+                    neon_execution::overlaps(slab.data(), slab_bytes, s.output,
+                        (std::size_t(plan.rows[other] - 1) * s.ldc + s.N) * sizeof(float)) ||
+                    (s.bias && neon_execution::overlaps(slab.data(), slab_bytes, s.bias, std::size_t(s.N) * sizeof(float))))
+                    throw std::invalid_argument("Native ARM fused panel slab aliases a member publication");
+            }
+            for (int p = 0; p < count; ++p)
+            {
+                if (!plan.panels[p]) continue;
+                panels[p].emplace(CPUNativeNEONPackedPrefill::bindPooled(*batches[p], partial_storage,
+                    plan.panel_workers, plan.panel_slot_floats));
+                panels[p]->requireTeam(neon_execution::packedPrefillWorkers());
+            }
+        }
         /*
          * Pool every member's independent (row tile, chunk group) tasks into
          * one dynamic workshare. Running members one after another put a team
@@ -593,13 +772,19 @@ namespace llaminar2::cpu::native_quantised
          * 35B-A3B decode fuses 16 routed gate/up projections of N=512 (8 tasks
          * each), i.e. 16 serial phases of 8 tasks on 20 workers. Each task
          * still writes only its own tile with the same full-K arithmetic, so
-         * pooling changes no byte.
+         * pooling changes no byte. A packed-panel member contributes one task
+         * per 64-column chunk instead: it decodes each four-column strip once
+         * into the worker's slot and consumes it for all of its rows. A routed
+         * expert in prefill sees tens to hundreds of rows, so decoding native
+         * payload per four-row tile (IQ3_S grid + signs at K=512) repeated the
+         * decode up to 100 times per weight and made the down projection 65-75%
+         * slower than the former expanded-INT8 layout.
          */
         std::array<std::int64_t, NativeQuantisedFusedRowsPlan::capacity + 1> first_task{};
         std::array<std::int64_t, NativeQuantisedFusedRowsPlan::capacity> member_tasks{};
         for (int p = 0; p < count; ++p)
         {
-            member_tasks[p] = batches[p]->taskCount();
+            member_tasks[p] = panels[p] ? panels[p]->taskCount() : batches[p]->taskCount();
             first_task[p + 1] = first_task[p] + member_tasks[p];
         }
         if (const auto observe = nativeNEONFusedLaunchObserver().load(std::memory_order_acquire))
@@ -613,7 +798,8 @@ namespace llaminar2::cpu::native_quantised
                 {
                     int p = 0;
                     while (task >= first_task[p + 1]) ++p;
-                    batches[p]->template runTask<Instruction>(task - first_task[p]);
+                    if (panels[p]) panels[p]->template runTask<Instruction>(task - first_task[p]);
+                    else batches[p]->template runTask<Instruction>(task - first_task[p]);
                 }
             };
             OMP_WORKSHARE_REGION(workshare);

@@ -38,6 +38,7 @@
 #include "kernels/common/EmbeddingWorkspaceContract.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "kernels/cpu/gemm/CPUNativeX86PanelWorkspace.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "kernels/cuda/gemm/CUDAFloatingPointGemmWorkspaceContract.h"
@@ -51,6 +52,7 @@
 #include <array>
 #include <climits>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 using namespace llaminar2;
@@ -117,7 +119,151 @@ TEST(Test__WorkspaceMemoryEstimator, CPUFusedPartialEnvelopeBoundsEveryOwnership
     EXPECT_THROW(cpuProjectionPartialEnvelopeFloats(1, 64, INT_MAX, INT_MAX, 4), std::overflow_error);
 }
 
-/** @test CPU admission and execution price one shared transform, independent of codebook and layer count. */
+/** @test The planner reserves the panel only for an eligible participant and physical shape. */
+TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysicalStrips)
+{
+    namespace panel = cpu::native_quantised::x86_panel;
+    constexpr int rows = 31, k = 4096;
+    CPUProjectionWorkspaceGeometry geometry{.rows = rows, .n = 128, .k = k, .workers = 1,
+        .execution = test::kSyntheticCPUExecutionGeometry};
+    const auto expectPartials = [&](std::string_view format, std::size_t partial_floats) {
+        SCOPED_TRACE(format);
+        const auto requirements = CPUProjectionWorkspaceContract::sourceNative(format, geometry);
+        const auto expected_q8 = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
+        ASSERT_EQ(requirements.buffers.size(), partial_floats ? 2u : 1u);
+        EXPECT_EQ(requirements.buffers.front().name, kCPUProjectionQ8);
+        EXPECT_EQ(requirements.buffers.front().size_bytes, expected_q8.buffers.front().size_bytes);
+        if (partial_floats)
+        {
+            EXPECT_EQ(requirements.buffers.back().name, kCPUProjectionPartials);
+            EXPECT_EQ(requirements.buffers.back().size_bytes, partial_floats * sizeof(float));
+        }
+    };
+    // Eight K blocks, eight dot vectors and two affine factor vectors each.
+    // N=128 gives each of the one-worker team's AVX-512 strips a whole
+    // 64-column chunk.
+    expectPartials("Q4_K", 8 * (8 + 2) * 64);
+    expectPartials("IQ2_S", 0);
+    // Below the dense panel's sixteen rows the stage may still carry pooled
+    // ordinary-prefill members of the batched expert route (from two rows):
+    // one whole-chunk AVX-512 slot per worker, here one worker.
+    geometry.rows = 15;
+    expectPartials("Q4_K", 8 * (8 + 2) * 64);
+    geometry.rows = 1; // One row has no pooled panel and no dense panel.
+    expectPartials("Q4_K", 0);
+    geometry.rows = rows;
+    geometry.workers = 2;
+    geometry.serial_n = 128; // Strip eligibility is based on physical N, not the serial policy's width.
+    geometry.n = 16;
+    // One sixteen-column AVX-512 strip: the admitted two-worker team cannot
+    // select the dense panel (a one-worker team can, with one 64-column slot),
+    // but pooled members need no strip per worker: two whole-chunk slots.
+    expectPartials("Q4_K", 2 * 8 * (8 + 2) * 64);
+    geometry.n = 17; // A masked tail is the second worker's sixteen-column strip.
+    // Dense: two sixteen-column slots or one wide slot; pooled: two wide slots.
+    expectPartials("Q4_K", std::max({2 * 8 * (8 + 2) * 16, 8 * (8 + 2) * 64, 2 * 8 * (8 + 2) * 64}));
+    geometry.n = 129; // Three chunks: both widths of the team own whole-chunk strips.
+    expectPartials("Q4_K", 2 * 8 * (8 + 2) * 64);
+    geometry.n = 16;
+    geometry.execution.active_isa = ISALevel::AVX2; // Same AVX-512 build, narrower runtime strips.
+    geometry.execution.maximum_native_row_tile = 2;
+    expectPartials("Q4_K", 2 * 8 * (8 + 2) * 8);
+    geometry.k = 4608;
+    geometry.numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    // Ordered replay and packed-panel carry share a bank, not the sum of both routes.
+    expectPartials("Q4_K", rows * 16 * 64);
+    geometry.k = k;
+    geometry.numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
+    geometry.execution = {.maximum_native_row_tile = 4, .projection_abi = CPUProjectionScheduleABI::ARMRegisterK,
+        .compiled_isa = ISALevel::NEON, .active_isa = ISALevel::NEON};
+    expectPartials("Q4_K", 0); // Native ARM has no Q4_K panel on this route.
+    expectPartials("Q5_K", 2 * 16 * (128 + 8 * sizeof(float)) / sizeof(float)); // Existing ARM-only layout.
+
+    // 144 blocks over 16 partitions gives nine per partition and requires
+    // one carry vector per row, after the eight-block panel in each slot.
+    const auto sixteen = [](int) { return 16; };
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, rows, 16, 144, 2, sixteen),
+        2u * (8 * (8 + 2) * 8 + 32 * 8)); // 31 carry rows rounded to a cache line.
+    // AVX-512 N=17: two workers own sixteen-column strips, one worker the
+    // whole chunk; each slot carries one partial row per strip column.
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 16, rows, 17, 144, 2, sixteen),
+        std::max(2u * (8 * (8 + 2) * 16 + rows * 16), 1u * (8 * (8 + 2) * 64 + rows * 64)));
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 16, rows, 128, 144, 2, sixteen),
+        2u * (8 * (8 + 2) * 64 + rows * 64));
+    // The strip rule itself: a chunk per worker when every worker can own one.
+    EXPECT_EQ(panel::stripColumns(16, 128, 2), 64);
+    EXPECT_EQ(panel::stripColumns(16, 129, 3), 64);
+    EXPECT_EQ(panel::stripColumns(16, 128, 3), 16);
+    EXPECT_EQ(panel::stripColumns(8, 4096, 1), 8);
+}
+
+/** @test Pooled expert-prefill panels are quoted from two rows, one whole-chunk (AVX-512) or eight-column (AVX2) slot per worker. */
+TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPooledPanelQuoteStartsAtTwoRows)
+{
+    namespace panel = cpu::native_quantised::x86_panel;
+    static_assert(panel::min_pooled_rows == 2 && panel::min_pooled_rows <= panel::min_rows);
+    EXPECT_EQ(panel::pooledStrip(16), panel::wide_strip);
+    EXPECT_EQ(panel::pooledStrip(8), 8);
+    const auto contiguous = [](int) { return 0; };
+    const auto sixteen = [](int) { return 16; };
+    for (int workers = 1; workers <= 64; ++workers)
+    {
+        SCOPED_TRACE(workers);
+        // Sixteen K blocks: at most eight in the panel, no carry in either tree.
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::IQ3S, 16, 2, 16, workers, contiguous),
+            std::size_t(workers) * 8 * (8 + 1) * 64);
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q5K, 8, 3, 16, workers, sixteen),
+            std::size_t(workers) * 8 * (8 + 2) * 8);
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q4K, 16, 1, 16, workers, contiguous), 0u);
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::None, 16, 31, 16, workers, contiguous), 0u);
+        // 144 blocks over 16 partitions of nine: one carry partial per row and
+        // strip column after the eight-block panel, rounded to a cache line.
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q4K, 8, 31, 144, workers, sixteen),
+            std::size_t(workers) * (8 * (8 + 2) * 8 + 32 * 8));
+    }
+    // Only a narrower team folds long partitions here: the admitted quote
+    // still covers its carry, and never shrinks with the admitted width.
+    const auto carry_only_alone = [](int width) { return width == 1 ? 2 : 0; };
+    EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q4K, 16, 100, 144, 1, carry_only_alone),
+        8u * (8 + 2) * 64 + 100u * 64);
+    EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q4K, 16, 100, 144, 2, carry_only_alone),
+        std::max(2u * 8 * (8 + 2) * 64, 8u * (8 + 2) * 64 + 100u * 64));
+    EXPECT_THROW(panel::pooledWorkspaceFloats(panel::Format::Q4K, 16, 31, 144, 0, contiguous), std::invalid_argument);
+    EXPECT_THROW(panel::pooledWorkspaceFloats(panel::Format::Q4K, 12, 31, 144, 1, contiguous), std::invalid_argument);
+}
+
+/** @test The panel quote covers every team narrower than the admitted width and never shrinks with it. */
+TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelQuoteCoversNarrowerTeams)
+{
+    namespace panel = cpu::native_quantised::x86_panel;
+    // Unpartitioned K: 8 K blocks x (8 dot + 2 factor) vectors x 8 AVX2 lanes per slot.
+    constexpr std::size_t slot = 8 * (8 + 2) * 8;
+    const auto contiguous = [](int) { return 0; };
+    // N=40 has five AVX2 strips. Admitted teams wider than five cannot select
+    // the panel, yet any narrower team can; the quote stays at five slots.
+    for (int workers = 1; workers <= 64; ++workers)
+    {
+        SCOPED_TRACE(workers);
+        EXPECT_EQ(panel::invocationFloats(panel::Format::Q4K, 8, 31, 40, 144, 0, workers),
+            workers <= 5 ? workers * slot : 0u);
+        EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, 31, 40, 144, workers, contiguous),
+            std::min(workers, 5) * slot);
+    }
+    // The carry depends on the width through the serial tree: here one worker
+    // folds two long partitions (one carry vector per each of 100 rows), two
+    // workers keep one contiguous partition. The admitted two-worker quote
+    // must cover the single-worker team, which a one-width quote missed.
+    const auto carry_only_alone = [](int width) { return width == 1 ? 2 : 0; };
+    EXPECT_EQ(panel::invocationFloats(panel::Format::Q4K, 8, 100, 16, 144, 0, 2), 2 * slot);
+    EXPECT_EQ(panel::invocationFloats(panel::Format::Q4K, 8, 100, 16, 144, 2, 1), slot + 100 * 8);
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, 100, 16, 144, 2, carry_only_alone), slot + 100 * 8);
+    // Ineligible rows or formats quote nothing at any width.
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, 15, 40, 144, 4, contiguous), 0u);
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::None, 8, 31, 40, 144, 4, contiguous), 0u);
+    EXPECT_THROW(panel::workspaceFloats(panel::Format::Q4K, 8, 31, 40, 144, 0, contiguous), std::invalid_argument);
+}
+
+/** @test CPU admission prices one shared transform and the production projection envelope across layers. */
 TEST(Test__WorkspaceMemoryEstimator, CPUDownTransformUsesCanonicalShapeAndSerialNameMerge)
 {
     ModelMemoryProfile profile;
@@ -144,10 +290,20 @@ TEST(Test__WorkspaceMemoryEstimator, CPUDownTransformUsesCanonicalShapeAndSerial
                 geometry.shard_index = shard;
                 const size_t width = size_t(4096 / shards) + (shard < 4096 % shards ? 1u : 0u);
                 auto requirements = cpuSwiGLUWorkspaceRequirements(31, width);
+                // Recompute the projection bank independently of the contract the
+                // estimator consumes. Quantized sources borrow one Q8 row bank:
+                // 31 rows x ceil(width / 32) blocks x 36 B.
                 if (std::string_view(format) == "Q4_K" || std::string_view(format) == "IQ2_S")
-                    requirements.merge(cpuProjectionQ8WorkspaceRequirements(31, width));
+                    requirements.buffers.push_back({kCPUProjectionQ8, 31 * ((width + 31) / 32) * sizeof(Q8_1Block), 64});
+                // 2*N*K stays below the 16M-FLOP split threshold, so K is never
+                // partitioned. Only Q4_K has an x86 panel: 31 rows >= 16 and the
+                // one worker owns whole 64-column AVX-512 strips, every shard has
+                // >= 8 K blocks, and no carry:
+                // 8 K blocks x (8 dot + 2 factor) planes x 64 columns x 4 B.
+                if (std::string_view(format) == "Q4_K")
+                    requirements.buffers.push_back({kCPUProjectionPartials, 8 * (8 + 2) * 64 * sizeof(float), 64});
                 EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry) - empty,
-                    requirements.total_bytes_with_alignment());
+                    requirements.total_bytes_with_alignment()) << format << " shard=" << shard << '/' << shards;
             }
         }
         geometry.total_shards = 1;
@@ -188,11 +344,20 @@ TEST(Test__WorkspaceMemoryEstimator, CPUSparseFollowerAdmitsInvocationScratch)
             {.name = "blk.0.ffn_down_exps.weight", .quant_type = format,
              .elements = 8u * 128 * 512, .K = 512, .layer_index = 0}};
         auto requirements = cpuSwiGLUWorkspaceRequirements(2 * 15 * 3, 512);
-        for (const auto [n, k] : {std::pair{512, 128}, std::pair{128, 512}})
-            requirements.merge(CPUProjectionWorkspaceContract::sourceNative(format, {
-                .rows = 2 * 15 * 3, .n = n, .k = k, .workers = 8,
-                .execution = geometry.cpu_execution,
-                .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
+        // Recompute the expert projection banks independently of the contract
+        // the estimator consumes. None of these formats has an x86 panel.
+        if (std::string_view(format) != "F32" && std::string_view(format) != "F16" && std::string_view(format) != "BF16")
+        {
+            constexpr std::size_t rows = 2 * 15 * 3;
+            // The wider K=512 down projection sizes the shared Q8 bank: 16 blocks x 36 B per row.
+            requirements.buffers.push_back({kCPUProjectionQ8, rows * 16 * sizeof(Q8_1Block), 64});
+            // GPU-aligned ordered K partitions keep one 64-column FP32 partial
+            // per (row, N chunk, partition): gate/up have 8 chunks x 4
+            // partitions (K=128) and down has 2 chunks x 16 partitions (K=512),
+            // 32 vectors per row either way. Both exceed seven idle workers x
+            // four-row tiles x 64 columns x partitions, so the serial bank sizes the slab.
+            requirements.buffers.push_back({kCPUProjectionPartials, rows * 32 * 64 * sizeof(float), 64});
+        }
         EXPECT_EQ(WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile, geometry),
             requirements.total_bytes_with_alignment()) << format;
     }
@@ -2667,12 +2832,19 @@ TEST(Test__WorkspaceMemoryEstimator, NativeSharedExpertWorkspaceUsesOriginalFFNA
 
     auto foreign_generic_width = original;
     foreign_generic_width.d_ff = 1;
-    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    // ROCm's descriptor workspace is a device-free contract. The exact CUDA
+    // dispatch workspace is unavailable unless that implementation was built.
+    for (const auto backend : {DeviceType::ROCm
+#ifdef HAVE_CUDA
+        , DeviceType::CUDA
+#endif
+    })
     {
         SCOPED_TRACE(deviceTypeToString(backend));
         auto geometry = graphGeometry(DeviceId(backend, 1), 256, 2);
         geometry.shard_index = 1;
         geometry.runtime_device_policy_available = true;
+        geometry.device_compute_units = 80; // Recorded workspace policy; no hardware query.
         geometry.last_layer = original.mainLayerCount() - 1;
         geometry.has_exact_tensor_parallel_assignment = true;
         geometry.local_query_head_start = 4;

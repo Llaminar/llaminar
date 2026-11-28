@@ -584,7 +584,10 @@ requires the package's imported target; do not hard-code an unchecked library
 filename or add the profiler toolchain to the production serving image.
 
 Use an out-of-tree Ninja build and unrestricted build parallelism. The
-container image and workspace environment pin the same Ninja release. Resolve
+container image and workspace environment pin the same Ninja release. The native
+static-link evidence checker additionally recognizes the builder-owned
+`1.13.0.git.kitware.jobserver-pipe-1` stamp by exact spelling, never by a generic
+Git-version suffix. A pin roll must review that admission and its negative controls. Resolve
 that active executable once when configuring, record it in
 `CMAKE_MAKE_PROGRAM`, and invoke builds through `cmake --build`. Never
 alternate Ninja executables on one build tree: incompatible command-log hashes

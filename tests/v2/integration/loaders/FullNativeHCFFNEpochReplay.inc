@@ -206,7 +206,7 @@ public:
   */
  FullEpochNumericalPair(DeviceId device,std::shared_ptr<ILocalTPContext> tp,std::shared_ptr<PublishedFFNEpoch> source,
   const FrozenModelWeightSet& shared,const TensorParallelConfig& partition,PreparedWeightStore& store,
-  OriginalFFNFixtureGeometry shape,EpochNumericalBody body=EpochNumericalBody::OriginalNative):device_(device),worker_(GPUDeviceContextPool::instance().getContext(device)),
+  OriginalFFNFixtureGeometry shape,EpochNumericalBody body):device_(device),worker_(GPUDeviceContextPool::instance().getContext(device)),
   tp_(std::move(tp)),initial_(std::move(source)),shape_(shape),body_(body),widths_{4u*shape.hidden,4u*shape.hidden,R,R,4u*shape.hidden,
    std::size_t(shape.hidden),std::size_t(shape.experts),std::size_t(shape.hidden),std::size_t(shape.top_k)*shape.hidden,
    std::size_t(shape.hidden),std::size_t(shape.hidden),0,0} {
@@ -451,17 +451,14 @@ public:
     for(unsigned slot=0;slot<unsigned(shape_.top_k);++slot)if(std::find(current.promoted_experts.begin(),
        current.promoted_experts.end(),int(ids_[1][slot]))!=current.promoted_experts.end()) {
      const auto& row=acquired_[slot];
-     if(retained()) {
-      const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(
-       current.bank->layerForModelLayer(0).fragment_family);
-      require(declaration.matchesNativeGateUp(row.gate,row.up)&&declaration.matchesNativeDown(row.down),
-       "genuine GPU arrival executes actual same-source prepared descriptors");
-      std::osyncstream(std::cout)<<"QFN_RETAINED_ACQUIRED_ARRIVAL,epoch="<<epoch<<",member="<<member_
-       <<",expert="<<int(ids_[1][slot])<<",gate="<<unsigned(row.gate.codebook_id)
-       <<",up="<<unsigned(row.up.codebook_id)<<",down="<<unsigned(row.down.codebook_id)
-       <<",F="<<row.gate.n<<",down_N="<<row.down.n<<",down_K="<<row.down.k<<'\n';
-     } else require(row.down.codebook_id==kNativeQuantisedExpandedInt8MinCodebook&&row.down.payload&&row.down.scales,
-      "genuine CPU arrival executes its actual prepared physical23 descriptor");
+     const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(
+      current.bank->layerForModelLayer(0).fragment_family);
+     require(declaration.matchesNativeGateUp(row.gate,row.up)&&declaration.matchesNativeDown(row.down),
+      "genuine GPU arrival executes actual same-source prepared descriptors");
+     std::osyncstream(std::cout)<<"QFN_RETAINED_ACQUIRED_ARRIVAL,epoch="<<epoch<<",member="<<member_
+      <<",expert="<<int(ids_[1][slot])<<",gate="<<unsigned(row.gate.codebook_id)
+      <<",up="<<unsigned(row.up.codebook_id)<<",down="<<unsigned(row.down.codebook_id)
+      <<",F="<<row.gate.n<<",down_N="<<row.down.n<<",down_K="<<row.down.k<<'\n';
      witnessed=true;
     }
     require(witnessed,"actual full selected packet includes genuine promoted expert");

@@ -46,12 +46,6 @@ SUPPORTED_SUFFIXES = (".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".inc", ".inl"
 EXEMPT_SITES: dict[tuple[str, str], str] = {
     ("src/v2/app/MPIBootstrapPhase.cpp", "verifyStartupThreadAffinity"):
         "one-time rank bootstrap affinity verification at process start",
-    ("src/v2/kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h", "repackNativeBlocksToInterleaved"):
-        "one-time weight packing for prepared publication",
-    ("src/v2/kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h", "packExpandedInt8Direct"):
-        "one-time weight packing for prepared publication",
-    ("src/v2/kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h", "packWeightsCPUNativeQuantised"):
-        "one-time weight packing for prepared publication",
     ("src/v2/kernels/cpu/gemm/CPUPreparedWeightWriter.cpp", "append"):
         "one-time prepared-weight publication",
     ("src/v2/kernels/cuda/gemm/CUDAWeightPacker.cpp", "packNativeQuantisedCUDA"):

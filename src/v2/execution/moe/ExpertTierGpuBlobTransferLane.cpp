@@ -7,6 +7,8 @@
  * cross-runtime event waits are deliberately forbidden. Two persistent slots
  * let the source prepare a later chunk while the destination consumes an
  * earlier one, without allocation, synchronization, or inference-stream joins.
+ * All coded edges use the same compact unit wire as cross-rank relay.
+ * Both endpoints convert against retained mapped slots, never raw bit-plane DMA.
  */
 
 #include "ExpertTierGpuBlobTransferLane.h"
@@ -47,6 +49,17 @@ namespace llaminar2
                     descriptor.ptrs.d_emins != nullptr);
         }
 
+        /** @return Exact live GPU planes while preserving the backing allocation's layout byte and bit placement. */
+        ExpertTierGpuMutableProjectionView blobProjectionView(const GpuExpertPackedDescriptor &packed)
+        {
+            return {.payload = packed.ptrs.d_vnni,
+                .scales = static_cast<std::uint16_t *>(packed.ptrs.d_scales),
+                .mins = static_cast<std::uint16_t *>(packed.ptrs.d_mins), .emins = static_cast<std::uint32_t *>(packed.ptrs.d_emins),
+                .payload_bytes = packed.vnni_bytes, .scales_bytes = packed.scales_bytes,
+                .mins_bytes = packed.mins_bytes, .emins_bytes = packed.emins_bytes,
+                .metadata_layout = packed.metadata_layout};
+        }
+
         /** @brief Convert a scoped region enum to an array index. */
         constexpr std::size_t regionIndex(
             ExpertTierGpuBlobRegion region) noexcept
@@ -67,6 +80,8 @@ namespace llaminar2
     void ExpertTierGpuBlobChunkProtocol::reset() noexcept
     {
         begun_ = false;
+        coded_layouts_.reset();
+        next_unit_ = 0;
         region_bytes_.fill(0);
         element_bytes_.fill(0);
         intersection_.reset();
@@ -100,6 +115,29 @@ namespace llaminar2
         const ExpertTierWeightProjectionIntersection& intersection, std::string* error) noexcept
     {
         reset();
+        if (source.metadata_layout || destination.metadata_layout)
+        {
+            try
+            {
+                if (chunk_capacity_bytes_ > UINT32_MAX)
+                    throw std::invalid_argument("Coded GPU blob staging exceeds the unit ABI");
+                const auto layouts = makeCodedGpuProjectionRelayLayouts(
+                    source, destination, intersection, static_cast<std::uint32_t>(chunk_capacity_bytes_));
+                if (!blobProjectionView(source).validFor(layouts.pack) ||
+                    !blobProjectionView(destination).validFor(layouts.unpack))
+                    throw std::invalid_argument("Coded GPU blob planes disagree with their original root phase or extents");
+                coded_layouts_ = layouts;
+                total_bytes_ = layouts.pack.chunkBytes(layouts.pack.unit_count);
+                begun_ = true;
+                if (error) error->clear();
+                return true;
+            }
+            catch (const std::exception &exception)
+            {
+                assignBlobTransferError(error, exception.what());
+                return false;
+            }
+        }
         if(!source.valid() || !destination.valid() || !descriptorPointersCoverRegions(source) ||
             !descriptorPointersCoverRegions(destination) || source.codebook_id!=destination.codebook_id ||
             source.payload_bytes_per_block!=destination.payload_bytes_per_block ||
@@ -179,6 +217,18 @@ namespace llaminar2
         if (!begun_ || exhausted())
             return std::nullopt;
 
+        if (coded_layouts_)
+        {
+            const auto &layout = coded_layouts_->pack;
+            const auto units = std::min(layout.maximum_units_per_chunk, layout.unit_count - next_unit_);
+            const auto bytes = layout.chunkBytes(units, next_unit_);
+            ExpertTierGpuBlobChunk chunk{.region_offset = submitted_bytes_, .bytes = bytes,
+                .sequence = next_sequence_++, .first_unit = next_unit_, .unit_count = units};
+            next_unit_ += units;
+            submitted_bytes_ += bytes;
+            return chunk;
+        }
+
         const std::size_t remaining =
             region_bytes_[region_index_] - region_offset_;
         auto range=std::optional<ExpertTierProjectionByteRange>{ExpertTierProjectionByteRange{
@@ -205,10 +255,16 @@ namespace llaminar2
 
     bool ExpertTierGpuBlobChunkProtocol::exhausted() const noexcept
     {
-        return begun_ && region_index_ == region_bytes_.size();
+        return begun_ && (coded_layouts_ ? next_unit_ == coded_layouts_->pack.unit_count
+                                        : region_index_ == region_bytes_.size());
     }
 
     ExpertTierGpuBlobTransferLane::ExpertTierGpuBlobTransferLane(Config config)
+        : ExpertTierGpuBlobTransferLane(std::move(config), false)
+    {
+    }
+
+    ExpertTierGpuBlobTransferLane::ExpertTierGpuBlobTransferLane(Config config, bool fixture_same_gpu_device)
         : config_(std::move(config)),
           protocol_(config_.staging_capacity_bytes)
     {
@@ -226,7 +282,8 @@ namespace llaminar2
             (config_.relay_kind ==
                  ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess &&
              same_backend &&
-             config_.source_device != config_.destination_device);
+             (config_.source_device != config_.destination_device ||
+              fixture_same_gpu_device));
         if (!topology_matches)
         {
             throw std::invalid_argument(
@@ -420,6 +477,14 @@ namespace llaminar2
         } catch(const std::exception& exception) {
             assignBlobTransferError(error,exception.what());return false;
         }
+    }
+
+    bool ExpertTierGpuBlobTransferLane::accepts(const GpuExpertPackedDescriptor &source,
+        const GpuExpertPackedDescriptor &destination, const ExpertTierWeightProjectionIntersection &intersection,
+        std::string *error) const noexcept
+    {
+        ExpertTierGpuBlobChunkProtocol probe(config_.staging_capacity_bytes);
+        return probe.begin(source, destination, intersection, error);
     }
 
     bool ExpertTierGpuBlobTransferLane::start(
@@ -713,8 +778,9 @@ namespace llaminar2
         const ExpertTierGpuBlobChunk &chunk,
         std::string *error) noexcept
     {
-        const std::uint8_t *source_pointer = sourceChunkPointer(chunk);
-        if (!chunk.valid() || !source_pointer ||
+        const auto &coded = protocol_.codedLayouts();
+        const std::uint8_t *source_pointer = coded ? nullptr : sourceChunkPointer(chunk);
+        if (!chunk.valid() || (!coded && !source_pointer) ||
             chunk.bytes > config_.staging_capacity_bytes)
         {
             requestFailure(
@@ -730,11 +796,11 @@ namespace llaminar2
         std::string submission_failure;
         try
         {
-            slot.source_progress.publishDeviceToMappedHost(
-                source_pointer,
-                chunk.bytes,
-                0u,
-                chunk.bytes);
+            if (coded)
+                slot.source_progress.publishPackedDeviceToMappedHost(blobProjectionView(source_).asConst(),
+                    coded->pack, chunk.first_unit, chunk.unit_count, nullptr, 0u);
+            else
+                slot.source_progress.publishDeviceToMappedHost(source_pointer, chunk.bytes, 0u, chunk.bytes);
             published = true;
         }
         catch (const std::exception &exception)
@@ -792,9 +858,9 @@ namespace llaminar2
         Slot &slot,
         std::string *error) noexcept
     {
-        std::uint8_t *destination_pointer =
-            destinationChunkPointer(slot.chunk);
-        if (!destination_pointer)
+        const auto &coded = protocol_.codedLayouts();
+        std::uint8_t *destination_pointer = coded ? nullptr : destinationChunkPointer(slot.chunk);
+        if (!coded && !destination_pointer)
         {
             requestFailure(
                 "GPU host-relay destination pointer is null",
@@ -829,11 +895,11 @@ namespace llaminar2
         std::string submission_failure;
         try
         {
-            slot.destination_progress.publishMappedHostToDevice(
-                destination_pointer,
-                slot.chunk.bytes,
-                0u,
-                slot.chunk.bytes);
+            if (coded)
+                slot.destination_progress.publishPackedMappedHostToDevice(blobProjectionView(destination_),
+                    coded->unpack, slot.chunk.first_unit, slot.chunk.unit_count, nullptr, 0u);
+            else
+                slot.destination_progress.publishMappedHostToDevice(destination_pointer, slot.chunk.bytes, 0u, slot.chunk.bytes);
             published = true;
         }
         catch (const std::exception &exception)

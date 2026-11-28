@@ -291,8 +291,7 @@ extern "C"
      *
      * The execution codebook selects the physical decoder and any learned
      * prefill overlay. The arithmetic-policy codebook selects the serial-M1
-     * reduction tree that every row must reproduce. They differ after a cold
-     * CPU tier promotes a compact asymmetric matrix into codebook 23.
+     * reduction tree that every row must reproduce.
      */
     bool cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(
         uint8_t codebook_id,
@@ -502,9 +501,7 @@ bool llaminar2::cuda::nativeQuantisedPrefillWorkspaceEnvelopeForHardware(
 extern "C" bool cudaNativeQuantisedPrefill_fp32_withPolicy(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const uint16_t *d_scales,
-    const uint16_t *d_mins,
-    const uint32_t *d_emins,
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
     float *d_C_fp32,
     const float *d_scales_A_block,
     const int32_t *d_sums_A_block,
@@ -521,7 +518,10 @@ extern "C" bool cudaNativeQuantisedPrefill_fp32_withPolicy(
     void *stream,
     CUDAPrefillContext *prefill_ctx)
 {
-    if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
+    if (!d_A_int8 || !d_payload || !d_meta.primary || !d_C_fp32 || !d_scales_A_block)
+        return false;
+    // A coded matrix needs its superblock plane and a codable execution codebook.
+    if (d_meta.coded() && (!d_meta.secondary || !::llaminar2::nativeQuantisedSuperblockCodable(codebook_id)))
         return false;
     if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
         return false;
@@ -556,7 +556,7 @@ extern "C" bool cudaNativeQuantisedPrefill_fp32_withPolicy(
     case INDEX:                                                                      \
         ok = LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_INDEXED_SYMBOL(             \
             cudaNativeQuantisedPrefill_launch, INDEX)(                               \
-            d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,                \
+            d_A_int8, d_payload, d_meta, d_C_fp32,                \
             d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing,    \
             d_bias, codebook_id, serial_m1_k_partitions,                             \
             serial_m1_uses_ordered_reducer, cuda_stream, prefill_ctx);               \
@@ -618,9 +618,7 @@ extern "C" bool cudaNativeQuantisedPrefill_fp32_withPolicy(
 extern "C" bool cudaNativeQuantisedPrefill_fp32(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const uint16_t *d_scales,
-    const uint16_t *d_mins,
-    const uint32_t *d_emins,
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
     float *d_C_fp32,
     const float *d_scales_A_block,
     const int32_t *d_sums_A_block,
@@ -639,9 +637,7 @@ extern "C" bool cudaNativeQuantisedPrefill_fp32(
     return cudaNativeQuantisedPrefill_fp32_withPolicy(
         d_A_int8,
         d_payload,
-        d_scales,
-        d_mins,
-        d_emins,
+        d_meta,
         d_C_fp32,
         d_scales_A_block,
         d_sums_A_block,

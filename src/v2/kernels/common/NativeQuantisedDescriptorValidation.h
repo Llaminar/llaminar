@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "DeviceNativeQuantisedMatrixDesc.h"
+#include "../../tensors/NativeQuantisedScalePlane.h"
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define LLAMINAR_DESCRIPTOR_HD __host__ __device__
 #else
@@ -47,7 +48,7 @@ struct NativeQuantisedDescriptorValidation final {
         switch(code) {
         case 0: case 4: case 5: case 6: case 7: case 8: case 9: case 10:
         case 11: case 12: case 13: case 14: case 15: case 16: case 17:
-        case 19: case 23: case 24: case 25: return true;
+        case 19: case 24: case 25: return true;
         default: return false;
         }
     }
@@ -55,7 +56,7 @@ struct NativeQuantisedDescriptorValidation final {
     LLAMINAR_DESCRIPTOR_HD static constexpr bool secondary(unsigned code) noexcept {
         switch(code) {
         case 5: case 7: case 8: case 9: case 10: case 11: case 13:
-        case 14: case 16: case 17: case 23: case 24: return true;
+        case 14: case 16: case 17: case 24: return true;
         default: return false;
         }
     }
@@ -68,12 +69,20 @@ struct NativeQuantisedDescriptorValidation final {
     template<class Descriptor>
     LLAMINAR_DESCRIPTOR_HD static constexpr bool accepts(
         const Descriptor& d,unsigned n,unsigned k,unsigned decoder) noexcept {
-        return d.payload && d.scales &&
+        // A superblock-coded matrix holds its code plane in `scales` (the
+        // payload for code-in-payload formats) and its superblock plane in
+        // `mins`; it never has an emins plane. The layout byte itself must be
+        // valid for the physical codebook: coded only for codable codebooks,
+        // no reserved bits, and no phase or bit shift on a per-block matrix.
+        const bool coded = nativeQuantisedLayoutRepresentation(d.metadata_layout) ==
+                           NativeQuantisedMetadataRepresentation::SuperblockCoded;
+        return nativeQuantisedLayoutValid(d.codebook_id, d.metadata_layout) &&
+            d.payload && d.scales &&
             static_cast<unsigned>(d.n)==n && static_cast<unsigned>(d.k)==k &&
             d.blocks_per_row==k/32 &&
             (d.codebook_id==decoder || (decoder==24 && d.codebook_id==4)) &&
-            (!secondary(decoder) || d.codebook_id==4 || d.mins) &&
-            (decoder!=10 || d.emins);
+            (coded ? (d.mins && !d.emins)
+                   : ((!secondary(decoder) || d.codebook_id==4 || d.mins) && (decoder!=10 || d.emins)));
     }
     /**
      * @brief Strong ready-publication postcondition; never infers allocation capacity.

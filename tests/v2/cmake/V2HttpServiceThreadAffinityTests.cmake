@@ -15,22 +15,26 @@ if(NOT V2_PERF_TESTS_ONLY)
     set_tests_properties(V2_Integration_HTTPServiceThreadAffinity PROPERTIES
         LABELS "V2;Integration;ProductionTestPreflight;HTTP;Observability;Threading;Regression;DeviceFree"
         TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HTTPServiceThreadAffinity)
     add_test(NAME V2_Integration_HTTPServiceThreadAffinityUnbound
         COMMAND ${CMAKE_COMMAND} -E env --unset=KMP_AFFINITY OMP_PROC_BIND=false OMP_NUM_THREADS=2
             $<TARGET_FILE:v2_test_server_mode> --gtest_filter=HttpServiceThreadAffinity.*)
     set_tests_properties(V2_Integration_HTTPServiceThreadAffinityUnbound PROPERTIES
         LABELS "V2;Integration;ProductionTestPreflight;HTTP;Observability;Threading;Regression;DeviceFree"
         TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HTTPServiceThreadAffinityUnbound)
     add_test(NAME V2_Integration_PrefixArchiveWorkerAffinity
         COMMAND ${CMAKE_COMMAND} -E env --unset=KMP_AFFINITY OMP_PROC_BIND=close OMP_PLACES=cores OMP_NUM_THREADS=2
             $<TARGET_FILE:v2_test_server_mode> --gtest_filter=PrefixArchiveWorkerAffinity.*)
     set_tests_properties(V2_Integration_PrefixArchiveWorkerAffinity PROPERTIES
         LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Threading;Lifecycle;Regression;DeviceFree"
         TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PrefixArchiveWorkerAffinity)
     add_test(NAME V2_Integration_PrefixArchiveWorkerAffinityUnbound
         COMMAND ${CMAKE_COMMAND} -E env --unset=KMP_AFFINITY OMP_PROC_BIND=false OMP_NUM_THREADS=2
             $<TARGET_FILE:v2_test_server_mode> --gtest_filter=PrefixArchiveWorkerAffinity.*)
     set_tests_properties(V2_Integration_PrefixArchiveWorkerAffinityUnbound PROPERTIES
         LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Threading;Lifecycle;Regression;DeviceFree"
         TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PrefixArchiveWorkerAffinityUnbound)
 endif()

@@ -45,6 +45,11 @@
  * - Counted traffic: the shortlisted evaluation's touched prepared bytes
  *   are counted and reported against the full head (rows x per-row
  *   bytes), so the traffic claim is a measurement, not a comment.
+ * - IQ3_S is prepared at GGUF file density (native grid payload plus
+ *   superblock-coded scales). The row walk reads it only through the
+ *   production codec readers (compactColumnPayload, restoreCodedPayload,
+ *   decode_native_block, blockScale) and derives per-row prepared bytes
+ *   from the production geometry, never from a hard-coded unit layout.
  */
 
 #include <gtest/gtest.h>
@@ -53,11 +58,14 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/cpu/gemm/CPUNativeNEONContributionContract.h"
 #include "kernels/cpu/gemm/CPUNativeNEONMultiScaleOps.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedCodedMetadata.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedDecode.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/gemm/CPUProjectionQ8Publication.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "tensors/AlignedVector.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
 #include "tensors/TensorClasses.h"
 #include "utils/QuantizedVerifierFormats.h"
 
@@ -86,11 +94,20 @@ namespace
     /// K blocks for a head width (K/32).
     constexpr int kHeadBlocks(int k) { return k / 32; }
 
-    /// Prepared bytes one vocabulary row touches: 4 B per group x 8 groups
-    /// per block + the fp16 scale + the raw nibble word, per K block.
-    size_t rowBytes(int blocks_per_row)
+    /**
+     * @brief Logical prepared bytes one vocabulary row owns.
+     *
+     * Prepared units interleave 64 output columns with equal per-column
+     * payload, code and superblock-header shares, so one row's share is the
+     * production matrix footprint divided by its padded column count.
+     */
+    size_t rowBytes(const CPUNativeQuantisedGemmKernel &engine)
     {
-        return static_cast<size_t>(blocks_per_row) * (32u + 2u + 2u);
+        const auto &packed = engine.packedWeights();
+        const size_t columns = static_cast<size_t>(packed.N_padded);
+        if (columns == 0u || packed.preparedBytes() % columns != 0u)
+            throw std::logic_error("prepared head bytes are not an exact per-column share");
+        return packed.preparedBytes() / columns;
     }
 
     /** @brief Bitwise equality of two floats (signed zero included). */
@@ -107,11 +124,14 @@ namespace
      *        production BackendNative program and count the touched bytes.
      *
      * The row is identified by its GLOBAL ID; only this row's bytes are
-     * read. Per K block: the row's four K bytes per group feed the
-     * production SDOT leaf (independent per-column lanes; lane 0 is the
-     * exact per-column sum), then ONE production FP32 scale/accumulate
-     * step with the IQ3_S source-scale equation — the same block order
-     * and FP32 rounding points as the reference GEMV at BackendNative.
+     * read. Per K block: the production codec readers restore the row's
+     * 32 signed IQ3_S grid values from the file-density unit, their four K
+     * bytes per group feed the production SDOT leaf (independent per-column
+     * lanes; lane 0 is the exact per-column sum), then ONE production FP32
+     * scale/accumulate step with the production IQ3_S source scale
+     * (`blockScale`: header d times the odd coded coefficient) — the same
+     * block order and FP32 rounding points as the reference GEMV at
+     * BackendNative.
      */
     float evaluateRowFromPlanes(const CPUNativeQuantisedGemmKernel &engine,
         const Q8_1Block *activation_row, std::uint32_t global_row,
@@ -126,18 +146,20 @@ namespace
         float32x4_t accumulator = vdupq_n_f32(0.0f);
         for (int block = 0; block < packed.blocks_per_row; ++block)
         {
-            const auto *unit = packed.interleavedBase() +
-                (static_cast<size_t>(chunk) *
-                        static_cast<size_t>(packed.blocks_per_row) +
-                    static_cast<size_t>(block)) *
-                    static_cast<size_t>(packed.interleaved_block_stride);
+            std::uint8_t payload[20]{};
+            std::int8_t values[32];
+            cpu::native_quantised::compactColumnPayload(
+                packed.blockUnit(chunk, block), packed.codebook_id, column,
+                payload);
+            native_quantised_superblock::restoreCodedPayload(
+                packed.codebook_id, payload);
+            cpu::native_quantised::decode_native_block(packed.codebook_id,
+                payload, values);
             int32x4_t dot = vdupq_n_s32(0);
             for (int group = 0; group < 8; ++group)
             {
                 std::uint32_t row_bytes = 0;
-                std::memcpy(&row_bytes,
-                    unit + static_cast<size_t>(group) * 256u +
-                        static_cast<size_t>(column) * 4u,
+                std::memcpy(&row_bytes, values + group * 4,
                     sizeof(row_bytes));
                 const auto weights =
                     vreinterpretq_s8_u32(vdupq_n_u32(row_bytes));
@@ -148,17 +170,7 @@ namespace
                     std::bit_cast<MultiScaleOps::I>(weights),
                     MultiScaleOps::I{} + word);
             }
-            const std::uint16_t d_half = *reinterpret_cast<const uint16_t *>(
-                unit + static_cast<size_t>(packed.data_stride) + 128u +
-                static_cast<size_t>(column) * 2u);
-            const std::uint16_t metadata =
-                *reinterpret_cast<const uint16_t *>(
-                    unit + static_cast<size_t>(packed.data_stride) + 256u +
-                    static_cast<size_t>(column) * 2u);
-            const float scale0 =
-                cpu::native_quantised::nativeQuantisedFP16ScaleToFP32(d_half);
-            const float scale = scale0 *
-                static_cast<float>(static_cast<int>(metadata) * 2 + 1);
+            const float scale = packed.blockScale(chunk, block, column);
             const float activation_scale =
                 cpu::native_quantised::nativeQuantisedFP16ScaleToFP32(
                     activation_row[block].d);
@@ -167,7 +179,7 @@ namespace
                     vdupq_n_f32(scale), activation_scale,
                     CPUProjectionNumericalPolicy::BackendNative);
         }
-        touched_bytes += rowBytes(packed.blocks_per_row);
+        touched_bytes += rowBytes(engine);
         return vgetq_lane_f32(accumulator, 0);
     }
 
@@ -315,7 +327,7 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
             evaluated_rows_total += 1;
         }
         EXPECT_EQ(touched, static_cast<size_t>(arm.n) *
-                rowBytes(kHeadBlocks(kHeadK)))
+                rowBytes(*heads[0].engine))
             << "arm " << arm.label << " touched-byte accounting";
         counted_selected_bytes += touched;
         std::cout << "CPU_B4_HEAD_TRAFFIC,arm=" << arm.label
@@ -323,7 +335,7 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
                   << ",logical_operand_bytes=" << touched
                   << ",like_for_like_full_head_bytes="
                   << static_cast<size_t>(kTailVocab) *
-                     rowBytes(kHeadBlocks(kHeadK))
+                     rowBytes(*heads[0].engine)
                   << ",accounting=logical_prepared_operand_volume"
                   << ",not_hardware_traffic=1\n";
     }
@@ -331,7 +343,7 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
         << "the aggregate evaluated rows across arms (1+3+2+64+63+95)";
     // The reverse arms cover the final vocabulary row (V-1) and the
     // ragged tail rows (chunk 1, columns 0..31).
-    EXPECT_EQ(counted_selected_bytes, 228u * rowBytes(kHeadBlocks(kHeadK)));
+    EXPECT_EQ(counted_selected_bytes, 228u * rowBytes(*heads[0].engine));
 
     // Second geometry exercised: the V=64/K=1024 head gets its own
     // reference and a shortlist arm (the same bitwise oracle).
@@ -377,7 +389,7 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
                 << "second geometry: selected row " << global_row
                 << " is not bitwise identical";
         }
-        EXPECT_EQ(touched1, 3u * rowBytes(kHeadBlocks(kSmallK)));
+        EXPECT_EQ(touched1, 3u * rowBytes(*heads[1].engine));
     }
 }
 

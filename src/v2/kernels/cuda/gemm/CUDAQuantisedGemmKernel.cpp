@@ -44,6 +44,7 @@
  * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/cpu/gemm/CPUNativeQuantisedEncoding.h"
 #include "kernels/common/HCDownOutputPublication.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "CUDAQuantisedActivationProducers.h"
@@ -67,6 +68,7 @@
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
 #include "tensors/NativeQuantisedScalePlane.h"
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "kernels/common/NativeQuantisedPrimaryPlaneUpload.h"
 #include "transfer/TransferEngine.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -147,9 +149,7 @@ namespace llaminar2
             bool cudaNativeQuantisedGemvTuned_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                const uint16_t *d_mins,
-                const uint32_t *d_emins,
+                ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
                 float *d_C_fp32,
                 const float *d_scales_A_block,
                 int N, int K,
@@ -166,9 +166,7 @@ namespace llaminar2
             bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                const uint16_t *d_mins,
-                const uint32_t *d_emins,
+                ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
                 float *d_C_fp32,
                 const float *d_scales_A_block,
                 int N, int K,
@@ -185,9 +183,7 @@ namespace llaminar2
             bool cudaNativeQuantisedGemvTuned_small_m_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                const uint16_t *d_mins,
-                const uint32_t *d_emins,
+                ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
                 float *d_C_fp32,
                 const float *d_scales_A_block,
                 int M,
@@ -224,9 +220,7 @@ namespace llaminar2
             bool cudaNativeQuantisedPrefill_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                const uint16_t *d_mins,
-                const uint32_t *d_emins,
+                ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
                 float *d_C_fp32,
                 const float *d_scales_A_block,
                 const int32_t *d_sums_A_block,
@@ -242,15 +236,12 @@ namespace llaminar2
             /**
              * @brief Execute physical NativeQuantised bytes with a source policy.
              *
-             * Expert promotion may normalize the byte decoder to codebook 23
-             * while retaining a compact source codebook's reduction order.
+             * The original source selects reduction order independently of decoding.
              */
             bool cudaNativeQuantisedPrefill_fp32_withPolicy(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                const uint16_t *d_mins,
-                const uint32_t *d_emins,
+                ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
                 float *d_C_fp32,
                 const float *d_scales_A_block,
                 const int32_t *d_sums_A_block,
@@ -525,6 +516,23 @@ namespace llaminar2
             uint32_t *d_weights_native_emins = nullptr;
             uint8_t native_codebook_id = 0;
             uint32_t native_blocks_per_row = 0;
+            /**
+             * Packed metadata layout (representation + superblock phase) recorded
+             * by the weights' producer; zero is the per-block-plane layout.
+             */
+            uint8_t native_metadata_layout = 0;
+
+            /** @return The typed metadata planes of the prepared matrix. */
+            [[nodiscard]] ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes nativeMetadataPlanes() const
+            {
+                if (!nativeQuantisedLayoutValid(native_codebook_id, native_metadata_layout))
+                    throw std::logic_error(
+                        "[CUDAQuantisedGemmKernel] prepared weights carry an invalid metadata layout");
+                return {d_weights_native_scales, d_weights_native_mins, d_weights_native_emins,
+                        nativeQuantisedLayoutPhase(native_metadata_layout),
+                        nativeQuantisedLayoutRepresentation(native_metadata_layout),
+                        nativeQuantisedLayoutCodeBitShift(native_metadata_layout)};
+            }
             NativeQuantisedSourceIdentity native_source_identity;
             // Borrowed immutable IQ view is bound cold once and never replaced.
             // A backend reset invalidates it together with the prepared weights.
@@ -890,7 +898,6 @@ namespace llaminar2
                 case 16:
                 case 17:
                 case 19:
-                case kNativeQuantisedExpandedInt8MinCodebook:
                     return true;
                 default:
                     return false;
@@ -904,7 +911,6 @@ namespace llaminar2
                 case 5:  // Q4_1 / Q4_K
                 case 7:  // Q5_1 / Q5_K
                 case 16: // IQ1_S
-                case kNativeQuantisedExpandedInt8MinCodebook:
                     return true;
                 default:
                     return false;
@@ -1030,9 +1036,7 @@ namespace llaminar2
                         cudaNativeQuantisedGemvTuned_fp32_withPolicy(
                         d_A_int8,
                         impl->d_weights_native_quantised,
-                        impl->d_weights_native_scales,
-                        impl->d_weights_native_mins,
-                        impl->d_weights_native_emins,
+                        impl->nativeMetadataPlanes(),
                         d_C_fp32,
                         d_scales_A_blockwise,
                         n, k,
@@ -1075,9 +1079,7 @@ namespace llaminar2
                     if (cudaNativeQuantisedPrefill_fp32_withPolicy(
                             d_A_int8,
                             impl->d_weights_native_quantised,
-                            impl->d_weights_native_scales,
-                            impl->d_weights_native_mins,
-                            impl->d_weights_native_emins,
+                            impl->nativeMetadataPlanes(),
                             d_C_fp32,
                             d_scales_A_blockwise,
                             d_sums_A_blockwise,
@@ -1231,7 +1233,8 @@ namespace llaminar2
             uint8_t codebook_id, uint32_t blocks_per_row,
             std::shared_ptr<void> lifetime_owner,
             NativeQuantisedSourceIdentity source_identity,
-            NativeQuantisedReusableDeviceAllocationFormat allocation_format)
+            NativeQuantisedReusableDeviceAllocationFormat allocation_format,
+            uint8_t metadata_layout)
             : weights_(nullptr),
               packed_(nullptr),
               lifetime_owner_(std::move(lifetime_owner)),
@@ -1249,6 +1252,13 @@ namespace llaminar2
             impl_->d_weights_native_emins = d_emins;
             impl_->native_codebook_id = codebook_id;
             impl_->native_blocks_per_row = blocks_per_row;
+            if (!nativeQuantisedLayoutValid(codebook_id, metadata_layout) ||
+                (metadata_layout && (!d_mins || d_emins || !d_scales ||
+                    (native_quantised_superblock::superblockCodeInPayload(codebook_id) &&
+                        reinterpret_cast<const void *>(d_scales) != d_vnni))))
+                throw std::invalid_argument(
+                    "[CUDAQuantisedGemmKernel] invalid metadata layout for prepared weights");
+            impl_->native_metadata_layout = metadata_layout;
             const NativeQuantisedFormatInfo *source_format =
                 source_identity.present
                     ? native_quantised_formats::forSourceIdentity(
@@ -1258,7 +1268,7 @@ namespace llaminar2
             if (!source_format ||
                 !deviceVnniExecutionCompatibleWithSource(
                     *source_format, codebook_id) ||
-                ((codebook_id == 11 || codebook_id == kNativeQuantisedExpandedInt8MinCodebook ||
+                ((codebook_id == 11 ||
                   codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook) &&
                  d_mins == nullptr))
             {
@@ -1269,16 +1279,19 @@ namespace llaminar2
             impl_->native_source_identity = source_identity;
             if (allocation_format.payload_bytes_per_block != 0)
             {
-                const auto canonical_format = canonicalDeviceVnniFormat(*source_format);
-                const auto execution_format =
-                    codebook_id == canonical_format.codebook_id
-                        ? canonical_format
-                        : migrationStableDeviceVnniFormat(*source_format);
+                const bool coded = cpu::native_quantised::migrationUsesSuperblockCodes(*source_format);
+                if (coded != (metadata_layout != 0) || (coded &&
+                    (allocation_format.payload_bytes_per_block != source_format->payload_bytes ||
+                        !allocation_format.has_mins || allocation_format.has_emins)))
+                    throw std::invalid_argument("[CUDAQuantisedGemmKernel] Reusable slot does not preserve the source's migration metadata layout");
+                const auto execution_format = canonicalDeviceVnniFormat(*source_format);
+                if (codebook_id != execution_format.codebook_id)
+                    throw std::invalid_argument("Reusable slot requires the canonical NativeQuantised execution codebook");
                 if (allocation_format.payload_bytes_per_block <
                         execution_format.payload_bytes_per_block ||
                     (execution_format.is_asymmetric &&
                      !allocation_format.has_mins) ||
-                    (execution_format.has_emins &&
+                    (!coded && execution_format.has_emins &&
                      !allocation_format.has_emins))
                 {
                     throw std::invalid_argument(
@@ -1453,9 +1466,7 @@ namespace llaminar2
 
             impl_->rowmajor = cudaRowMajorWeights_createForCodebook(
                 impl_->d_weights_native_quantised,
-                impl_->d_weights_native_scales,
-                impl_->d_weights_native_mins,
-                impl_->d_weights_native_emins,
+                impl_->nativeMetadataPlanes(),
                 static_cast<int>(N_),
                 static_cast<int>(K_),
                 impl_->native_codebook_id,
@@ -1491,7 +1502,8 @@ namespace llaminar2
                 .allocation_has_emins = static_cast<std::uint8_t>(impl_->native_allocation_format.has_emins),
                 .source_codebook_id = source.codebook_id,
                 .source_is_superblock = static_cast<std::uint8_t>(source.is_superblock),
-                .source_identity_present = static_cast<std::uint8_t>(source.present)};
+                .source_identity_present = static_cast<std::uint8_t>(source.present),
+                .metadata_layout = impl_->native_metadata_layout};
             (void)requireQ8ResidualNativeMatrix(descriptor, m, n, k);
             if (q8ResidualNeedsIQTables(descriptor.codebook_id))
             {
@@ -1728,6 +1740,7 @@ namespace llaminar2
             out.scales = impl_->d_weights_native_scales;
             out.mins = impl_->d_weights_native_mins;
             out.emins = impl_->d_weights_native_emins;
+            out.metadata_layout = impl_->native_metadata_layout;
             out.n = static_cast<int>(N_);
             out.k = static_cast<int>(K_);
             out.blocks_per_row = impl_->native_blocks_per_row;
@@ -4289,9 +4302,7 @@ namespace llaminar2
                 return cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
                     d_A_int8,
                     impl_->d_weights_native_quantised,
-                    impl_->d_weights_native_scales,
-                    impl_->d_weights_native_mins,
-                    impl_->d_weights_native_emins,
+                    impl_->nativeMetadataPlanes(),
                     d_C,
                     d_scales_A_blockwise,
                     m,
@@ -4400,9 +4411,7 @@ namespace llaminar2
             const bool ok = cudaNativeQuantisedGemvTuned_fp32_withPolicy(
                 d_A_int8,
                 impl_->d_weights_native_quantised,
-                impl_->d_weights_native_scales,
-                impl_->d_weights_native_mins,
-                impl_->d_weights_native_emins,
+                impl_->nativeMetadataPlanes(),
                 d_C,
                 d_scales_A_blockwise,
                 n,

@@ -1594,9 +1594,13 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_RuntimeMVerifierAllNativeFormatsM
             params.prepared_store = prepared.store.get();
             params.force_decode_equivalent_verifier_prefill = run_seq > 1;
 
-            CPUProjectionTestWorkspace workspace(run_seq, inter);
+            // Size the arena from the stage's own production declaration: the
+            // grouped verifier route may borrow buffers (e.g. the NEON packed
+            // prefill partial bank) beyond the SwiGLU tile and Q8 bank, and a
+            // missing declaration must fail here rather than hide behind a
+            // hand-built fixture arena.
             SharedExpertFFNStage stage(params);
-            stage.bindWorkspace(workspace.get());
+            test::CPUStageTestWorkspace workspace(stage, run_seq);
             if (run_seq > 1)
                 EXPECT_TRUE(stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
             return stage.execute(cpu_ctx_.get());

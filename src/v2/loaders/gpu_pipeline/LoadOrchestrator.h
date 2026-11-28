@@ -115,7 +115,8 @@ namespace llaminar2
                         bool is_asymmetric, bool has_emins,
                         NativeQuantisedScalePlaneWidth scale_plane,
                         size_t raw_gguf_bytes,
-                        WeightVRAMPool::ContiguousAlias alias = {0});
+                        WeightVRAMPool::ContiguousAlias alias = {0},
+                        std::optional<WeightVRAMPool::SuperblockCodedMetadata> coded = std::nullopt);
 
         /**
          * @brief Plan one weight against an explicit physical owner line.
@@ -136,7 +137,8 @@ namespace llaminar2
             NativeQuantisedScalePlaneWidth scale_plane,
             size_t raw_gguf_bytes,
             PhysicalMemoryOwner owner,
-            WeightVRAMPool::ContiguousAlias alias = {0});
+            WeightVRAMPool::ContiguousAlias alias = {0},
+            std::optional<WeightVRAMPool::SuperblockCodedMetadata> coded = std::nullopt);
 
         /// Plan a raw (floating-point) weight for a specific device. No repack needed.
         void planRawWeight(int device_id, const std::string &name, int N, int K, size_t raw_bytes);

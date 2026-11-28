@@ -17,6 +17,8 @@
 #include <mpi.h>
 #include <nlohmann/json.hpp>
 #include <csignal>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -40,9 +42,20 @@ static void observe(const std::filesystem::path &path, const char *mode,
 /** @brief Exercise actual production scope order and return the exact requested outcome. */
 int main(int argc, char **argv)
 {
+    const auto startup = std::chrono::steady_clock::now();
+    const auto phase = [&](const char *name) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startup).count();
+        std::fprintf(stderr, "MPI_SINGLETON_STARTUP pid=%ld phase=%s elapsed_ms=%lld\n",
+            static_cast<long>(::getpid()), name, static_cast<long long>(elapsed));
+        std::fflush(stderr);
+    };
+    phase("main");
     // Ownership starts before this frontend creates MPI or runtime state.
     if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    phase("owner-entered");
     llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+    phase("runtime-lifetime-entered");
 
     if (argc != 4 || std::string(argv[1]) != "--observation") return 125;
     const std::filesystem::path observation = argv[2];
@@ -51,7 +64,9 @@ int main(int argc, char **argv)
     try {
         std::string temporary, shared;
         {
+            phase("mpi-session-begin");
             auto session = llaminar2::MPIProcessSession::initialize(argc,argv);
+            phase("mpi-session-end");
             const char *tmp = std::getenv("TMPDIR");
             const char *shm = std::getenv("OMPI_MCA_btl_vader_backing_directory");
             if (!tmp || !shm) throw std::runtime_error("Missing singleton owned runtime roots");

@@ -601,7 +601,11 @@ namespace llaminar2::test
         }
     }
 
-    /** @brief The canonical directory BOM and wire profile omit fixed down storage. */
+    /**
+     * @brief The canonical directory BOM and wire profile omit fixed down storage.
+     * @details Forged projection sets and every wire maximum other than the
+     * derived largest-family payload (oversized, undersized, zero) are rejected.
+     */
     TEST(DeviceMoEExpertDescriptorBuilder, GateUpDirectoryProfilePricesOnlyMovableBytes)
     {
         using Directory = DeviceMoETransferSlotDirectory;
@@ -625,9 +629,45 @@ namespace llaminar2::test
             EXPECT_LT(pair_bom.total_bytes, triple_bom.total_bytes);
             EXPECT_THROW(Directory::profileForLayerFormats({pair}), std::invalid_argument);
             EXPECT_THROW(Directory::profileForLayerFormats({triple}, DeviceMoEProjectionSet::GateUp), std::invalid_argument);
+            // The quote stamps projection_set into every slot descriptor, so a
+            // profile whose families disagree with it must never be priced.
             auto forged = projected;
             forged.projection_set = DeviceMoEProjectionSet::CompleteExpert;
             EXPECT_THROW(Directory::allocationBOM(capacity, forged), std::invalid_argument);
+            auto forged_complete = complete;
+            forged_complete.projection_set = DeviceMoEProjectionSet::GateUp;
+            EXPECT_THROW(Directory::allocationBOM(capacity, forged_complete), std::invalid_argument);
+            // The wire maximum is derived, never authored: an arrival wire
+            // larger than every family slot, a positive underquote that would
+            // underprice the largest family's arrivals, or no wire at all is
+            // rejected; only the exact largest-family wire is admissible.
+            auto oversized_wire = projected;
+            ++oversized_wire.max_wire_payload_bytes;
+            EXPECT_THROW(Directory::allocationBOM(capacity, oversized_wire), std::invalid_argument);
+            for (const size_t underquote : {projected.max_wire_payload_bytes - 1u, size_t{1}})
+            {
+                auto undersized_wire = projected;
+                undersized_wire.max_wire_payload_bytes = underquote;
+                EXPECT_THROW(Directory::allocationBOM(capacity, undersized_wire), std::invalid_argument);
+                auto undersized_complete = complete;
+                undersized_complete.max_wire_payload_bytes = underquote;
+                EXPECT_THROW(Directory::allocationBOM(capacity, undersized_complete), std::invalid_argument);
+            }
+            auto empty_wire = projected;
+            empty_wire.max_wire_payload_bytes = 0u;
+            EXPECT_THROW(Directory::allocationBOM(capacity, empty_wire), std::invalid_argument);
+            // With several families the canonical wire is the largest one's
+            // payload and stays admissible; a quote equal to a smaller
+            // family's payload fits that slot but underprices the largest.
+            auto wide = pair;
+            for (auto &spec : wide) spec.K *= 2;
+            const auto mixed = Directory::profileForLayerFormats({pair, wide}, DeviceMoEProjectionSet::GateUp);
+            ASSERT_EQ(mixed.families.size(), 2u);
+            EXPECT_EQ(mixed.max_wire_payload_bytes, 2u * projected.max_wire_payload_bytes);
+            EXPECT_NO_THROW((void)Directory::allocationBOM(capacity, mixed));
+            auto smaller_family_wire = mixed;
+            smaller_family_wire.max_wire_payload_bytes = projected.max_wire_payload_bytes;
+            EXPECT_THROW(Directory::allocationBOM(capacity, smaller_family_wire), std::invalid_argument);
             pair[0].label = "up";
             EXPECT_THROW(Directory::profileForLayerFormats({pair}, DeviceMoEProjectionSet::GateUp), std::invalid_argument);
         }
