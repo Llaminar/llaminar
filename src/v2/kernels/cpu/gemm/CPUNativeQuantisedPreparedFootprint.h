@@ -326,11 +326,23 @@ namespace llaminar2::cpu::native_quantised
         return 0;
     }
 
-    /** @return Whether the original source carries one signed Q8 byte per value. */
-    [[nodiscard]] constexpr bool isSignedInt8SingleScaleSource(int codebook_id) noexcept
+    /**
+     * @brief Identify native signed-byte sources on both CPU and GPU.
+     * @param codebook_id Original source identity, not its normalized GPU decoder.
+     * @return Whether the original source carries one signed Q8 byte per value.
+     */
+    [[nodiscard]]
+#if defined(__CUDACC__) || defined(__HIPCC__)
+    __host__ __device__
+#endif
+    constexpr bool isSignedInt8SingleScaleSource(int codebook_id) noexcept
     {
-        using namespace native_quantised_formats;
-        return codebook_id == Q8_0.codebook_id || codebook_id == Q8_1.codebook_id || codebook_id == Q8_K.codebook_id;
+        // Materialize scalar constant expressions: a runtime device argument must
+        // never turn catalog member access into a read of host constexpr storage.
+        constexpr auto q8_0 = native_quantised_formats::Q8_0.codebook_id;
+        constexpr auto q8_1 = native_quantised_formats::Q8_1.codebook_id;
+        constexpr auto q8_k = native_quantised_formats::Q8_K.codebook_id;
+        return codebook_id == q8_0 || codebook_id == q8_1 || codebook_id == q8_k;
     }
 
     /**

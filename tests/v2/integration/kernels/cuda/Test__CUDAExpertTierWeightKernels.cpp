@@ -78,6 +78,16 @@
 
 namespace llaminar2::test
 {
+    /**
+     * @brief Evaluate production predicates with runtime device layout fields.
+     * @param layout Candidate format tuple.
+     * @param result Three device bytes receiving catalog/preserve/Q8 results.
+     * @param stream Exact non-default fixture stream.
+     * @return Native launch status.
+     */
+    cudaError_t launchExpertTierDeviceFormatPredicates(
+        ExpertTierWeightDeviceLayout layout, std::uint8_t *result, cudaStream_t stream);
+
     /** @brief Exercise the production no-peer protocol with disjoint roots on one real CUDA device. */
     struct ExpertTierGpuBlobRelayFixtureAccess
     {
@@ -698,6 +708,55 @@ namespace llaminar2
                     << "production IQ decode tables must be initialized";
             }
         };
+
+        /** @test Runtime CUDA predicates equal host results for every source tuple and malformed physical plane. */
+        TEST_F(CUDAExpertTierWeightKernelsTest, DeviceFormatPredicatesMatchCanonicalHostCatalog)
+        {
+            constexpr std::array fields{
+                &ExpertTierWeightDeviceLayout::gpu_source_codebook_id,
+                &ExpertTierWeightDeviceLayout::gpu_source_is_superblock,
+                &ExpertTierWeightDeviceLayout::gpu_codebook_id,
+                &ExpertTierWeightDeviceLayout::gpu_payload_bytes_per_block,
+                &ExpertTierWeightDeviceLayout::gpu_is_asymmetric,
+                &ExpertTierWeightDeviceLayout::gpu_has_emins};
+            std::vector<ExpertTierWeightDeviceLayout> candidates;
+            for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+            {
+                const auto layout = makeGpuToCpuExpertTierWeightStreamManifest(*entry.metadata,
+                    70, 256, 1, 0, 0, ExpertTierWeightProjection::Down, 3).deviceLayout();
+                ASSERT_TRUE(layout.gpuFormatMatchesSource()) << entry.quant_type;
+                candidates.push_back(layout);
+                for (const auto field : fields)
+                {
+                    auto mutation = layout;
+                    mutation.*field ^= 1u;
+                    candidates.push_back(mutation);
+                }
+                auto malformed = layout;
+                malformed.gpu_codebook_id = 255;
+                ASSERT_FALSE(malformed.gpuFormatMatchesSource());
+                candidates.push_back(malformed);
+            }
+            TestCUDAStream stream;
+            TestCUDABuffer<std::uint8_t> results(candidates.size() * 3);
+            for (std::size_t i = 0; i < candidates.size(); ++i)
+                ASSERT_EQ(test::launchExpertTierDeviceFormatPredicates(
+                    candidates[i], results.data() + i * 3, stream.native()), cudaSuccess);
+            std::vector<std::uint8_t> observed(candidates.size() * 3);
+            ASSERT_EQ(cudaMemcpyAsync(observed.data(), results.data(), results.bytes(),
+                cudaMemcpyDeviceToHost, stream.native()), cudaSuccess);
+            ASSERT_EQ(stream.synchronize(), cudaSuccess);
+            for (std::size_t i = 0; i < candidates.size(); ++i)
+            {
+                SCOPED_TRACE(i);
+                const auto &layout = candidates[i];
+                EXPECT_EQ(observed[i * 3], layout.gpuFormatMatchesSource()) << "catalog";
+                EXPECT_EQ(observed[i * 3 + 1], expertTierPreservesNativeSingleScale(
+                    layout.cpu_encoding, layout.cpu_codebook_id)) << "native-single-scale";
+                EXPECT_EQ(observed[i * 3 + 2], cpu::native_quantised::isSignedInt8SingleScaleSource(
+                    layout.cpu_codebook_id)) << "signed-Q8";
+            }
+        }
 
         /** @test Native CUDA migration preserves every coded plane through a phased, partial intersection. */
         TEST_F(CUDAExpertTierWeightKernelsTest, FileDensityPlanesRoundTripMatchesSourceNative)

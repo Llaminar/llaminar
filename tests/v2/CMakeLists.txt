@@ -13045,6 +13045,7 @@ add_v2_test(V2_Integration_CUDA_MoEFloatingSharedExpertTableDecode
 )
 add_executable(v2_integration_cuda_expert_tier_weight_kernels
     integration/kernels/cuda/Test__CUDAExpertTierWeightKernels.cpp
+    integration/kernels/cuda/ExpertTierDeviceFormatPredicates.cu
     integration/mpi_gtest_main.cpp)
 target_link_libraries(v2_integration_cuda_expert_tier_weight_kernels
     llaminar2_core GTest::gtest CUDA::cudart MPI::MPI_CXX)
@@ -13088,7 +13089,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_ExpertTierWei
 
 add_v2_test(V2_Integration_CUDA_CapturedExpertTierPackedTransferProgress
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
-            --gtest_filter=CUDAExpertTierWeightKernelsTest.CapturedLocalPackedTransfersProgressAllFormats:CUDAExpertTierWeightKernelsTest.CapturedRemotePackedTransfersProgressAllFormats
+            --gtest_filter=CUDAExpertTierWeightKernelsTest.DeviceFormatPredicatesMatchCanonicalHostCatalog:CUDAExpertTierWeightKernelsTest.CapturedLocalPackedTransfersProgressAllFormats:CUDAExpertTierWeightKernelsTest.CapturedRemotePackedTransfersProgressAllFormats
     LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;WeightStreaming;GraphCapture;Async;ByteExact;AllFormats;Regression"
     MPI_PROCS 1
     NO_MODELS
