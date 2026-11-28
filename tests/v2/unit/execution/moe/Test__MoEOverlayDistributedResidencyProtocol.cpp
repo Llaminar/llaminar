@@ -517,6 +517,10 @@ namespace llaminar2::test
                         ExpertTierWeightProjection::Gate, admitted).deviceLayout();
                     ASSERT_TRUE(layout.valid());
                     const auto cpu = layout.cpuStorage();
+                    std::vector<uint8_t> original(cpu.cpuStorageBytes());
+                    for (size_t byte = 0; byte < original.size(); ++byte)
+                        original[byte] = static_cast<uint8_t>(byte * 37u + 11u);
+                    std::vector<uint8_t> restored(original.size(), 0xa5);
                     size_t maximum = 0, total = 0;
                     for (uint32_t first = 0; first < layout.unit_count;)
                     {
@@ -532,6 +536,11 @@ namespace llaminar2::test
                         }
                         EXPECT_EQ(layout.chunkBytes(count, first), bytes);
                         EXPECT_EQ(expertTierWireUnitAt(layout, total), first);
+                        std::vector<uint8_t> wire(bytes), observed(bytes);
+                        ASSERT_TRUE(gatherExpertTierCPUWeightChunk(cpu, original, first, count, wire));
+                        ASSERT_TRUE(scatterExpertTierCPUWeightChunk(cpu, wire, first, count, restored));
+                        ASSERT_TRUE(gatherExpertTierCPUWeightChunk(cpu, restored, first, count, observed));
+                        EXPECT_EQ(observed, wire);
                         maximum = std::max(maximum, bytes);
                         total += bytes;
                         first += count;
@@ -552,6 +561,7 @@ namespace llaminar2::test
                     small.unit_count = blocks;
                     small.maximum_units_per_chunk = 1;
                     EXPECT_EQ(small.maximumChunkBytes(), small.maximumWireUnitBytes());
+                    EXPECT_LT(small.maximumChunkBytes(), maximum);
                     auto empty = small;
                     empty.unit_count = empty.maximum_units_per_chunk = 0;
                     EXPECT_EQ(empty.maximumChunkBytes(), 0u);
