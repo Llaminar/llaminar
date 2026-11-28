@@ -15,18 +15,32 @@
  * covers the transposed weight contract and the alpha/beta epilogue at
  * serving scale.
  *
+ * The same shapes are then run against the oneDNN FP32 reference, the way
+ * the AMX-BF16 route was compared on its host: an interleaved same-process
+ * min-of-20 measurement with the GF/s / t=oneDNN/native table, and a
+ * numerical agreement gate (the two implementations use different reduction
+ * orders, so agreement is bounded, not byte-identical — measured here at
+ * relL2 1.1-1.3e-6 with a 1e-4 contract for other envelopes).
+ *
  * No model or accelerator is required; the test is device-free and exercises
  * only the native CPU route against independently computed reference words.
  */
 
 #include <gtest/gtest.h>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 #include <omp.h>
+
+#include <oneapi/dnnl/dnnl.hpp>
 
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 
@@ -113,6 +127,72 @@ namespace
             }
         }
         EXPECT_EQ(mismatches, 0u);
+    }
+
+    /** 64-byte-aligned buffer, as oneDNN expects for direct user storage. */
+    class AlignedBuffer final
+    {
+        void *ptr_;
+    public:
+        explicit AlignedBuffer(std::size_t elements)
+        {
+            const std::size_t bytes = elements * sizeof(float);
+            if (bytes == 0)
+            {
+                ptr_ = nullptr;
+                return;
+            }
+            const std::size_t aligned = (bytes + 63) & ~std::size_t(63);
+            ptr_ = std::aligned_alloc(64, aligned);
+            if (!ptr_)
+                throw std::runtime_error("AlignedBuffer allocation failed");
+        }
+        ~AlignedBuffer() { std::free(ptr_); }
+        AlignedBuffer(const AlignedBuffer &) = delete;
+        AlignedBuffer &operator=(const AlignedBuffer &) = delete;
+        float *data() { return static_cast<float *>(ptr_); }
+        const float *data() const { return static_cast<const float *>(ptr_); }
+    };
+
+    /** oneDNN FP32 matmul with the same row-major src / transposed weights. */
+    class OneDNNFP32Matmul final
+    {
+        dnnl::engine eng_{dnnl::engine::kind::cpu, 0};
+        dnnl::stream str_{eng_};
+        dnnl::matmul prim_;
+        dnnl::memory src_, wei_, dst_;
+    public:
+        OneDNNFP32Matmul(const float *A, const float *B, float *C, int M, int N, int K)
+        {
+            dnnl::memory::desc s({M, K}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab);
+            dnnl::memory::desc w({K, N}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ba);
+            dnnl::memory::desc d({M, N}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab);
+            dnnl::matmul::primitive_desc pd(eng_, s, w, d);
+            prim_ = dnnl::matmul(pd);
+            src_ = dnnl::memory(s, eng_, const_cast<float *>(A));
+            wei_ = dnnl::memory(w, eng_, const_cast<float *>(B));
+            dst_ = dnnl::memory(d, eng_, C);
+        }
+        void run()
+        {
+            prim_.execute(str_, {{DNNL_ARG_SRC, src_}, {DNNL_ARG_WEIGHTS, wei_}, {DNNL_ARG_DST, dst_}});
+            str_.wait();
+        }
+    };
+
+    using Clock = std::chrono::steady_clock;
+    double elapsedMs(Clock::time_point a, Clock::time_point b)
+    {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    }
+
+    /** Max absolute deviation between two same-shape FP32 outputs. */
+    double maxAbsoluteDiff(const std::vector<float> &a, const std::vector<float> &b)
+    {
+        double maximum = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            maximum = std::max(maximum, std::fabs(double(a[i]) - double(b[i])));
+        return maximum;
     }
 }
 
@@ -205,4 +285,90 @@ TEST(CPUFloatingRouteSerialOracle, TransposedWeightsAndEpilogueAtServingScale)
 
     expectByteIdentical(actual, oracle);
     EXPECT_LE(relativeL2(actual, oracle), 1e-5);
+}
+
+// ============================================================================
+// Native-vs-oneDNN comparison at the canonical serving shapes
+// ============================================================================
+
+TEST(CPUFloatingRouteOneDNN, ServingShapesAgreeWithOneDNNReference)
+{
+    for (const auto &shape : kServingShapes)
+    {
+        const int M = shape[0], N = shape[1], K = shape[2];
+        SCOPED_TRACE(::testing::Message() << "M=" << M << " N=" << N << " K=" << K);
+        AlignedBuffer a(static_cast<std::size_t>(M) * K), b(static_cast<std::size_t>(N) * K);
+        AlignedBuffer cdnn(static_cast<std::size_t>(M) * N);
+        std::vector<float> cnat(static_cast<std::size_t>(M) * N, 0.0f);
+        const std::vector<float> aValues = fp32Values(static_cast<std::size_t>(M) * K, 0xd011);
+        const std::vector<float> bValues = fp32Values(static_cast<std::size_t>(N) * K, 0xd022);
+        std::memcpy(a.data(), aValues.data(), aValues.size() * sizeof(float));
+        std::memcpy(b.data(), bValues.data(), bValues.size() * sizeof(float));
+
+        ThreadBudget threads(8);
+        ASSERT_TRUE(gemm::run_fp32_skinny_matmul(
+            a.data(), b.data(), cnat.data(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr));
+
+        OneDNNFP32Matmul reference(a.data(), b.data(), cdnn.data(), M, N, K);
+        reference.run();
+
+        const std::vector<float> actual(cnat.begin(), cnat.end());
+        const std::vector<float> expected(cdnn.data(), cdnn.data() + cnat.size());
+        // Different reduction orders: agreement is bounded, not byte-identical.
+        // Measured on the AVX2 host at relL2 1.06-1.34e-6; 1e-4 covers other
+        // envelopes and library build geometry.
+        EXPECT_LE(relativeL2(actual, expected), 1e-4)
+            << "native FP32 and the oneDNN FP32 reference disagree beyond the gate";
+        std::printf("    %dx%dx%d: relL2=%.3e maxAbs=%.3e\n",
+                    M, N, K, relativeL2(actual, expected), maxAbsoluteDiff(actual, expected));
+    }
+}
+
+TEST(CPUFloatingRouteOneDNN, ServingShapesInterleavedMin20ComparisonTable)
+{
+    // Same-process interleaved min-of-20 comparison, exactly the methodology
+    // used for the AMX-BF16 route on its host. Timings are informational:
+    // absolute GF/s drift under host load, the interleaved ratios are the
+    // meaningful numbers. No performance gate is asserted (no flaky CI).
+    printf("    native FP32 vs oneDNN FP32 (interleaved, min of 20, 8 threads)\n");
+    printf("    %-15s | %10s %10s %9s\n", "shape", "FP32nat", "oneDNN32", "t=dnn/nat");
+    ThreadBudget threads(8);
+    for (const auto &shape : kServingShapes)
+    {
+        const int M = shape[0], N = shape[1], K = shape[2];
+        SCOPED_TRACE(::testing::Message() << "M=" << M << " N=" << N << " K=" << K);
+        AlignedBuffer a(static_cast<std::size_t>(M) * K), b(static_cast<std::size_t>(N) * K);
+        AlignedBuffer c(static_cast<std::size_t>(M) * N);
+        const std::vector<float> aValues = fp32Values(static_cast<std::size_t>(M) * K, 0x715e);
+        const std::vector<float> bValues = fp32Values(static_cast<std::size_t>(N) * K, 0x715e);
+        std::memcpy(a.data(), aValues.data(), aValues.size() * sizeof(float));
+        std::memcpy(b.data(), bValues.data(), bValues.size() * sizeof(float));
+
+        OneDNNFP32Matmul reference(a.data(), b.data(), c.data(), M, N, K);
+
+        double bestNative = 1e9, bestOneDNN = 1e9;
+        for (int warm = 0; warm < 3; ++warm)
+        {
+            ASSERT_TRUE(gemm::run_fp32_skinny_matmul(
+                a.data(), b.data(), c.data(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr));
+            reference.run();
+        }
+        for (int round = 0; round < 20; ++round)
+        {
+            auto t = Clock::now();
+            ASSERT_TRUE(gemm::run_fp32_skinny_matmul(
+                a.data(), b.data(), c.data(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr));
+            bestNative = std::min(bestNative, elapsedMs(t, Clock::now()));
+            t = Clock::now();
+            reference.run();
+            bestOneDNN = std::min(bestOneDNN, elapsedMs(t, Clock::now()));
+        }
+        const auto gfs = [&](double millis) { return 2.0 * M * N * K / 1e9 / millis * 1e3; };
+        printf("    %-15s | %10.0f %10.0f %8.2fx\n",
+               (std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K)).c_str(),
+               gfs(bestNative), gfs(bestOneDNN), bestOneDNN / bestNative);
+        EXPECT_GT(bestNative, 0.0);
+        EXPECT_GT(bestOneDNN, 0.0);
+    }
+    printf("    t=dnn/nat = oneDNN_time / native_time; < 1.0 = oneDNN FASTER, > 1.0 = native faster.\n");
 }

@@ -20978,14 +20978,14 @@ if(V2_CPU_TARGET_X86)
         NO_MODELS
     )
 endif()
-if(USE_ONEDNN AND ONEDNN_FOUND)
+if(USE_ONEDNN AND ONEDNN_FOUND AND ONEDNN_LIB)
     add_executable(v2_integration_cpu_floating_route
         integration/kernels/cpu/gemm/Test__CPUHostFloatingRoute.cpp)
     target_link_libraries(v2_integration_cpu_floating_route PRIVATE
-        llaminar2_core GTest::gtest GTest::gtest_main)
-    add_v2_test(V2_Integration_CPU_FloatingRouteSerialOracle
+        llaminar2_core GTest::gtest GTest::gtest_main ${ONEDNN_LIB})
+    add_v2_test(V2_Integration_CPU_FloatingRouteOneDNN
         COMMAND $<TARGET_FILE:v2_integration_cpu_floating_route> --gtest_brief=1
-        LABELS "V2;Integration;CPU;GEMM;FP32;ByteExact;Determinism;Regression"
+        LABELS "V2;Integration;CPU;GEMM;FP32;OneDNN;ByteExact;Determinism;Regression"
         MPI_PROCS 1
         NO_MODELS
     )
