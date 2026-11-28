@@ -206,25 +206,6 @@ def main(argv: list[str] | None = None) -> int:
         # retain their red result and still exercise the independent next lane.
         print(f"[production-preflight] {lane}: {len(tests)} selected, "
               f"result={'passed' if evidence['complete'] else 'failed'}", flush=True)
-        if lane == "host" and result.returncode == 8:
-            # PR75/78: after a failed host gate, collect bounded MPI startup
-            # diagnostics in the same image/uid/build before the container
-            # retires. This NEVER changes the result (evidence only) and the
-            # hook returns 0 after collection. The hook receives the BUILD
-            # directory (where CTest inventory lives) plus the results dir
-            # (where host.xml + evidence are written) as separate arguments.
-            try:
-                from mpi_diag.ci_mpi_hook import run_after_failed_host_lane
-                hook = run_after_failed_host_lane(
-                    output / "host.xml", output, build,
-                    os.environ)
-                print(f"[production-preflight] mpi-diag: "
-                      f"selected={hook['selected']}", flush=True)
-            except Exception as error:
-                # Diagnostic failure must never mask the gate's red result.
-                print(f"[production-preflight] mpi-diag hook error: {error}",
-                      flush=True)
-
         report["return_code"] = overall
         write_json(path, report)
     report["complete"] = overall == 0
