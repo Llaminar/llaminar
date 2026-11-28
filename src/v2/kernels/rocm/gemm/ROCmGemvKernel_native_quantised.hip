@@ -61,6 +61,7 @@
 
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
+#include "kernels/rocm/gemm/ROCmNativeM1CaptureABI.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "kernels/common/NativeQuantisedPackedBits.h"
 #include "kernels/common/NativeTileCompletion.cuh"
@@ -5768,6 +5769,8 @@ template <int TN,int CPT,bool HasWork>
 void finishNativeM1Producer(float *partials,float *output,int n,int kb,int device,void *stream,
     llaminar2::rocm::NativeM1ReductionTicket *deferred,llaminar2::ProjectionRowWork work)
 {
+    static_assert(std::is_same_v<decltype(gemv_native_quantised_reduce_kernel_t<TN,CPT,HasWork>),
+        llaminar2::rocm::NativeM1ReducerSignature>);
     if(deferred)
     {
         if(hipPeekAtLastError()!=hipSuccess)throw std::runtime_error("M1 deferred producer submission failed");
@@ -6015,6 +6018,10 @@ void launchNativeQuantisedSerialGeometry(
     llaminar2::rocm::NativeM1ReductionTicket *deferred=nullptr,
     const llaminar2::rocm::NativeQ8SerialGeometryAdmission *prepared=nullptr)
 {
+    static_assert(std::is_same_v<decltype(gemv_native_quantised_kernel_t<TN,CPT,FMT,false>),
+        llaminar2::rocm::NativeM1ProducerSignature>);
+    static_assert(std::is_same_v<decltype(gemv_native_quantised_kernel_t<TN,CPT,FMT,true>),
+        llaminar2::rocm::NativeM1ProducerSignature>);
     static_assert(CPT == 1 || CPT == 2);
     static_assert(TN % CPT == 0);
     using Loads=llaminar2::rocm::NativeQ8SerialProducerLoads;

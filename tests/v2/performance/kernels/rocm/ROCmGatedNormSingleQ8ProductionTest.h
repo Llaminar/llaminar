@@ -13,6 +13,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
+#include "utils/ROCmNativeM1CaptureArguments.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/TensorSlice.h"
 #include <array>
@@ -33,24 +34,29 @@ inline void require(bool value,const char* why) {
         throw std::runtime_error(why);
     }
 }
-/**
- * @brief Recover one source-owned captured argument without constructing a placeholder.
- * @tparam T Exact trivially-copyable native argument type, including checked descriptors.
- * @param node Retained kernel node whose immutable argument storage is still alive.
- * @param index Source-authenticated zero-based argument slot in that native ABI.
- * @return Value reconstructed from all sizeof(T) captured bytes, without a default constructor.
- * @throws std::runtime_error If the retained argument storage is absent.
- * @details Copying through bytes avoids pointer-object strict aliasing. bit_cast
- * also admits ProjectionRowWork, whose checked factories intentionally provide
- * no default constructor; no descriptor fields or replacement policy are guessed.
- */
-template<class T>T argument(const hipKernelNodeParams& node,int index)
+/** @brief Recover a signature-checked native argument while its graph is retained. */
+template<class Signature, std::size_t Index>
+auto argument(const hipKernelNodeParams& node)
 {
-    require(node.kernelParams&&node.kernelParams[index],"Missing captured argument");
-    static_assert(std::is_trivially_copyable_v<T>);
-    std::array<std::byte,sizeof(T)> bytes{};
-    std::memcpy(bytes.data(),node.kernelParams[index],bytes.size());
-    return std::bit_cast<T>(bytes);
+    return test::nativeM1CaptureArgument<Signature, Index>(node.kernelParams);
+}
+using Producer = rocm::NativeM1ProducerSignature;
+using Reducer = rocm::NativeM1ReducerSignature;
+using Normalizer = void(rocm::GatedNormSingleQ8Input);
+/** @brief Compare each semantic argument field, excluding aggregate padding. */
+template<class Signature, std::size_t... Indices>
+void sameArguments(const hipKernelNodeParams& a,const hipKernelNodeParams& b,std::index_sequence<Indices...>)
+{
+    const auto same=[&]<std::size_t Index>() {
+        const auto x=argument<Signature,Index>(a),y=argument<Signature,Index>(b);
+        using T=std::remove_cv_t<decltype(x)>;
+        if constexpr(std::is_same_v<T,rocm_native_metadata::MetadataPlanes>)
+            return x.primary==y.primary&&x.secondary==y.secondary&&x.emins==y.emins&&
+                x.superblock_phase==y.superblock_phase&&x.representation==y.representation&&x.code_bit_shift==y.code_bit_shift;
+        else if constexpr(std::is_same_v<T,ProjectionRowWork>)return x.captureIdentity()==y.captureIdentity();
+        else return x==y;
+    };
+    require((same.template operator()<Indices>()&&...),"Composite changed original projection argument");
 }
 /** @brief Preserve exact native producer/reducer argument and geometry identity. */
 inline void sameProjection(const hipKernelNodeParams& a,const hipKernelNodeParams& b,bool producer)
@@ -58,12 +64,8 @@ inline void sameProjection(const hipKernelNodeParams& a,const hipKernelNodeParam
     require(a.func==b.func&&a.gridDim.x==b.gridDim.x&&a.gridDim.y==b.gridDim.y&&a.gridDim.z==b.gridDim.z&&
         a.blockDim.x==b.blockDim.x&&a.blockDim.y==b.blockDim.y&&a.blockDim.z==b.blockDim.z&&a.sharedMemBytes==b.sharedMemBytes,
         "Composite changed original projection function/geometry");
-    const auto pointer=[&](const hipKernelNodeParams& p,int i){return argument<const void*>(p,i);};
-    for(int i=0;i<(producer?9:2);++i)require(pointer(a,i)==pointer(b,i),"Composite changed original projection pointer");
-    for(int i=producer?9:2;i<(producer?12:4);++i)
-        require(argument<int>(a,i)==argument<int>(b,i),"Composite changed original projection scalar");
-    require(argument<ProjectionRowWork>(a,producer?12:4).captureIdentity()==
-        argument<ProjectionRowWork>(b,producer?12:4).captureIdentity(),"Composite changed original projection row authority");
+    if(producer)sameArguments<Producer>(a,b,std::make_index_sequence<rocm::NativeM1CaptureABI<Producer>::arity>{});
+    else sameArguments<Reducer>(a,b,std::make_index_sequence<rocm::NativeM1CaptureABI<Reducer>::arity>{});
 }
 /** @brief One exact native stream retired after all graph/borrowed-storage owners. */
 struct Stream
@@ -262,7 +264,7 @@ public:
             const std::string name(raw);
             if(name.find("gemv_native_quantised_kernel_t")!=std::string::npos||name.find("gemv_native_quantised_reduce_kernel_t")!=std::string::npos) {
                 original.push_back(node);
-                if(name.find("reduce_kernel_t")==std::string::npos)parts=argument<int>(node,11);
+                if(name.find("reduce_kernel_t")==std::string::npos)parts=argument<Producer,9>(node);
             }
             else require(name.find("rocm_gated_rmsnorm_kernel")!=std::string::npos||name.find("quantizeActivationsQ8")!=std::string::npos,
                 "Foreign original complete-boundary kernel");
@@ -272,7 +274,7 @@ public:
             const auto* raw=hipKernelNameRefByPtr(node.func,stream.value);require(raw,"Missing candidate raw symbol");
             const std::string name(raw);
             if(name.find("rocm_gdn_gated_norm_single_q8_kernel")!=std::string::npos) {
-                ++fused;const auto native=argument<rocm::GatedNormSingleQ8Input>(node,0);
+                ++fused;const auto native=argument<Normalizer,0>(node);
                 require(native.input==values.gpu_data_ptr()&&native.output==values.gpu_data_ptr()&&native.gate==gate.gpu_data_ptr()&&
                     native.gamma==gamma.gpu_data_ptr()&&native.columns==k&&native.parameters==policy&&
                     native.quant==banks[0].first&&native.scales==banks[1].first,"Captured composite producer ABI differs");
@@ -335,7 +337,7 @@ public:
         for(const auto& node:candidate.kernelNodes()) {
             const auto* raw=hipKernelNameRefByPtr(node.func,stream.value);
             if(raw&&std::string(raw).find("rocm_gdn_gated_norm_single_q8_kernel")!=std::string::npos) {
-                native=argument<rocm::GatedNormSingleQ8Input>(node,0);found=true;
+                native=argument<Normalizer,0>(node);found=true;
             }
         }
         require(found,"Missing exact captured producer tuple for selection rejection");

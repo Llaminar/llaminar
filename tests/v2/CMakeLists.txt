@@ -46037,7 +46037,8 @@ endif()
 # their link authority, so an authority without them fails this link on every
 # CPU architecture, and the death tests prove both reporters terminate.
 add_executable(v2_unit_native_superblock_walk_contract
-    unit/kernels/Test__NativeSuperblockWalkContract.cpp)
+    unit/kernels/Test__NativeSuperblockWalkContract.cpp
+    unit/kernels/Test__ROCmNativeM1CaptureABI.cpp)
 target_compile_features(v2_unit_native_superblock_walk_contract PRIVATE cxx_std_20)
 target_include_directories(v2_unit_native_superblock_walk_contract PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(v2_unit_native_superblock_walk_contract PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX
@@ -46049,6 +46050,14 @@ add_v2_test(V2_Integration_NativeSuperblockWalkContract
     COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GEMM;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeSuperblockWalkContract)
+add_v2_test(V2_Unit_ROCmNativeM1CaptureABI
+    COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract> --gtest_filter=ROCmNativeM1CaptureABI.*
+    LABELS "V2;Unit;CPU;DeviceFree;GEMM;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ROCmNativeM1CaptureABI
+    COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract> --gtest_filter=ROCmNativeM1CaptureABI.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GEMM;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmNativeM1CaptureABI)
+
 
 # Bounded x86 contribution-helper contraction witness on the production core's
 # actual command; see the module for its per-configuration qualification.
