@@ -214,6 +214,8 @@ class ToolchainCacheTests(unittest.TestCase):
         self.assertEqual(checkpoint["with"]["target"], "gpu-sdk")
         self.assertIn("scope=llaminar-gpu-sdk-neon", checkpoint["with"]["cache-to"])
         self.assertEqual(toolchain["with"]["target"], "toolchain")
+        # A cold toolchain must reuse the checkpointed SDK, not rebuild it.
+        self.assertIn("type=gha,scope=llaminar-gpu-sdk-neon,", toolchain["with"]["cache-from"])
         for step in (checkpoint, toolchain):
             self.assertEqual(step["with"]["platforms"], "linux/arm64")
             self.assertIn("LLAMINAR_CUDA_ARCHS=121", step["with"]["build-args"])

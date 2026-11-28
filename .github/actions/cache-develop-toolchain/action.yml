@@ -188,6 +188,10 @@ runs:
         outputs: type=oci,dest=${{ steps.cache.outputs.path_neon }},tar=false
         provenance: false
         sbom: false
+        # Consume the SDK checkpoint, as the AVX2 build does. Without it a warm
+        # checkpoint leaves nothing local, so this step rebuilds the CUDA SDK
+        # and its OCI export fails.
+        cache-from: type=gha,scope=llaminar-gpu-sdk-neon,version=2
     - name: Authenticate NEON toolchain bytes and inputs
       id: verify-neon
       if: inputs.cpu-isa == 'NEON'
