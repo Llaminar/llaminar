@@ -23,18 +23,20 @@
 extern "C" void m16k(const void*, const void*, const void*, long, long);
 extern "C" void f32tile(const void*, const void*, const void*, long, long);
 extern "C" void vntile8(const void*, const void*, const void*, long, long);
+extern "C" void avx2f32(const void*, const void*, const void*, long, long);
 namespace cb = llaminar2::gemm::cpu_bf16;
 namespace fp = llaminar2::gemm;
 using Clock = std::chrono::steady_clock;
 static double ms(Clock::time_point a, Clock::time_point b){ return std::chrono::duration<double,std::milli>(b-a).count(); }
 
 struct ShapeData {
-    int M=0,N=0,K=0,kp=0,mb=0,g=0,g8=0,k4=0;
+    int M=0,N=0,K=0,kp=0,mb=0,mb2=0,g=0,g8=0,k4=0;
     uint16_t *A16=nullptr,*B16=nullptr; float *A32=nullptr,*B32=nullptr;
     uint8_t *A8=nullptr; int8_t *B8=nullptr;
     std::vector<uint16_t> Ap, Bp;
     std::vector<float> ApF, BpF;
     std::vector<uint8_t> ApI; std::vector<int8_t> BpI;
+    std::vector<float> Ap2, Bp2; // avx2 packs [mb][k][8x4B], [g][k][8x4B]
     std::vector<float> C; std::vector<int32_t> Ci;
     dnnl::engine eng{dnnl::engine::kind::cpu,0};
     dnnl::stream str{eng};
@@ -44,7 +46,7 @@ struct ShapeData {
 };
 
 static const char* kRowFile = "/tmp/tier2d_rows.txt";
-static const char* Lnames[6]={"FP32 scalar","AVX512-BF16 4x4","AVX512-BF16 packed 16x24","FMA32 512-bit","VNNI int8","AMX-BF16"};
+static const char* Lnames[7]={"FP32 scalar","AVX2-FMA32 8x8","AVX512-BF16 4x4","AVX512-BF16 packed","FMA32 512","VNNI int8","AMX-BF16"};
 static const char* Onames[7]={"oneDNN FP32 (avx512_core)",
                                "oneDNN int8 (avx512 vnni)",
                                "oneDNN BF16 (avx512_core_bf16)",
@@ -55,15 +57,15 @@ static const char* Onames[7]={"oneDNN FP32 (avx512_core)",
 static int showMode(int){
     FILE* f=fopen(kRowFile,"r");
     if(!f){ printf("no saved rows - run once plain and once with DNNL_MAX_CPU_ISA=avx512_core_bf16 first\n"); return 1; }
-    double mn[5][6]={}, mx[5][6]={}; bool have[5][6]={};
+    double mn[8][7]={}, mx[8][7]={}; bool have[8][7]={};
     char line[512];
     while(fgets(line,sizeof line,f)){
         // row|<canon>|v0min,v0max|v1min,v1max|...|v5min,v5max|
         int canon=-1;
-        if(sscanf(line,"row|%d|",&canon)!=1 || canon<0 || canon>4) continue;
+        if(sscanf(line,"row|%d|",&canon)!=1 || canon<0 || canon>7) continue;
         char* p=strchr(line+5,'|');
         if(!p) continue;
-        for(int l=0;l<6;++l){
+        for(int l=0;l<7;++l){
             double a=0,b=0;
             if(sscanf(p+1,"%lf,%lf|",&a,&b)!=2) break;
             if(a<0){ p=strchr(p+1,'|'); if(!p) break; continue; }
@@ -76,24 +78,28 @@ static int showMode(int){
     fclose(f);
     printf("SINGLE 2D INSTRUCTION-TIER MATRIX: oneDNN tiers (rows, low->high) x Llaminar engines (cols, low->high)\n");
     printf("cell = oneDNN_time / Llaminar_time (range over the 4 shapes); >1.0 = Llaminar faster\n\n");
-    const char* RN[5]={"oneDNN FP32 (avx512_core)",
+    const char* RN[8]={"oneDNN FP32 (avx2) - n/a: no avx2 matmul tier",
+                       "oneDNN int8 (avx2) - n/a: no avx2 matmul tier",
+                       "oneDNN BF16 (avx2) - n/a: no avx2 matmul tier",
+                       "oneDNN FP32 (avx512_core)",
                        "oneDNN int8 (avx512 vnni)",
                        "oneDNN BF16 (avx512_core_bf16)",
                        "oneDNN int8 (AMX int8)",
                        "oneDNN BF16 (AMX, default)"};
-    printf("%-26s | %-20s | %-20s | %-20s | %-20s | %-20s | %-20s\n","","FP32 scalar","AVX512-BF16 4x4","AVX512-BF16 pk 16x24","FMA32 512","VNNI int8","AMX-BF16");
-    for(int c=0;c<5;++c){
+    printf("%-24s | %-18s | %-18s | %-18s | %-18s | %-18s | %-18s | %-18s\n","","FP32 scalar","AVX2-FMA32 8x8","AVX512-BF16 4x4","AVX512-BF16 pk","FMA32 512","VNNI int8","AMX-BF16");
+    for(int c=0;c<8;++c){
         printf("%-26s |", RN[c]);
-        for(int l=0;l<6;++l){
+        for(int l=0;l<7;++l){
             char cell[28];
             if(!have[c][l]) snprintf(cell,sizeof cell,"%s","-");
             else if(mx[c][l]-mn[c][l]<0.05) snprintf(cell,sizeof cell,"%.2fx",(mn[c][l]+mx[c][l])/2);
             else snprintf(cell,sizeof cell,"%.2f-%.2fx",mn[c][l],mx[c][l]);
-            printf(" %-20s |", cell);
+            printf(" %-18s |", cell);
         }
         printf("\n");
     }
-    printf("\naligned same-instruction-type cells (should be >= 1.0): FP32 col x row 1; AVX512-BF16 cols x row 3; AMX-BF16 col x row 5; VNNI int8 col x rows 2 and 4.\n");
+    printf("\naligned same-instruction-type cells (should be >= 1.0): AVX512-BF16 cols x row oneDNN BF16(avx512); AMX-BF16 col x row oneDNN BF16(AMX); VNNI int8 col x row oneDNN int8(avx512); AVX2-FMA32 col has no oneDNN matmul counterpart (no avx2 matmul tier); FP32 scalar col x oneDNN FP32 row is 0.04x by design.\n");
+    printf("not executable on this appliance (verified): FP16 vdpphps #UD; AMX-int8 tdpbusd executes but returns zeros; VNNI-16 vpdpwssd has an unresolved deterministic deviation.\n");
     return 0;
 }
 int main(int argc, char** argv){
@@ -124,6 +130,12 @@ int main(int argc, char** argv){
         d.ApI.resize((size_t)d.mb*d.k4*16); d.BpI.resize((size_t)d.g8*d.k4*24);
         for(int b=0;b<d.mb;++b) for(int p=0;p<d.k4;++p) for(int r=0;r<16;++r) memcpy(&d.ApI[((size_t)b*d.k4+p)*16+r],&d.A8[((size_t)(b*16+r))*K+p*4],4);
         for(int b=0;b<d.g8;++b) for(int p=0;p<d.k4;++p) for(int c=0;c<24;++c){ int n=b*24+c; if(n>=N)continue; memcpy(&d.BpI[((size_t)b*d.k4+p)*24+c],&d.B8[(size_t)n*K+p*4],4); }
+        d.mb2=(M+7)/8;
+        d.Ap2.resize((size_t)d.mb2*K*8); d.Bp2.resize((size_t)(N/8)*K*8);
+        for(int b=0;b<d.mb2;++b) for(int p=0;p<K;++p) for(int r=0;r<8;++r)
+            memcpy(&d.Ap2[((size_t)b*K+p)*8+r], &d.A32[((size_t)(b*8+r))*K+p], 4);
+        for(int b=0;b<(N/8);++b) for(int p=0;p<K;++p) for(int c=0;c<8;++c)
+            memcpy(&d.Bp2[((size_t)b*K+p)*8+c], &d.B32[((size_t)(b*8+c))*K+p], 4);
         d.C.assign((size_t)M*N+8192,0.f);
         d.Ci.assign((size_t)M*N+8192,0);
         memory::desc sB({M,K},memory::data_type::bf16,memory::format_tag::ab);
@@ -142,37 +154,46 @@ int main(int argc, char** argv){
         d.isrc=memory(sI,d.eng,d.A8); d.iwei=memory(wI,d.eng,d.B8); d.idst=memory(dI,d.eng,d.Ci.data());
     }
     // Llaminar engines (columns, low->high instructions)
-    std::function<void(ShapeData&)> L[6];
+    std::function<void(ShapeData&)> L[7];
     L[0]=[](ShapeData&d){ fp::run_fp32_skinny_matmul(d.A32,d.B32,d.C.data(),d.M,d.N,d.K,true,1.f,0.f,nullptr,nullptr); }; // FP32 scalar
-    L[1]=[](ShapeData&d){ cb::Engine sel; cb::run_bf16_gemm(d.A16,d.B16,d.C.data(),d.M,d.N,d.K,true,1.f,0.f,cb::Engine::AVX512BF16,&sel); }; // vdpbf16ps 4x4
-    L[2]=[](ShapeData&d){
+    L[1]=[](ShapeData&d){
+        #pragma omp parallel for schedule(static) collapse(2)
+        for(int i=0;i<d.mb2;++i) for(int j=0;j<(d.N/8);++j){
+            alignas(64) float st[8*8];
+            avx2f32(d.Ap2.data()+(size_t)i*d.K*8, d.Bp2.data()+(size_t)j*d.K*8, st, d.K, 0);
+            for(int c=0;c<8;++c) for(int r=0;r<8;++r)
+                d.C[(size_t)(i*8+r)*d.N+j*8+c]=st[c*8+r];
+        }
+    }; // AVX2 FMA32 8x8 (VEX-only)
+    L[2]=[](ShapeData&d){ cb::Engine sel; cb::run_bf16_gemm(d.A16,d.B16,d.C.data(),d.M,d.N,d.K,true,1.f,0.f,cb::Engine::AVX512BF16,&sel); }; // vdpbf16ps 4x4
+    L[3]=[](ShapeData&d){
         #pragma omp parallel for schedule(static) collapse(2)
         for(int i=0;i<d.mb;++i) for(int j=0;j<d.g;++j)
             m16k(d.Ap.data()+(size_t)i*d.kp*32, d.Bp.data()+(size_t)j*d.kp*48, d.C.data()+(size_t)i*16*d.N+(size_t)j*24, d.kp, (long)d.N*4);
     }; // vdpbf16ps packed 16x24
-    L[3]=[](ShapeData&d){
+    L[4]=[](ShapeData&d){
         #pragma omp parallel for schedule(static) collapse(2)
         for(int i=0;i<d.mb;++i) for(int j=0;j<(d.N/16);++j)
             f32tile(d.ApF.data()+(size_t)i*d.K*16, d.BpF.data()+(size_t)j*d.K*16, d.C.data()+(size_t)i*16*d.N+(size_t)j*16, d.K, (long)d.N*4);
     }; // vfmadd231ps 512
-    L[4]=[](ShapeData&d){
+    L[5]=[](ShapeData&d){
         #pragma omp parallel for schedule(static) collapse(2)
         for(int i=0;i<d.mb;++i) for(int j=0;j<d.g8;++j)
             vntile8(d.ApI.data()+(size_t)i*d.k4*16, d.BpI.data()+(size_t)j*d.k4*24, d.Ci.data()+(size_t)i*16*d.N+(size_t)j*24, d.k4, (long)d.N*4);
     }; // vpdpbusd int8
-    L[5]=[](ShapeData&d){ cb::Engine sel; cb::run_bf16_gemm(d.A16,d.B16,d.C.data(),d.M,d.N,d.K,true,1.f,0.f,cb::Engine::AMXBF16,&sel); }; // tdpbf16ps
+    L[6]=[](ShapeData&d){ cb::Engine sel; cb::run_bf16_gemm(d.A16,d.B16,d.C.data(),d.M,d.N,d.K,true,1.f,0.f,cb::Engine::AMXBF16,&sel); }; // tdpbf16ps
     // oneDNN tiers (rows, low->high)
     std::function<void(ShapeData&)> O[3];
     O[0]=[](ShapeData&d){ d.primF.execute(d.str,{{DNNL_ARG_SRC,d.fs},{DNNL_ARG_WEIGHTS,d.fw},{DNNL_ARG_DST,d.fd}}); d.str.wait(); };
     O[1]=[](ShapeData&d){ d.primI.execute(d.str,{{DNNL_ARG_SRC,d.isrc},{DNNL_ARG_WEIGHTS,d.iwei},{DNNL_ARG_DST,d.idst}}); d.str.wait(); };
     O[2]=[](ShapeData&d){ d.primB.execute(d.str,{{DNNL_ARG_SRC,d.msrc},{DNNL_ARG_WEIGHTS,d.mwei},{DNNL_ARG_DST,d.mdst}}); d.str.wait(); };
     // warmup
-    for(int s=0;s<4;++s) for(int l=0;l<6;++l){ if(l==5){ try{L[l](D[s]);}catch(...){} continue;} L[l](D[s]); }
+    for(int s=0;s<4;++s) for(int l=0;l<7;++l){ if(l==6){ try{L[l](D[s]);}catch(...){} continue;} L[l](D[s]); }
     for(int s=0;s<4;++s) for(int o=0;o<3;++o) O[o](D[s]);
-    double tl[6][4], to[3][4];
-    for(int l=0;l<6;++l) for(int s=0;s<4;++s) tl[l][s]=1e9;
+    double tl[7][4], to[3][4];
+    for(int l=0;l<7;++l) for(int s=0;s<4;++s) tl[l][s]=1e9;
     for(int o=0;o<3;++o) for(int s=0;s<4;++s) to[o][s]=1e9;
-    for(int l=0;l<6;++l){
+    for(int l=0;l<7;++l){
         for(int s=0;s<4;++s){
             for(int r=0;r<20;++r){ auto t=Clock::now(); L[l](D[s]); double e=ms(t,Clock::now()); if(e<tl[l][s])tl[l][s]=e; }
         }
@@ -184,15 +205,19 @@ int main(int argc, char** argv){
     }
     const bool forced = getenv("DNNL_MAX_CPU_ISA") && strstr(getenv("DNNL_MAX_CPU_ISA"),"avx512_core_bf16");
     const char* Oisa[3]={ "avx512_core", forced?"avx512_vnni":"AMX int8", forced?"avx512_core_bf16":"AMX (default)"};
-    // canonical row ids: fp32=0, int8-avx512=1, bf16-avx512=2, int8-amx=3, bf16-amx=4
-    int rowId[3] = {0, forced?1:3, forced?2:4};
+    // canonical row ids: 0 fp32-avx2, 1 int8-avx2, 2 bf16-avx2, 3 fp32-avx512, 4 int8-avx512, 5 bf16-avx512, 6 int8-amx, 7 bf16-amx
+    bool isAvx2 = forced==false && getenv("DNNL_MAX_CPU_ISA") && strstr(getenv("DNNL_MAX_CPU_ISA"),"avx2");
+    int rowId[3];
+    if (isAvx2) rowId[0]=0, rowId[1]=1, rowId[2]=2;
+    else if (forced) rowId[0]=3, rowId[1]=4, rowId[2]=5;
+    else rowId[0]=3, rowId[1]=6, rowId[2]=7;
     printf("this run\'s rows saved; run the second ISA mode too, then ./tier2d --show for the single merged matrix.\n");
     {
         FILE* f=fopen(kRowFile,"a");
         if(f){
             for(int o=0;o<3;++o){
                 fprintf(f,"row|%d|", rowId[o]);
-                for(int l=0;l<6;++l){
+                for(int l=0;l<7;++l){
                     double vmin=99,vmax=0; bool any=false;
                     for(int s=0;s<4;++s){ double r=to[o][s]/tl[l][s]; if(r<vmin)vmin=r; if(r>vmax)vmax=r; any=true; }
                     if(any) fprintf(f,"%.4f,%.4f|", vmin, vmax);
@@ -208,7 +233,7 @@ int main(int argc, char** argv){
     for(int o=0;o<3;++o){
         char buf[64]; snprintf(buf,sizeof buf,"%s (%s)",Onames[o], forced?Oisa[o]:Oisa[o]);
         printf("%-22s |", buf);
-        for(int l=0;l<6;++l){
+        for(int l=0;l<7;++l){
             double vmin=99,vmax=0; bool any=false;
             for(int s=0;s<4;++s){ double r=to[o][s]/tl[l][s]; if(r<vmin)vmin=r; if(r>vmax)vmax=r; any=true; }
             if(!any){ printf(" %22s","n/a"); continue; }
