@@ -16202,6 +16202,13 @@ add_v2_test(V2_Integration_PagedKVInstanceContract
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Instance;Admission;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVInstanceContract)
+add_executable(v2_test_paged_kv_retention_demotion integration/prefix_cache/Test__PagedKVRetentionDemotion.cpp)
+target_link_libraries(v2_test_paged_kv_retention_demotion llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PagedKVRetentionDemotion
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_retention_demotion>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;PagedKV;Retention;Demotion;TailFirst;DeficitOnly;MoveOnce;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVRetentionDemotion)
 add_executable(v2_test_retention_intent_resolver unit/prefix_cache/Test__RetentionIntentResolver.cpp)
 target_link_libraries(v2_test_retention_intent_resolver llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_RetentionIntentResolver

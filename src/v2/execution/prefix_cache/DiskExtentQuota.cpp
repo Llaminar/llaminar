@@ -31,6 +31,14 @@ bool DiskExtentQuota::admit(DiskExtentKey extent)
     return true;
 }
 
+bool DiskExtentQuota::wouldAdmit(DiskExtentKey extent) const
+{
+    if (!extent.bytes || contains(extent) || extent.bytes > quota_ ||
+        reserved_ > quota_ - extent.bytes)
+        return false;
+    return count_ < capacity();
+}
+
 bool DiskExtentQuota::retire(DiskExtentKey extent)
 {
     for (std::size_t i = 0; i < count_; ++i)

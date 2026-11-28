@@ -54,6 +54,9 @@ public:
      * @return True on admission; false without mutating when quota or journal full.
      */
     bool admit(DiskExtentKey extent);
+    /** @brief Non-mutating admission query (same rules as admit). The
+     * demotion planner uses it as the real-overflow gate before any move. */
+    bool wouldAdmit(DiskExtentKey extent) const;
     /** @brief Retire an exact admitted extent; unknown identity refuses. */
     bool retire(DiskExtentKey extent);
     /** @return Whether the exact extent identity is currently admitted. */
