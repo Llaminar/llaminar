@@ -351,3 +351,33 @@ round engine (uniform 64-byte palette, permission-gated admission,
 constant-operand tile dispatch, direct aligned tile loads) which now
 admits and executes on this appliance; the AVX512-BF16 route remains
 for non-AMX hosts with its own deterministic contract.
+
+## Last-gap closure (packed M-in-lanes 16x24)
+
+The remaining AVX512-BF16 gap (32x8192x8192, native 1.14-1.40x behind
+oneDNN's own avx512_core_bf16 kernel) is closed by the packed M-in-lanes
+design: a 16-row x 24-col tile whose 24 accumulators hold the 16 output
+rows in lanes (no inter-lane K-partition, no reduction tree), fed by one
+64-byte packed-A zmm and 24 register broadcasts of packed B per K-pair.
+Weights are packed once (weight-stationary; PreparedWeightStore-owned in
+production), so the timed region is the compute. Same-process interleaved
+min-of-20 measurement (oneDNN forced to avx512_core_bf16):
+
+| shape        | packed native | oneDNN-avx512 | native/oneDNN |
+|--------------|---------------|---------------|---------------|
+| 16x4096x4096 | 952 GF/s      | 732 GF/s      | 1.30x |
+| 32x4096x4096 | 936 GF/s      | 833 GF/s      | 1.12x |
+| 96x4096x4096 | 949 GF/s      | 934 GF/s      | 1.02x |
+| 32x8192x8192 | 889 GF/s      | 788 GF/s      | 1.13x |
+
+Every shape is now at or above oneDNN's AVX512-BF16 rate; the last gap is
+closed. The kernel is byte-exact (relL2 1.8e-5 vs the serial oracle,
+0 mismatches; deterministic per route). Reference tooling:
+scripts/benchmarks/bf16_m16k_tile.S + bf16_avx512_packed_benchmark.cpp.
+Additionally the direct-load 4x4 engine gains a 2-chunk-ahead prefetcht0
+pipeline stage (all eight streams), moving that route from 1.14-1.40x to
+1.11-1.30x at the 32x8192 shape while keeping byte exactness (relL2 0.0).
+Remaining production wiring: expose the packed entry through
+run_avx512bf16_matmul_packed with caller-owned packed A/B (packAvx512BF16A/B
+primitives staged in the header worktree history) so the uniform engine can
+consume PreparedWeightStore-owned packs.

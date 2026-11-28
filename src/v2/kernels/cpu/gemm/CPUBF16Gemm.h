@@ -472,6 +472,19 @@ namespace llaminar2
                     "cmp %8, %%r14d\n\t"
                     "jge 7f\n\t"
                     // Load set A = chunk i+2, FMA set B = chunk i+1.
+                    // Prefetch chunk i+4 on every stream (two chunks ahead of
+                    // the in-flight loads): the long-K regime is L2-latency
+                    // bound and a single-ahead pipeline starves; prefetcht0 is
+                    // a non-faulting hint, so the final iterations may hint
+                    // past the buffers.
+                    "prefetcht0 128(%0,%%r14,1)\n\t"
+                    "prefetcht0 128(%1,%%r14,1)\n\t"
+                    "prefetcht0 128(%2,%%r14,1)\n\t"
+                    "prefetcht0 128(%3,%%r14,1)\n\t"
+                    "prefetcht0 128(%4,%%r14,1)\n\t"
+                    "prefetcht0 128(%5,%%r14,1)\n\t"
+                    "prefetcht0 128(%6,%%r14,1)\n\t"
+                    "prefetcht0 128(%7,%%r14,1)\n\t"
                     "vmovdqu16 (%0,%%r14,1), %%zmm16\n\t"
                     "vmovdqu16 (%1,%%r14,1), %%zmm17\n\t"
                     "vmovdqu16 (%2,%%r14,1), %%zmm18\n\t"
