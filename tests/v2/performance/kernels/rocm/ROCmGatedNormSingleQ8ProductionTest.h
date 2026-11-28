@@ -13,7 +13,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
-#include "utils/ROCmNativeM1CaptureArguments.h"
+#include "../../../utils/ROCmNativeM1CaptureArguments.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/TensorSlice.h"
 #include <array>
