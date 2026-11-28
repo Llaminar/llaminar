@@ -2202,11 +2202,27 @@ namespace llaminar2
                         params_.pooled_position_from_publication
                             ? borrowed_view.rows() - 1
                             : params_.position_offset;
-                    success = kernel->compute_pooled_snapshot_decoder(
-                        params_.Q, view, params_.output,
-                        params_.n_heads, params_.n_kv_heads, params_.head_dim,
-                        kernel_causal, params_.window_size, pooled_position,
-                        params_.head_start, params_.gqa_n_rep, params_.execution_policy);
+                    // N1 (R52): the stage itself bounds the query window to
+                    // the publication — a misuse (negative offset or a query
+                    // batch reaching past the borrowed view) is structurally
+                    // impossible, never a silent partial mask.
+                    const int pooled_query_span =
+                        is_decode_mode ? 1 : params_.seq_len;
+                    if (pooled_position < 0 ||
+                        pooled_position + pooled_query_span > borrowed_view.rows())
+                    {
+                        pooled_ok = false;
+                        LOG_ERROR("[AttentionComputeStage] Pooled query window outside the publication"
+                                  << " position=" << pooled_position
+                                  << " rows=" << pooled_query_span
+                                  << " publication=" << borrowed_view.rows());
+                    }
+                    if (pooled_ok)
+                        success = kernel->compute_pooled_snapshot_decoder(
+                            params_.Q, view, params_.output,
+                            params_.n_heads, params_.n_kv_heads, params_.head_dim,
+                            kernel_causal, params_.window_size, pooled_position,
+                            params_.head_start, params_.gqa_n_rep, params_.execution_policy);
                     if (!success)
                         LOG_ERROR("[AttentionComputeStage] Pooled snapshot decode refused"
                                   << " layer=" << params_.layer_idx);

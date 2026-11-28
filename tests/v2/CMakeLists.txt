@@ -18536,6 +18536,16 @@ add_v2_test(V2_Integration_NonNUMAKernelClassification
 
 # Recorded-input replay of the continuous-batching serving step: a real-model
 # trace replayed device-free through the production ServingSession.
+add_executable(v2_test_pooled_serving_slot
+    unit/execution/serving/Test__PooledServingSlotOwner.cpp)
+target_include_directories(v2_test_pooled_serving_slot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_pooled_serving_slot llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_PooledServingSlotOwner
+    COMMAND $<TARGET_FILE:v2_test_pooled_serving_slot>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Pooled;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledServingSlotOwner)
+
 add_executable(v2_test_serving_step_replay unit/execution/serving/Test__ServingStepReplay.cpp unit/execution/serving/Test__ServingSubmissionOutcome.cpp unit/execution/serving/Test__ServingContinuationManifest.cpp unit/execution/serving/Test__AdmissionPressureGate.cpp)
 target_include_directories(v2_test_serving_step_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(v2_test_serving_step_replay PRIVATE

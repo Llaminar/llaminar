@@ -676,7 +676,12 @@ public:
             const int prior_rows = cells_[layer].cells[0].live()
                 ? cells_[layer].cells[0].snapshot.view().rows() : 0;
             if (next.snapshot.view().rows() != prior_rows + step_rows_)
+            {
+                LOG_ERROR("[PooledKVDecodeBinding] step incomplete layer " << layer
+                          << " prior=" << prior_rows << " step=" << step_rows_
+                          << " next=" << next.snapshot.view().rows());
                 return false;
+            }
         }
         return true;
     }

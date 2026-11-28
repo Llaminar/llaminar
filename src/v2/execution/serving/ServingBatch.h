@@ -49,6 +49,12 @@ namespace llaminar2
          *        prove batch composition never changes a request's arithmetic.
          */
         bool record_logit_digests = false;
+        /** @brief §8.4 standard retention fields (typed strings as parsed by
+         * the HTTP frontend; the flow's resolver is the single typed path).
+         * Empty = absent. The serving session forwards them verbatim to the
+         * pooled prefix flow at slot admission. */
+        std::string prompt_cache_retention;
+        std::string prompt_cache_key;
     };
 
     /** @brief Why a serving request stopped producing tokens. */

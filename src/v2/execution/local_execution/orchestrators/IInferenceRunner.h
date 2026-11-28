@@ -1284,6 +1284,7 @@ namespace llaminar2
      *
      * Implemented by DeviceGraphOrchestrator for transformer model inference.
      */
+    class PooledKVDecodeBinding;
     class IInferenceRunner
     {
     public:
@@ -3355,6 +3356,36 @@ namespace llaminar2
          * @brief Get current batch size
          */
         virtual int batch_size() const { return 1; }
+
+        /**
+         * @brief R52 pooled-serving geometry probe: the exact pooled KV
+         * geometry for the composed instance (the same geometry that
+         * admitted the ordinary KV cache). @return false when the runner is
+         * not ready / not CPU dense (pooled serving unsupported).
+         */
+
+        /**
+         * @brief R52 phase wiring: set the pooled GROUP decode batch or the
+         * pooled SINGLE binding for the NEXT serving-rows forward. The
+         * serving session's phase-split calls one shape per forward; the
+         * DGO refuses the other's boundary (decode group = one row per
+         * member; single = one prefill row-batch).
+         */
+        virtual void setPooledServingGroup(
+            const std::vector<PooledKVDecodeBinding *> &bindings)
+        {
+            (void)bindings;
+        }
+        virtual void setPooledServingBinding(PooledKVDecodeBinding *binding)
+        {
+            (void)binding;
+        }
+        virtual bool pooledKVCacheGeometry(int &kv_heads, int &head_dim,
+                                           int &layers) const
+        {
+            (void)kv_heads; (void)head_dim; (void)layers;
+            return false;
+        }
 
         /**
          * @brief Get padded sequence length for current batch

@@ -69,6 +69,34 @@ namespace llaminar2
         /** @brief Restore a cached prompt prefix into a fresh slot; see IInferenceRunner. */
         virtual int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
                                             PrefixLookupResult &admission) = 0;
+        /**
+         * @brief POOLED slot admission (R52): when the runner serves through
+         * the composed paged-KV instance the session calls this INSTEAD of
+         * the ring prefix restore. The executor admits the retention record
+         * (flow.admit with the resolver's single typed path) and, on a hit,
+         * restores the stored prefix into the slot's pooled binding.
+         * @return true = the slot is pooled (set @p restored_tokens to the
+         *         restored prefix row count; the remaining prompt prefills
+         *         through the pooled single row-batch); false = pooled
+         *         serving is not configured on this executor and the caller
+         *         keeps the ring path (no fallback: the mode is chosen once
+         *         by configuration, never per request).
+         */
+        virtual bool pooledAdmit(int slot, std::uint64_t request_id,
+                                 std::string_view retention,
+                                 std::string_view key,
+                                 const std::vector<int32_t> &prompt,
+                                 int &restored_tokens)
+        {
+            (void)slot; (void)request_id; (void)retention; (void)key;
+            (void)prompt;
+            restored_tokens = 0;
+            return false;
+        }
+        /** @brief POOLED request retirement (R52): demote the finished
+         * request's tail to the disk tier (flow.demoteTail) before the ring
+         * reset. Default no-op (no pooled flow configured). */
+        virtual bool pooledDemote(int slot) { (void)slot; return true; }
 
         /** @brief Archive a slot's consumed prompt; see IInferenceRunner. */
         virtual bool harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,

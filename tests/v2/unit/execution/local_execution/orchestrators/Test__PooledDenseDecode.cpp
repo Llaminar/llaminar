@@ -2153,3 +2153,237 @@ TEST(PooledDenseDecode, ContinuedPrefillAfterSharedAttachMatchesControl)
             << "continued-prefill decode diverged at step " << step;
     }
 }
+
+/** @test R52b: forwardServingRows with a pooled GROUP — the phase-split
+ * DECODE batch (every row = one token, one binding per row) byte-equal to
+ * the batched ring serving path. This is the exact call shape the
+ * ServingSession decode phase uses. */
+TEST(PooledDenseDecode, ServingRowsPooledGroupDecodeMatchesRingControl)
+{
+    const auto device = DeviceId::cpu();
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 24;
+    const std::array<int32_t, 3> prompt_a{1, 3, 5};
+    const std::array<int32_t, 4> prompt_b{2, 4, 6, 8};
+    const std::array<int32_t, 5> decode_a{7, 9, 11, 13, 15};
+    const std::array<int32_t, 5> decode_b{10, 12, 14, 16, 18};
+
+    auto make_runner = [&](int batch,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, batch,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        if (!owner_out->initializeInferenceStateFromArena(batch, fx.config.max_seq_len, device))
+            throw std::runtime_error("initialize failed");
+        owner_out->setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(*owner_out, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    // RING control (serving rows, batch 2).
+    std::unique_ptr<DeviceGraphOrchestrator> ring_owner;
+    PreparedWeightStore ring_store;
+    std::shared_ptr<QwenStandardGraph> ring_builder;
+    make_runner(2, ring_owner, ring_store, ring_builder);
+    ASSERT_OK("ring A prefill", ring_owner->forwardServingRows({0}, {{std::vector<int32_t>(prompt_a.begin(), prompt_a.end())}}));
+    ASSERT_OK("ring B prefill", ring_owner->forwardServingRows({1}, {{std::vector<int32_t>(prompt_b.begin(), prompt_b.end())}}));
+
+    // POOLED: one instance, two bindings, single-binding prefills (M3).
+    PagedKVPoolBudget budget;
+    budget.remaining_budget_bytes = 4 * 1024 * 1024;
+    budget.frame_bytes = 4 * 1024;
+    budget.request_records = 8;
+    budget.max_pages_per_request = 64;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(8, fx.config.n_layers, 8, 4);
+    auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+    ASSERT_TRUE(plan);
+    auto table_geom = plan->table_geometry;
+    table_geom.bank_count = 2 * table_geom.bank_count;
+    table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+    table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+    auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+    widened->table_geometry = table_geom;
+    widened->total_bytes = PhysicalPagePool::physicalBytes(plan->pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+    PhysicalMemoryPlanBuilder mbuilder;
+    mbuilder.add({.world_rank=0, .device=device,
+        .total_bytes=widened->total_bytes,
+        .admission_available_bytes=widened->total_bytes},
+        PhysicalMemoryOwner::KVCache, widened->total_bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mbuilder.build()), 0);
+    auto created = PagedKVInstance::create(authority, *widened, device);
+    ASSERT_TRUE(created);
+    PagedKVInstance instance = std::move(*created);
+
+    std::unique_ptr<DeviceGraphOrchestrator> pooled_owner;
+    PreparedWeightStore pooled_store;
+    std::shared_ptr<QwenStandardGraph> pooled_builder;
+    make_runner(2, pooled_owner, pooled_store, pooled_builder);
+    PooledKVDecodeBinding binding_a(&instance.pool(), &instance.table(), 601, 0,
+        fx.config.n_kv_heads, fx.config.head_dim, 8, fx.config.n_layers, 8);
+    PooledKVDecodeBinding binding_b(&instance.pool(), &instance.table(), 602, 1,
+        fx.config.n_kv_heads, fx.config.head_dim, 8, fx.config.n_layers, 8);
+    pooled_owner->setPooledDecodeBinding(&binding_a);
+    pooled_owner->setPooledDecodePositions({0, 0});
+    ASSERT_OK("pooled A prefill", pooled_owner->forward(prompt_a.data(), 3, 1) != nullptr);
+    pooled_owner->setPooledDecodeBinding(nullptr);
+    pooled_owner->setPooledDecodeBinding(&binding_b);
+    pooled_owner->setPooledDecodePositions({0, 0});
+    ASSERT_OK("pooled B prefill", pooled_owner->forward(prompt_b.data(), 4, 1) != nullptr);
+    pooled_owner->setPooledDecodeBinding(nullptr);
+    pooled_owner->setPooledDecodeGroup({&binding_a, &binding_b});
+
+    const std::size_t vocab = static_cast<std::size_t>(fx.config.vocab_size);
+    for (int step = 0; step < static_cast<int>(decode_a.size()); ++step)
+    {
+        std::vector<int> slots{0, 1};
+        std::vector<std::vector<int>> rows{
+            {decode_a[step]}, {decode_b[step]}};
+        ASSERT_OK("ring batched decode", ring_owner->forwardServingRows(slots, rows));
+        ASSERT_OK("pooled batched decode", pooled_owner->forwardServingRows(slots, rows));
+        const float *ring_a = ring_owner->servingRowLogits(0);
+        const float *ring_b = ring_owner->servingRowLogits(1);
+        const float *pooled_a = pooled_owner->servingRowLogits(0);
+        const float *pooled_b = pooled_owner->servingRowLogits(1);
+        ASSERT_NE(ring_a, nullptr); ASSERT_NE(ring_b, nullptr);
+        ASSERT_NE(pooled_a, nullptr); ASSERT_NE(pooled_b, nullptr);
+        EXPECT_EQ(std::memcmp(pooled_a, ring_a, vocab * sizeof(float)), 0)
+            << "serving-rows pooled A diverged at step " << step;
+        EXPECT_EQ(std::memcmp(pooled_b, ring_b, vocab * sizeof(float)), 0)
+            << "serving-rows pooled B diverged at step " << step;
+    }
+    EXPECT_EQ(binding_a.priorFor(0)->snapshot.view().rows(), 8);
+    EXPECT_EQ(binding_b.priorFor(0)->snapshot.view().rows(), 9);
+}
+
+/** @test R52b: forwardServingRows with a pooled SINGLE binding — the
+ * phase-split PREFILL call: a continued prefill of a private remainder over
+ * a live attached publication (the serving call shape for a partial-hit
+ * prefill phase), then serving-rows decode. Byte-equal to the uninterrupted
+ * pooled control. */
+TEST(PooledDenseDecode, ServingRowsPooledSingleContinuedPrefillMatchesControl)
+{
+    const auto device = DeviceId::cpu();
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 32;
+    const std::array<int32_t, 10> prompt_src{1, 3, 5, 7, 9, 11, 13, 15, 17, 19};
+    const std::array<int32_t, 2> src_after{2, 4};
+    const std::array<int32_t, 3> private_rest{19, 2, 4};
+    const std::array<int32_t, 3> decodes{6, 8, 10};
+
+    auto make_runner = [&](std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        if (!owner_out->initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initialize failed");
+        owner_out->setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(*owner_out, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 4 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 8;
+        budget.max_pages_per_request = 64;
+        const auto policy = PooledKVDecodeBinding::requestPolicy(8, fx.config.n_layers, 12, 4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        auto table_geom = plan->table_geometry;
+        table_geom.bank_count = 2 * table_geom.bank_count;
+        table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+        table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+        auto pool_geom = plan->pool_geometry;
+        pool_geom.frames = 96 + 8 * pool_geom.frames;
+        pool_geom.request_records = 8;
+        auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+        widened->pool_geometry = pool_geom;
+        widened->table_geometry = table_geom;
+        widened->total_bytes = PhysicalPagePool::physicalBytes(pool_geom, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=widened->total_bytes,
+            .admission_available_bytes=widened->total_bytes},
+            PhysicalMemoryOwner::KVCache, widened->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *widened, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    // SOURCE: 10-row prefill + 2 decodes.
+    PagedKVInstance src_instance;
+    ASSERT_TRUE(make_instance(src_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> src_owner;
+    PreparedWeightStore src_store;
+    std::shared_ptr<QwenStandardGraph> src_builder;
+    make_runner(src_owner, src_store, src_builder);
+    PooledKVDecodeBinding src(&src_instance.pool(), &src_instance.table(), 701, 0,
+        fx.config.n_kv_heads, fx.config.head_dim, 8, fx.config.n_layers, 12, false);
+    src_owner->setPooledDecodeBinding(&src);
+    ASSERT_OK("source prefill", src_owner->forward(prompt_src.data(), 10, 1) != nullptr);
+    ASSERT_OK("source decode 0", src_owner->forward(&src_after[0], 1, 1) != nullptr);
+    ASSERT_OK("source decode 1", src_owner->forward(&src_after[1], 1, 1) != nullptr);
+
+    // DESTINATION via SERVING ROWS: attach 9, continued prefill through
+    // forwardServingRows (prefill phase), decodes through forwardServingRows.
+    PagedKVInstance dst_instance;
+    ASSERT_TRUE(make_instance(dst_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> dst_owner;
+    PreparedWeightStore dst_store;
+    std::shared_ptr<QwenStandardGraph> dst_builder;
+    make_runner(dst_owner, dst_store, dst_builder);
+    PooledKVDecodeBinding dst(&src_instance.pool(), &src_instance.table(), 703, 0,
+        fx.config.n_kv_heads, fx.config.head_dim, 8, fx.config.n_layers, 12, false);
+    ASSERT_TRUE(dst.attachSharedPrefix(src, 9));
+    dst_owner->setPooledDecodeBinding(&dst);
+    ASSERT_OK("serving-rows continued prefill",
+        dst_owner->forwardServingRows({0}, {{std::vector<int32_t>(private_rest.begin(), private_rest.end())}}));
+    EXPECT_EQ(dst.priorFor(0)->snapshot.view().rows(), 12);
+
+    // CONTROL: uninterrupted pooled runner (full 12-row prefill, same decodes
+    // via serving rows as the ring-shape oracle).
+    PagedKVInstance ctrl_instance;
+    ASSERT_TRUE(make_instance(ctrl_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> ctrl_owner;
+    PreparedWeightStore ctrl_store;
+    std::shared_ptr<QwenStandardGraph> ctrl_builder;
+    make_runner(ctrl_owner, ctrl_store, ctrl_builder);
+    PooledKVDecodeBinding ctrl(&ctrl_instance.pool(), &ctrl_instance.table(), 704, 0,
+        fx.config.n_kv_heads, fx.config.head_dim, 8, fx.config.n_layers, 12, false);
+    ctrl_owner->setPooledDecodeBinding(&ctrl);
+    const std::array<int32_t, 12> full_prompt{1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 2, 4};
+    ASSERT_OK("control prefill", ctrl_owner->forward(full_prompt.data(), 12, 1) != nullptr);
+
+    const std::size_t vocab = static_cast<std::size_t>(fx.config.vocab_size);
+    for (int step = 0; step < static_cast<int>(decodes.size()); ++step)
+    {
+        ASSERT_OK("control decode", ctrl_owner->forwardServingRows({0}, {{std::vector<int32_t>{decodes[step]}}}));
+        ASSERT_OK("dst decode", dst_owner->forwardServingRows({0}, {{std::vector<int32_t>{decodes[step]}}}));
+        const float *ctrl_logits = ctrl_owner->servingRowLogits(0);
+        const float *dst_logits = dst_owner->servingRowLogits(0);
+        ASSERT_NE(ctrl_logits, nullptr);
+        ASSERT_NE(dst_logits, nullptr);
+        EXPECT_EQ(std::memcmp(dst_logits, ctrl_logits, vocab * sizeof(float)), 0)
+            << "serving-rows continued prefill decode diverged at step " << step;
+    }
+}

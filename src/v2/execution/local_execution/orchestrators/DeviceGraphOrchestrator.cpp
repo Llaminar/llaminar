@@ -18003,10 +18003,22 @@ namespace llaminar2
          * a bounded multi-row continuation with established history is decode.
          */
         const int decode_max_seq_len = std::max(1, cache_config_.decode_seq_len);
+        // POOLED shapes are phase-unambiguous by contract: the GROUP is a
+        // decode batch (one row per member); a single binding is DECODE for
+        // exactly one row and PREFILL for any multi-row row-batch (including
+        // a continued prefill over a live publication — never a heuristic
+        // decode-continuation). Resolve explicitly so the step-guard row
+        // count and the graph topology agree under the serving path too.
+        ForwardInvocationKind effective_invocation = invocation;
+        if (pooled_kv_binding_ || !pooled_kv_binding_group_.empty())
+            effective_invocation =
+                (seq_len == 1 || !pooled_kv_binding_group_.empty())
+                    ? ForwardInvocationKind::ExplicitDecode
+                    : ForwardInvocationKind::ExplicitPrefill;
         const ForwardExecutionPhase resolved_phase =
             resolveForwardExecutionPhase({
                 .role = execution_role,
-                .invocation = invocation,
+                .invocation = effective_invocation,
                 .seq_len = seq_len,
                 .batch_size = batch_size,
                 .decode_max_seq_len = decode_max_seq_len,
@@ -61922,6 +61934,28 @@ namespace llaminar2
             used[static_cast<size_t>(slot)] = true;
         }
 
+        // POOLED serving (R52b): the pooled publication is the position
+        // authority — never the serving host mirror. The adapter sets ONE
+        // pooled shape per call: the GROUP (every row = one decode token,
+        // one binding per row — the phase-split decode batch) or the SINGLE
+        // binding (one prefill row-batch — a prefill phase, including a
+        // continued prefill over a live publication). Both shapes refuse the
+        // other's boundary rather than mis-addressing pooled pages.
+        const bool pooled_group_serving = !pooled_kv_binding_group_.empty();
+        const bool pooled_single_serving = pooled_kv_binding_ != nullptr;
+        if (pooled_group_serving && pooled_single_serving)
+            return fail("Pooled serving refuses a single binding and a group in one forward");
+        if (pooled_group_serving)
+        {
+            if (rows.size() != pooled_kv_binding_group_.size())
+                return fail("Pooled group serving requires one binding per serving row");
+            for (size_t row = 0; row < rows.size(); ++row)
+                if (rows[row].size() != 1)
+                    return fail("Pooled group serving is decode-only (prefill participants use one pooled single forward per row-batch)");
+        }
+        else if (pooled_single_serving && rows.size() != 1)
+            return fail("Pooled single serving prefill requires exactly one row-batch per forward");
+
         // The LM head ordinarily computes one row (the last physical row of
         // the whole batch). Serving needs each row's own last real token, so
         // select exactly those terminal rows: row r is padded to the widest
@@ -61944,12 +61978,22 @@ namespace llaminar2
         request_batched_prefill_logits_row_count_ = row_count;
 
         // Rows address arbitrary slots: positions are presented in row order
-        // for this transaction and written back to each slot afterwards.
+        // for this transaction and written back to each slot afterwards. In
+        // POOLED serving the publication row count is the single authority:
+        // state_.positions is seated from each member's nextPosition() (the
+        // graph-time pooled checks compare against exactly this), and the host
+        // mirror is refreshed FROM the publication after the forward.
         state_.positions.assign(rows.size(), 0);
         state_.sequence_lengths.assign(rows.size(), 0);
         for (size_t row = 0; row < rows.size(); ++row)
         {
-            state_.positions[row] = serving_slot_positions_[static_cast<size_t>(slots[row])];
+            if (pooled_group_serving)
+                state_.positions[row] = pooled_kv_binding_group_[row]->nextPosition();
+            else if (pooled_single_serving)
+                state_.positions[row] = pooled_kv_binding_->nextPosition();
+            else
+                state_.positions[row] =
+                    serving_slot_positions_[static_cast<size_t>(slots[row])];
             state_.sequence_lengths[row] = state_.positions[row];
         }
         serving_row_slots_ = slots;
@@ -61964,12 +62008,21 @@ namespace llaminar2
             serving_row_error_ = "Serving forward failed in the graph executor (see the preceding error)";
         if (ok)
             for (size_t row = 0; row < rows.size(); ++row)
-                serving_slot_positions_[static_cast<size_t>(slots[row])] +=
-                    static_cast<int>(rows[row].size());
+            {
+                if (pooled_group_serving)
+                    serving_slot_positions_[static_cast<size_t>(slots[row])] =
+                        pooled_kv_binding_group_[row]->nextPosition();
+                else if (pooled_single_serving)
+                    serving_slot_positions_[static_cast<size_t>(slots[row])] =
+                        pooled_kv_binding_->nextPosition();
+                else
+                    serving_slot_positions_[static_cast<size_t>(slots[row])] +=
+                        static_cast<int>(rows[row].size());
+            }
         return ok;
     }
 
-    const float *DeviceGraphOrchestrator::servingRowLogits(int row) const
+const float *DeviceGraphOrchestrator::servingRowLogits(int row) const
     {
         if (row < 0 || row >= serving_logits_rows_)
             return nullptr;

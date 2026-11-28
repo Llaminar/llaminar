@@ -4660,6 +4660,32 @@ namespace llaminar2
          */
         int n_kv_heads() const { return graph_builder_ ? graph_builder_->config().n_kv_heads : 0; }
 
+        void setPooledServingGroup(
+            const std::vector<PooledKVDecodeBinding *> &bindings) override
+        {
+            setPooledDecodeGroup(bindings);
+        }
+        void setPooledServingBinding(
+            PooledKVDecodeBinding *binding) override
+        {
+            setPooledDecodeBinding(binding);
+        }
+        bool pooledKVCacheGeometry(int &kv_heads, int &head_dim,
+                                   int &layers) const override
+        {
+            if (!graph_builder_ || !state_.kv_cache ||
+                !state_.device_id.is_cpu())
+                return false;
+            const int heads = n_kv_heads();
+            const int dim = state_.kv_cache->local_kv_dim();
+            if (heads <= 0 || dim <= 0 || dim % heads != 0)
+                return false;
+            kv_heads = heads;
+            head_dim = dim / heads;
+            layers = n_layers();
+            return layers > 0;
+        }
+
         /**
          * @brief Get cache statistics
          */

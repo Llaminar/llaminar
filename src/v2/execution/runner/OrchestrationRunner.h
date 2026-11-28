@@ -30,6 +30,7 @@
 #pragma once
 
 #include "execution/serving/ServingSession.h"
+#include "execution/serving/PooledServingSlotOwner.h"
 #include "../../models/ModelGenerationPolicy.h"
 
 #include "IOrchestrationRunner.h"
@@ -312,6 +313,7 @@ namespace llaminar2
         using IOrchestrationRunner::beginServingBatch;
         bool beginServingBatch(int capacity,
                                std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage) override;
+        bool setupPooledServing(int capacity, int supported, std::string &error);
         bool submitServingRequest(ServingBatchRequest request) override;
         void cancelServingRequest(std::uint64_t id) override;
         void grantServingTokens(std::uint64_t id, int tokens) override;
@@ -2381,6 +2383,11 @@ namespace llaminar2
          */
         std::unique_ptr<IServingRowExecutor> serving_rows_adapter_;
         std::unique_ptr<ServingSession> serving_session_;
+        /** @brief R52 pooled serving: the composed instance + per-slot pool
+         * binding owner (present only when the operator configured an
+         * explicit paged-KV pool cap; the default ring path is untouched). */
+        std::unique_ptr<PagedKVInstance> pooled_instance_;
+        std::unique_ptr<PooledServingSlotOwner> pooled_slots_;
         std::shared_ptr<IServingTraceRecorder> serving_trace_recorder_;
         bool batched_decode_active_{false};
         int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited

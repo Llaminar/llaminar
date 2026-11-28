@@ -56,6 +56,8 @@
 #include "execution/moe/MoEOverlayRowCandidateFinalization.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "planning/TensorParallelSourceDeclaration.h"
+#include "planning/PagedKVInstanceFactory.h"
+#include "planning/PagedKVInstancePlan.h"
 #include "planning/OriginalRankCapacityExchange.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
@@ -26776,14 +26778,67 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         class InferenceRunnerServingRows final : public IServingRowExecutor
         {
         public:
-            explicit InferenceRunnerServingRows(IInferenceRunner &runner) : runner_(runner) {}
+            InferenceRunnerServingRows(IInferenceRunner &runner,
+                                       PooledServingSlotOwner *pooled)
+                : runner_(runner), pooled_(pooled) {}
             bool forwardServingRows(const std::vector<int> &slots,
                                     const std::vector<std::vector<int>> &rows) override
             {
-                return runner_.forwardServingRows(slots, rows);
+                if (pooled_ && !rows.empty())
+                {
+                    // R52 phase wiring: the DGO gets the pooled shape the
+                    // session's phase-split work implies — ONE GROUP for the
+                    // decode phase (every row one token) or ONE SINGLE
+                    // binding for the prefill phase (exactly one row-batch).
+                    if (rows.size() == 1 && rows[0].size() > 1)
+                    {
+                        runner_.setPooledServingBinding(pooled_->bindingFor(slots[0]));
+                    }
+                    else
+                    {
+                        std::vector<PooledKVDecodeBinding *> group;
+                        group.reserve(slots.size());
+                        for (const int slot : slots)
+                        {
+                            auto *b = pooled_->bindingFor(slot);
+                            if (!b)
+                                return false;
+                            group.push_back(b);
+                        }
+                        runner_.setPooledServingGroup(group);
+                    }
+                }
+                const bool ok = runner_.forwardServingRows(slots, rows);
+                runner_.setPooledServingGroup({});
+                runner_.setPooledServingBinding(nullptr);
+                return ok;
             }
-            const float *servingRowLogits(int row) const override { return runner_.servingRowLogits(row); }
-            bool resetServingRow(int slot) override { return runner_.resetServingRow(slot); }
+            bool pooledAdmit(int slot, std::uint64_t request_id,
+                             std::string_view retention, std::string_view key,
+                             const std::vector<int32_t> &prompt,
+                             int &restored_tokens) override
+            {
+                pooled_error_.clear();
+                if (!pooled_)
+                    return false;
+                return pooled_->admitSlot(slot, request_id, retention, key,
+                    prompt, restored_tokens, pooled_error_);
+            }
+            bool pooledDemote(int slot) override
+            {
+                pooled_error_.clear();
+                if (!pooled_)
+                    return true;
+                return pooled_->demoteSlot(slot, pooled_error_);
+            }
+            const float *servingRowLogits(int row) const override
+            {
+                return runner_.servingRowLogits(row);
+            }
+            bool resetServingRow(int slot) override
+            {
+                return runner_.resetServingRow(slot);
+            }
             int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
                                         PrefixLookupResult &admission) override
             {
@@ -26794,26 +26849,95 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             {
                 return runner_.harvestServingRowPrefix(slot, admission, prompt);
             }
-            std::string servingRowError() const override { return runner_.servingRowError(); }
-            // P4 production continuation: the runner's own cache exports/imports
-            // the slot KV (never a host shadow; the cache bytes are canonical).
-            std::optional<std::vector<std::byte>> exportSlotKV(int slot) const override
+            std::string servingRowError() const override
             {
-                return runner_.exportSlotKV(slot);
+                return pooled_error_.empty() ? runner_.servingRowError() : pooled_error_;
             }
-            bool importSlotKV(int slot, std::span<const std::byte> bytes) override
-            {
-                return runner_.importSlotKV(slot, bytes);
-            }
-            bool resumedSlotKVLength(int slot, int expected) const override
-            {
-                return runner_.resumedSlotKVLength(slot, expected);
-            }
-
         private:
             IInferenceRunner &runner_;
+            PooledServingSlotOwner *pooled_;
+            std::string pooled_error_;
         };
     } // namespace
+
+    bool OrchestrationRunner::setupPooledServing(int capacity, int supported,
+        std::string &error)
+    {
+        const auto &tiers = plan_.runtime.paged_kv_tiers;
+        // The typed intent gate: an EXPLICIT finite pool cap opts into pooled
+        // serving; the default (Auto) keeps the production ring path. The
+        // pooled replacement of the ring is never implicit.
+        if (tiers.pool_budget_mode != PagedKVPoolBudgetMode::Cap)
+            return true;
+        int kv_heads = 0, head_dim = 0, layers = 0;
+        if (!runner_ ||
+            !runner_->pooledKVCacheGeometry(kv_heads, head_dim, layers))
+        {
+            error = "pooled serving requires a CPU dense runner with an "
+                    "admitted KV geometry (CPU paged pooling only)";
+            return false;
+        }
+        const int context = plan_.runtime.max_seq_len > 0
+            ? plan_.runtime.max_seq_len
+            : config_.max_seq_len;
+        constexpr int kPageTokens = 8; // Pooled page granularity (CPU vertical).
+        // The accepted-work envelope covers the request's forwards: prefill
+        // chunks (context / kPrefillChunk rounded up) + decode steps
+        // (context) + margin.
+        const int issuances =
+            context + (context + 63) / 64 + 8;
+        // The instance plan seats the WHOLE serving capacity: every slot's
+        // accepted-work envelope (banks = max(capacity * issuances, the
+        // two-banks-per-layer floor)) and enough pool request records for
+        // the live grants (import + demotion truncate).
+        const std::size_t banks = std::max<std::size_t>(
+            static_cast<std::size_t>(capacity) *
+                static_cast<std::size_t>(issuances),
+            2 * static_cast<std::size_t>(layers));
+        const auto policy = PagedKVInstancePolicy{kPageTokens,
+            banks, /*readers_per_bank=*/4,
+            /*request_records=*/capacity + 2};
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = tiers.pool_cap_bytes;
+        budget.frame_bytes = static_cast<std::size_t>(kPageTokens) * 2 *
+            static_cast<std::size_t>(kv_heads) * static_cast<std::size_t>(head_dim) *
+            sizeof(float);
+        budget.request_records = capacity;
+        budget.max_pages_per_request =
+            (context + kPageTokens - 1) / kPageTokens + 4;
+        auto plan = planPagedKVInstance(tiers, budget, policy, DeviceId::cpu());
+        if (!plan)
+        {
+            error = "pooled serving plan refused (paged KV geometry does not "
+                    "admit the configured pool cap)";
+            return false;
+        }
+        auto outcome = admitConfiguredPagedKVInstance(
+            physical_memory_authority_, tiers, budget, policy, DeviceId::cpu());
+        if (!outcome.ok())
+        {
+            error = "pooled serving memory admission refused: " + outcome.refusal;
+            return false;
+        }
+        if (!outcome.instance)
+        {
+            error = "pooled serving instance outcome is empty after a success receipt";
+            return false;
+        }
+        pooled_instance_ = std::make_unique<PagedKVInstance>(
+            std::move(*outcome.instance));
+        pooled_slots_ = std::make_unique<PooledServingSlotOwner>(
+            *pooled_instance_, capacity, kv_heads, head_dim, layers,
+            kPageTokens, issuances, /*readers_per_bank=*/4,
+            tiers.retention_classes_ceiling,
+            /*trust_domain=*/1 /* the local CPU route's authenticated value */,
+            static_cast<std::size_t>(capacity), static_cast<std::size_t>(capacity));
+        // Re-create the row adapter with the pooled owner (the DGO per-phase
+        // wiring and the flow hooks are active for the whole session).
+        serving_rows_adapter_ = std::make_unique<InferenceRunnerServingRows>(
+            *runner_, pooled_slots_.get());
+        return true;
+    }
 
     bool OrchestrationRunner::beginServingBatch(
         int capacity, std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage)
@@ -26832,7 +26956,8 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         // session's lifetime because the slots own all live sequence state.
         runner_->clear_cache();
         const int context = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len : config_.max_seq_len;
-        serving_rows_adapter_ = std::make_unique<InferenceRunnerServingRows>(*runner_);
+        serving_rows_adapter_ = std::make_unique<InferenceRunnerServingRows>(
+            *runner_, pooled_slots_.get());
         serving_session_ = std::make_unique<ServingSession>(*serving_rows_adapter_, context, vocabSize());
         serving_session_->setTraceRecorder(serving_trace_recorder_);
         std::string error;
@@ -26847,6 +26972,22 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         {
             serving_session_.reset();
             serving_rows_adapter_.reset();
+            return setError(error);
+        }
+        // R52 POOLED serving: an EXPLICIT finite paged-KV pool cap is the
+        // typed intent (the default Auto/Off config keeps the production
+        // ring path — no implicit mode change). The composed instance is
+        // admitted under the runner's OWN physical memory authority, the
+        // per-slot binding owner is created, and the row adapter wires the
+        // DGO per phase. Any refusal fails the whole batch open (typeless
+        // partial pooled serving is not a state).
+        if (!setupPooledServing(capacity, supported, error))
+        {
+            serving_session_->end();
+            serving_session_.reset();
+            serving_rows_adapter_.reset();
+            pooled_slots_.reset();
+            pooled_instance_.reset();
             return setError(error);
         }
         return true;
@@ -26919,6 +27060,8 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             serving_session_->end();
         serving_session_.reset();
         serving_rows_adapter_.reset();
+        pooled_slots_.reset();
+        pooled_instance_.reset();
     }
 
     void OrchestrationRunner::setServingTraceRecorder(std::shared_ptr<IServingTraceRecorder> recorder)

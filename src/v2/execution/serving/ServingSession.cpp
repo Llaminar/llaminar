@@ -367,8 +367,18 @@ namespace llaminar2
                 pending_forced_.erase(f);
             }
             // Reuse the longest cached prefix in this slot only; at least one
-            // prompt token is still computed by the row's own forward.
-            const int restored = executor_.restoreServingRowPrefix(slot, row.request.prompt, row.prefix_admission);
+            // prompt token is still computed by the row's own forward. In
+            // POOLED serving the pooled flow owns the prefix: pooledAdmit
+            // admits the retention record and, on a hit, restores the stored
+            // prefix into the slot's pooled binding (the ring restore is not
+            // called; a miss prefills through the pooled single row-batch).
+            int restored = 0;
+            if (!executor_.pooledAdmit(slot, row.request.id,
+                    row.request.prompt_cache_retention,
+                    row.request.prompt_cache_key, row.request.prompt, restored))
+            {
+                restored = executor_.restoreServingRowPrefix(slot, row.request.prompt, row.prefix_admission);
+            }
             if (restored < 0)
             {
                 ServingBatchEvent event;
@@ -377,6 +387,9 @@ namespace llaminar2
                 event.error = "Serving prefix restore failed";
                 event.prompt_tokens = static_cast<int>(row.request.prompt.size());
                 events.push_back(std::move(event));
+                if (!executor_.pooledDemote(slot))
+                    return sealAll("Serving slot " + std::to_string(slot) +
+                                   " pooled demotion refused after a failed prefix restore", events);
                 if (!executor_.resetServingRow(slot))
                     return sealAll("Serving slot " + std::to_string(slot) +
                                    " could not be reset after a failed prefix restore", events);
@@ -588,6 +601,12 @@ namespace llaminar2
             event.finish = finish[r];
             if (finish[r] == ServingFinishReason::Error)
                 event.error = finish_error[r];
+            // POOLED retirement (R52): the finished request's tail demotes to
+            // the disk tier BEFORE the ring reset (demotion is lifecycle
+            // ordered at the call boundary; a refusal seals precisely).
+            if (!executor_.pooledDemote(row.slot) && reset_failure.empty())
+                reset_failure = "Serving slot " + std::to_string(row.slot) +
+                                " pooled demotion refused";
             if (!executor_.resetServingRow(row.slot) && reset_failure.empty())
                 reset_failure = "Serving slot " + std::to_string(row.slot) + " could not be reset";
             slot_busy_[static_cast<std::size_t>(row.slot)] = false;

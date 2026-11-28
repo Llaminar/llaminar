@@ -2156,6 +2156,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/runner/ContinuationRequestGroup.cpp
     execution/runner/OrchestrationRunner.cpp
     execution/serving/ServingSession.cpp
+    execution/serving/PooledServingSlotOwner.cpp
     execution/serving/ServingContinuationManifest.cpp
     execution/serving/AdmissionPressureGate.cpp
     execution/runner/MTPStochasticVerificationOwner.cpp
