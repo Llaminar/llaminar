@@ -75,6 +75,23 @@ const PooledPrefixRecord *PooledKVPrefixFlow::record(std::uint64_t ns,
     return nullptr;
 }
 
+namespace
+{
+/** @brief R51 retry: pending retire failures (real remove errors) are
+ * re-attempted BEFORE any gate of the operation can refuse — a
+ * live/zero-deficit/not-resident/whole-prefix refusal still heals them.
+ * Failures stay owned in the record (never anonymous). */
+void retryPendingRetire(PooledPrefixRecord &rec, PagedKVArchiveStore &store)
+{
+    if (rec.pending_retire.empty())
+        return;
+    std::vector<PagedKVArchiveExtentKey> still;
+    for (const auto &key : rec.pending_retire)
+        if (!store.retire(key)) still.push_back(key);
+    rec.pending_retire = std::move(still);
+}
+} // namespace
+
 PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
     std::uint64_t ns, std::uint64_t prefix, PooledKVDecodeBinding &binding,
     std::size_t deficit_pages)
@@ -86,6 +103,8 @@ PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
         outcome.refusal = "demotion requires an idle admitted prefix record";
         return outcome;
     }
+    auto *store = instance_.diskStore();
+    retryPendingRetire(*rec, *store); // Before ANY operation gate.
     if (deficit_pages == 0)
         return outcome; // Zero deficit: nothing to do.
     if (binding.pool() != &instance_.pool())
@@ -150,17 +169,6 @@ PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
             head_rows = static_cast<int>(head);
         heads.push_back(section->slice(0, head).withProvenance(trust_domain_, prefix));
         tails.push_back(section->slice(head, rows).withProvenance(trust_domain_, prefix));
-    }
-    // Hardening (R51): a retire failure from an earlier restore keeps its
-    // extent in the record (owned + admitted, never anonymous); EVERY later
-    // flow operation on the record re-attempts the pending retirements.
-    auto *store = instance_.diskStore();
-    if (!rec->pending_retire.empty())
-    {
-        std::vector<PagedKVArchiveExtentKey> still;
-        for (const auto &key : rec->pending_retire)
-            if (!store->retire(key)) still.push_back(key);
-        rec->pending_retire = std::move(still);
     }
     // ALL-or-none against the store: publish the RESIDENT HEAD and the TAIL
     // as separate per-layer extents (the restore path owns the complete
@@ -243,6 +251,7 @@ bool PooledKVPrefixFlow::restore(std::uint64_t ns, std::uint64_t prefix,
         if (refusal) *refusal = "restore requires an admitted prefix record";
         return false;
     }
+    retryPendingRetire(*rec, *instance_.diskStore()); // Before ANY gate.
     if (binding.pool() != &instance_.pool())
     {
         if (refusal) *refusal = "restore requires the composed instance's binding";
@@ -252,18 +261,6 @@ bool PooledKVPrefixFlow::restore(std::uint64_t ns, std::uint64_t prefix,
     {
         if (refusal) *refusal = "the prefix is not fully resident in the store (head+tail required)";
         return false;
-    }
-    // Hardening (R51): re-attempt pending retirements first (same rule as
-    // demotion — a failure keeps them admitted + owned by the record).
-    {
-        auto *store_r = instance_.diskStore();
-        if (!rec->pending_retire.empty())
-        {
-            std::vector<PagedKVArchiveExtentKey> still;
-            for (const auto &key : rec->pending_retire)
-                if (!store_r->retire(key)) still.push_back(key);
-            rec->pending_retire = std::move(still);
-        }
     }
     // Read every stamped head+tail extent back (the store verifies identity
     // and digest; the binding enforces the ROUTE's trust/ancestry

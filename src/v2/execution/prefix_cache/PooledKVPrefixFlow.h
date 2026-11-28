@@ -52,8 +52,10 @@ struct PooledPrefixRecord
     std::vector<PagedKVArchiveExtentKey> tail_extents;
     /** @brief Extents whose RETIRE failed (a real filesystem remove error —
      * NOT the missing-file healing, which reports success). They stay OWNED
-     * and admitted by this record (never anonymous unowned disk quota) and
-     * every later demotion/restore of the record re-attempts them. */
+     * and admitted by this record (never anonymous unowned disk quota); the
+     * flow re-attempts them on the next demotion/restore of the record that
+     * reaches the record lookup (before any refusal gate of the operation —
+     * a live/not-resident/whole-prefix refusal still heals them). */
     std::vector<PagedKVArchiveExtentKey> pending_retire;
     /** @brief The authenticated route values stamped at write time; the
      * restore passes THE SAME values as the expectation parameters. */
