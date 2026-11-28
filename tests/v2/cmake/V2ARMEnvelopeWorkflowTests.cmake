@@ -17,8 +17,3 @@ v2_add_core_free_test(V2_Unit_NativeBuildCacheReceipt
         -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
         -p test_native_build_cache_receipt.py
     LABELS V2 Unit DeviceFree CI)
-v2_add_core_free_test(V2_Unit_ArmWitnessToolchainManifest
-    COMMAND "${Python3_EXECUTABLE}" -m unittest discover
-        -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
-        -p test_arm_witness_toolchain_manifest.py
-    LABELS V2 Unit DeviceFree CI)
