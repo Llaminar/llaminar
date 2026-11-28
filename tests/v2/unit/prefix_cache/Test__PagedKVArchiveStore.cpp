@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 namespace llaminar2
@@ -143,6 +145,31 @@ TEST(PagedKVArchiveStore, RetireRemovesExtentAndReleasesQuota)
     EXPECT_FALSE(refusal.empty());
 }
 
+/** @test H2: an admitted-but-missing extent heals on retire — the quota is
+ * released (the extent holds no storage, its charge must not stick until
+ * restart) and a second retire no-ops. */
+TEST(PagedKVArchiveStore, RetireHealsAdmittedButMissingExtent)
+{
+    TempDir dir;
+    const auto route = validatePagedKVDiskRoute(tierWithDisk(dir.path, 1 << 20, 8));
+    ASSERT_TRUE(route.valid);
+    PagedKVArchiveStore store(route);
+    ArchiveFixture fx;
+    auto archive = makeArchive(fx);
+    auto key = store.put(archive, 1, 7);
+    ASSERT_TRUE(key.has_value());
+    EXPECT_GT(store.quota().bytesAdmitted(), 0u);
+    // Simulate external loss of the extent file (crash prune, admin removal).
+    std::error_code ec;
+    const auto path = dir.path + "/" + prefixHashHex(key->digest) + ".7.1";
+    ASSERT_TRUE(std::filesystem::remove(path, ec));
+    EXPECT_TRUE(store.retire(*key));
+    EXPECT_EQ(store.quota().bytesAdmitted(), 0u);
+    EXPECT_FALSE(store.quota().contains({key->generation, key->namespace_id,
+        key->digest, key->bytes}));
+    EXPECT_FALSE(store.retire(*key)); // Already withdrawn.
+}
+
 /** @test A quota that cannot hold the rounded extent refuses BEFORE storage:
  * no file, no quota admission, precise diagnostic. */
 TEST(PagedKVArchiveStore, QuotaFullRefusesBeforeAnyFile)
@@ -200,9 +227,10 @@ TEST(PagedKVArchiveStore, CorruptAndTamperedExtentRefuse)
     EXPECT_TRUE(store.retire(*key));
 }
 
-/** @test Engine-only cleanup: only the exact temp pattern is removed; a
+/** @test Namespace-safe cleanup (H1): removes ONLY the exact engine temp
+ * shape whose owning pid is PROVABLY GONE; a live process's in-flight temp, a
  * named extent and a foreign file are never touched. */
-TEST(PagedKVArchiveStore, CleanupIsNamespaceSafe)
+TEST(PagedKVArchiveStore, CleanupIsNamespaceSafeAndOwnershipProof)
 {
     TempDir dir;
     const auto route = validatePagedKVDiskRoute(tierWithDisk(dir.path, 1 << 20, 8));
@@ -212,22 +240,97 @@ TEST(PagedKVArchiveStore, CleanupIsNamespaceSafe)
     auto archive = makeArchive(fx);
     auto key = store.put(archive, 1, 7);
     ASSERT_TRUE(key.has_value());
-    // Simulate a crash-orphaned engine temp AND a foreign file.
+    // A genuinely dead owner: fork a child that exits immediately, then use
+    // its pid (kill(pid,0) -> ESRCH afterwards — provably gone).
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) _exit(0);
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    // Orphan engine temp of the DEAD child pid + live temp of THIS process
+    // (an in-flight concurrent put of a live job) + a foreign file.
     {
-        std::ofstream t(dir.path + "/.llaminar-kv-12345.tmp");
+        std::ofstream t(dir.path + "/.llaminar-kv-" + std::to_string(child) + "-1.tmp");
         t << "orphan";
+    }
+    {
+        std::ofstream t(dir.path + "/.llaminar-kv-" + std::to_string(::getpid()) + "-999.tmp");
+        t << "live in-flight";
     }
     {
         std::ofstream f(dir.path + "/foreign-file.txt");
         f << "keep me";
     }
     EXPECT_EQ(store.cleanOrphanedTemps(), 1u);
+    // Dead-owner orphan removed; LIVE temp MUST remain (ownership proof);
+    // foreign file MUST remain; named extent MUST remain and still read.
+    EXPECT_FALSE(std::filesystem::exists(
+        dir.path + "/.llaminar-kv-" + std::to_string(child) + "-1.tmp"));
+    EXPECT_TRUE(std::filesystem::exists(
+        dir.path + "/.llaminar-kv-" + std::to_string(::getpid()) + "-999.tmp"));
     EXPECT_TRUE(std::filesystem::exists(dir.path + "/foreign-file.txt"));
-    // The named extent still exists and reads.
     std::string refusal;
     EXPECT_TRUE(store.get(*key, &refusal).has_value()) << refusal;
-    // A second cleanup finds nothing more.
     EXPECT_EQ(store.cleanOrphanedTemps(), 0u);
+}
+
+/** @test H1: a live process's engine temp is NEVER removed by cleanup
+ * (negative control: pid liveness beats name matching). */
+TEST(PagedKVArchiveStore, LiveTempNegativeIsNeverCleaned)
+{
+    TempDir dir;
+    const auto route = validatePagedKVDiskRoute(tierWithDisk(dir.path, 1 << 20, 8));
+    ASSERT_TRUE(route.valid);
+    PagedKVArchiveStore store(route);
+    {
+        std::ofstream t(dir.path + "/.llaminar-kv-" + std::to_string(::getpid()) + "-7.tmp");
+        t << "in flight";
+    }
+    EXPECT_EQ(store.cleanOrphanedTemps(), 0u);
+    EXPECT_TRUE(std::filesystem::exists(
+        dir.path + "/.llaminar-kv-" + std::to_string(::getpid()) + "-7.tmp"));
+}
+
+/** @test H1: concurrent puts in one process use fresh exclusive temp names
+ * (O_EXCL per-operation) and never corrupt each other. */
+TEST(PagedKVArchiveStore, ConcurrentPutsUseFreshExclusiveTemps)
+{
+    TempDir dir;
+    const auto route = validatePagedKVDiskRoute(tierWithDisk(dir.path, 1 << 20, 32));
+    ASSERT_TRUE(route.valid);
+    PagedKVArchiveStore store(route);
+    ArchiveFixture fx;
+    // One shared immutable section is REPLACED per thread under its own
+    // generation (distinct final paths; the caller's real replacement shape).
+    auto archive = makeArchive(fx, 4);
+    std::vector<std::optional<PagedKVArchiveExtentKey>> keys(8);
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < keys.size(); ++i)
+        threads.emplace_back([&, i]() {
+            keys[i] = store.put(archive, static_cast<std::uint64_t>(100 + i), 7);
+        });
+    for (auto &t : threads) t.join();
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        ASSERT_TRUE(keys[i].has_value()) << "put " << i << " failed";
+        ASSERT_EQ(keys[i]->generation, static_cast<std::uint64_t>(100 + i));
+        std::string refusal;
+        auto loaded = store.get(*keys[i], &refusal);
+        ASSERT_TRUE(loaded.has_value()) << refusal;
+        const auto a = archive.serialize();
+        const auto b = loaded->serialize();
+        ASSERT_EQ(a.size(), b.size());
+        EXPECT_EQ(std::memcmp(a.data(), b.data(), a.size()), 0);
+    }
+    // No temp files remain after the concurrent puts.
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir.path, ec),
+             end = std::filesystem::directory_iterator();
+         !ec && it != end; it.increment(ec))
+    {
+        const auto name = it->path().filename().string();
+        EXPECT_EQ(name.rfind(".llaminar-kv-", 0), std::string::npos) << name;
+    }
 }
 
 /** @test Construction refuses a wrong directory (engine-only namespace). */

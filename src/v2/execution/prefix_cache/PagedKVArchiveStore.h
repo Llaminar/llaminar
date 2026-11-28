@@ -15,8 +15,9 @@
  * (partial/corrupt archives refuse). Retirement removes exactly the
  * advertised extent and releases its quota; replacement extents (old + new)
  * are BOTH admitted until the old one is retired, so the quota counts the
- * real on-disk set. Cleanup removes ONLY engine-named temp files; a foreign
- * file in the configured directory is never touched.
+ * real on-disk set. Cleanup removes ONLY engine-named temp files whose
+ * owning pid is provably gone — a live process's in-flight temp and any
+ * foreign file are never touched.
  *
  * The store never derives quota, never probes free disk space and never
  * invents a default directory: the route (validated by validatePagedKVDiskRoute)
@@ -70,9 +71,9 @@ public:
      * @param namespace_id Engine-chosen namespace (content partition).
      * @return The admitted extent key (digest + rounded bytes), or empty with
      * a precise refusal when the quota is too small, the directory is not
-     * writable, the write fails, or the section is not storable. A refused
-     * put NEVER leaves a file behind and NEVER leaves an outstanding quota
-     * admission.
+     * writable, the write or directory-fsync fails, or the section is not
+     * storable. A refused put NEVER leaves a file behind and NEVER leaves an
+     * outstanding quota admission.
      */
     std::optional<PagedKVArchiveExtentKey> put(
         const PagedKVArchive &archive, std::uint64_t generation,
@@ -90,19 +91,22 @@ public:
 
     /**
      * @brief Retire one exact admitted extent: unlink + quota release.
-     * @return True when the extent existed and was removed; false when the
-     * identity was not admitted or the file was already gone (no mutation).
+     * @return True when the extent is gone (removed, or an admitted-but-
+     * missing extent whose quota was released as defined healing); false only
+     * when the identity was never admitted or removal itself failed
+     * (no mutation).
      */
     bool retire(const PagedKVArchiveExtentKey &key);
 
     /**
      * @brief Engine-only cleanup of orphaned temp files.
      *
-     * Removes ONLY files matching the engine's temp pattern in the configured
-     * directory (crash-orphaned `.<strategy>.tmp-*` from failed puts). A
-     * foreign file is never removed; a named extent is never removed here
-     * (retirement owns extents). The configured directory itself is never
-     * touched.
+     * Removes ONLY files matching the engine temp shape whose owning pid is
+     * provably gone (crash-orphaned `.llaminar-kv-<pid>-<ordinal>.tmp` from
+     * failed puts). A temp owned by a live process is an in-flight
+     * concurrent operation and is never removed; a foreign file is never
+     * removed; a named extent is never removed here (retirement owns
+     * extents). The configured directory itself is never touched.
      * @return Number of temp files removed.
      */
     std::size_t cleanOrphanedTemps() const;
