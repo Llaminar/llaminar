@@ -373,7 +373,28 @@ namespace llaminar2
                     source->size_bytes(), layout);
                 auto *pool = orchestrator.getPool(device.ordinal);
                 ASSERT_NE(pool, nullptr);
-                EXPECT_EQ(pool->totalPlannedBytes(), bom.gpu_live_bytes);
+                // Planning exposes the last region's unrounded end; physical
+                // allocation rounds that end once, independently of staging.
+                const auto planned_cursor = pool->totalPlannedBytes();
+                EXPECT_EQ(alignGPUWeightLoadAllocation(planned_cursor), bom.gpu_live_bytes);
+
+                // A following operand aligns its first region, not every
+                // logical byte. Verify the interior boundary as well as the
+                // final allocation so tail padding is neither lost nor doubled.
+                test::MockBackend pair_backend(device.type);
+                LoadOrchestrator pair(&pair_backend, kTestOnlyUnadmittedGPUAllocation);
+                pair.addDevice(device.ordinal);
+                planMoEExpertGPUWeight(pair, device, "gate_e0", *source,
+                    source->size_bytes(), layout);
+                planMoEExpertGPUWeight(pair, device, "up_e0", *source,
+                    source->size_bytes(), layout);
+                auto *pair_pool = pair.getPool(device.ordinal);
+                ASSERT_NE(pair_pool, nullptr);
+                EXPECT_EQ(pair_pool->totalPlannedBytes(), bom.gpu_live_bytes + planned_cursor);
+                ASSERT_TRUE(pair_pool->allocate(&pair_backend, device.ordinal));
+                EXPECT_EQ(pair_pool->totalPlannedBytes(), 2 * bom.gpu_live_bytes);
+                EXPECT_EQ(pair_backend.getTotalAllocatedBytes(), 2 * bom.gpu_live_bytes);
+
                 ASSERT_TRUE(pool->allocate(&backend, device.ordinal));
                 EXPECT_EQ(backend.getTotalAllocatedBytes(), bom.gpu_live_bytes);
                 EXPECT_EQ(pool->totalPlannedBytes(), backend.getTotalAllocatedBytes());
@@ -385,10 +406,15 @@ namespace llaminar2
                     source->size_bytes(), {0});
                 if (layout == Layout::SourceNative)
                 {
-                    if (declaration && original.totalPlannedBytes() > bom.gpu_live_bytes)
+                    const auto original_physical_bytes =
+                        alignGPUWeightLoadAllocation(original.totalPlannedBytes());
+                    if (declaration && original_physical_bytes > bom.gpu_live_bytes)
                         ++original_mismatches;
                     if (!declaration)
-                        EXPECT_EQ(original.totalPlannedBytes(), pool->totalPlannedBytes());
+                    {
+                        EXPECT_EQ(original.totalPlannedBytes(), planned_cursor);
+                        EXPECT_EQ(original_physical_bytes, pool->totalPlannedBytes());
+                    }
                 }
             }
         }
