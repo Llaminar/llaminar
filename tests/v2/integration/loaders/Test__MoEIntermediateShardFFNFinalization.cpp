@@ -1842,8 +1842,13 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         const int k=relocateDown?shape.routed:shape.hidden;
                         const auto blocks=std::size_t(n)*(k/32);
                         const auto payload=blocks*(relocateDown?20:16);
-                        const auto coefficients=blocks*2;
-                        const auto roleBytes=payload+2*coefficients;
+                        const auto& originalProjection=relocateDown?update.experts.front().down:update.experts.front().gate;
+                        const auto codedPlanes=native_quantised_superblock::planeBytes(originalProjection.codebook_id,n,k/32,
+                            nativeQuantisedLayoutPhase(originalProjection.metadata_layout));
+                        const auto scaleBytes=originalProjection.metadata_layout?codedPlanes.code:
+                            nativeQuantisedScalePlaneStorageWords(originalProjection.codebook_id,blocks)*sizeof(std::uint16_t);
+                        const auto minBytes=originalProjection.metadata_layout?codedPlanes.superblock:blocks*sizeof(std::uint16_t);
+                        const auto roleBytes=payload+scaleBytes+minBytes;
                         clonedBytes=(relocateDown?1:2)*source.expert_count*roleBytes;
                         auto* allocation=static_cast<std::uint8_t*>(backend->allocate(clonedBytes,device.ordinal));
                         require(allocation,"allocate independent fixture-owned copies of original weight planes");
@@ -1856,13 +1861,13 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                                     !projection.source_is_superblock,"only original plain Q5_1 Down can use this witness");
                             auto* base=allocation+team*roleBytes;
                             require(backend->deviceToDevice(base,projection.payload,payload,device.ordinal,stream) &&
-                                backend->deviceToDevice(base+payload,projection.scales,coefficients,device.ordinal,stream) &&
-                                backend->deviceToDevice(base+payload+coefficients,projection.mins,coefficients,device.ordinal,stream),
+                                backend->deviceToDevice(base+payload,projection.scales,scaleBytes,device.ordinal,stream) &&
+                                backend->deviceToDevice(base+payload+scaleBytes,projection.mins,minBytes,device.ordinal,stream),
                                 "copy original prepared physical planes on the captured lane's transfer stream");
                             require(base!=projection.payload,"physical plane address changed");
                             projection.payload=base;
                             projection.scales=base+payload;
-                            projection.mins=base+payload+coefficients;
+                            projection.mins=base+payload+scaleBytes;
                         };
                         for(std::size_t expert=0;expert<source.expert_count;++expert)
                             if(update.local_compute_mask[expert]) {

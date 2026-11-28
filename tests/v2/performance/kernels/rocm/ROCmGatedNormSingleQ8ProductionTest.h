@@ -141,8 +141,17 @@ public:
             const auto blocks=static_cast<size_t>(n)*descriptor.blocks_per_row;
             immutable={{const_cast<uint8_t*>(descriptor.payload),blocks*(descriptor.allocation_payload_bytes_per_block?
                 descriptor.allocation_payload_bytes_per_block:physical.payload_bytes_per_block)},
-                {const_cast<void*>(descriptor.scales),blocks*2}};
-            if(descriptor.mins)immutable.emplace_back(const_cast<void*>(descriptor.mins),blocks*2);
+            };
+            if(descriptor.metadata_layout) {
+                const auto planes=native_quantised_superblock::planeBytes(descriptor.codebook_id,n,descriptor.blocks_per_row,
+                    nativeQuantisedLayoutPhase(descriptor.metadata_layout));
+                if(planes.code)immutable.emplace_back(const_cast<void*>(descriptor.scales),planes.code);
+                immutable.emplace_back(const_cast<void*>(descriptor.mins),planes.superblock);
+            } else {
+                immutable.emplace_back(const_cast<void*>(descriptor.scales),
+                    nativeQuantisedScalePlaneStorageWords(descriptor.codebook_id,blocks)*sizeof(std::uint16_t));
+                if(descriptor.mins)immutable.emplace_back(const_cast<void*>(descriptor.mins),blocks*sizeof(std::uint16_t));
+            }
             if(descriptor.emins)immutable.emplace_back(const_cast<void*>(descriptor.emins),blocks*4);
             for(const auto& bank:immutable)original_immutable.push_back(download(bank.first,bank.second));
             const std::vector<const TensorBase*> inputs{&values,&gate,&gamma};
