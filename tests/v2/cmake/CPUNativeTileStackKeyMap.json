@@ -464,7 +464,7 @@
    },
    "headers": {
     "src/v2/kernels/cpu/gemm/CPUNativeQuantisedEncoding.h": "aeb07dad407e71c592fc7acaef7a9efa3b26cc40620b003d9bad4c09903a2130",
-    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h": "40d0684ef8fe38cc20950f3e47bbd2ed8d7a38709e6f777631ee1b45d995b185",
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h": "3dedbb38fd6a7b1b219ff851093004bde51a08f7f86842fb36914a111ed8e6d2",
     "src/v2/tensors/NativeQuantisedFormatInfo.h": "24ab4ba864ff917e093bef67f8ec84f32e7eb21e5deae77ab2713c39f8ded0e9"
    }
   },
