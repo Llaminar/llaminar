@@ -819,6 +819,18 @@ namespace
             (static_cast<int>(blockIdx.x) * Geometry::projection_warps + warp) *
             kColumnsPerWarp;
 
+        // Stream the narrow dominant formats through lane-owned shared slots.
+        // The partition totals and integer MMA results must not stay live across
+        // metadata decoding; the 128-lane plane stride keeps accesses bank-local.
+        constexpr bool kStreamContributions =
+            ColumnsPerBlock == 32 && (CodebookId == 4 || CodebookId == 13);
+        constexpr int kStreamThreads = Geometry::projection_threads;
+        constexpr int kStreamPlanes = CodebookId == 13 ? 16 : 12;
+        __shared__ float streamed_sums[
+            kStreamContributions ? 8 * kStreamThreads : 1];
+        __shared__ int32_t streamed_dots[
+            kStreamContributions ? (kStreamPlanes - 8) * kStreamThreads : 1];
+        const int stream_lane = static_cast<int>(threadIdx.x);
         constexpr bool kStageIQ4Metadata =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut && ColumnsPerBlock == 32;
         constexpr int kScaleColumns =
@@ -848,9 +860,22 @@ namespace
             (blocks_per_row + k_partitions - 1) / k_partitions;
         float total[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+        if constexpr (kStreamContributions)
+        {
+#pragma unroll
+            for (int element = 0; element < 4; ++element)
+                streamed_sums[element * kStreamThreads + stream_lane] = 0.0f;
+        }
+
         for (int partition = 0; partition < k_partitions; ++partition)
         {
             float partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if constexpr (kStreamContributions)
+            {
+#pragma unroll
+                for (int element = 0; element < 4; ++element)
+                    streamed_sums[(4 + element) * kStreamThreads + stream_lane] = 0.0f;
+            }
             const int block_begin = partition * blocks_per_partition;
             const int block_end = min(
                 blocks_per_row,
@@ -936,12 +961,23 @@ namespace
                     mmaM16N8K32(dot_lo, a_fragment, b_fragment);
                 }
 
-// The four fragment elements read their metadata under one uniform
+                if constexpr (kStreamContributions)
+                {
+#pragma unroll
+                    for (int element = 0; element < 4; ++element)
+                    {
+                        streamed_dots[element * kStreamThreads + stream_lane] = dot_lo[element];
+                        if constexpr (CodebookId == 13)
+                            streamed_dots[(4 + element) * kStreamThreads + stream_lane] = dot_hi[element];
+                    }
+                }
+
+                // The four fragment elements read their metadata under one uniform
                 // representation branch, so their loads overlap instead of each
                 // element waiting behind its own branch (loadBlockMetadataAs()).
                 const auto accumulate_elements = [&](auto metadata_form)
                 {
-    #pragma unroll
+    #pragma unroll (kStreamContributions ? 1 : 4)
                     for (int element = 0; element < 4; ++element)
                     {
                         const int local_row = mmaFragmentRow(lane, element);
@@ -954,17 +990,27 @@ namespace
                         const float activation_scale = scales_A[
                             static_cast<size_t>(grouped_row) * blocks_per_row +
                             block];
+                        const int32_t low_dot = kStreamContributions
+                            ? streamed_dots[element * kStreamThreads + stream_lane]
+                            : dot_lo[element];
+                        int32_t high_dot = 0;
+                        if constexpr (kStreamContributions && CodebookId == 13)
+                            high_dot = streamed_dots[(4 + element) * kStreamThreads + stream_lane];
+                        else if constexpr (!kStreamContributions)
+                            high_dot = dot_hi[element];
+                        const float previous = kStreamContributions
+                            ? streamed_sums[(4 + element) * kStreamThreads + stream_lane]
+                            : partial[element];
+                        float contribution;
                         if constexpr (kStageIQ4Metadata)
                         {
                             const int scale_index =
                                 warp * kColumnsPerWarp +
                                 mmaFragmentColumn(lane, element);
-                            partial[element] = __fadd_rn(
-                                partial[element],
-                                contributionFromStagedSymmetricMma<CodebookId>(
-                                    dot_lo[element],
+                            contribution = contributionFromStagedSymmetricMma<CodebookId>(
+                                    low_dot,
                                     activation_scale,
-                                    shared_weight_scales[scale_index], descriptor.codebook_id));
+                                    shared_weight_scales[scale_index], descriptor.codebook_id);
                         }
                         else
                         {
@@ -972,17 +1018,20 @@ namespace
                                 static_cast<size_t>(block) * N + column;
                             const uint8_t *payload =
                                 descriptor.payload + linear * kPayloadBytes;
-                            partial[element] = __fadd_rn(
-                                partial[element],
-                                contributionFromMma<CodebookId, decltype(metadata_form)>(
+                            contribution = contributionFromMma<CodebookId, decltype(metadata_form)>(
                                     shared_a + local_row * kQuantBlock,
-                                    dot_lo[element],
-                                    dot_hi[element],
+                                    low_dot,
+                                    high_dot,
                                     payload,
                                     weight_meta,
                                     ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N),
-                                    activation_scale, descriptor.codebook_id));
+                                    activation_scale, descriptor.codebook_id);
                         }
+                        const float next = __fadd_rn(previous, contribution);
+                        if constexpr (kStreamContributions)
+                            streamed_sums[(4 + element) * kStreamThreads + stream_lane] = next;
+                        else
+                            partial[element] = next;
                     }
                 };
                 if constexpr (kStageIQ4Metadata)
@@ -997,10 +1046,12 @@ namespace
 #pragma unroll
             for (int element = 0; element < 4; ++element)
             {
-                const int local_row = mmaFragmentRow(lane, element);
-                total[element] = __fadd_rn(
-                    total[element],
-                    partial[element]);
+                if constexpr (kStreamContributions)
+                    streamed_sums[element * kStreamThreads + stream_lane] = __fadd_rn(
+                        streamed_sums[element * kStreamThreads + stream_lane],
+                        streamed_sums[(4 + element) * kStreamThreads + stream_lane]);
+                else
+                    total[element] = __fadd_rn(total[element], partial[element]);
             }
         }
 
@@ -1012,7 +1063,9 @@ namespace
                 column_base + mmaFragmentColumn(lane, element);
             if (local_row < active_rows && column < N)
             {
-                float value = total[element];
+                float value = kStreamContributions
+                    ? streamed_sums[element * kStreamThreads + stream_lane]
+                    : total[element];
                 if (route_weights)
                 {
                     value = __fmul_rn(
