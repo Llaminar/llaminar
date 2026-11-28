@@ -1010,7 +1010,8 @@ namespace llaminar2
         // Extract model name from path for response metadata
         std::string model_name = std::filesystem::path(config.model_path).stem().string();
 
-        ChatCompletionHandler handler(*runner, *tokenizer, model_name);
+        ChatCompletionHandler handler(*runner, *tokenizer, model_name,
+            config.paged_kv_tiers.retention_classes_ceiling);
         // Adopted §9.4: one resolved serving capacity backs the execution response
         // pool. Automatic intent preserves the existing accepted-response
         // semantics (active + queued <= kDefaultCapacity); authored intent is

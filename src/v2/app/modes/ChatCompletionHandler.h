@@ -20,6 +20,7 @@
 
 #include "app/modes/RequestGenerationLane.h"
 #include "app/modes/HttpRuntimeStats.h"
+#include "execution/prefix_cache/RetentionIntentResolver.h"
 #include "utils/Sampler.h"
 #include "utils/ChatTemplate.h"
 #include "utils/ToolCallTypes.h"
@@ -278,7 +279,8 @@ namespace llaminar2
         static constexpr int kStreamingPublicationWindowTokens = 16;
 
         ChatCompletionHandler(IOrchestrationRunner &runner, ITokenizer &tokenizer,
-                              const std::string &model_name = "");
+                              const std::string &model_name = "",
+                              std::optional<RetentionClass> retention_ceiling = std::nullopt);
 
         /**
          * @brief Read completed lifetime counters without touching inference state.
@@ -348,6 +350,11 @@ namespace llaminar2
         static std::string generateRequestId();
 
     private:
+        /// §8.4/P0 §4: configured operator ceiling (nullopt = none), enforced
+        /// HERE at HTTP admission — a request whose retention class exceeds it
+        /// receives a precise invalid_request_error before any inference work,
+        /// never a deep pool refusal afterwards.
+        std::optional<RetentionClass> retention_ceiling_;
         HttpRuntimeStats runtime_stats_; ///< Passive terminal observations; never a GPU state mirror.
         /**
          * @brief Resolve one request's reasoning mode from its override and model default.

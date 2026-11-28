@@ -304,6 +304,42 @@ TEST_F(Test__ChatCompletionHandler, ThinkingSamplingDefaultsRespectEveryExplicit
     }
 }
 
+/** @test The configured operator ceiling is enforced at HTTP admission:
+ * an above-ceiling class is a precise 400 before any inference work (never a
+ * deep pool refusal); at-or-below values pass through untouched. */
+TEST_F(Test__ChatCompletionHandler, RetentionCeilingEnforcedAtAdmission)
+{
+    auto handler = std::make_unique<ChatCompletionHandler>(
+        *runner_, *tokenizer_, "models", RetentionClass::Default);
+    {
+        // Above the ceiling: precise 400 at admission.
+        const auto response = handler->handleRawRequest(
+            minimalRequest({{"prompt_cache_retention", "24h"}}));
+        EXPECT_FALSE(response.ok);
+        EXPECT_EQ(response.http_status, 400);
+        EXPECT_NE(response.json_body.find("exceeds the configured retention classes ceiling"),
+            std::string::npos) << response.json_body;
+    }
+    {
+        // At-or-below the ceiling PASSES the ceiling admission (Default ==
+        // ceiling; InMemory is below). Deep execution is another mock's
+        // scope, so admission success means: NOT a ceiling refusal.
+        const auto response = handler->handleRawRequest(
+            minimalRequest({{"prompt_cache_retention", "in_memory"},
+                            {"prompt_cache_key", "k"}}));
+        EXPECT_EQ(response.json_body.find("exceeds the configured retention classes ceiling"),
+            std::string::npos) << response.json_body;
+    }
+    {
+        // No ceiling: 24h is not ceiling-refused.
+        auto unset = std::make_unique<ChatCompletionHandler>(*runner_, *tokenizer_);
+        const auto response = unset->handleRawRequest(
+            minimalRequest({{"prompt_cache_retention", "24h"}}));
+        EXPECT_EQ(response.json_body.find("exceeds the configured retention classes ceiling"),
+            std::string::npos) << response.json_body;
+    }
+}
+
 /** @test §8.4 standard retention fields parse exactly; an unsupported or
  * mistyped value is a precise 400 invalid_request_error, never a remap. */
 TEST_F(Test__ChatCompletionHandler, RetentionFieldsParseExactly)

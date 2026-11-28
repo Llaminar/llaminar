@@ -13,6 +13,12 @@
  * returns the exact typed intent or a precise refusal. No mutation, no
  * allocation policy: the caller (serving path or tests) owns the
  * RetentionOwner and its bounded metadata.
+ *
+ * The namespace is BYTE IDENTITY ONLY: it partitions retention and
+ * accounting (design §8.4) and never makes incompatible content shareable or
+ * grants access across trust domains. Per-domain trust isolation is the
+ * WIRING's job (the surge path applies the §8.1 trust-domain key alongside
+ * the namespace); this resolver performs no access-control decision.
  */
 #pragma once
 #include "execution/prefix_cache/RetentionOwner.h"

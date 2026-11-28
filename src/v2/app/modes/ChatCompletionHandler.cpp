@@ -545,9 +545,11 @@ namespace llaminar2
 
     ChatCompletionHandler::ChatCompletionHandler(
         IOrchestrationRunner &runner, ITokenizer &tokenizer,
-        const std::string &model_name)
+        const std::string &model_name,
+        std::optional<RetentionClass> retention_ceiling)
         : runtime_stats_(runner.prefixCacheTelemetrySources()),
-          runner_(runner), tokenizer_(tokenizer), model_name_(model_name)
+          runner_(runner), tokenizer_(tokenizer), model_name_(model_name),
+          retention_ceiling_(retention_ceiling)
     {
     }
 
@@ -834,14 +836,13 @@ namespace llaminar2
         // operator ceiling is applied by the config owner when the retention
         // owner is admitted; no ceiling at this layer).
         {
-            std::string refusal;
             const auto resolution = RetentionIntentResolver{std::nullopt}.resolve(
                 request.prompt_cache_retention, request.prompt_cache_key);
             if (!resolution.ok())
             {
                 error_out.http_status = 400;
                 error_out.json_body = dumpJsonForHttp({{"error", {
-                    {"message", refusal}, {"type", "invalid_request_error"}}}});
+                    {"message", resolution.refusal}, {"type", "invalid_request_error"}}}});
                 return std::nullopt;
             }
         }
@@ -2144,6 +2145,24 @@ namespace llaminar2
         auto request = parseRequest(json_body, error);
         if (!request)
             return error;
+
+        // §8.4/P0 §4: the operator ceiling is enforced HERE, at HTTP request
+        // admission — a request whose retention class exceeds the configured
+        // ceiling receives a precise invalid_request_error before any
+        // inference work (never a deep pool refusal after acceptance).
+        if (retention_ceiling_.has_value())
+        {
+            const auto resolution = RetentionIntentResolver{retention_ceiling_}.resolve(
+                request->prompt_cache_retention, request->prompt_cache_key);
+            if (!resolution.ok())
+            {
+                error.ok = false;
+                error.http_status = 400;
+                error.json_body = dumpJsonForHttp({{"error", {
+                    {"message", resolution.refusal}, {"type", "invalid_request_error"}}}});
+                return error;
+            }
+        }
 
         if (request->stream && stream_cb)
             return handleStreamingRequest(*request, stream_cb);
