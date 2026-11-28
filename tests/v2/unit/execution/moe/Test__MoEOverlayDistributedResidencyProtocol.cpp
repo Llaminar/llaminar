@@ -500,6 +500,66 @@ namespace llaminar2::test
         EXPECT_NE(error.find("GPU"), std::string::npos);
     }
 
+    /** @test Staging quotes include coded closing headers and compact full-to-tail ranges. */
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeChunkCapacityIncludesEveryClosingHeader)
+    {
+        for (const auto *source : {&native_quantised_formats::Q4_0, &native_quantised_formats::Q4_K})
+        {
+            for (const int blocks : {6, 8, 9})
+            {
+                for (const uint32_t admitted : {1u, 3u, 7u})
+                {
+                    SCOPED_TRACE(source->codebook_id);
+                    SCOPED_TRACE(blocks);
+                    SCOPED_TRACE(admitted);
+                    const auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
+                        *source, 65, blocks * 32, 2, 0, 0,
+                        ExpertTierWeightProjection::Gate, admitted).deviceLayout();
+                    ASSERT_TRUE(layout.valid());
+                    const auto cpu = layout.cpuStorage();
+                    size_t maximum = 0, total = 0;
+                    for (uint32_t first = 0; first < layout.unit_count;)
+                    {
+                        const auto count = std::min(admitted, layout.unit_count - first);
+                        size_t bytes = 0;
+                        for (uint32_t unit = first; unit < first + count; ++unit)
+                        {
+                            const auto columns = unit < uint32_t(blocks) ? 64u : 1u;
+                            const auto geometry = cpu.wireGeometry(columns);
+                            bytes += geometry.block_stride;
+                            if (geometry.closesSuperblock(unit % blocks))
+                                bytes += geometry.header_bytes;
+                        }
+                        EXPECT_EQ(layout.chunkBytes(count, first), bytes);
+                        EXPECT_EQ(expertTierWireUnitAt(layout, total), first);
+                        maximum = std::max(maximum, bytes);
+                        total += bytes;
+                        first += count;
+                    }
+                    EXPECT_EQ(cpu.maximumChunkBytes(), maximum);
+                    EXPECT_EQ(total, layout.chunkBytes(layout.unit_count));
+                    EXPECT_EQ(expertTierWireUnitAt(layout, total), layout.unit_count);
+                    EXPECT_EQ(layout.chunkBytes(0, layout.unit_count), 0u);
+                    if (cpu.coded())
+                    {
+                        EXPECT_GT(layout.chunkBytes(1, blocks - 1), layout.chunkBytes(1));
+                        if (admitted == 1)
+                            EXPECT_GT(maximum, layout.chunkBytes(1));
+                    }
+                    // Reusing the quote for a smaller schedule must not retain the large range.
+                    auto small = cpu;
+                    small.N = small.cpu_N = 1;
+                    small.unit_count = blocks;
+                    small.maximum_units_per_chunk = 1;
+                    EXPECT_EQ(small.maximumChunkBytes(), small.maximumWireUnitBytes());
+                    auto empty = small;
+                    empty.unit_count = empty.maximum_units_per_chunk = 0;
+                    EXPECT_EQ(empty.maximumChunkBytes(), 0u);
+                }
+            }
+        }
+    }
+
     /** @test GPU relay authenticates live source-code fields across independent, phased GPU roots. */
     TEST(Test__MoEOverlayDistributedResidencyProtocol, CodedGpuRelayAuthenticatesExactPhasedWire)
     {

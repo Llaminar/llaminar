@@ -289,6 +289,27 @@ namespace llaminar2
             return row_bytes && ((uint64_t(cpu_N)+63)/64)<=std::numeric_limits<size_t>::max()/row_bytes && expected<=std::numeric_limits<uint32_t>::max() && unit_count==expected &&
                 maximum_units_per_chunk>0 && maximum_units_per_chunk<=unit_count;
         }
+        /**
+         * @brief Quote the largest actual chunk in the admitted ordered schedule.
+         *
+         * Coded closing units include a superblock header, unlike the first
+         * unit. Inspect complete ranges, including the compact final N tile,
+         * rather than treating the first chunk as a fixed byte stride.
+         * @return Exact staging capacity required by this schedule, or zero for invalid counts.
+         */
+        [[nodiscard]] constexpr size_t maximumChunkBytes() const noexcept
+        {
+            if (!maximum_units_per_chunk || maximum_units_per_chunk > unit_count)
+                return 0;
+            size_t maximum = 0;
+            for (uint32_t first = 0; first < unit_count;)
+            {
+                const auto count = std::min(maximum_units_per_chunk, unit_count - first);
+                maximum = std::max(maximum, chunkBytes(count, first));
+                first += count;
+            }
+            return maximum;
+        }
         /** @return Complete final CPU allocation bytes, independent of communicated extent. */
         constexpr size_t cpuStorageBytes() const noexcept
         { return rootGeometry().matrixBytes((cpu_N + 63) / 64); }

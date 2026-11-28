@@ -798,7 +798,7 @@ namespace llaminar2
                                         .device = DeviceId::rocm(0),
                                         .staging = TransferEngine::instance()
                                                        .allocatePersistentTransferStagingSlices(
-                                                           flow->gpu_to_cpu_layout.chunkBytes(1),
+                                                           flow->gpu_to_cpu_layout.cpuStorage().maximumWireUnitBytes(),
                                                            1u,
                                                            DeviceId::rocm(0))
                                                        .front(),
@@ -829,7 +829,7 @@ namespace llaminar2
                                         .device = DeviceId::cuda(0),
                                         .staging = TransferEngine::instance()
                                                        .allocatePersistentTransferStagingSlices(
-                                                           flow->cpu_to_gpu_layout.chunkBytes(1),
+                                                           flow->cpu_to_gpu_layout.cpuStorage().maximumWireUnitBytes(),
                                                            1u,
                                                            DeviceId::cuda(0))
                                                        .front(),
@@ -1444,7 +1444,7 @@ namespace llaminar2
                                     .device = DeviceId::cuda(0),
                                     .staging = TransferEngine::instance()
                                                    .allocatePersistentTransferStagingSlices(
-                                                       layout.chunkBytes(1),
+                                                       layout.cpuStorage().maximumWireUnitBytes(),
                                                        1u,
                                                        DeviceId::cuda(0))
                                                    .front(),
