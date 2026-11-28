@@ -1047,37 +1047,24 @@ public:
             snapshots.clear();
             return false;
         }
-        // Every layer published and bound: now (and only now) make the
-        // cells live.
-        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
-        {
-            auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
-            cell.ref = refs[static_cast<std::size_t>(layer)];
-            cell.snapshot = std::move(snapshots[static_cast<std::size_t>(layer)]);
-        }
-        // Retain the COW grant for the bank's lifetime (my private pages
-        // stay owned by this binding, never retiring while read).
-        if (cow_grant)
-            private_publication_grant_ = std::move(cow_grant);
-        // Ancestry = the SOURCE's exact publication refs (the content
-        // identity the prefix was exported from), per layer.
-        prefix_ancestry_refs_.clear();
-        prefix_ancestry_refs_.reserve(cells_.size());
-        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
-        {
-            const auto *src_cell = source.priorFor(static_cast<int>(layer));
-            prefix_ancestry_refs_.push_back(src_cell ? src_cell->ref : PagedKVSnapshotRef{});
-        }
+        // (The lease minting below runs BEFORE any destination cell becomes
+        // live; the cells-live / COW-grant / ancestry publication follows it.)
         // P3 effective-use ordering at successful attachment: mint ONE
         // content/replica-bound receipt per layer on the SOURCE publications
-        // we adopted. The lease is the bounded temporary pin/fence: the
-        // replica cannot be retired while this receipt is outstanding, and it
-        // is acknowledged at the ordering point (the first decode step that
-        // consumes the attached prefix) — never a permanent protection that
-        // fakes 'hotness'. A lease that cannot be minted (journal full /
-        // sealed / obsolete) refuses the attachment BEFORE it is considered
-        // successful; duplicates cannot affect a replacement because every
-        // touch minted its own fresh ordinal (never a glow on an old receipt).
+        // we adopted — BEFORE any destination cell becomes live (G1). The
+        // touch authenticates against the SOURCE snapshot (still live here),
+        // so no destination cell needs to exist yet; a touch refusal can
+        // NEVER leave a live publication behind. The lease is the bounded
+        // temporary pin/fence: the replica cannot be retired while this
+        // receipt is outstanding, and it is acknowledged at the ordering
+        // point (the first decode step that consumes the attached prefix) —
+        // never a permanent protection that fakes 'hotness'. A lease that
+        // cannot be minted (journal full / sealed / obsolete) abandons the
+        // already-minted receipts (bounded), drops EVERY committed snapshot
+        // (banks return to Free, fully unbound — identical to a bind
+        // failure) and refuses: the binding is exactly as before the call.
+        // Duplicates cannot affect a replacement because every touch mints
+        // its own fresh ordinal (never a glow on an old receipt).
         attach_use_leases_.clear();
         attach_use_leases_.reserve(cells_.size());
         for (std::size_t layer = 0; layer < cells_.size(); ++layer)
@@ -1086,18 +1073,32 @@ public:
             auto lease = table_->touchEffectiveUse(src_cell->snapshot);
             if (!lease)
             {
-                // Obligations for already-minted leases are explicitly
-                // abandoned (bounded; never a silent leak) and the attach
-                // fails closed: no effective use is recorded as successful
-                // when the receipt cannot be issued.
                 for (auto &held : attach_use_leases_)
                     held.abandon();
                 attach_use_leases_.clear();
+                snapshots.clear(); // Banks 1 -> 0 -> Free/unbound.
                 LOG_ERROR("[PooledKVDecodeBinding] Shared prefix effective-use touch refused at layer "
                           << layer);
                 return false;
             }
             attach_use_leases_.push_back(std::move(*lease));
+        }
+        // Everything below is infallible state publication: make the cells
+        // live first, then retain the COW grant and record the ancestry.
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            auto &cell = cells_[static_cast<std::size_t>(layer)].cells[0];
+            cell.ref = refs[static_cast<std::size_t>(layer)];
+            cell.snapshot = std::move(snapshots[static_cast<std::size_t>(layer)]);
+        }
+        if (cow_grant)
+            private_publication_grant_ = std::move(cow_grant);
+        prefix_ancestry_refs_.clear();
+        prefix_ancestry_refs_.reserve(cells_.size());
+        for (std::size_t layer = 0; layer < cells_.size(); ++layer)
+        {
+            const auto *src_cell = source.priorFor(static_cast<int>(layer));
+            prefix_ancestry_refs_.push_back(src_cell ? src_cell->ref : PagedKVSnapshotRef{});
         }
         ++cursor_epoch_;
         return true;

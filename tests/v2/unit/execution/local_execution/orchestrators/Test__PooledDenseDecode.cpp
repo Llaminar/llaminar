@@ -1857,3 +1857,156 @@ TEST(PooledDenseDecode, SharedPrefixAttachEffectiveUseOrdering)
     EXPECT_TRUE(src_table.effectiveUseMayEvict(src.priorFor(0)->snapshot.version()))
         << "after abandonment the replica is eviction-eligible (no leak)";
 }
+
+/** @test G1 negative: a touch refusal at shared-prefix attach leaves the
+ * destination EXACTLY as before the call — no live publication, no prior
+ * cell, no ancestry, no private grant, epoch unchanged. The leases are
+ * minted BEFORE any destination cell becomes live (a JournalFull touch is
+ * realistic under concurrent attachments), and a refusal drops every
+ * committed snapshot so the banks return to Free, fully unbound. */
+TEST(PooledDenseDecode, SharedPrefixAttachTouchRefusalLeavesDestinationFresh)
+{
+    const auto device = DeviceId::cpu();
+    const std::array<int32_t, 10> prompt_src{1, 3, 5, 7, 9, 11, 13, 15, 17, 19};
+
+    auto make_runner = [&](test::TinyQwenForwardFixture &fx,
+                           std::unique_ptr<DeviceGraphOrchestrator> &owner_out,
+                           PreparedWeightStore &store_out,
+                           std::shared_ptr<QwenStandardGraph> &builder_out)
+    {
+        auto builder = std::make_shared<QwenStandardGraph>(fx.config, fx.mpi);
+        auto deps = test::cpuInferenceFixtureDependencies(builder, fx.mpi, 1,
+            fx.config.max_seq_len, fx.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fx.modelWeights(), fx.config.n_layers));
+        owner_out = DeviceGraphOrchestrator::createForTest(std::move(deps));
+        auto &runner = *owner_out;
+        if (!runner.initializeInferenceStateFromArena(1, fx.config.max_seq_len, device))
+            throw std::runtime_error("initializeInferenceStateFromArena failed");
+        runner.setWeights(fx.modelWeights());
+        test::prepareDenseForwardWeights(runner, *builder, store_out, device);
+        builder_out = std::move(builder);
+    };
+
+    test::TinyQwenForwardFixture fx(device, KVCachePrecision::FP32);
+    fx.config.mtp.enabled = false; fx.config.mtp.graph_capacity_draft_tokens = 0;
+    fx.config.max_seq_len = 16;
+
+    auto make_instance = [&](PagedKVInstance &out) -> bool
+    {
+        PagedKVPoolBudget budget;
+        budget.remaining_budget_bytes = 4 * 1024 * 1024;
+        budget.frame_bytes = 4 * 1024;
+        budget.request_records = 8;
+        budget.max_pages_per_request = 64;
+        // readers_per_bank = 1: the lease journal can be FULL with a single
+        // outstanding touch (bank_count * readers_per_bank lease cells; a
+        // small bank count keeps the fill deterministic).
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/fx.config.n_layers, /*admitted_issuances=*/10,
+            /*readers_per_bank=*/1);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
+        if (!plan) return false;
+        auto table_geom = plan->table_geometry;
+        table_geom.bank_count = 2 * table_geom.bank_count;
+        table_geom.issuance_headroom = 4 * table_geom.issuance_headroom;
+        table_geom.issuance_budget = 2 * table_geom.issuance_headroom;
+        auto pool_geom = plan->pool_geometry;
+        pool_geom.frames = 64 + 8 * pool_geom.frames;
+        pool_geom.request_records = 8;
+        auto widened = std::make_shared<PagedKVInstancePlan>(*plan);
+        widened->pool_geometry = pool_geom;
+        widened->table_geometry = table_geom;
+        widened->total_bytes = PhysicalPagePool::physicalBytes(pool_geom, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geom, device);
+        PhysicalMemoryPlanBuilder mb;
+        mb.add({.world_rank=0, .device=device,
+            .total_bytes=widened->total_bytes,
+            .admission_available_bytes=widened->total_bytes},
+            PhysicalMemoryOwner::KVCache, widened->total_bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+        auto created = PagedKVInstance::create(authority, *widened, device);
+        if (!created) return false;
+        out = std::move(*created);
+        return true;
+    };
+
+    PagedKVInstance src_instance;
+    ASSERT_TRUE(make_instance(src_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> src_owner;
+    PreparedWeightStore src_store;
+    std::shared_ptr<QwenStandardGraph> src_builder;
+    make_runner(fx, src_owner, src_store, src_builder);
+    PooledKVDecodeBinding src(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/431, /*slot=*/0,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+    src_owner->setPooledDecodeBinding(&src);
+    ASSERT_OK("source prefill", src_owner->forward(prompt_src.data(), 10, 1) != nullptr);
+
+    PagedKVInstance dst_instance;
+    ASSERT_TRUE(make_instance(dst_instance));
+    std::unique_ptr<DeviceGraphOrchestrator> dst_owner;
+    PreparedWeightStore dst_store;
+    std::shared_ptr<QwenStandardGraph> dst_builder;
+    make_runner(fx, dst_owner, dst_store, dst_builder);
+    PooledKVDecodeBinding dst(&src_instance.pool(), &src_instance.table(),
+        /*request_id=*/432, /*slot=*/1,
+        fx.config.n_kv_heads, fx.config.head_dim,
+        /*page_tokens=*/8, fx.config.n_layers, /*admitted_issuances=*/10,
+        /*persistent_tail=*/false);
+
+    // Fill the effective-use lease journal: every additional layer touch on
+    // the source publication consumes one lease cell. With readers_per_bank
+    // 1 the journal is bank_count cells; touch until one refuses.
+    std::vector<EffectiveUseLease> fillers;
+    for (int attempt = 0; attempt < 512; ++attempt)
+    {
+        auto lease = src_instance.table().touchEffectiveUse(
+            src.priorFor(0)->snapshot);
+        if (!lease) break;
+        fillers.push_back(std::move(*lease));
+    }
+    ASSERT_FALSE(src_instance.table().touchEffectiveUse(
+        src.priorFor(0)->snapshot).has_value())
+        << "test setup: the effective-use journal must be full";
+    // Drain the fillers so the source keeps its own publication semantics.
+    for (auto &lease : fillers)
+        lease.abandon();
+    fillers.clear();
+    // Refill with EXACTLY the journal capacity: abandon released each slot,
+    // so one touch per lease cell (= journal capacity) fills it again.
+    {
+        std::vector<EffectiveUseLease> fill2;
+        for (int attempt = 0; attempt < 512; ++attempt)
+        {
+            auto lease = src_instance.table().touchEffectiveUse(
+                src.priorFor(0)->snapshot);
+            if (!lease) break;
+            fill2.push_back(std::move(*lease));
+        }
+        // Now the journal is full and stays full (leases are live).
+        ASSERT_FALSE(src_instance.table().touchEffectiveUse(
+            src.priorFor(0)->snapshot).has_value());
+        // G1: attach must refuse AND leave the destination exactly fresh.
+        EXPECT_EQ(dst.cursorEpoch(), 0u);
+        EXPECT_FALSE(dst.attachSharedPrefix(src, 9))
+            << "attach must refuse when the lease journal cannot admit the receipt";
+        EXPECT_FALSE(dst.hasLivePublication())
+            << "no live publication after a refused attach";
+        EXPECT_EQ(dst.priorFor(0), nullptr)
+            << "no prior cell after a refused attach";
+        EXPECT_EQ(dst.prefixAncestryRefs().size(), 0u)
+            << "no ancestry recorded after a refused attach";
+        EXPECT_EQ(dst.cursorEpoch(), 0u)
+            << "epoch must not advance after a refused attach";
+        // The source is untouched: its publication still lives with the
+        // same rows.
+        EXPECT_EQ(src.priorFor(0)->snapshot.view().rows(), 10)
+            << "source publication must be untouched by the refused attach";
+        // Cleanup: abandon the fillers (bounded; never a leak).
+        for (auto &lease : fill2)
+            lease.abandon();
+    }
+}
