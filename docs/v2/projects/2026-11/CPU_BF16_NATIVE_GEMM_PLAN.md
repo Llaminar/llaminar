@@ -228,3 +228,51 @@ Default-engine flip after isolated
 instructions), `PerfStats` counter registration, `M=1` native GEMV,
 fused-SwiGLU/LM-head gate sites, codegen-witness registration, image matrix
 and README synchronization.
+
+## Reference-kernel extraction (2026-11 continuation)
+
+This revision corrects earlier reasoning and records the verified facts:
+
+1. **"A JIT is required" was wrong.** A JIT only produces an instruction
+   schedule; the schedule is reproducible in static assembly. The actual
+   residual was never "JIT magic"; it is an unidentified instruction stream
+   in the reference implementation on this host.
+2. **The reference schedule was replicated verbatim.** The classic
+   `jit_avx512_core_gemm_bf16bf16f32_kern.cpp` kernel (48x8 tile, 3 A regs,
+   ping-pong b_regs, end-of-h A preloads, prefetch_a/b placement, 4-pair
+   K blocks, `L_aligned` semantics) was re-emitted as a static .S with
+   matching packed AN/BN panels: **0.93-0.95 TF/s, byte-exact (relL2=0.0**
+   **vs serial FMA)** — the same ~0.5 FMA/cyc plateau as every earlier design.
+3. **The executed reference is not that classic kernel.** oneDNN's verbose
+   label names `brg_matmul` (brgemm). The brgemm AVX512 microkernel uses the
+   *opposite* operand roles (A per-row 4B broadcast, B 64B vector loads,
+   lane=N-columns). A static replication of that structure (14x32 tile,
+   28 accs) measured **0.22-0.26 FMA/cyc — worse**, not better.
+4. **The bf16-emulation path is slower.** oneDNN's
+   `bf16_emulation_t::vdpbf16ps` (shift-extract + vfmadd231ps x2, 10 uops per
+   dot) applied to the 48x8 schedule measured **0.17 FMA/cyc**.
+5. **oneDNN's 2.08-2.17 FMA/cyc is real, single-core, correct compute:**
+   wall-vs-CPU time = 0.98x at `omp_set_num_threads(1)` (no hidden
+   parallelism); output relL2 = 1.7e-7 vs serial (fully computed); all-zero B
+   runs at identical time (no zero-skip). It exceeds every pure-ALU chain we
+   can issue on this host (vdpbf16ps chain 0.95, fp32 FMA32 chain 1.31,
+   vpmaddubsw chain 1.22), so its kernel uses a unit/stream we have not
+   reproduced.
+6. **AMX is definitively absent on this appliance:** a fresh process is
+   *granted* `arch_prctl(ARCH_REQ_XCOMP_PERM, XTILEDATA)` (returns 0), yet
+   `tilezero` still #UDs — the guest kernel's permission gate works but the
+   hypervisor does not implement tile data units (spoofed CPUID). The oneDNN
+   JIT pool in a live process contains no vdpbf16ps and no tdpbf16ps in any
+   rwx region, and libdnnl.so text contains none either (571 raw byte
+   patterns all decode as false positives / other opcodes) — the reference
+   compute stream executes from a path not present in any dumpable region.
+
+**Status: parity remains unproven.** All static/replicable structures cap at
+0.9-1.0 TF/s (0.2-0.5 FMA/cyc), while the reference holds 2.08-2.17
+FMA/cyc/thread on this host. The remaining gap is a concrete, measured
+reference-kernel characteristic on this machine, not scheduling or structure
+reproducibility; the reference stream itself remains unidentified. Evidence:
+/tmp/bench_ref.cpp (48x8 exact-schedule), /tmp/vntile.S + /tmp/vnbench.cpp
+(14x32 brgemm-shape), /tmp/bf16emu.S (emulation variant), /tmp/amxperm.cpp
+(permission-grant + tilezero #UD), /tmp/cputime.cpp (wall/CPU 0.98x),
+/tmp/verchk.cpp (reference output correct).
