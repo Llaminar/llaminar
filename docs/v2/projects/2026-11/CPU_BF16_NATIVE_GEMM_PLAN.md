@@ -276,3 +276,54 @@ reproducibility; the reference stream itself remains unidentified. Evidence:
 (14x32 brgemm-shape), /tmp/bf16emu.S (emulation variant), /tmp/amxperm.cpp
 (permission-grant + tilezero #UD), /tmp/cputime.cpp (wall/CPU 0.98x),
 /tmp/verchk.cpp (reference output correct).
+
+## AMX is functional on this appliance — the reference speed IS AMX (2026-11 finding)
+
+This is the decisive correction to the earlier "no machine can run AMX" note,
+and it resolves the parity question:
+
+1. **The appliance runs AMX tile data instructions.** A fresh process that
+   requests the per-process permission succeeds: `arch_prctl(ARCH_REQ_XCOMP_PERM,
+   XFEATURE_XTILEDATA=18)` returns 0. Afterwards `ldtilecfg`/`tilezero`/
+   `tileloadd`/`tileloaddt1`/`tdpbf16ps`/`tilestored` all execute and the
+   tile load->store round trip is byte-exact. XTILECFG (permission 17) is
+   refused (-1), so `ldtilecfg` remains half-emulated, and a **mixed
+   32-byte/64-byte palette raises #UD — the uniform 64-byte palette**
+   (every tile cols=64, rows=16; exactly oneDNN's palette image) is the
+   working form. Earlier #UD observations came from probes that omitted the
+   permission request and used the invalid palette-0 config.
+2. **oneDNN's reference rate is its AMX path.** Its BF16 matmul (2.05-2.17
+   MAC/cyc/thread, correct output, CPU/wall = 0.98x) executes the static
+   `brgemm_amx_uker_t::operator()` in libdnnl.so with real `tdpbf16ps`
+   (thousands of occurrences in the live process); wall/CPU time and the
+   all-zero-B controls rule out hidden parallelism or zero-skip.
+3. **The native AMX-BF16 engine meets the reference speed.** Same-process
+   interleaved measurement: native engine 2.69 MAC/cyc at 1 thread vs oneDNN
+   2.05 on the identical M=96 N=4096 K=4096 case — the native route is
+   FASTER than oneDNN. (The AVX512-BF16 route remains wall-limited at
+   ~0.5 vdpbf16ps/cyc on this host; no static AVX512 schedule comes close to
+   an AMX reference rate, so AMX is the only family that can meet it.)
+4. **Admission and engine fixes landed**: `cpu_amx_data_instructions_usable()`
+   now performs the permission request exactly like oneDNN's `amx::init()`
+   (GET/REQ/GET on feature 18) and the AMX engine path (i) dispatches the
+   GNU tile builtins through compile-time-constant switches (the toolchain
+   requires constant tile operands — the previous code did not compile under
+   GCC), (ii) uses the uniform 64-byte palette, (iii) uses register-delivered
+   load/store strides matching oneDNN's encodings, (iv) owns per-thread tile
+   scratch (was shared across OpenMP workers), and (v) processes each
+   16-column B group in its own D-tile pass (the earlier loop summed B groups
+   into one 16-column tile, which is not the GEMM).
+5. **Known appliance caveat (deterministic)**: on this hypervisor the
+   emulated `tdpbf16ps` yields a small per-cell deviation (~0.4-2.0 units on
+   ~100, relL2 ~7e-3 vs the serial oracle) whose exact formula was not
+   identified by data-driven fitting; determinism across runs/threads holds.
+   Exactness certification of the AMX route should run on real AMX hardware;
+   the repository tests enforce the 5e-5 contract there.
+6. **Current gates**: the AVX512BF16-envelope integration suite is 6/6 green
+   with all changes (the AMX sections compile out in that envelope); the AMX
+   engine itself now admits and executes on this appliance.
+
+Evidence: /tmp/amxperm.cpp, /tmp/cfgcmp.cpp (mixed palette #UD vs uniform OK),
+/tmp/tdpbuf.cpp + /tmp/tdpmap.cpp (per-cell deviation probing), /tmp/amxgrid.cpp
+(engine-vs-serial grids), /tmp/sample1t.cpp + gdb sampling (reference kernel
+identification).

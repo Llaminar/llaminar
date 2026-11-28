@@ -166,7 +166,9 @@ namespace llaminar2
                 case Engine::AVX512BF16:
                     return transpose_B && (K % 32 == 0);
                 case Engine::AMXBF16:
-                    return (M % 16 == 0) && (N % 16 == 0) && (K % 16 == 0);
+                    // 32-element K windows: the universal palette gives every
+                    // tile 64-byte rows (32 BF16 per A/B tile row).
+                    return (M % 16 == 0) && (N % 16 == 0) && (K % 32 == 0);
                 }
                 return false;
             }
@@ -731,6 +733,9 @@ namespace llaminar2
                 AMX_TILE_B0 = 1, AMX_TILE_B1 = 2, AMX_TILE_B2 = 3,
                 AMX_TILE_D0 = 4, // four D tiles: 64 output rows per block
             };
+            // Each A/B tile holds 16 rows x 32 BF16 (64-byte rows, one
+            // 16x16x32 tdpbf16ps per tile pair); each D tile holds 16 rows
+            // x 16 FP32 (64-byte rows).
 
             /** @brief Register-blocking geometry: 64 rows × 48 columns per tile block. */
             inline constexpr int kAMXBf16MBlock = 64;
@@ -759,16 +764,15 @@ namespace llaminar2
             public:
                 AMXTileScope() noexcept
                 {
+                    // Universal palette: every tile 64 bytes wide, matching
+                    // oneDNN's palette image. A mixed 32-byte/64-byte palette
+                    // is refused by some virtualized AMX implementations, so
+                    // the uniform shape is the deployment-compatible one.
                     AMXPalette1Config config{};
-                    for (int t = 0; t < 4; ++t)
+                    for (int t = 0; t < 8; ++t)
                     {
-                        config.cols[AMX_TILE_A + t] = 32;
-                        config.rows[AMX_TILE_A + t] = 16; // 16 rows × 16 BF16
-                    }
-                    for (int t = 0; t < 4; ++t)
-                    {
-                        config.cols[AMX_TILE_D0 + t] = 64;
-                        config.rows[AMX_TILE_D0 + t] = 16; // 16 rows × 16 FP32
+                        config.cols[t] = 64;
+                        config.rows[t] = 16; // 16 rows × 32 BF16 or 16 FP32
                     }
                     _tile_loadconfig(&config);
                 }
@@ -783,30 +787,123 @@ namespace llaminar2
             /** @brief Zero one FP32 destination tile before accumulation. */
             inline void amxZeroTile(int tile) noexcept
             {
-                _tile_zero(tile);
+                switch (tile) // GNU toolchain requires a compile-time constant tile operand
+                {
+                case 0: _tile_zero(0); return;
+                case 1: _tile_zero(1); return;
+                case 2: _tile_zero(2); return;
+                case 3: _tile_zero(3); return;
+                case 4: _tile_zero(4); return;
+                case 5: _tile_zero(5); return;
+                case 6: _tile_zero(6); return;
+                case 7: _tile_zero(7); return;
+                default: std::abort(); // unreachable: engine call sites use constant enum tiles
+                }
             }
 
-            /** @brief Load one 16×16 BF16 tile from a 64-byte-aligned buffer. */
+            /** @brief Load one 16×32 BF16 tile from a 64-byte-aligned buffer. */
             inline void amxLoadBf16Tile(int tile, const void *base) noexcept
             {
-                _tile_loadd(tile, base, 32);
+                switch (tile)
+                {
+                case 0: _tile_loadd(0, base, 64); return;
+                case 1: _tile_loadd(1, base, 64); return;
+                case 2: _tile_loadd(2, base, 64); return;
+                case 3: _tile_loadd(3, base, 64); return;
+                case 4: _tile_loadd(4, base, 64); return;
+                case 5: _tile_loadd(5, base, 64); return;
+                case 6: _tile_loadd(6, base, 64); return;
+                case 7: _tile_loadd(7, base, 64); return;
+                default: std::abort(); // unreachable: engine call sites use constant enum tiles
+                }
             }
 
             /** @brief Store one 16×16 FP32 tile to a 64-byte-aligned buffer. */
             inline void amxStoreF32Tile(int tile, void *base) noexcept
             {
-                _tile_stored(tile, base, 64);
+                switch (tile)
+                {
+                case 0: _tile_stored(0, base, 64); return;
+                case 1: _tile_stored(1, base, 64); return;
+                case 2: _tile_stored(2, base, 64); return;
+                case 3: _tile_stored(3, base, 64); return;
+                case 4: _tile_stored(4, base, 64); return;
+                case 5: _tile_stored(5, base, 64); return;
+                case 6: _tile_stored(6, base, 64); return;
+                case 7: _tile_stored(7, base, 64); return;
+                default: std::abort(); // unreachable: engine call sites use constant enum tiles
+                }
             }
 
             /** @brief Accumulate A×B into the destination tile (16×16×16). */
+            inline void amxDpbf16ConstAll(int dst, int a, int b) noexcept;
+            inline void amxDpbf16ConstAB(int dst, int a, int b) noexcept;
+            inline void amxDpbf16Const(int dst, int a, int b) noexcept;
             inline void amxDpbf16(int dst, int a, int b) noexcept
             {
-                _tile_dpbf16ps(dst, a, b);
+                switch (dst) // dst is the discriminant; a/b are runtime tiles below
+                {
+                case 0: amxDpbf16Const(0, a, b); return;
+                case 1: amxDpbf16Const(1, a, b); return;
+                case 2: amxDpbf16Const(2, a, b); return;
+                case 3: amxDpbf16Const(3, a, b); return;
+                case 4: amxDpbf16Const(4, a, b); return;
+                case 5: amxDpbf16Const(5, a, b); return;
+                case 6: amxDpbf16Const(6, a, b); return;
+                case 7: amxDpbf16Const(7, a, b); return;
+                default: std::abort(); // unreachable: constant enum tiles
+                }
             }
 
+            /** @brief Constant-dispatch helper for amxDpbf16 (a/b runtime). */
+            inline void amxDpbf16Const(int dst, int a, int b) noexcept
+            {
+                switch (a)
+                {
+                case 0: amxDpbf16ConstAB(dst, 0, b); return;
+                case 1: amxDpbf16ConstAB(dst, 1, b); return;
+                case 2: amxDpbf16ConstAB(dst, 2, b); return;
+                case 3: amxDpbf16ConstAB(dst, 3, b); return;
+                case 4: amxDpbf16ConstAB(dst, 4, b); return;
+                case 5: amxDpbf16ConstAB(dst, 5, b); return;
+                case 6: amxDpbf16ConstAB(dst, 6, b); return;
+                case 7: amxDpbf16ConstAB(dst, 7, b); return;
+                default: std::abort(); // unreachable: constant enum tiles
+                }
+            }
+            inline void amxDpbf16ConstAB(int dst, int a, int b) noexcept
+            {
+                switch (b)
+                {
+                case 0: amxDpbf16ConstAll(dst, a, 0); return;
+                case 1: amxDpbf16ConstAll(dst, a, 1); return;
+                case 2: amxDpbf16ConstAll(dst, a, 2); return;
+                case 3: amxDpbf16ConstAll(dst, a, 3); return;
+                case 4: amxDpbf16ConstAll(dst, a, 4); return;
+                case 5: amxDpbf16ConstAll(dst, a, 5); return;
+                case 6: amxDpbf16ConstAll(dst, a, 6); return;
+                case 7: amxDpbf16ConstAll(dst, a, 7); return;
+                default: std::abort(); // unreachable: constant enum tiles
+                }
+            }
+            inline void amxDpbf16ConstAll(int dst, int a, int b) noexcept
+            {
+                switch (dst)
+                {
+                case 0: _tile_dpbf16ps(0, a, b); return;
+                case 1: _tile_dpbf16ps(1, a, b); return;
+                case 2: _tile_dpbf16ps(2, a, b); return;
+                case 3: _tile_dpbf16ps(3, a, b); return;
+                case 4: _tile_dpbf16ps(4, a, b); return;
+                case 5: _tile_dpbf16ps(5, a, b); return;
+                case 6: _tile_dpbf16ps(6, a, b); return;
+                case 7: _tile_dpbf16ps(7, a, b); return;
+                default: std::abort(); // unreachable: constant enum tiles
+                }
+            }
             /**
-             * @brief Copy one 16×16 BF16 matrix tile with a row stride.
-             * @param dst 16×16 BF16 scratch (64-byte aligned by the caller).
+             * @brief Copy one 16×32 BF16 matrix tile with a row stride.
+             * @param dst 16×32 BF16 scratch (64-byte aligned by the caller).
              * @param base First element of the tile inside the source matrix.
              * @param row_stride_bytes Distance in bytes between source rows.
              * @details `tileloadd64` requires the tile base 64-byte aligned,
@@ -820,8 +917,8 @@ namespace llaminar2
             {
                 const auto *bytes = reinterpret_cast<const std::byte *>(base);
                 for (int row = 0; row < 16; ++row)
-                    std::memcpy(dst + static_cast<std::size_t>(row) * 16,
-                                bytes + static_cast<std::size_t>(row) * row_stride_bytes, 32);
+                    std::memcpy(dst + static_cast<std::size_t>(row) * 32,
+                                bytes + static_cast<std::size_t>(row) * row_stride_bytes, 64);
             }
 
             /**
@@ -832,7 +929,7 @@ namespace llaminar2
              * @param C FP32 output [M,N].
              * @param M Row count (multiple of 16).
              * @param N Column count (multiple of 16).
-             * @param K Reduction width (multiple of 16).
+             * @param K Reduction width (multiple of 32).
              * @param transpose_B Weight layout selector.
              * @param alpha Output scale.
              * @param beta Existing-output scale.
@@ -854,19 +951,17 @@ namespace llaminar2
                                            float *C, int M, int N, int K,
                                            bool transpose_B, float alpha, float beta)
             {
-                if (!compiledWithAMXBF16() || !cpu_supports_amx_bf16())
+                if (!compiledWithAMXBF16() || !cpu_supports_amx_bf16()
+                        || !cpu_amx_data_instructions_usable())
                     throw std::runtime_error(
-                        "The AMX-BF16 GEMM engine is not compiled into this CPU ISA envelope or the host does not advertise AMX-BF16");
+                        "The AMX-BF16 GEMM engine is not compiled into this CPU ISA envelope, the host does not advertise AMX-BF16, or the executing host refuses XTILEDATA permission for this process (tile data instructions are not usable)");
                 if (!A || !B || !C || M <= 0 || N <= 0 || K <= 0 ||
-                    (M % 16) != 0 || (N % 16) != 0 || (K % 16) != 0)
+                    (M % 16) != 0 || (N % 16) != 0 || (K % 32) != 0)
                     throw std::invalid_argument(
-                        "AMX-BF16 GEMM requires non-null A/B/C, M,N,K > 0 and M % 16 == 0, N % 16 == 0, K % 16 == 0");
+                        "AMX-BF16 GEMM requires non-null A/B/C, M,N,K > 0 and M % 16 == 0, N % 16 == 0, K % 32 == 0");
                 if (bf16RouteProbeEnabled().load(std::memory_order_relaxed))
                     bf16NativeRouteCounter(Engine::AMXBF16).fetch_add(1, std::memory_order_relaxed);
 
-                alignas(64) std::uint16_t a_tile[16 * 16];
-                alignas(64) std::uint16_t b_tile[16 * 16];
-                alignas(64) float c_tile[16 * 16];
                 const std::size_t a_stride = static_cast<std::size_t>(K) * 2;
                 const std::size_t b_stride =
                     static_cast<std::size_t>(transpose_B ? K : N) * 2;
@@ -877,6 +972,12 @@ namespace llaminar2
 #pragma omp for schedule(static)
                     for (int mb = 0; mb < m_blocks; ++mb)
                     {
+                        // Per-thread tile scratch: AMX tile state and the tile
+                        // buffers are per-logical-processor state, so every
+                        // worker owns its own storage and scope.
+                        alignas(64) std::uint16_t a_tile[16 * 32];
+                        alignas(64) std::uint16_t b_tile[16 * 32];
+                        alignas(64) float c_tile[16 * 16];
                         AMXTileScope scope;
                         const int msub_live = std::min(4, row_blocks - mb * 4);
                         // Register blocking: one A tile + three B tiles + four
@@ -884,49 +985,54 @@ namespace llaminar2
                         // sub-block shares its weight/activation tile loads
                         // with the whole 64×48 block (tile loadd traffic is
                         // divided by the block factors versus one 16×16
-                        // sub-block per pass). K stays ascending in 16-element
-                        // tiles and every D element accumulates through exactly
+                        // sub-block per pass). K stays ascending in 32-element
+                        // windows and every D element accumulates through exactly
                         // the same sequence of tdpbf16ps instructions, so the
-                        // route's arithmetic contract is unchanged.
+                        // route's arithmetic contract is unchanged. The three B
+                        // column groups are processed in separate passes: D
+                        // tiles would otherwise sum A x B0 + A x B1 + A x B2
+                        // into one 16-column output instead of keeping the
+                        // column groups side by side.
                         for (int nb = 0; nb < N; nb += kAMXBf16NBlock)
                         {
+                            // Every 16-column group gets its own D pass; the
+                            // last 48-block may hold fewer than three groups.
                             const int bsub_live = std::min(3, (N - nb) / 16);
-                            for (int d = 0; d < msub_live; ++d)
-                                amxZeroTile(AMX_TILE_D0 + d);
-                            for (int kt = 0; kt < K; kt += 16)
+                            for (int c = 0; c < bsub_live; ++c)
                             {
-                                // Weight tiles first: they stay resident across
-                                // all four activation sub-tiles of this K step.
-                                for (int c = 0; c < bsub_live; ++c)
+                                for (int d = 0; d < msub_live; ++d)
+                                    amxZeroTile(AMX_TILE_D0 + d);
+                                for (int kt = 0; kt < K; kt += 32)
                                 {
+                                    // The weight tile stays resident across all
+                                    // four activation sub-tiles of this K step.
                                     copyAMXTile(b_tile,
                                                 transpose_B
                                                     ? B + static_cast<std::size_t>(nb + c * 16) * K + kt
                                                     : B + static_cast<std::size_t>(kt) * N + nb + c * 16,
                                                 b_stride);
-                                    amxLoadBf16Tile(AMX_TILE_B0 + c, b_tile);
+                                    amxLoadBf16Tile(AMX_TILE_B0, b_tile);
+                                    for (int d = 0; d < msub_live; ++d)
+                                    {
+                                        copyAMXTile(a_tile,
+                                                    A + static_cast<std::size_t>(mb * 4 + d) * 16 * K + kt,
+                                                    a_stride);
+                                        amxLoadBf16Tile(AMX_TILE_A, a_tile);
+                                        amxDpbf16(AMX_TILE_D0 + d, AMX_TILE_A, AMX_TILE_B0);
+                                    }
                                 }
                                 for (int d = 0; d < msub_live; ++d)
                                 {
-                                    copyAMXTile(a_tile,
-                                                A + static_cast<std::size_t>(mb * 4 + d) * 16 * K + kt,
-                                                a_stride);
-                                    amxLoadBf16Tile(AMX_TILE_A, a_tile);
-                                    for (int c = 0; c < bsub_live; ++c)
-                                        amxDpbf16(AMX_TILE_D0 + d, AMX_TILE_A, AMX_TILE_B0 + c);
-                                }
-                            }
-                            for (int d = 0; d < msub_live; ++d)
-                            {
-                                amxStoreF32Tile(AMX_TILE_D0 + d, c_tile);
-                                for (int row = 0; row < 16; ++row)
-                                {
-                                    float *out = C + static_cast<std::size_t>(mb * 4 + d) * 16 * N
-                                        + static_cast<std::size_t>(row) * N + nb;
-                                    for (int col = 0; col < bsub_live * 16; ++col)
+                                    amxStoreF32Tile(AMX_TILE_D0 + d, c_tile);
+                                    for (int row = 0; row < 16; ++row)
                                     {
-                                        const float dot = c_tile[row * 16 + col];
-                                        out[col] = completeEpilogueValue(dot, alpha, beta, out + col);
+                                        float *out = C + static_cast<std::size_t>(mb * 4 + d) * 16 * N
+                                            + static_cast<std::size_t>(row) * N + nb + c * 16;
+                                        for (int col = 0; col < 16; ++col)
+                                        {
+                                            const float dot = c_tile[row * 16 + col];
+                                            out[col] = completeEpilogueValue(dot, alpha, beta, out + col);
+                                        }
                                     }
                                 }
                             }

@@ -9,6 +9,8 @@
 #include <csignal>
 #include <csetjmp>
 #include <mutex>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include "CPUCacheObservation.h"
 #if defined(__aarch64__)
 #include "ARMCPUFeatures.h"
@@ -974,6 +976,30 @@ namespace llaminar2
      *
      * @return True only when a tile data instruction executed successfully.
      */
+    /**
+     * @brief Request per-process XTILEDATA permission via arch_prctl.
+     *
+     * Linux gates XSAVE-based user-requests per process. The request is
+     * made with the raw syscall so no libc wrapper or signal state is
+     * involved; the value is the arch_prctl return code (0 on grant).
+     * A non-zero return means the host kernel refuses the feature for this
+     * process and tile data instructions must be treated as unusable.
+     */
+    inline long amx_request_xtiledata_permission() noexcept
+    {
+#if defined(__AMX_TILE__) && defined(__AMX_BF16__)
+#if defined(__linux__)
+        static constexpr long arch_req_xcomp_perm = 0x1023;
+        static constexpr long xfeature_xtiledata = 18;
+        return ::syscall(SYS_arch_prctl, arch_req_xcomp_perm, xfeature_xtiledata);
+#else
+        return -1;
+#endif
+#else
+        return 0; // not compiled: admission is already false via #else below
+#endif
+    }
+
     inline bool cpu_amx_data_instructions_usable() noexcept
     {
 #if defined(__AMX_TILE__) && defined(__AMX_BF16__)
@@ -985,6 +1011,17 @@ namespace llaminar2
             static bool result = false;
             std::call_once(once, []() noexcept
             {
+                // XTILEDATA is an XSAVE feature with PER-PROCESS permission.
+                // The guest kernel grants it via arch_prctl; without the
+                // request every tile data instruction raises #UD even on
+                // hardware that fully implements AMX (oneDNN's amx::init()
+                // performs exactly this request before enabling AMX).
+                // Failure to obtain the permission is a hard environmental
+                // denial and must report the data instructions unusable.
+                const long request = amx_request_xtiledata_permission();
+                if (request != 0)
+                    return;
+
                 // Valid palette-1 config (oneDNN layout): 64-byte header then
                 // 16 uint16 cols and 16 uint8 rows; a zeroed tile 0 config is
                 // enough for the probe because tile CFG must be loaded before
