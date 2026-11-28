@@ -2337,6 +2337,8 @@ TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipDeduplicatesPreparedArit
         }
         EXPECT_EQ(reporters, (std::set<int>{0, 2}));
         EXPECT_EQ(observers.front().device().ordinal, 4);
+        EXPECT_EQ(std::count_if(observers.begin(), observers.end(),
+            [](const auto &observer) { return observer.physicalNode() == 0; }), 1);
         auto distinct = cluster;
         auto &peer = distinct.ranks[1].gpus;
         const auto gpu = std::find_if(peer.begin(), peer.end(), [&](const auto &value) { return value.type == backend; });
