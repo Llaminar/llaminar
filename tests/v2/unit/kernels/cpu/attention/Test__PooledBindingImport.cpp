@@ -171,7 +171,7 @@ TEST(PooledBindingImport, GateNegativesRefuseWithoutMutation)
         archive.meta().trust_domain, archive.meta().ancestry_id));
     const auto epoch = binding.cursorEpoch();
     SCOPED_TRACE("case B: duplicate attach refusal");
-    EXPECT_FALSE(binding.attachStoredImport({archive}));
+    EXPECT_FALSE(binding.attachStoredImport({archive}, 0, 0));
     EXPECT_EQ(binding.cursorEpoch(), epoch);
     // Geometry mismatch: a binding with a DIFFERENT dimension (its own frame
     // geometry admits its envelope) imports the archive and refuses.
