@@ -151,12 +151,23 @@ PooledPrefixDemotionOutcome PooledKVPrefixFlow::demoteTail(
         heads.push_back(section->slice(0, head).withProvenance(trust_domain_, prefix));
         tails.push_back(section->slice(head, rows).withProvenance(trust_domain_, prefix));
     }
+    // Hardening (R51): a retire failure from an earlier restore keeps its
+    // extent in the record (owned + admitted, never anonymous); EVERY later
+    // flow operation on the record re-attempts the pending retirements.
+    auto *store = instance_.diskStore();
+    if (!rec->pending_retire.empty())
+    {
+        std::vector<PagedKVArchiveExtentKey> still;
+        for (const auto &key : rec->pending_retire)
+            if (!store->retire(key)) still.push_back(key);
+        rec->pending_retire = std::move(still);
+    }
     // ALL-or-none against the store: publish the RESIDENT HEAD and the TAIL
     // as separate per-layer extents (the restore path owns the complete
     // prefix in the store — head + tail are both needed because a hijacked
     // restore must be reconstructable without any live binding). A failure
     // retires the already-published ones and truncates NOTHING.
-    auto *store = instance_.diskStore();
+
     std::vector<PagedKVArchiveExtentKey> published;
     auto putExtent = [&](const PagedKVArchive &section, std::uint64_t gen)
         -> std::optional<PagedKVArchiveExtentKey>
@@ -242,6 +253,18 @@ bool PooledKVPrefixFlow::restore(std::uint64_t ns, std::uint64_t prefix,
         if (refusal) *refusal = "the prefix is not fully resident in the store (head+tail required)";
         return false;
     }
+    // Hardening (R51): re-attempt pending retirements first (same rule as
+    // demotion — a failure keeps them admitted + owned by the record).
+    {
+        auto *store_r = instance_.diskStore();
+        if (!rec->pending_retire.empty())
+        {
+            std::vector<PagedKVArchiveExtentKey> still;
+            for (const auto &key : rec->pending_retire)
+                if (!store_r->retire(key)) still.push_back(key);
+            rec->pending_retire = std::move(still);
+        }
+    }
     // Read every stamped head+tail extent back (the store verifies identity
     // and digest; the binding enforces the ROUTE's trust/ancestry
     // expectations BEFORE a single byte is staged).
@@ -281,16 +304,27 @@ bool PooledKVPrefixFlow::restore(std::uint64_t ns, std::uint64_t prefix,
     }
     // F2: move-between-tiers CREDITS THE SOURCE AFTER PRESERVATION — the
     // demoted extents are retired now (store quota returns to its
-    // pre-demotion value; no anonymous unowned disk quota), AFTER the import
-    // succeeded (failed restores keep the extents and the record).
+    // pre-demotion value), AFTER the import succeeded (failed restores keep
+    // the extents and the record). R51 hardening: a REAL retire failure
+    // (filesystem remove error — not the missing-file healing, which
+    // succeeds) keeps that extent in the record's pending_retire (admitted
+    // and OWNED, never anonymous) and is reported in the refusal string; the
+    // return value stays true because the restore itself succeeded.
     auto *store_retire = instance_.diskStore();
+    std::vector<PagedKVArchiveExtentKey> failed;
     for (const auto &head : rec->head_extents)
-        (void)store_retire->retire(head);
-    for (const auto &tail : rec->tail_extents)
-        (void)store_retire->retire(tail);
-    rec->tail_extents.clear();
+        if (!store_retire->retire(head)) failed.push_back(head);
     rec->head_extents.clear();
+    for (const auto &tail : rec->tail_extents)
+        if (!store_retire->retire(tail)) failed.push_back(tail);
+    rec->tail_extents.clear();
+    for (auto &f : failed) rec->pending_retire.push_back(std::move(f));
     rec->resident_head_rows = 0; // Fully resident again: no demoted head.
+    if (!failed.empty() && refusal)
+        *refusal = "restore succeeded; " + std::to_string(failed.size()) +
+            " demoted extent(s) could not be retired and remain owned in the "
+            "record (disk quota still charged); retirement is re-attempted on "
+            "the next demotion/restore";
     return true;
 }
 } // namespace llaminar2

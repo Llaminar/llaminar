@@ -50,6 +50,11 @@ struct PooledPrefixRecord
     std::vector<PagedKVArchiveExtentKey> head_extents;
     /** @brief Stamped tail extents in the disk tier (with trust/ancestry). */
     std::vector<PagedKVArchiveExtentKey> tail_extents;
+    /** @brief Extents whose RETIRE failed (a real filesystem remove error —
+     * NOT the missing-file healing, which reports success). They stay OWNED
+     * and admitted by this record (never anonymous unowned disk quota) and
+     * every later demotion/restore of the record re-attempts them. */
+    std::vector<PagedKVArchiveExtentKey> pending_retire;
     /** @brief The authenticated route values stamped at write time; the
      * restore passes THE SAME values as the expectation parameters. */
     std::uint64_t trust_domain = 0;
@@ -120,7 +125,11 @@ public:
      * imports through attachStoredImport with the ROUTE's real
      * trust/ancestry expectations (the authenticated attach enforces; a
      * tampered or wrong-domain extent refuses). The record's extents are
-     * cleared only after the complete import succeeded.
+     * cleared only after the complete import succeeded. Then the demoted
+     * extents are RETIRED (move-between-tiers credits the source after
+     * preservation): a real retire failure keeps that extent in the record's
+     * pending_retire (owned, still admitted) and is reported in the refusal
+     * string — the return value stays true (the restore itself succeeded).
      */
     bool restore(std::uint64_t namespace_id, std::uint64_t prefix_id,
         PooledKVDecodeBinding &binding, std::string *refusal = nullptr);

@@ -274,6 +274,60 @@ TEST(PooledKVPrefixFlow, LateTruncateRefusalLeavesEverything)
     EXPECT_EQ(r->tail_extents.size(), 1u);
 }
 
+/** @test R51 HARDENING: a REAL retire failure (the store directory was made
+ * non-writable — remove() returns EACCES, unlike the missing-file healing)
+ * keeps the extent OWNED in the record's pending_retire (disk quota still
+ * charged, never anonymous) and reports it in the refusal string; the
+ * restore's return value stays true. A later flow operation re-attempts the
+ * pending retirement and heals it away. Runs under a non-root account only:
+ * root bypasses directory permissions, so the same binary SKIPs (the
+ * store-level remove-failure contract is covered by the dedicated store
+ * suite's own negative). */
+TEST(PooledKVPrefixFlow, RetireFailureKeepsOwnedExtentAndHeals)
+{
+    if (::geteuid() == 0)
+        GTEST_SKIP() << "directory permissions are bypassed by root; the "
+                        "store-level remove-failure contract is covered "
+                        "elsewhere";
+    FlowFixture fx;
+    auto source = publishArchive(fx, 12, 7);
+    PooledKVPrefixFlow flow(*fx.instance, 4, 8, std::nullopt, 42);
+    ASSERT_TRUE(flow.admit(3, 96, "24h", "k").has_value());
+    ASSERT_TRUE(flow.setLive(3, 96, false));
+    auto binding = fx.binding(808);
+    ASSERT_TRUE(binding.attachStoredImport({source}, 0, 0));
+    auto demote = flow.demoteTail(3, 96, binding, 1);
+    ASSERT_TRUE(demote.ok()) << demote.refusal;
+    const auto quota_before = fx.instance->diskStore()->quota().bytesAdmitted();
+    ASSERT_GT(quota_before, 0u);
+    // Make the store directory non-writable: read-back + import succeed
+    // (the files stay readable), retire FAILS with EACCES.
+    ASSERT_EQ(::chmod(fx.dir.path.c_str(), 0550), 0);
+    auto fresh = fx.binding(809, 1, /*issuances=*/2);
+    std::string refusal;
+    ASSERT_TRUE(flow.restore(3, 96, fresh, &refusal)) << refusal;
+    EXPECT_NE(refusal.find("could not be retired"), std::string::npos);
+    const auto *r = flow.record(3, 96);
+    ASSERT_TRUE(r != nullptr);
+    EXPECT_EQ(r->head_extents.size(), 0u);
+    EXPECT_EQ(r->tail_extents.size(), 0u);
+    // BOTH extents failed to retire (the whole directory is non-writable):
+    // every one of them stays OWNED — the quota is unchanged (nothing is
+    // anonymously released, nothing leaks unowned).
+    EXPECT_EQ(r->pending_retire.size(), 2u);
+    EXPECT_EQ(fx.instance->diskStore()->quota().bytesAdmitted(), quota_before);
+    // Heal: restore write access -> a later flow operation re-attempts the
+    // pending retires BEFORE any new work (the extents were superseded by
+    // the successful restore — they are residue; retiring them is always
+    // safe). The second demotion itself is refused here (envelope), but the
+    // retry already released every pending admission.
+    ASSERT_EQ(::chmod(fx.dir.path.c_str(), 0755), 0);
+    auto second = flow.demoteTail(3, 96, fresh, 1);
+    EXPECT_FALSE(second.ok());
+    EXPECT_EQ(flow.record(3, 96)->pending_retire.size(), 0u);
+    EXPECT_EQ(fx.instance->diskStore()->quota().bytesAdmitted(), 0u);
+}
+
 /** @test GATE NEGATIVES: live record refuses demotion; no-demoted record
  * refuses restore; zero deficit is a no-op. */
 TEST(PooledKVPrefixFlow, GateNegatives)
