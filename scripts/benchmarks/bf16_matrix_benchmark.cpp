@@ -179,42 +179,60 @@ int main(int argc, char** argv){
             for(int r=0;r<20;++r){ auto t=Clock::now(); fn[v](D[s]); double e=ms(t,Clock::now()); if(e<best[v][s])best[v][s]=e; }
         }
     }
-    printf("full BF16/FP32 instruction matrix (same process, interleaved, min of 20, %d threads)\n\n", T);
-    printf("%-34s | %11s %8s | %11s %8s | %11s %8s | %11s %8s\n",
-           "variant","16x4096","vs1d","32x4096","vs1d","96x4096","vs1d","32x8192","vs1d");
-    for(int v=0;v<10;++v){
-        if(v==0&&!amxOK){ printf("%-34s |  n/a (AMX not admitted on this host)\n", names[v]); continue; }
-        if(v==9){ printf("%-34s |  n/a (avx512_fp16 advertised in CPUID but vdpphps raises #UD on this appliance)\n", names[v]); continue; }
+    // Per-function tier view: native production tier vs oneDNN tier.
+    printf("PER-FUNCTION TIER COMPARISON (production path vs production path)\n");
+    printf("same process, interleaved, min of 20, %d threads. ratio = oneDNN_time/native_time (< 1.0 = native slower)\n\n", T);
+
+    auto row = [&](const char* name, int v, int ref, const char* refname){
         double gf[4];
         for(int s=0;s<4;++s) gf[s]=2.0*D[s].M*D[s].N*D[s].K/1e9/best[v][s]*1e3;
-        if(v<3){
-            // BF16-native rows vs oneDNN BF16
-            printf("%-34s | %11.0f %7.2fx %11.0f %7.2fx %11.0f %7.2fx %11.0f %7.2fx\n",
-                   names[v], gf[0], best[6][0]/best[v][0], gf[1], best[6][1]/best[v][1],
-                   gf[2], best[6][2]/best[v][2], gf[3], best[6][3]/best[v][3]);
-        } else if(v==6){
-            printf("%-34s | %11.0f %7s %11.0f %7s %11.0f %7s %11.0f %7s\n",
-                   names[v], gf[0],"-", gf[1],"-", gf[2],"-", gf[3],"-");
-        } else if(v==3){
-            printf("%-34s | %11.0f %7.2fx %11.0f %7.2fx %11.0f %7.2fx %11.0f %7.2fx\n",
-                   names[v], gf[0], best[7][0]/best[v][0], gf[1], best[7][1]/best[v][1],
-                   gf[2], best[7][2]/best[v][2], gf[3], best[7][3]/best[v][3]);
-        } else if(v==4){
-            printf("%-34s | %11.0f %7.2fx %11.0f %7.2fx %11.0f %7.2fx %11.0f %7.2fx\n",
-                   names[v], gf[0], best[8][0]/best[v][0], gf[1], best[8][1]/best[v][1],
-                   gf[2], best[8][2]/best[v][2], gf[3], best[8][3]/best[v][3]);
-        } else if(v==5){
-            printf("%-34s | %11.0f %7.2fx %11.0f %7.2fx %11.0f %7.2fx %11.0f %7.2fx\n",
-                   names[v], gf[0], best[7][0]/best[v][0], gf[1], best[7][1]/best[v][1],
-                   gf[2], best[7][2]/best[v][2], gf[3], best[7][3]/best[v][3]);
-        } else if(v==7){
-            printf("%-34s | %11.0f %7s %11.0f %7s %11.0f %7s %11.0f %7s\n",
-                   names[v], gf[0],"-", gf[1],"-", gf[2],"-", gf[3],"-");
-        } else if(v==8){
-            printf("%-34s | %11.0f %7s %11.0f %7s %11.0f %7s %11.0f %7s\n",
-                   names[v], gf[0],"-", gf[1],"-", gf[2],"-", gf[3],"-");
-        }
+        printf("%-30s | %10.0f %6.2fx | %10.0f %6.2fx | %10.0f %6.2fx | %10.0f %6.2fx\n",
+               name, gf[0], best[ref][0]/best[v][0], gf[1], best[ref][1]/best[v][1],
+               gf[2], best[ref][2]/best[v][2], gf[3], best[ref][3]/best[v][3]);
+        (void)refname;
+    };
+    auto rowAbs = [&](const char* name, int v){
+        double gf[4];
+        for(int s=0;s<4;++s) gf[s]=2.0*D[s].M*D[s].N*D[s].K/1e9/best[v][s]*1e3;
+        printf("%-30s | %10.0f %6s | %10.0f %6s | %10.0f %6s | %10.0f %6s\n",
+               name, gf[0],"-", gf[1],"-", gf[2],"-", gf[3],"-");
+    };
+
+    printf("===== 1. BF16 GEMM (bf16 x bf16 -> f32) =====\n");
+    printf("%-30s | %17s | %17s | %17s | %17s\n","tier","16x4096x4096","32x4096x4096","96x4096x4096","32x8192x8192");
+    printf("-- native tier vs oneDNN with the ACTIVE ISA (this host default = AMX-backed): --\n");
+    printf("%-30s | %10s %6s | %10s %6s | %10s %6s | %10s %6s\n","(GF/s, ratio)","GF/s","r","GF/s","r","GF/s","r","GF/s","r");
+    row("native AMX-BF16 (auto engine)", 0, 6, "oneDNN BF16");
+    rowAbs(forcedI ? "oneDNN BF16 (active ISA)" : "oneDNN BF16 (default = AMX)", 6);
+    const bool forcedI = getenv("DNNL_MAX_CPU_ISA") && strstr(getenv("DNNL_MAX_CPU_ISA"),"avx512_core_bf16");
+    printf("-- same-ISA tier: native AVX512-BF16 vs oneDNN's own AVX512-BF16 kernel --\n");
+    if (forcedI) {
+        row("native AVX512-BF16 4x4+prefetch", 1, 6, "oneDNN BF16");
+        rowAbs("oneDNN BF16 (avx512_core_bf16)", 6);
+    } else {
+        printf("   (AVX512-vs-AVX512 needs a forced-ISA run: DNNL_MAX_CPU_ISA=avx512_core_bf16 ./bf16matrix %d\n", T);
+        printf("   native AVX512-BF16 4x4+prefetch here: ");
+        row("", 1, 6, "oneDNN BF16");
     }
+    printf("   (prototype, not production: packed weight-stationary 16x24: %0.f-%.0f GF/s, ratio 1.12-1.37x vs oneDNN-avx512)\n",
+           2.0*D[0].M*D[0].N*D[0].K/1e9/best[2][0]*1e3,
+           2.0*D[3].M*D[3].N*D[3].K/1e9/best[2][3]*1e3);
+
+    printf("\n===== 2. FP32 GEMM (f32 x f32 -> f32) =====\n");
+    printf("-- native production tier (determinism-first scalar route) vs oneDNN FP32: --\n");
+    row("native FP32 scalar (contract route)", 5, 7, "oneDNN FP32");
+    rowAbs("oneDNN FP32", 7);
+    printf("   (prototype, not production: 512-bit FMA32 packed tile: %.0f-%.0f GF/s, ratio 0.51-1.42x vs oneDNN FP32)\n",
+           2.0*D[0].M*D[0].N*D[0].K/1e9/best[3][0]*1e3,
+           2.0*D[3].M*D[3].N*D[3].K/1e9/best[3][3]*1e3);
+
+    printf("\n===== 3. int8 GEMM (u8 x s8 -> s32) =====\n");
+    printf("-- native prototype (vpdpbusd tile, exact) vs oneDNN int8: --\n");
+    row("native VNNI int8 (prototype)", 4, 8, "oneDNN int8");
+    rowAbs("oneDNN int8", 8);
+
+    printf("\n===== 4. FP16 =====\n");
+    printf("native FP16 (vdpphps): n/a - avx512_fp16 advertised in /proc/cpuinfo but the instruction raises #UD on this appliance (execution probe).\n");
     printf("\nvs1d = oneDNN_BF16_time / native_time for the BF16 rows; < 1.0 = native faster.\n");
     printf("The oneDNN BF16 row uses whatever ISA the environment selects (see DNNL_MAX_CPU_ISA).\n");
     return 0;
