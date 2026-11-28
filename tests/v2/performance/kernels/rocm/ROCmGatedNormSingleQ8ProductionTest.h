@@ -19,6 +19,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstring>
+#include <iostream>
 #include <type_traits>
 extern "C" bool rocmGDN_gated_rmsnorm(const float*,const float*,const float*,float*,
     int,int,int,int,float,bool,llaminar2::GatedNormActivation,int,void*);
@@ -26,7 +27,12 @@ namespace gated_norm_single_q8_production
 {
 using namespace llaminar2;
 /** @brief Fatal diagnostic admission; never select another arithmetic program. */
-inline void require(bool value,const char* why) {if(!value)throw std::runtime_error(why);}
+inline void require(bool value,const char* why) {
+    if(!value) {
+        std::cerr<<"GDN_NORM_SINGLE_Q8_REQUIRE,error="<<why<<std::endl;
+        throw std::runtime_error(why);
+    }
+}
 /**
  * @brief Recover one source-owned captured argument without constructing a placeholder.
  * @tparam T Exact trivially-copyable native argument type, including checked descriptors.
@@ -106,6 +112,12 @@ public:
             if(record.domain=="gdn_output"&&record.name=="normalization_submission"&&record.tags.at("preparation")=="fused_single_q8")count+=record.count;
         return count;
     }
+    /** @brief Flush a test-local boundary before native code can terminate without a GoogleTest result. */
+    void phase(const char* name)const {
+        std::cerr<<"GDN_NORM_SINGLE_Q8_PHASE,format="<<tensorTypeName(weights->native_type())
+            <<",N="<<n<<",K="<<k<<",activation="<<static_cast<int>(policy.activation)
+            <<",phase="<<name<<std::endl;
+    }
     /** @brief Materialize actual original sources/scratch, bind once, then capture both programs. */
     Cell(const test::QuantizedVerifierFormatCase& format,int columns,int width,
         GatedNormActivation activation,bool subtract,float epsilon=1e-6f)
@@ -123,14 +135,21 @@ public:
             require(consumer,"Original prepared source has no workspace contract");
             workspace=std::make_unique<Workspace>(device,consumer->getWorkspaceRequirements(3,n,k));
             context=IDeviceContext::create(device,1);require(bool(context),"Missing exact native context");
+            phase("context_created");
             GEMMStage::Params params;
             params.device_id=device;params.A=&values;params.B=weights.get();params.C=&output;
             params.gated_norm=GEMMStage::GatedNormPublication{&gate,&gamma,BufferId::GDN_Z,policy};
             params.m=1;params.n=n;params.k=k;params.a_buffer_id=BufferId::ATTN_OUTPUT;params.c_buffer_id=BufferId::ATTN_PROJ;
             params.prepared_ref=prepared.ref;params.prepared_store=prepared.store.get();
+            phase("stage_construct_begin");
             stage=std::make_unique<GEMMStage>(params);stage->setGPUStream(stream.value);
-            stage->bindWorkspace(workspace->value.get());publish(0);join();
+            phase("workspace_bind_begin");
+            stage->bindWorkspace(workspace->value.get());
+            phase("initial_publish_begin");
+            publish(0);join();
+            phase("cold_prepare_begin");
             require(stage->prepareGraphLaunch(context.get(),stream.value),"Composite cold preparation failed");
+            phase("capture_identity_begin");
             signature=stage->graphCaptureVariantSignature();require(signature!=0,"Missing composite capture identity");
             for(const auto* name:{GemmWorkspaceBuffers::QUANT_A,GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
                 GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::SCALES_A})
@@ -153,7 +172,9 @@ public:
                 if(descriptor.mins)immutable.emplace_back(const_cast<void*>(descriptor.mins),blocks*sizeof(std::uint16_t));
             }
             if(descriptor.emins)immutable.emplace_back(const_cast<void*>(descriptor.emins),blocks*4);
+            phase("immutable_readback_begin");
             for(const auto& bank:immutable)original_immutable.push_back(download(bank.first,bank.second));
+            phase("immutable_readback_end");
             const std::vector<const TensorBase*> inputs{&values,&gate,&gamma};
             const std::vector<TensorBase*> outputs{&values,&output};
             // Recording declares dependencies but cannot import an external
@@ -164,8 +185,10 @@ public:
             const auto before_submissions=submissionCount();
             // Capture the actual selected program first: the control cannot
             // initialize a missing source/table/workspace on its behalf.
+            phase("candidate_capture_begin");
             require(candidate.capture(stream.value,device,inputs,outputs,[&]{return stage->execute(context.get());}),
                 "Actual composite stage capture failed");
+            phase("control_capture_begin");
             require(control.capture(stream.value,device,inputs,outputs,[&]{
                 if(!rocmGDN_gated_rmsnorm(static_cast<const float*>(values.gpu_data_ptr()),
                     static_cast<const float*>(gate.gpu_data_ptr()),static_cast<const float*>(gamma.gpu_data_ptr()),
@@ -176,13 +199,25 @@ public:
             }),"Original complete capture failed");
             recorded_submissions=submissionCount();
             require(recorded_submissions==before_submissions+1,"Actual composite capture submission counter missing");
+            phase("inspect_begin");
             inspect();
-        }catch(...){join();throw;}
+            phase("prepared");
+        }catch(const std::exception& error){
+            std::cerr<<"GDN_NORM_SINGLE_Q8_SETUP_EXCEPTION,error="<<error.what()<<std::endl;
+            join();throw;
+        }catch(...){phase("setup_nonstandard_exception");join();throw;}
     }
     /** @brief Retire native work/graphs before any borrowed allocation can unwind. */
     ~Cell(){join();control.reset();candidate.reset();if(stage)stage->unbindWorkspace();}
     /** @brief Test-only terminal observation boundary, never production ordering. */
-    void join()const {if(hipStreamSynchronize(stream.value)!=hipSuccess)std::terminate();}
+    void join()const {
+        const auto status=hipStreamSynchronize(stream.value);
+        if(status!=hipSuccess) {
+            std::cerr<<"GDN_NORM_SINGLE_Q8_JOIN_ERROR,status="<<static_cast<int>(status)
+                <<",error="<<hipGetErrorString(status)<<std::endl;
+            std::terminate();
+        }
+    }
     /** @brief Observe only an explicitly owned native bank, outside captured/timed work. */
     std::vector<uint8_t> download(const void* pointer,size_t bytes)const
     {
@@ -266,7 +301,9 @@ public:
     /** @brief Compare every produced/unused byte, guards and immutable native plane after a dirty replay. */
     std::vector<std::vector<uint8_t>> observe(bool fused,int dirty,unsigned char poison)
     {
+        phase(fused?"candidate_replay_begin":"control_replay_begin");
         publish(dirty,poison);require((fused?candidate:control).launch(stream.value),"Norm retained replay failed");join();
+        phase("replay_readback_begin");
         return currentObservation(dirty,poison);
     }
     /** @brief Observe the ACTUAL completed result without restoring, submitting or replaying anything. */
