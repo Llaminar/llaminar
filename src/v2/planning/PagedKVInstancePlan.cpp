@@ -3,6 +3,7 @@
  * @brief Single-candidate pooled-KV instance bundling implementation.
  */
 #include "PagedKVInstancePlan.h"
+#include "execution/prefix_cache/PagedKVArchiveStore.h"
 
 namespace llaminar2
 {
@@ -56,6 +57,30 @@ std::optional<PagedKVInstancePlan> planPagedKVInstance(
     auto pool = resolvePagedKVPoolGeometry(pool_budget);
     if (!pool || pool->geometry.frames < pool->geometry.max_pages_per_request)
         return std::nullopt; // No frame or under-cap per-request bound: no instance.
+    if (config.disk_enabled)
+    {
+        // Composed route: the disk membership is sized from the PLANNED
+        // geometry's typed need (one record per admitted frame, plus one
+        // in-flight write, one pending replacement and journal rounding) and
+        // the quota must hold at least one rounded extent of the admitted
+        // frame geometry. An authored cap below the need, or a quota that
+        // cannot hold the smallest possible section, fails closed here with
+        // a precise diagnostic (never a silent boundary, never a default).
+        const std::size_t membership_need =
+            pool->geometry.frames + 4; // + in-flight + pending + rounding.
+        if (config.disk_journal_membership < membership_need)
+            throw std::invalid_argument("paged KV disk membership " +
+                std::to_string(config.disk_journal_membership) +
+                " is below the planned geometry's typed extent need (" +
+                std::to_string(membership_need) + ")");
+        const auto smallest_extent =
+            pagedKVArchiveExtentBytes(pool->geometry.frame_bytes);
+        if (config.disk_cap_bytes < smallest_extent)
+            throw std::invalid_argument("paged KV disk quota " +
+                std::to_string(config.disk_cap_bytes) +
+                " cannot hold one rounded extent of the admitted frame geometry (" +
+                std::to_string(smallest_extent) + " bytes)");
+    }
     PagedKVInstancePlan plan;
     plan.pool_geometry = pool->geometry;
     plan.table_geometry = table_geometry;
@@ -66,6 +91,13 @@ std::optional<PagedKVInstancePlan> planPagedKVInstance(
     if (table_bytes > std::numeric_limits<std::size_t>::max() - pool_bytes)
         throw std::overflow_error("Paged KV instance complete BOM overflows");
     plan.total_bytes = pool_bytes + table_bytes;
+    if (config.disk_enabled)
+    {
+        auto route = validatePagedKVDiskRoute(config);
+        if (!route.valid)
+            throw std::invalid_argument(route.refusal);
+        plan.disk_route = route;
+    }
     return plan;
 }
 } // namespace llaminar2

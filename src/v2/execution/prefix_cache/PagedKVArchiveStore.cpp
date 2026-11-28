@@ -94,6 +94,13 @@ std::optional<pid_t> parseTempOwner(const std::string &name)
 }
 } // namespace
 
+std::size_t pagedKVArchiveExtentBytes(std::size_t payload_bytes)
+{
+    // Same rule the store charges (single authority: one block rounding plus
+    // the metadata/rounding overhead constant above).
+    return roundUp(payload_bytes, kExtentOverheadBytes) + kExtentOverheadBytes;
+}
+
 PagedKVArchiveStore::PagedKVArchiveStore(const PagedKVDiskRoute &route)
     : quota_(makePagedKVDiskQuota(route)), directory_(route.directory)
 {
@@ -141,8 +148,7 @@ std::optional<PagedKVArchiveExtentKey> PagedKVArchiveStore::put(
         return std::nullopt;
     }
     const auto serialized = archive.serialize();
-    const std::size_t bytes = roundUp(serialized.size(), kExtentOverheadBytes) +
-        kExtentOverheadBytes;
+    const std::size_t bytes = pagedKVArchiveExtentBytes(serialized.size());
     const std::uint64_t digest = archiveDigest(archive);
     const PagedKVArchiveExtentKey key{generation, namespace_id, digest, bytes};
     // Admit BEFORE any byte reaches storage; refused = no file, no admission.

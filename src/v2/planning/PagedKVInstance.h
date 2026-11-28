@@ -13,10 +13,12 @@
  * instance is the unit of retirement (no orphan table without its pool).
  */
 #pragma once
+#include "execution/prefix_cache/PagedKVArchiveStore.h"
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
 #include "planning/PagedKVInstancePlan.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include <memory>
+#include <string>
 
 namespace llaminar2
 {
@@ -36,15 +38,18 @@ public:
      * @param plan Complete pool/table candidate from the planner.
      * @param device Original CPU allocator identity.
      * @param placement Explicit first-touch policy.
+     * @param refusal Optional precise refusal diagnostic (empty on success).
      * @return The live instance, or empty when the authority cannot admit the
-     * complete planned BOM (refusal is total: no pool/table partial exists).
+     * complete planned BOM or the composed disk store refuses its validated
+     * route (refusal is total: no pool/table/disk partial exists).
      * @throws std::invalid_argument For a foreign authority, device mismatch,
      * or a planned geometry that disagrees with the pool/table factories.
      */
     static std::optional<PagedKVInstance> create(
         std::shared_ptr<PhysicalMemoryAuthority> authority,
         const PagedKVInstancePlan &plan, DeviceId device,
-        CPUStoragePlacement placement = CPUStoragePlacement::local());
+        CPUStoragePlacement placement = CPUStoragePlacement::local(),
+        std::string *refusal = nullptr);
 
     /** @return The pool sub-authority (same PMA instance). */
     PhysicalPagePool &pool() const { return *pool_; }
@@ -57,17 +62,24 @@ public:
     {
         return authority_;
     }
+    /** @return The composed disk store (validated route, engine-owned
+     * directory); nullptr exactly when the tier's disk is disabled. The
+     * store is part of THIS instance: it retires with the instance and its
+     * quota is pre-admitted from the planned geometry. */
+    PagedKVArchiveStore *diskStore() const noexcept { return disk_store_.get(); }
     explicit operator bool() const noexcept { return pool_ && table_; }
 
 private:
     PagedKVInstance(std::shared_ptr<PhysicalMemoryAuthority> authority,
         std::shared_ptr<PhysicalPagePool> pool,
         std::shared_ptr<CPUFP32PagedKVTable> table,
+        std::unique_ptr<PagedKVArchiveStore> disk_store,
         PagedKVInstancePlan plan);
     void retire() noexcept;
     std::shared_ptr<PhysicalMemoryAuthority> authority_;
     std::shared_ptr<PhysicalPagePool> pool_;
     std::shared_ptr<CPUFP32PagedKVTable> table_;
+    std::unique_ptr<PagedKVArchiveStore> disk_store_;
     PagedKVInstancePlan plan_;
 };
 } // namespace llaminar2

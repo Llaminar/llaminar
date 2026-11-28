@@ -15,10 +15,12 @@
  */
 #pragma once
 #include "execution/config/RuntimeConfig.h"
+#include "execution/prefix_cache/PagedKVDiskRoute.h"
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
 #include "planning/PagedKVPoolGeometry.h"
 #include "planning/PhysicalPagePool.h"
 #include <cstddef>
+#include <optional>
 
 namespace llaminar2
 {
@@ -37,6 +39,16 @@ struct PagedKVInstancePlan
     PhysicalPagePoolGeometry pool_geometry;
     CPUFP32PagedKVTableGeometry table_geometry;
     std::size_t total_bytes = 0; ///< Pool + table metadata physical BOM.
+    /**
+     * @brief The validated composed disk route (quota + membership + exact
+     * directory); present exactly when the tier's disk is enabled. The
+     * membership is checked against the planned geometry's typed need (one
+     * record per admitted frame + in-flight + pending replacement + rounding)
+     * and the quota is checked to hold at least one rounded extent of the
+     * admitted frame geometry — an impossible composed route fails closed
+     * here, never at a silent boundary.
+     */
+    std::optional<PagedKVDiskRoute> disk_route;
 };
 
 /**

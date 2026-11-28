@@ -35,6 +35,17 @@
 
 namespace llaminar2
 {
+/**
+ * @brief Exact admitted byte size of one disk extent for a payload.
+ *
+ * The SAME rounding/metadata rule the store charges: payload rounded up to
+ * the storage block plus a fixed metadata/rounding overhead, never a
+ * payload-only number. The planner uses it against the admitted frame
+ * geometry so a route that cannot hold even one rounded extent fails closed
+ * before any backend opens.
+ */
+std::size_t pagedKVArchiveExtentBytes(std::size_t payload_bytes);
+
 /** @brief One typed disk extent identity (generation, namespace, digest, bytes). */
 struct PagedKVArchiveExtentKey
 {
